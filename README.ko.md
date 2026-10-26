@@ -64,4 +64,4 @@ git clone https://github.com/udonsari0101/CTF_Agent.git ~/CTF_Agent && cd ~/CTF_
 | Forensics | `binwalk`, `foremost`, `exiftool`, Sleuth Kit, `testdisk`, Volatility 3, `tshark`, YARA, `ffmpeg`, `steghide`, `stegseek`: 파일, 디스크, 메모리, 패킷, 미디어, 스테가노그래피 분석 |
 | Network 및 기타 | `dig`, `whois`, `nmap`, Scapy, `socat`, `tesseract`, `zbarimg`, Python: 프로토콜, 자동화, OCR |
 
-REA는 기본 이미지에 포함되지 않습니다. REA가 연결하는 Ghidra와 JADX는 이미지에서 직접 사용할 수 있습니다. 버전과 설치 범위는 [도구 목록](docs/ctf-toolchain.md)을 참고하세요. GPU와 KVM 같은 호스트 기능은 로컬 Docker 설정에 따라 사용할 수 있습니다.
+[REA](https://github.com/morluto/rea)는 기본 이미지에 포함되지 않습니다. REA는 분석 도구를 연결하는 선택적 MCP 인터페이스이며, Ghidra와 JADX는 이미지에서 직접 사용할 수 있습니다. 버전과 설치 범위는 [도구 목록](docs/ctf-toolchain.md)을 참고하세요. GPU와 KVM 같은 호스트 기능은 로컬 Docker 설정에 따라 사용할 수 있습니다.

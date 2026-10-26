@@ -271,8 +271,39 @@ def _writeup_narrative(sections: dict[str, str], locale: str = "ko") -> str:
     return "\n".join(prose)
 
 
+def _has_fenced_code(section: str) -> bool:
+    """Accept a code-only section only when it contains a nonempty closed fence."""
+
+    marker_char: str | None = None
+    marker_length = 0
+    has_content = False
+    for line in section.splitlines():
+        fence = re.match(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$", line)
+        if marker_char is None:
+            if fence:
+                marker_char = fence.group(1)[0]
+                marker_length = len(fence.group(1))
+                has_content = False
+            continue
+        if (
+            fence
+            and fence.group(1)[0] == marker_char
+            and len(fence.group(1)) >= marker_length
+            and not fence.group(2).strip()
+        ):
+            if has_content:
+                return True
+            marker_char = None
+            marker_length = 0
+            continue
+        has_content = has_content or bool(line.strip())
+    return False
+
+
 def _english_explanations_present(sections: dict[str, str], challenge_name: str) -> bool:
     for heading in _ENGLISH_WRITEUP_SECTIONS[:-1]:
+        if heading == "Code and Commands" and _has_fenced_code(sections[heading]):
+            continue
         single = {name: sections[name] if name == heading else "" for name in _ENGLISH_WRITEUP_SECTIONS}
         prose = _writeup_narrative(single, "en")
         # Keep the exact challenge title even when the source CTF named it in Korean.
@@ -296,7 +327,11 @@ def _valid_writeup(markdown: str, challenge_name: str, flag: str, locale: str = 
     # explanatory section still needs natural Korean prose.
     if locale == "en" and not _english_explanations_present(sections, challenge_name):
         return False
-    if locale == "ko" and any(not _HANGUL.search(sections[heading]) for heading in headings[:-1]):
+    if locale == "ko" and any(
+        not _HANGUL.search(sections[heading])
+        and not (heading == "풀이 코드 및 명령어" and _has_fenced_code(sections[heading]))
+        for heading in headings[:-1]
+    ):
         return False
     if sections["Flag"].strip() not in {flag, f"`{flag}`"}:
         return False
@@ -321,9 +356,16 @@ def _writeup_validation_issues(
         if any(not sections[heading] for heading in headings):
             issues.append("빈 섹션 존재")
         if (locale == "en" and not _english_explanations_present(sections, challenge_name)) or (
-            locale == "ko" and any(not _HANGUL.search(sections[heading]) for heading in headings[:-1])
+            locale == "ko" and any(
+                not _HANGUL.search(sections[heading])
+                and not (heading == "풀이 코드 및 명령어" and _has_fenced_code(sections[heading]))
+                for heading in headings[:-1]
+            )
         ):
-            issues.append("설명 섹션의 한국어 문장 누락")
+            issues.append(
+                "Missing English explanatory prose" if locale == "en"
+                else "설명 섹션의 한국어 문장 누락"
+            )
         if sections["Flag"].strip() not in {flag, f"`{flag}`"}:
             issues.append("Flag 섹션 값 불일치")
     narrative = _writeup_narrative(sections, locale) if sections is not None else markdown
