@@ -13,8 +13,9 @@ import tempfile
 from fastapi.testclient import TestClient
 
 from ctf_agent.main import create_app
+from ctf_agent.codex_native import native_codex_binary
 from ctf_agent.providers.codex import CodexAccount
-from ctf_agent.solver_worker import REQUIRED_CLAUDE_VERSION, REQUIRED_CODEX_VERSION
+from ctf_agent.solver_worker import REQUIRED_CLAUDE_VERSION, REQUIRED_CODEX_VERSION, resolve_codex_command
 
 
 with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
@@ -70,14 +71,20 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
             assert REQUIRED_CLAUDE_VERSION in result.stdout
         print(result.stdout.strip())
 
-    codex_native_binaries = tuple(
-        Path("/usr/local/lib/node_modules/@openai/codex/node_modules/@openai").glob(
-            "codex-linux-*/vendor/*/bin/codex"
-        )
-    )
-    assert len(codex_native_binaries) == 1
-    codex_native = codex_native_binaries[0]
+    codex_native = native_codex_binary(Path("/usr/local/lib/node_modules/@openai/codex"))
+    assert codex_native is not None
     assert codex_native.is_file() and not codex_native.is_symlink()
+    os.environ["CTF_SOLVER_EXTERNAL_SANDBOX"] = "true"
+    assert resolve_codex_command(Path("/unused"), REQUIRED_CODEX_VERSION) == [str(codex_native)]
+    for layout in ("nested", "hoisted"):
+        package_root = root / f"codex-{layout}" / "node_modules" / "@openai" / "codex"
+        optional_root = (package_root / "node_modules" / "@openai"
+                         if layout == "nested" else package_root.parent)
+        candidate = optional_root / "codex-linux-x64" / "vendor" / "x86_64-unknown-linux-musl" / "bin" / "codex"
+        candidate.parent.mkdir(parents=True)
+        candidate.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        candidate.chmod(0o700)
+        assert native_codex_binary(package_root) == candidate
     code_mode_host = codex_native.with_name("codex-code-mode-host")
     host_details = code_mode_host.stat(follow_symlinks=False)
     assert stat.S_ISREG(host_details.st_mode) and not code_mode_host.is_symlink()

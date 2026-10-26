@@ -11,6 +11,7 @@ from pathlib import Path
 
 import httpx
 
+from ..codex_native import native_codex_binary
 from .codex import CodexAccount, ProviderError, isolated_environment, stop_process
 
 
@@ -180,7 +181,7 @@ class CodexRuntime:
 
     async def update(self, version: str, after_switch):
         if not VERSION.fullmatch(version):
-            raise ProviderError("버전은 0.153.4 같은 정확한 숫자 버전이어야 합니다.", "invalid_version")
+            raise ProviderError("버전은 0.164.0 같은 정확한 숫자 버전이어야 합니다.", "invalid_version")
         if self.busy:
             raise ProviderError("다른 업데이트가 진행 중입니다.", "busy")
         if os.name == "nt" or not shutil.which("npm"):
@@ -227,7 +228,7 @@ class CodexRuntime:
                 command = self.version_command(version)
                 if not command:
                     raise ProviderError("설치된 실행 파일을 확인할 수 없습니다.")
-                await self.verify(command)
+                await self.verify(command, version=version)
                 previous = previous_state.get("previous") if previous_state.get("selected") == version else previous_state.get("selected")
                 self.save({"selected": version, "previous": previous, "updated_at": time.time()})
                 switched = True
@@ -270,7 +271,35 @@ class CodexRuntime:
                     if stage is not None and self.storage_budget is not None:
                         self.storage_budget.release("runtime:" + stage.name.removeprefix("install-"))
 
-    async def verify(self, command):
+    async def verify(self, command, *, version: str | None = None):
+        if version is not None:
+            package_root = self.root / f"codex-{version}" / "node_modules" / "@openai" / "codex"
+            native = native_codex_binary(package_root)
+            if native is None:
+                raise ProviderError(
+                    "설치된 Codex에서 worker용 실행 파일을 찾을 수 없습니다.",
+                    "native_runtime_unavailable",
+                )
+            process = None
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    str(native), "--version", stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=isolated_environment(self.root / "probe"), cwd=self.root,
+                )
+                output, _ = await asyncio.wait_for(process.communicate(), 10)
+                if process.returncode != 0 or version.encode() not in output[:2048]:
+                    raise ProviderError(
+                        "설치된 Codex 실행 파일의 버전을 확인할 수 없습니다.",
+                        "native_runtime_unavailable",
+                    )
+            except (OSError, TimeoutError) as exc:
+                raise ProviderError(
+                    "설치된 Codex 실행 파일을 실행할 수 없습니다.",
+                    "native_runtime_unavailable",
+                ) from exc
+            finally:
+                await stop_process(process)
         probe = CodexAccount(self.root / "probe-auth", command)
         try:
             await probe.start()
@@ -299,7 +328,7 @@ class CodexRuntime:
         command = self.version_command(previous) if previous else [fallback] if fallback else []
         if not command:
             raise ProviderError("이전 기본 Codex 실행 파일이 없습니다.", "unavailable")
-        await self.verify(command)
+        await self.verify(command, version=previous)
         try:
             self.save({"selected": previous, "previous": current.get("selected"), "updated_at": time.time()})
             await after_switch()

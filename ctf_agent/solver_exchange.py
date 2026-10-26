@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     reasoning_effort TEXT NOT NULL,
     max_reasoning_available INTEGER NOT NULL DEFAULT 0 CHECK(max_reasoning_available IN (0,1)),
     service_tier TEXT,
-    codex_version TEXT NOT NULL DEFAULT '0.153.4',
+    codex_version TEXT NOT NULL DEFAULT '0.164.0',
     codex_runtime_sha256 TEXT,
     claude_version TEXT,
     claude_runtime_sha256 TEXT,
@@ -464,7 +464,7 @@ class SolverExchangeCoordinator:
             db.executescript(SCHEMA)
             columns = {row[1] for row in db.execute("PRAGMA table_info(solver_jobs)")}
             if "codex_version" not in columns:
-                db.execute("ALTER TABLE solver_jobs ADD COLUMN codex_version TEXT NOT NULL DEFAULT '0.153.4'")
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN codex_version TEXT NOT NULL DEFAULT '0.164.0'")
             if "codex_runtime_sha256" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN codex_runtime_sha256 TEXT")
             if "claude_version" not in columns:

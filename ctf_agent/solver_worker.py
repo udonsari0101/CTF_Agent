@@ -38,6 +38,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
+from .codex_native import native_codex_binary as _native_codex_binary
 from .agent_workspace import INITIAL_GOAL, NUDGE, POISON_REGOAL, prepare_agent_workspace
 from .archive_workspace import ArchiveSafetyError
 from .solver import (
@@ -66,7 +67,7 @@ except ImportError:  # pragma: no cover - Windows development host
 
 
 EXCHANGE_PROTOCOL = 1
-REQUIRED_CODEX_VERSION = os.environ.get("CTF_IMAGE_CODEX_VERSION", "0.153.4")
+REQUIRED_CODEX_VERSION = os.environ.get("CTF_IMAGE_CODEX_VERSION", "0.164.0")
 if not re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", REQUIRED_CODEX_VERSION):
     raise RuntimeError("CTF_IMAGE_CODEX_VERSION must be an exact semantic version")
 REQUIRED_CLAUDE_VERSION = os.environ.get("CTF_IMAGE_CLAUDE_VERSION", "2.1.310")
@@ -2155,6 +2156,7 @@ def resolve_codex_command(exchange: Path, version: str, expected_digest: str | N
                 native = _native_codex_binary(Path("/usr/local/lib/node_modules/@openai/codex"))
                 if native:
                     return [str(native)]
+                raise WorkerRefusal("invalid_runtime", "이미지에 포함된 Codex native runtime을 확인할 수 없습니다.")
             return [executable]
     runtime = exchange / "runtime" / f"codex-{version}"
     if runtime.exists():
@@ -2203,22 +2205,6 @@ def resolve_claude_command(exchange: Path, version: str, expected_digest: str | 
     if package.get("version") != version or not executable.is_file() or executable.is_symlink():
         raise WorkerRefusal("invalid_runtime", "Claude Code 패키지 버전을 확인하지 못했습니다.")
     return [str(executable)]
-
-
-def _native_codex_binary(package_root: Path) -> Path | None:
-    candidates = sorted(package_root.glob("node_modules/@openai/codex-linux-*/vendor/*/bin/codex"))
-    if len(candidates) != 1:
-        return None
-    candidate = candidates[0]
-    try:
-        details = candidate.lstat()
-    except OSError:
-        return None
-    if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
-        return None
-    if not details.st_mode & stat.S_IXUSR:
-        return None
-    return candidate
 
 
 def _validate_runtime_tree(root: Path) -> None:
@@ -2495,7 +2481,7 @@ class CodexAppServer:
                 "type": "externalSandbox",
                 "networkAccess": "enabled" if network_access else "restricted",
             }
-        # Codex 0.153.4 does not yet expose restricted read roots on Linux.
+        # Codex does not expose restricted read roots on Linux here.
         # The container therefore contains no host mounts except the single
         # exchange, while these flags make the challenge the only writable
         # path (including excluding Codex's usual /tmp exceptions).

@@ -448,7 +448,7 @@ export async function renderAccounts(container, api, options = {}) {
     if (!info.can_manage) codexSection.append(el('p', 'Codex 업데이트는 관리자만 실행할 수 있습니다.'));
     else if (!info.update_supported) codexSection.append(el('p', '이 환경에서는 웹 업데이트를 지원하지 않습니다.'));
     else {
-      const version = el('input'); version.placeholder = '버전 (예: 0.153.4)'; version.setAttribute('aria-label', '설치할 Codex 버전');
+      const version = el('input'); version.placeholder = '버전 (예: 0.164.0)'; version.setAttribute('aria-label', '설치할 Codex 버전');
       const controls = el('div', undefined, 'runtime-controls');
       controls.append(version, button('최신 버전 조회', async () => { const data = await api('/api/providers/codex/catalog'); version.value = data.latest; }),
         button('버전 설치', async () => {

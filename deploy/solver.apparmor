@@ -35,12 +35,16 @@ profile "ctf-agent-solver" flags=(attach_disconnected,mediate_deleted) {
   /usr/local/libexec/ctf-agent-archive-launcher px -> "ctf-agent-solver//&ctf-agent-command",
   /usr/local/libexec/ctf-command/* ix,
   /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex ix,
+  /usr/local/lib/node_modules/@openai/codex-linux-*/vendor/*/bin/codex ix,
   /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host ix,
+  /usr/local/lib/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host ix,
   /usr/local/lib/node_modules/@anthropic-ai/claude-code/** ix,
   /usr/local/lib/node_modules/@anthropic-ai/claude-code-*/** ix,
   /solver-exchange/runtime/claude-*/node_modules/@anthropic-ai/claude-code-linux-*/claude ix,
   /solver-exchange/runtime/codex-*/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex ix,
+  /solver-exchange/runtime/codex-*/node_modules/@openai/codex-linux-*/vendor/*/bin/codex ix,
   /solver-exchange/runtime/codex-*/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host ix,
+  /solver-exchange/runtime/codex-*/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host ix,
   /bin/** ix,
   /usr/bin/** ix,
   /usr/local/bin/** ix,
@@ -106,15 +110,19 @@ profile "ctf-agent-app-server" flags=(attach_disconnected,mediate_deleted) {
   /dev/random r,
 
   /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex ix,
+  /usr/local/lib/node_modules/@openai/codex-linux-*/vendor/*/bin/codex ix,
   # Code-mode-only models delegate their functions.exec tool to this sibling
   # host. It must inherit the provider domain so nested shells still cross
   # into the filesystem-isolated ctf-agent-command profile below.
   /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host ix,
+  /usr/local/lib/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host ix,
   /usr/local/lib/node_modules/@anthropic-ai/claude-code/** ix,
   /usr/local/lib/node_modules/@anthropic-ai/claude-code-*/** ix,
   /solver-exchange/runtime/claude-*/node_modules/@anthropic-ai/claude-code-linux-*/claude ix,
   /solver-exchange/runtime/codex-*/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex ix,
+  /solver-exchange/runtime/codex-*/node_modules/@openai/codex-linux-*/vendor/*/bin/codex ix,
   /solver-exchange/runtime/codex-*/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host ix,
+  /solver-exchange/runtime/codex-*/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host ix,
   /usr/local/libexec/ctf-command/* px -> "ctf-agent-app-server//&ctf-agent-command",
   # Codex can use its Linux fallback or a model-selected shell instead of the
   # image's passwd shell. Cover both merged-/usr spellings and sh's dash target
@@ -234,12 +242,16 @@ profile "ctf-agent-command" flags=(attach_disconnected,mediate_deleted) {
   deny /usr/local/libexec/ctf-agent-codex-launcher x,
   deny /usr/local/libexec/ctf-agent-claude-launcher x,
   deny /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex x,
+  deny /usr/local/lib/node_modules/@openai/codex-linux-*/vendor/*/bin/codex x,
   deny /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host x,
+  deny /usr/local/lib/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host x,
   deny /usr/local/lib/node_modules/@anthropic-ai/claude-code/** x,
   deny /usr/local/lib/node_modules/@anthropic-ai/claude-code-*/** x,
   deny /solver-exchange/runtime/claude-*/node_modules/@anthropic-ai/claude-code-linux-*/claude x,
   deny /solver-exchange/runtime/codex-*/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex x,
+  deny /solver-exchange/runtime/codex-*/node_modules/@openai/codex-linux-*/vendor/*/bin/codex x,
   deny /solver-exchange/runtime/codex-*/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host x,
+  deny /solver-exchange/runtime/codex-*/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host x,
 
   # Match the original ctf_agent solve environment: challenge commands can use
   # direct Internet sockets and DNS. Persistent data, credentials, worker
