@@ -4696,7 +4696,7 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
     if kind == "activity":
         if (
             value.get("phase") not in {"started", "completed"}
-            or value.get("tool") not in {"shell", "web_search", "file", "analysis", "tool"}
+            or value.get("tool") not in {"shell", "web_search", "file", "analysis", "tool", "agent"}
             or not isinstance(value.get("summary"), str)
             or not value["summary"]
             or len(value["summary"].encode("utf-8")) > 400
