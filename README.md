@@ -14,7 +14,7 @@ The screenshots use synthetic challenges and account data.
 
 - Keep each CTF in a separate workspace. Add challenges manually or import selected challenges from CTFd; sync new or changed challenges later. Link related challenges by ID, including challenges with duplicate names.
 - Connect Codex and Claude Code through account sign-in or an API key. Choose the account, model, and reasoning level per challenge; see remaining account quota, live solve time, session activity, and child agents.
-- Send instructions during a solve. On retry, a compatible provider session can resume directly; switching between Codex and Claude Code carries bounded analysis notes and work files into the new provider session.
+- Send instructions during a solve. On retry, a compatible provider session can resume directly. Switching between Codex and Claude Code carries available work files and bounded analysis notes into a new session; if a run stops before it writes notes, a bounded summary of its recorded activity supplies the retry context.
 - Upload multiple files, including large binaries with resumable transfers. Challenge files and the database use separate data directories.
 - See status and flags update while a solve runs, without refreshing the page. Review, copy, and download Markdown write-ups in the selected interface language; request a revised write-up when needed.
 - Each user can register a Telegram bot token in **Personal settings**, connect a chat through a one-time link, and receive flag, write-up, error, and input-request notifications. No bot token is bundled or required during installation. CTFd flag submission is off by default.
