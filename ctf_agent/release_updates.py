@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html.parser
 import json
 import os
 import re
@@ -12,6 +13,8 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.error
+import urllib.parse
 import uuid
 import zipfile
 from pathlib import Path
@@ -31,6 +34,105 @@ def version_tuple(value: str) -> tuple[int, int, int] | None:
     return tuple(map(int, matched.groups())) if matched else None
 
 
+def _public_release_tag(repository: str) -> str:
+    """Resolve GitHub's public latest-release redirect without REST quota."""
+
+    request = urllib.request.Request(
+        f"https://github.com/{repository}/releases/latest",
+        headers={"User-Agent": "ctf-agent-release-check"}, method="HEAD",
+    )
+    with urllib.request.urlopen(request, timeout=12) as response:
+        destination = urllib.parse.urlsplit(response.geturl())
+    prefix = f"/{repository}/releases/tag/"
+    if (destination.scheme != "https" or destination.netloc != "github.com"
+            or destination.query or destination.fragment or not destination.path.startswith(prefix)):
+        raise ValueError("Invalid public release redirect")
+    tag = urllib.parse.unquote(destination.path[len(prefix):])
+    if version_tuple(tag) is None:
+        raise ValueError("Invalid public release version")
+    return tag
+
+
+class _ReleaseBodyParser(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if not self.depth:
+            if tag == "div" and dict(attrs).get("data-test-selector") == "body-content":
+                self.depth = 1
+            return
+        if tag == "div":
+            self.depth += 1
+        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n" + "#" * int(tag[1]) + " ")
+        elif tag == "li":
+            self.parts.append("\n- ")
+        elif tag in {"p", "br", "hr"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.depth:
+            return
+        if tag == "div":
+            self.depth -= 1
+        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6", "p", "li"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self.depth:
+            self.parts.append(data)
+
+    def markdown(self) -> str:
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in "".join(self.parts).splitlines()]
+        return "\n".join(line for line in lines if line)[:16_000]
+
+
+def _public_release(repository: str) -> dict:
+    tag = _public_release_tag(repository)
+    asset_root = f"https://github.com/{repository}/releases/download/{tag}/"
+    archive = f"CTF_Agent-{tag}-local-windows.zip"
+    for name in (archive, archive + ".sha256"):
+        request = urllib.request.Request(
+            asset_root + name,
+            headers={"User-Agent": "ctf-agent-release-check"}, method="HEAD",
+        )
+        with urllib.request.urlopen(request, timeout=12) as response:
+            if response.status != 200:
+                raise ValueError("Release installer assets are missing")
+    page_url = f"https://github.com/{repository}/releases/tag/{tag}"
+    notes = None
+    # New releases attach their original Markdown. Older releases only have
+    # the GitHub page, so retain the bounded HTML fallback for those tags.
+    try:
+        request = urllib.request.Request(
+            asset_root + "release-notes.md",
+            headers={"User-Agent": "ctf-agent-release-check"},
+        )
+        with urllib.request.urlopen(request, timeout=12) as response:
+            raw_notes = response.read(64 * 1024 + 1)
+        if len(raw_notes) <= 64 * 1024:
+            notes = raw_notes.decode("utf-8-sig").strip()[:16_000] or None
+    except (OSError, UnicodeError):
+        pass
+    if notes is None:
+        request = urllib.request.Request(page_url, headers={"User-Agent": "ctf-agent-release-check"})
+        with urllib.request.urlopen(request, timeout=12) as response:
+            if response.geturl() != page_url:
+                raise ValueError("Release page redirected unexpectedly")
+            page = response.read(1_000_001)
+        if len(page) > 1_000_000:
+            raise ValueError("Release page is too large")
+        parser = _ReleaseBodyParser()
+        parser.feed(page.decode("utf-8"))
+        notes = parser.markdown()
+    if not notes:
+        raise ValueError("Release notes are unavailable")
+    return {"tag": tag, "notes": notes, "published_at": None, "url": page_url}
+
+
 def latest_release(repository: str = REPOSITORY, *, force: bool = False) -> dict:
     global _LATEST_CACHE
     if not REPOSITORY_PATTERN.fullmatch(repository):
@@ -45,24 +147,29 @@ def latest_release(repository: str = REPOSITORY, *, force: bool = False) -> dict
             f"https://api.github.com/repos/{repository}/releases/latest",
             headers={"Accept": "application/vnd.github+json", "User-Agent": "ctf-agent-release-check"},
         )
-        with urllib.request.urlopen(request, timeout=12) as response:
-            raw = response.read(256 * 1024 + 1)
-        if len(raw) > 256 * 1024:
-            raise ValueError("Release metadata is too large")
-        payload = json.loads(raw)
-        tag = payload.get("tag_name")
-        if not isinstance(tag, str) or version_tuple(tag) is None or payload.get("draft") or payload.get("prerelease"):
-            raise ValueError("Invalid published release")
-        names = {item.get("name") for item in payload.get("assets", []) if isinstance(item, dict)}
-        archive = f"CTF_Agent-{tag}-local-windows.zip"
-        if archive not in names or archive + ".sha256" not in names:
-            raise ValueError("Release installer assets are missing")
-        result = {
-            "tag": tag,
-            "notes": str(payload.get("body") or "")[:16_000],
-            "published_at": payload.get("published_at"),
-            "url": f"https://github.com/{repository}/releases/tag/{tag}",
-        }
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                raw = response.read(256 * 1024 + 1)
+            if len(raw) > 256 * 1024:
+                raise ValueError("Release metadata is too large")
+            payload = json.loads(raw)
+            tag = payload.get("tag_name")
+            if not isinstance(tag, str) or version_tuple(tag) is None or payload.get("draft") or payload.get("prerelease"):
+                raise ValueError("Invalid published release")
+            names = {item.get("name") for item in payload.get("assets", []) if isinstance(item, dict)}
+            archive = f"CTF_Agent-{tag}-local-windows.zip"
+            if archive not in names or archive + ".sha256" not in names:
+                raise ValueError("Release installer assets are missing")
+            result = {
+                "tag": tag,
+                "notes": str(payload.get("body") or "")[:16_000],
+                "published_at": payload.get("published_at"),
+                "url": f"https://github.com/{repository}/releases/tag/{tag}",
+            }
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {403, 429}:
+                raise
+            result = _public_release(repository)
         _LATEST_CACHE[repository] = (time.monotonic(), result)
         return dict(result)
 

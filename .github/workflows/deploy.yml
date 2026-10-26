@@ -71,6 +71,7 @@ jobs:
           [[ "$DEPLOY_SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
           [[ "$DEPLOY_SSH_USER" =~ ^[A-Za-z0-9_-]+$ ]]
           [[ "$DEPLOY_RELEASE_ROOT" =~ ^/[A-Za-z0-9/_-]+$ ]]
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
           printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/deploy-key"
           printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/known-hosts"
           chmod 0600 "$RUNNER_TEMP/deploy-key" "$RUNNER_TEMP/known-hosts"
@@ -83,5 +84,5 @@ jobs:
             -o ConnectionAttempts=1 -o ConnectTimeout=30 \
             -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
             "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST" \
-            "sh -s -- '$REVISION' '$IMAGE_REF' '$DEPLOY_RELEASE_ROOT'" \
+            "CTF_SOURCE_REPOSITORY='$GITHUB_REPOSITORY' sh -s -- '$REVISION' '$IMAGE_REF' '$DEPLOY_RELEASE_ROOT'" \
             < .github/scripts/remote-rollout.sh

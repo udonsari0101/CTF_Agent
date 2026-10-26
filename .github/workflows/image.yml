@@ -12,6 +12,11 @@ on:
       - requirements-ctf.txt
       - ctf_agent/**
       - deploy/**
+      - installer/**
+      - compose.local.yaml
+      - scripts/package_local_release.py
+      - pyproject.toml
+      - .github/workflows/release.yml
   workflow_dispatch:
 
 permissions:

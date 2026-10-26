@@ -20,9 +20,10 @@ To browse challenge files in Windows Explorer, open the data directory via
 or use explorer.exe from a WSL terminal. Keep files inside the WSL Linux
 filesystem for Docker performance.
 
-The ZIP contains source and an installer. The first install builds the CTF
-toolchain and application images locally. Subsequent upgrades reuse an
-unchanged toolchain image.
+The ZIP contains source and an installer. The installer pulls the public
+release image, including the CTF toolchain, by verified GHCR digest. It does
+not build the application locally. The small update controller is built
+locally. A shared public image cache may remain after uninstall.
 
 Start.cmd and Uninstall.cmd are also copied to your local Windows app data
 folder under CTF Agent. Start.cmd starts the installed service even when

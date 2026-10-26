@@ -62,20 +62,33 @@ export CTF_LOCAL_FS_DATABASE="${CTF_LOCAL_FS_DATABASE:-$home_dir/Database/CTF_Ag
 export CTF_RELEASE_SHA="$revision"
 export CTF_RELEASE_VERSION="$version"
 cd -- "$target"
-toolchain_stamp="$home_dir/.toolchain-image"
-toolchain_fingerprint="$(sha256sum Dockerfile.toolchain toolchain.lock requirements.txt requirements-ctf.txt deploy/DecompileAll.java deploy/DecompileFn.java | sha256sum | cut -d ' ' -f 1)"
-toolchain_image="$(docker image inspect --format '{{.Id}}' ctf-agent-toolchain:local 2>/dev/null || true)"
-if [[ -z "$toolchain_image" || "$(cat -- "$toolchain_stamp" 2>/dev/null || true)" != "$toolchain_fingerprint $toolchain_image" ]]; then
-    docker build --file Dockerfile.toolchain --tag ctf-agent-toolchain:local .
-    toolchain_image="$(docker image inspect --format '{{.Id}}' ctf-agent-toolchain:local)"
-    [[ -n "$toolchain_image" ]] || { echo 'Toolchain image inspection failed.' >&2; exit 1; }
-    stamp_temp="$(mktemp "$home_dir/.toolchain-image.XXXXXXXX")"
-    printf '%s %s\n' "$toolchain_fingerprint" "$toolchain_image" > "$stamp_temp"
-    chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$stamp_temp"
-    mv -f -- "$stamp_temp" "$toolchain_stamp"
-else
-    echo 'Reusing the existing CTF toolchain image.'
+image_repository=ghcr.io/udonsari0101/ctf-agent-public
+image_tag="$image_repository:$revision"
+# Resolve the immutable registry digest before pulling. This is the same
+# release image used by the server, including its CTF toolchain layers.
+image_digest="$(docker manifest inspect --verbose "$image_tag" | python3 -c '
+import json, re, sys
+manifest = json.load(sys.stdin)
+descriptor = manifest.get("Descriptor") if isinstance(manifest, dict) else None
+digest = descriptor.get("digest") if isinstance(descriptor, dict) else None
+if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+    raise SystemExit("Published release image digest is invalid")
+print(digest)
+')"
+image_ref="$image_repository@$image_digest"
+docker pull "$image_ref"
+image_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_ref")"
+image_source="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$image_ref")"
+if [[ "$image_revision" != "$revision" || "$image_source" != "https://github.com/udonsari0101/CTF_Agent" ]]; then
+    echo 'Published image does not match this release.' >&2
+    exit 1
 fi
+image_ref_temp="$(mktemp "$target/.image-ref.XXXXXXXX")"
+printf '%s\n' "$image_ref" > "$image_ref_temp"
+if [[ "$(id -u)" == 0 ]]; then
+    chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$image_ref_temp"
+fi
+mv -f -- "$image_ref_temp" "$target/.image-ref"
 # The installed web coordinator stops claiming queued work while this file
 # exists. Wait for every claimed solve to finish before Compose recreates its
 # worker; a timed-out update leaves the current workers running.
@@ -124,7 +137,8 @@ PY
     echo "Waiting for $claimed active solver job(s) before update."
     sleep 10
 done
-python3 deploy/local-compose.py up -d --build
+docker image tag "$image_ref" ctf-agent-local:latest
+python3 deploy/local-compose.py up -d --no-build
 install -d -m 0750 -o "$CTF_LOCAL_UID" -g "$CTF_LOCAL_GID" "$home_dir/.launcher"
 for name in start.sh uninstall.py; do
     cp -- "$target/installer/$name" "$home_dir/.launcher/$name"

@@ -77,6 +77,36 @@ grep -Eq 'ctf-agent-public@sha256|CTF_EXPECTED_IMAGE_REPOSITORY' "$target_dir/re
     echo 'The host release script does not support the configured image registry.' >&2
     exit 1
 }
+# Host release directories carry machine-specific Compose and rollback files,
+# but the sandbox policy belongs to the exact application commit. A copied
+# profile from the previous release can make a new worker fail its canary or
+# leave a new credential path readable. Refresh both policies before startup.
+source_repo=${CTF_SOURCE_REPOSITORY:-udonsari0101/CTF_Agent}
+printf '%s\n' "$source_repo" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || exit 1
+case "$source_repo" in ./*|*/.|../*|*/..|*..*|*//*) exit 1 ;; esac
+for policy in solver.apparmor solver-legacy.apparmor; do
+    [ ! -L "$target_dir/$policy" ] || exit 1
+done
+policy_modern_tmp=
+policy_legacy_tmp=
+trap 'rm -f "$drain_file"; [ -z "$policy_modern_tmp" ] || rm -f "$policy_modern_tmp"; [ -z "$policy_legacy_tmp" ] || rm -f "$policy_legacy_tmp"' EXIT
+policy_modern_tmp=$(mktemp "$target_dir/.solver.apparmor-XXXXXXXX")
+policy_legacy_tmp=$(mktemp "$target_dir/.solver-legacy.apparmor-XXXXXXXX")
+curl -fsSL --connect-timeout 10 --max-time 45 \
+    "https://raw.githubusercontent.com/$source_repo/$revision/deploy/solver.apparmor" \
+    --output "$policy_modern_tmp"
+curl -fsSL --connect-timeout 10 --max-time 45 \
+    "https://raw.githubusercontent.com/$source_repo/$revision/deploy/solver-legacy.apparmor" \
+    --output "$policy_legacy_tmp"
+for policy_file in "$policy_modern_tmp" "$policy_legacy_tmp"; do
+    policy_size=$(wc -c < "$policy_file")
+    [ "$policy_size" -gt 100 ] && [ "$policy_size" -le 262144 ] || exit 1
+    grep -Fq 'profile "ctf-agent-solver"' "$policy_file" || exit 1
+    grep -Fq 'profile "ctf-agent-command"' "$policy_file" || exit 1
+    chmod 0640 "$policy_file"
+done
+mv -f "$policy_modern_tmp" "$target_dir/solver.apparmor"
+mv -f "$policy_legacy_tmp" "$target_dir/solver-legacy.apparmor"
 if [ -f "$target_dir/image-ref" ] &&
    [ "$(cat "$target_dir/image-ref")" != "$image_ref" ] &&
    [ "$(cat "$target_dir/image-ref")" != "$(cat "$source_dir/image-ref")" ]; then

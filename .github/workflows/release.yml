@@ -77,5 +77,6 @@ jobs:
           gh release create "$RELEASE_TAG" \
             "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" \
             "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip.sha256" \
+            "$notes" \
             --title "CTF Agent $RELEASE_TAG" \
             --notes-file "$notes"

@@ -42,6 +42,28 @@ if [[ "${#options[@]}" -ne 2 ]]; then
 fi
 docker info >/dev/null
 docker image inspect ctf-agent-local:latest >/dev/null
+image_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' ctf-agent-local:latest)"
+if [[ "$image_revision" != "$revision" ]]; then
+    echo 'Installed image does not match the selected release.' >&2
+    exit 1
+fi
+if [[ -f "$release/.image-ref" ]]; then
+    if [[ -L "$release/.image-ref" ]]; then
+        echo 'Installed image reference is invalid.' >&2
+        exit 1
+    fi
+    image_ref="$(cat -- "$release/.image-ref")"
+    if [[ ! "$image_ref" =~ ^ghcr\.io/udonsari0101/ctf-agent-public@sha256:[0-9a-f]{64}$ ]]; then
+        echo 'Installed image reference is invalid.' >&2
+        exit 1
+    fi
+    pinned_id="$(docker image inspect --format '{{.Id}}' "$image_ref")"
+    local_id="$(docker image inspect --format '{{.Id}}' ctf-agent-local:latest)"
+    if [[ -z "$pinned_id" || "$pinned_id" != "$local_id" ]]; then
+        echo 'Installed image does not match its public release digest.' >&2
+        exit 1
+    fi
+fi
 export CTF_LOCAL_HOME="$home_dir"
 export CTF_LOCAL_DATA="$home_dir/ctf_agent_data"
 export CTF_LOCAL_DATABASE="$home_dir/Database/CTF_Agent"
