@@ -9,38 +9,39 @@ const el = (tag, text, className) => {
 
 async function copyText(value) {
   const text = String(value ?? '');
-  const focused = document.activeElement;
-  const selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart,focused.selectionEnd] : null;
-  const area = document.createElement('textarea');
-  area.value = text;
-  area.setAttribute('readonly','');
-  area.setAttribute('aria-hidden','true');
-  area.className = 'clipboard-proxy';
-  document.body.append(area);
-  area.focus();
-  area.select();
-  area.setSelectionRange?.(0,area.value.length);
-  let copied = false;
-  try { copied = typeof document.execCommand === 'function' && document.execCommand('copy'); }
-  catch { copied = false; }
-  finally {
-    area.remove();
-    if (focused?.isConnected !== false) focused?.focus?.();
-    if (selection && focused?.isConnected !== false && typeof focused?.setSelectionRange === 'function') focused.setSelectionRange(...selection);
-  }
-  if (copied) return 'unverified';
   if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
     let timeout;
     try {
+      // Invoke while the click still has transient user activation.
+      const writing = navigator.clipboard.writeText(text);
       await Promise.race([
-        navigator.clipboard.writeText(text),
-        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('클립보드 응답이 지연되었습니다. 복사 여부를 확인하고 다시 시도하세요.')), 2000); }),
+        writing,
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('클립보드 응답이 지연되었습니다.')), 1200); }),
       ]);
       return 'unverified';
-    } catch { /* Clipboard permission may be denied or the response may stall. */ }
+    } catch { /* The text remains available for manual copying. */ }
     finally { clearTimeout(timeout); }
   }
-  throw new Error('클립보드 권한이 차단되었거나 응답이 지연되었습니다. 복사 여부를 확인하거나 로그인 링크를 직접 여세요.');
+  showManualCopy(text);
+  return 'manual';
+}
+
+function showManualCopy(text) {
+  const dialog = el('dialog', undefined, 'modal copy-select-dialog');
+  const heading = el('h2', i18n.t('직접 복사'));
+  const guidance = el('p', i18n.t('내용을 선택한 상태입니다. Ctrl+C를 누르세요.'));
+  const area = el('textarea');
+  area.readOnly = true;
+  area.value = text;
+  area.setAttribute('aria-label', i18n.t('복사할 내용'));
+  const close = el('button', i18n.t('닫기'));
+  close.type = 'button';
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => dialog.remove(), {once:true});
+  dialog.append(heading,guidance,area,close);
+  document.body.append(dialog);
+  dialog.showModal();
+  area.focus(); area.select();
 }
 
 const date = seconds => seconds != null ? new Date(seconds * 1000).toLocaleString(i18n.locale === 'ko' ? 'ko-KR' : 'en-US', {timeZone: 'Asia/Seoul'}) + ' KST' : i18n.t('미제공');
@@ -178,8 +179,8 @@ export async function renderAccounts(container, api, options = {}) {
       const link = el('a', 'Claude 로그인 페이지 열기');
       link.href = state.verification_url; link.target = '_blank'; link.rel = 'noopener noreferrer';
       claudeLink.append(link, button('링크 복사', async () => {
-        await copyText(state.verification_url);
-        setFeedback('복사를 시도했습니다. 링크가 필요하면 직접 열어 주소를 복사하세요.');
+        const result = await copyText(state.verification_url);
+        setFeedback(i18n.t(result === 'manual' ? '링크를 선택했습니다. Ctrl+C를 눌러 복사하세요.' : '복사를 시도했습니다. 링크가 필요하면 직접 열어 주소를 복사하세요.'));
       }));
     };
     if (isClaudeLogin) {

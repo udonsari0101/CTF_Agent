@@ -419,7 +419,6 @@ input:focus, textarea:focus, select:focus {
 .submission-row p { margin: 6px 0 0; font-size: 11px; }
 .telegram-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 0 0 18px; color: var(--muted); font-size: 11px; }
 .error-text { color: #ff9eaa; }
-.clipboard-proxy { position: fixed; inset: 0 auto auto 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .copy-select-action { margin-left: 10px; padding: 2px 7px; border-color: currentColor; color: inherit; }
 .copy-select-dialog { width: min(760px, calc(100vw - 24px)); padding: 20px; }
 .copy-select-dialog::backdrop { background: #000b; }
@@ -472,6 +471,7 @@ input:focus, textarea:focus, select:focus {
 .solver-continuation-workspace strong { color: #77c9ec; }
 .solver-continuation-session strong { color: #60d8bb; }
 .solver-continuation span { overflow-wrap: anywhere; }
+.solver-queue-state-update { color: #e2c57a; }
 .solver-progress { display: grid; gap: 4px; color: #bfd0d5; font-size: 11px; }
 .solver-progress progress { margin: 0; width: 100%; }
 .solver-artifact { display: grid; gap: 8px; border: 1px solid #25463b; border-radius: 8px; padding: 10px; background: #03110d; }

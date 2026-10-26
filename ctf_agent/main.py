@@ -696,7 +696,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if version_tuple(latest["tag"]) <= version_tuple(current):
             raise HTTPException(409, "이미 최신 버전입니다.")
         try:
-            request_id = queue_update(root, latest["tag"])
+            # Solver enqueue takes this writer lock before checking the
+            # updater marker. Publish the request while holding the same lock
+            # so a new solve cannot slip between the check and update start.
+            with database() as db:
+                db.execute("BEGIN IMMEDIATE")
+                request_id = queue_update(root, latest["tag"])
         except FileExistsError:
             raise HTTPException(409, "업데이트가 이미 대기 중입니다.") from None
         return {"request_id": request_id, "tag": latest["tag"], "status": "queued"}

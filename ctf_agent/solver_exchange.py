@@ -28,6 +28,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
+from .remote_relay import RemoteAccessError, parse_connection_info
 from .solver import ModelConfiguration, SelectedAccount, normalize_rate_limit_context
 from .solver_worker import (
     EXCHANGE_PROTOCOL,
@@ -90,6 +91,15 @@ _CONTINUATION_SESSION = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
 _CONTINUATION_SCRATCH = re.compile(r"ctf-job-[A-Za-z0-9_-]{6,64}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _VERSION = re.compile(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}\Z")
+_DESCRIPTION_HOST = r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)"
+_DESCRIPTION_ENDPOINT = re.compile(
+    rf"(?P<url>(?P<url_scheme>https?|tcp)://(?P<url_host>{_DESCRIPTION_HOST})(?::(?P<url_port>\d{{1,5}}))?)"
+    rf"|(?P<nc>(?P<nc_prefix>\b(?:nc|ncat|netcat)\s+)(?P<nc_host>{_DESCRIPTION_HOST})(?P<nc_sep>\s+)(?P<nc_port>\d{{1,5}}))"
+    rf"|(?P<host_label>(?P<host_prefix>\bHost:\s+)(?P<label_host>{_DESCRIPTION_HOST})(?![A-Za-z0-9.-]))"
+    rf"|(?P<port_label>(?P<port_prefix>\bPort:\s+)(?P<label_port>\d{{1,5}})(?!\d))"
+    rf"|(?P<host_port>(?P<bare_host>{_DESCRIPTION_HOST}):(?P<bare_port>\d{{1,5}})(?!\d))",
+    re.IGNORECASE,
+)
 _MAX_REMOTE_CHARS = 2000
 MAX_WRITEUP_REFINEMENT_INSTRUCTION_BYTES = 12 * 1024
 MAX_SOLVER_GUIDANCE_BYTES = 16 * 1024
@@ -160,6 +170,7 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     source_solver_job_id TEXT,
     challenge_input_sha256 TEXT,
     challenge_base_sha256 TEXT,
+    challenge_description TEXT,
     remote_mode TEXT NOT NULL DEFAULT 'unknown',
     flag_rejected_at REAL,
     error_json TEXT,
@@ -591,6 +602,8 @@ class SolverExchangeCoordinator:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN challenge_input_sha256 TEXT")
             if "challenge_base_sha256" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN challenge_base_sha256 TEXT")
+            if "challenge_description" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN challenge_description TEXT")
             if "remote_mode" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN remote_mode TEXT NOT NULL DEFAULT 'unknown'")
             if "flag_rejected_at" not in columns:
@@ -883,6 +896,16 @@ class SolverExchangeCoordinator:
         try:
             with self._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
+                # The updater queues a request under this same SQLite writer
+                # lock. A solve submitted during the update must not become a
+                # queued job that silently waits for worker containers to
+                # return (possibly after a long image pull).
+                if self._service_updating():
+                    raise ExchangeError(
+                        "service_updating",
+                        "서비스 업데이트 중입니다. 완료된 뒤 다시 시작해 주세요.",
+                        retryable=True,
+                    )
                 if ultra_source_job_id is not None:
                     existing_ultra = db.execute(
                         "SELECT id FROM solver_jobs WHERE ultra_source_job_id=? AND owner_user_id=?",
@@ -892,7 +915,7 @@ class SolverExchangeCoordinator:
                         db.commit()
                         return self.get(existing_ultra["id"], owner_user_id)
                 challenge = db.execute(
-                    """SELECT c.status,c.remote_mode,c.flag,c.completion_source,w.owner_user_id
+                    """SELECT c.status,c.remote_mode,c.description,c.flag,c.completion_source,w.owner_user_id
                               FROM challenges c
                        JOIN workspaces w ON w.id=c.workspace_id
                        JOIN users u ON u.id=w.owner_user_id
@@ -1134,13 +1157,33 @@ class SolverExchangeCoordinator:
                     exact_input = not checkpoint_row["input_sha256"] or secrets.compare_digest(
                         checkpoint_row["input_sha256"], challenge_input_sha256
                     )
-                    remote_resume = bool(
-                        checkpoint
-                        and checkpoint.reason == "needs_remote"
-                        and checkpoint_row["base_input_sha256"]
+                    same_base = bool(
+                        checkpoint_row["base_input_sha256"]
                         and secrets.compare_digest(
                             checkpoint_row["base_input_sha256"], challenge_base_sha256
                         )
+                    )
+                    description_resume = False
+                    if checkpoint and checkpoint.reason == "needs_remote" and not same_base:
+                        checkpoint_source = db.execute(
+                            """SELECT * FROM solver_jobs
+                               WHERE id=? AND owner_user_id=? AND workspace_id=?
+                                 AND challenge_id=? AND released_ingested=1 AND job_mode='solve'""",
+                            (checkpoint_row["source_job_id"], owner_user_id, workspace_id, challenge_id),
+                        ).fetchone()
+                        description_resume = bool(
+                            checkpoint_source
+                            and checkpoint_source["challenge_base_sha256"] == checkpoint_row["base_input_sha256"]
+                            and checkpoint_source["challenge_input_sha256"] == checkpoint_row["input_sha256"]
+                            and _remote_description_resume(
+                                db, checkpoint_source, owner_user_id, workspace_id,
+                                challenge_id, challenge_base_sha256,
+                            )
+                        )
+                    remote_resume = bool(
+                        checkpoint
+                        and checkpoint.reason == "needs_remote"
+                        and (same_base or description_resume)
                         and remote_mode in {"none", "endpoint"}
                         and (
                             checkpoint_row["source_remote_mode"] == "unknown"
@@ -1209,7 +1252,13 @@ class SolverExchangeCoordinator:
                             source and remote_resume and checkpoint and checkpoint.reason == "needs_remote"
                             and checkpoint_row and checkpoint_row["input_sha256"] == saved["input_sha256"]
                             and saved["input_sha256"] == source["challenge_input_sha256"]
-                            and source["challenge_base_sha256"] == challenge_base_sha256
+                            and (
+                                source["challenge_base_sha256"] == challenge_base_sha256
+                                or (
+                                    description_resume
+                                    and source["challenge_base_sha256"] == checkpoint_row["base_input_sha256"]
+                                )
+                            )
                             and source["remote_mode"] in {"unknown", "none", "endpoint"}
                             and remote_mode in {"none", "endpoint"}
                         )
@@ -1268,13 +1317,13 @@ class SolverExchangeCoordinator:
                        (id,job_mode,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,auth_kind,model,
                         reasoning_effort,ultra_escalation_mode,ultra_source_job_id,ultracode,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
                          retry_checkpoint_json,continuation_mode,continuation_source_job_id,writeup_instruction,writeup_locale,source_writeup_sha256,source_solver_job_id,
-                        challenge_input_sha256,challenge_base_sha256,remote_mode,status,previous_challenge_status,flag,private_notes,
+                        challenge_input_sha256,challenge_base_sha256,challenge_description,remote_mode,status,previous_challenge_status,flag,private_notes,
                         solver_artifact_json,flag_hooked,created_at,updated_at)
                        VALUES(:id,:job_mode,:owner_user_id,:workspace_id,:challenge_id,:account_id,
                                :account_label,:provider,:auth_kind,:model,:reasoning_effort,:ultra_escalation_mode,:ultra_source_job_id,:ultracode,:max_reasoning_available,:service_tier,:codex_version,
                                :codex_runtime_sha256,:claude_version,:claude_runtime_sha256,:retry_checkpoint_json,:continuation_mode,:continuation_source_job_id,
                               :writeup_instruction,:writeup_locale,:source_writeup_sha256,:source_solver_job_id,
-                              :challenge_input_sha256,:challenge_base_sha256,:remote_mode,'queued',:previous_challenge_status,:flag,
+                              :challenge_input_sha256,:challenge_base_sha256,:challenge_description,:remote_mode,'queued',:previous_challenge_status,:flag,
                               :private_notes,:solver_artifact_json,:flag_hooked,:created_at,:updated_at)""",
                     {
                         "id": job_id,
@@ -1309,6 +1358,7 @@ class SolverExchangeCoordinator:
                         "source_solver_job_id": source_solver_job_id,
                         "challenge_input_sha256": challenge_input_sha256,
                         "challenge_base_sha256": challenge_base_sha256,
+                        "challenge_description": challenge["description"],
                         "remote_mode": remote_mode,
                         "previous_challenge_status": (
                             challenge["status"] if job_mode == "solve" else None
@@ -1422,7 +1472,10 @@ class SolverExchangeCoordinator:
                        WHERE status='queued' AND (created_at<? OR (created_at=? AND id<=?))""",
                     (row["created_at"], row["created_at"], row["id"]),
                 ).fetchone()[0]
-        return _public_job(row, events, position, guidance=guidance)
+        result = _public_job(row, events, position, guidance=guidance)
+        if row["status"] == "queued" and self._service_updating():
+            result["queue_block_reason"] = "service_update"
+        return result
 
     def latest(
         self,
@@ -2268,6 +2321,22 @@ class SolverExchangeCoordinator:
             return False
         return stat.S_ISREG(drain.st_mode) and 0 <= self.clock() - drain.st_mtime < 7200
 
+    def _service_updating(self) -> bool:
+        if self._deployment_draining():
+            return True
+        control = self.data_dir / "update-control"
+        for name in ("request.json", "running.json"):
+            try:
+                (control / name).lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            # An unexpected marker should not let a solve slip into a queue
+            # while the update state is uncertain.
+            return True
+        return False
+
     def _claim_next(self, worker_instance_id: str) -> dict[str, Any] | None:
         # A deployment waits for claimed work to finish before recreating the
         # worker containers. Queued work remains durable and starts afterward.
@@ -2918,6 +2987,10 @@ class SolverExchangeCoordinator:
         source_id = job.get("continuation_source_job_id")
         if job.get("job_mode") != "solve" or not isinstance(source_id, str) or not _ID.fullmatch(source_id):
             return None
+        try:
+            checkpoint = decode_checkpoint(job.get("retry_checkpoint_json"))
+        except (TypeError, ValueError):
+            checkpoint = None
         with self._connect() as db:
             saved = db.execute(
                 """SELECT * FROM solver_continuations
@@ -2931,17 +3004,24 @@ class SolverExchangeCoordinator:
                      AND workspace_id=? AND challenge_id=? AND released_ingested=1""",
                 (source_id, job["owner_user_id"], job["workspace_id"], job["challenge_id"]),
             ).fetchone()
+            description_resume = bool(
+                source and checkpoint and checkpoint.reason == "needs_remote"
+                and source["challenge_base_sha256"] != job["challenge_base_sha256"]
+                and _remote_description_resume(
+                    db, source, job["owner_user_id"], job["workspace_id"],
+                    job["challenge_id"], job["challenge_base_sha256"],
+                )
+            )
         if not saved or not source or source["challenge_input_sha256"] != saved["input_sha256"]:
             return None
         exact_input = saved["input_sha256"] == job["challenge_input_sha256"]
         if not exact_input:
-            try:
-                checkpoint = decode_checkpoint(job.get("retry_checkpoint_json"))
-            except (TypeError, ValueError):
-                return None
             if not (
                 checkpoint and checkpoint.reason == "needs_remote"
-                and source["challenge_base_sha256"] == job["challenge_base_sha256"]
+                and (
+                    source["challenge_base_sha256"] == job["challenge_base_sha256"]
+                    or description_resume
+                )
                 and source["remote_mode"] in {"unknown", "none", "endpoint"}
                 and job["remote_mode"] in {"none", "endpoint"}
                 and job["continuation_mode"] == "workspace"
@@ -5064,6 +5144,108 @@ def _challenge_base_sha256(
             )
         )
     ).hexdigest()
+
+
+def _description_endpoint_tokens(description: str) -> tuple[list[str], list[tuple[str, str, str | None, int | None, str]]]:
+    """Split a brief at connection details, retaining all other text exactly."""
+
+    literals: list[str] = []
+    tokens: list[tuple[str, str, str | None, int | None, str]] = []
+    cursor = 0
+    for match in _DESCRIPTION_ENDPOINT.finditer(description):
+        literals.append(description[cursor:match.start()])
+        if match.group("url"):
+            scheme = match.group("url_scheme")
+            port = match.group("url_port")
+            tokens.append((
+                "url", scheme.lower(), match.group("url_host").strip("[]").lower(),
+                int(port) if port else (443 if scheme.lower() == "https" else 80),
+                match.group(),
+            ))
+        elif match.group("nc"):
+            tokens.append((
+                "nc", match.group("nc_prefix") + "\0" + match.group("nc_sep"),
+                match.group("nc_host").strip("[]").lower(), int(match.group("nc_port")), match.group(),
+            ))
+        elif match.group("host_label"):
+            tokens.append((
+                "host_label", match.group("host_prefix"),
+                match.group("label_host").strip("[]").lower(), None, match.group(),
+            ))
+        elif match.group("port_label"):
+            tokens.append((
+                "port_label", match.group("port_prefix"),
+                None, int(match.group("label_port")), match.group(),
+            ))
+        else:
+            tokens.append((
+                "host_port", "", match.group("bare_host").strip("[]").lower(),
+                int(match.group("bare_port")), match.group(),
+            ))
+        cursor = match.end()
+    literals.append(description[cursor:])
+    return literals, tokens
+
+
+def _only_remote_endpoint_changed(old: str, new: str, remote: str) -> bool:
+    """Accept changed endpoint tokens only when they identify the new remote."""
+
+    if old == new or len(old) > 100_000 or len(new) > 100_000:
+        return False
+    try:
+        endpoint = parse_connection_info(remote)
+    except (RemoteAccessError, TypeError, ValueError):
+        return False
+    old_literals, old_tokens = _description_endpoint_tokens(old)
+    new_literals, new_tokens = _description_endpoint_tokens(new)
+    if old_literals != new_literals or len(old_tokens) != len(new_tokens):
+        return False
+    changed = False
+    for previous, current in zip(old_tokens, new_tokens):
+        old_kind, old_stable, _, _, old_text = previous
+        new_kind, new_stable, new_host, new_port, new_text = current
+        if old_kind != new_kind or old_stable != new_stable:
+            return False
+        if old_text == new_text:
+            continue
+        changed = True
+        if (new_host is not None and new_host != endpoint.host.lower()) or (
+            new_port is not None and new_port != endpoint.port
+        ):
+            return False
+    return changed
+
+
+def _remote_description_resume(
+    db: sqlite3.Connection,
+    source: Mapping[str, Any],
+    owner_user_id: str,
+    workspace_id: str,
+    challenge_id: str,
+    current_base_sha256: str,
+) -> bool:
+    """Prove that only connection details in the brief changed since source."""
+
+    old_description = source["challenge_description"]
+    old_base = source["challenge_base_sha256"]
+    if (
+        not isinstance(old_description, str)
+        or not isinstance(old_base, str)
+        or not _SHA256.fullmatch(old_base)
+    ):
+        return False
+    payload = _challenge_input_payload(
+        db, owner_user_id, workspace_id, challenge_id, include_remote=True
+    )
+    current_description = payload["description"]
+    current_base = {key: value for key, value in payload.items() if key not in {"remote", "remote_mode"}}
+    if hashlib.sha256(_json_bytes(current_base)).hexdigest() != current_base_sha256:
+        return False
+    old_base_payload = {**current_base, "description": old_description}
+    return bool(
+        secrets.compare_digest(hashlib.sha256(_json_bytes(old_base_payload)).hexdigest(), old_base)
+        and _only_remote_endpoint_changed(old_description, current_description, payload["remote"])
+    )
 
 
 def _challenge_input_payload(

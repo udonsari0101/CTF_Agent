@@ -14,6 +14,17 @@ const activeUploads = new Map();
 const uploadViews = new Map();
 const startingListSolvers = new Set();
 let challengeFlags = new Map();
+const writeupCopyCache = new Map();
+const WRITEUP_COPY_CACHE_BYTES = 512 * 1024;
+const writeupCopyEpoch = new Map();
+const writeupCurrentStamp = new Map();
+let writeupCopyCacheBytes = 0;
+let writeupPrefetchObserver = null;
+let writeupPrefetchWorkspace = '';
+let writeupPrefetchQueue = [];
+let writeupPrefetchRequested = new Set();
+let writeupPrefetchActive = 0;
+let writeupPrefetchGeneration = 0;
 let selectedStatus = '', selectedCategory = '', selectedSort = 'added_desc', search = '', disposeAccounts = null, importPreview = null;
 let disposeTelegram = null;
 let ctfdRetryId = null;
@@ -406,6 +417,7 @@ function solverErrorMarkup(error, defaultTitle = '풀이 실행 오류') {
   }
   const providerCode = String(error.provider_code || '').toUpperCase();
   const needsRemote = error.code === 'remote_input_required';
+  const serviceUpdating = error.code === 'service_updating';
   const toolsUnavailable = error.code === 'provider_tools_unavailable';
   const authRequired = error.code === 'auth_required';
   const accessDenied = error.code === 'access_denied';
@@ -422,7 +434,10 @@ function solverErrorMarkup(error, defaultTitle = '풀이 실행 오류') {
   let title = quotaTitles[error.code] || defaultTitle;
   let guidance = quotaGuidance[error.code]
     || (error.retryable ? '잠시 후 다시 시도하세요.' : '설정과 실행 환경을 확인하세요.');
-  if (needsRemote) {
+  if (serviceUpdating) {
+    title = i18n.t('서비스 업데이트 중');
+    guidance = i18n.t('새 풀이 작업은 등록되지 않았습니다. 업데이트 완료 후 다시 시작해 주세요.');
+  } else if (needsRemote) {
     title = '원격 접속 정보가 필요합니다';
     guidance = '문제 수정에서 원격 대상을 설정하세요.';
   } else if (daybreakAccess) {
@@ -819,6 +834,19 @@ function solverContinuationMarkup(job) {
   return `<p class="solver-continuation solver-continuation-${mode}"><strong>${esc(i18n.t(label))}</strong>${details}</p>`;
 }
 
+function solverQueueMarkup(job) {
+  if (job?.phase !== 'queued') return '';
+  const position = Number(job.queue_position);
+  const hasPosition = job.queue_position != null && Number.isFinite(position);
+  const updating = job.queue_block_reason === 'service_update';
+  if (!hasPosition && !updating) return '';
+  const order = hasPosition
+    ? (i18n.locale === 'en' ? `Queue position ${Math.max(1,position)}` : `대기 순서 ${Math.max(1,position)}번째`)
+    : '';
+  const reason = updating ? i18n.t('서비스 업데이트 중 · 완료 후 시작') : '';
+  return `<p class="form-hint solver-queue-state${updating ? ' solver-queue-state-update' : ''}" role="status">${esc([order,reason].filter(Boolean).join(' · '))}</p>`;
+}
+
 function refreshSolverContinuation(panel, job) {
   const markup = solverContinuationMarkup(job);
   const current = panel.querySelector('.solver-continuation, .solver-retry-context');
@@ -862,7 +890,7 @@ function solverPanelMarkup(job, events = [], loading = false) {
     ${modelText ? `<p class="solver-model">${esc(modelText)}</p>` : ''}
     ${job.network_policy === 'general_internet' ? '<p class="form-hint solver-limit">인터넷 사용 가능</p>' : ''}
     ${solverContinuationMarkup(job)}
-    ${job.phase === 'queued' && Number.isFinite(Number(job.queue_position)) ? `<p class="form-hint">대기 순서 ${Math.max(1,Number(job.queue_position))}번째</p>` : ''}
+    ${solverQueueMarkup(job)}
     ${progressText ? `<div class="solver-progress"><span>${esc(progressText)}</span>${Number.isFinite(percent) ? `<progress max="100" value="${Math.max(0,Math.min(100,percent))}" aria-label="${esc(progressText)} 진행률"></progress>` : ''}</div>` : ''}
     ${usableFlag ? `<div class="solver-artifact solver-flag-found" role="status" aria-live="assertive"><strong>Flag를 발견했습니다</strong><code>${esc(flag)}</code><div class="actions"><button type="button" class="small ghost icon-action" data-action="copy-solver-flag" aria-label="Flag 복사" title="Flag 복사">⚑</button>${!active && currentChallenge?.completion_source !== 'manual' ? '<button type="button" class="small danger ghost" data-action="reject-solver-flag">오답으로 제외</button>' : ''}</div></div>` : ''}
     ${job.flag_rejected ? `<div class="solver-artifact solver-flag-rejected" role="status"><strong>제외한 Flag</strong><code>${esc(flag)}</code></div>` : ''}
@@ -992,6 +1020,7 @@ async function api(url, options = {}) {
     const error = new Error(message || `요청에 실패했습니다 (${response.status}).`);
     error.status = response.status;
     for (const key of ['code','category','stage','retryable','provider_code','quota','requirements']) if (payload[key] !== undefined) error[key] = payload[key];
+    if (error.code === 'service_updating') error.message = i18n.t('서비스 업데이트 중입니다. 완료 후 다시 시도하세요.');
     throw error;
   }
   return result;
@@ -1024,15 +1053,15 @@ function showManualCopy(value) {
   const dialog = document.createElement('dialog');
   dialog.className = 'modal copy-select-dialog';
   const heading = document.createElement('h2');
-  heading.textContent = '직접 복사';
+  heading.textContent = i18n.t('직접 복사');
   const guidance = document.createElement('p');
-  guidance.textContent = '내용을 선택한 상태입니다. Ctrl+C를 누르세요.';
+  guidance.textContent = i18n.t('내용을 선택한 상태입니다. Ctrl+C를 누르세요.');
   const textarea = document.createElement('textarea');
   textarea.readOnly = true;
   textarea.value = value;
-  textarea.setAttribute('aria-label', '복사할 내용');
+  textarea.setAttribute('aria-label', i18n.t('복사할 내용'));
   const close = document.createElement('button');
-  close.type = 'button'; close.textContent = '닫기';
+  close.type = 'button'; close.textContent = i18n.t('닫기');
   close.addEventListener('click', () => dialog.close());
   dialog.addEventListener('close', () => {
     dialog.remove();
@@ -1078,6 +1107,11 @@ function showLogin(expired = false, configured = true, setupAvailable = false) {
   if (solverConsoleDialog?.open) solverConsoleDialog.close();
   clearAccountsReturnTarget();
   ++modalRendering; ++ctfdSubmitRendering; challengeFlags.clear();
+  writeupPrefetchGeneration++;
+  writeupPrefetchObserver?.disconnect(); writeupPrefetchObserver = null;
+  writeupPrefetchQueue = []; writeupPrefetchRequested.clear(); writeupPrefetchWorkspace = ''; writeupPrefetchActive = 0;
+  writeupCopyCache.clear(); writeupCopyCacheBytes = 0;
+  writeupCopyEpoch.clear(); writeupCurrentStamp.clear();
   stopSolverPolling();
   stopResourcePolling();
   stopChallengeListPolling();
@@ -1195,7 +1229,8 @@ function challengeRunSummary(challenge) {
     configuration.reasoning_effort && `${i18n.t('추론')} ${configuration.reasoning_effort}`,
     configuration.ultracode ? 'Ultracode' : null,
     configuration.service_tier === 'fast' ? 'Fast 1.5×' : null,
-    phase && (solverPhases[phase] || statuses[phase] || phase)];
+    phase && (solverPhases[phase] || statuses[phase] || phase),
+    phase === 'queued' && run?.queue_block_reason === 'service_update' ? i18n.t('서비스 업데이트 중') : null];
   return parts.filter(Boolean).map(esc).join('<span aria-hidden="true">/</span>');
 }
 
@@ -1249,7 +1284,7 @@ function challengeCardMarkup(challenge, workspaceId) {
     ${needsInput ? challengeInputMarkup(challenge,workspaceId) : ''}
     <footer class="challenge-card-footer"><span class="challenge-updated">${esc(date(challenge.updated_at))}</span><div class="challenge-card-actions">
       ${challenge.flag ? `<button type="button" class="small ghost icon-action flag-action" data-action="copy-list-flag" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" aria-label="${esc(challenge.name)} Flag 복사" title="Flag 복사">⚑</button>` : ''}
-      ${canCopyWriteup ? `<button type="button" class="small ghost icon-action writeup-action" data-action="copy-list-writeup" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" aria-label="${esc(challenge.name)} write-up 복사" title="write-up 복사">▤</button>` : ''}
+      ${canCopyWriteup ? `<button type="button" class="small ghost icon-action writeup-action" data-action="copy-list-writeup" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-writeup-stamp="${esc(writeupStamp(challenge))}" aria-label="${esc(challenge.name)} write-up 복사" title="write-up 복사">▤</button>` : ''}
       ${latestRun ? `<button type="button" class="small ghost session-action${liveSession ? ' live' : ''}" data-action="open-solver-session" data-id="${esc(challenge.id)}" data-live="${liveSession}" aria-label="${esc(challenge.name)} ${liveSession ? '실시간 풀이 터미널' : '이전 풀이 터미널'} 보기" title="${liveSession ? '실시간 풀이 터미널' : '이전 풀이 터미널'}">${liveSession ? '<span class="session-live-dot" aria-hidden="true"></span>LIVE' : '<span aria-hidden="true">&gt;_</span>'}</button>` : ''}
       ${canStart ? `<button type="button" class="small ghost complete-action" data-action="complete-list-challenge" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${esc(challenge.name)} 수동 완료">수동 완료</button>` : ''}
       ${canStart ? `<button type="button" class="small primary solve-action" data-action="start-list-solver" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${esc(challenge.name)} 기본 설정으로 풀이 시작" title="기본 설정으로 풀이 시작" ${starting ? 'disabled aria-busy="true"' : ''}>${starting ? '시작 중' : '▶ 풀이 시작'}</button>` : ''}
@@ -1263,6 +1298,7 @@ function challengeCardSignature(challenge) {
     id:challenge.id,name:challenge.name,category:challenge.category,description:challenge.description,
     status:challenge.status,flag:challenge.flag,completion_source:challenge.completion_source,
     has_writeup:challenge.has_writeup,updated_at:challenge.updated_at,
+    writeup_updated_at:challenge.writeup_updated_at,notes_token:challenge.notes_token,
     latest_solver:challenge.latest_solver || challenge.solver || challenge.latest_run || null,
   });
 }
@@ -1283,6 +1319,125 @@ function challengeListingMarkup(result, workspaceId) {
     ${result.challenges.length ? `<div class="challenge-card-grid" role="list" aria-label="문제 목록" aria-live="polite">${result.challenges.map(c => challengeCardMarkup(c,workspaceId)).join('')}</div><div class="table-footer">${result.challenges.length}개 문제</div>` : `<div class="empty"><div class="empty-icon">▤</div><h2>${total ? '조건에 맞는 문제가 없습니다.' : '등록된 문제가 없습니다.'}</h2>${total ? '<button data-action="clear-filter">필터 초기화</button>' : '<button class="primary" data-action="new-challenge">＋ 문제 추가</button>'}</div>`}<p id="challenge-live-state" class="sr-only" role="status" aria-live="polite"></p>`;
 }
 
+function writeupStamp(challenge) {
+  return JSON.stringify([challenge.writeup_updated_at || challenge.updated_at || '',challenge.notes_token || '']);
+}
+
+function writeupIdentity(workspaceId, challengeId) {
+  return `${workspaceId}/${challengeId}`;
+}
+
+function writeupCopyKey(workspaceId, challengeId, stamp) {
+  return `${workspaceId}/${challengeId}/${stamp}`;
+}
+
+function invalidateWriteupCopy(workspaceId, challengeId) {
+  const identity = writeupIdentity(workspaceId,challengeId);
+  writeupCopyEpoch.set(identity,(writeupCopyEpoch.get(identity) || 0) + 1);
+  for (const [key,entry] of writeupCopyCache) {
+    if (entry.workspaceId !== workspaceId || entry.challengeId !== challengeId) continue;
+    writeupCopyCacheBytes -= entry.bytes;
+    writeupCopyCache.delete(key);
+  }
+  const prefix = `${identity}/`;
+  for (const key of writeupPrefetchRequested) if (key.startsWith(prefix)) writeupPrefetchRequested.delete(key);
+  writeupPrefetchQueue = writeupPrefetchQueue.filter(item => item.workspaceId !== workspaceId || item.challengeId !== challengeId);
+}
+
+function reconcileWriteupCopies(challenges, workspaceId) {
+  for (const challenge of challenges) {
+    const identity = writeupIdentity(workspaceId,challenge.id);
+    const stamp = challenge.has_writeup ? writeupStamp(challenge) : null;
+    const prior = writeupCurrentStamp.get(identity);
+    const staleCached = [...writeupCopyCache.values()].some(entry =>
+      entry.workspaceId === workspaceId && entry.challengeId === challenge.id && entry.stamp !== stamp);
+    if ((prior !== undefined && prior !== stamp) || staleCached) invalidateWriteupCopy(workspaceId,challenge.id);
+    writeupCurrentStamp.set(identity,stamp);
+  }
+}
+
+function cachedWriteup(workspaceId, challengeId, stamp) {
+  const key = writeupCopyKey(workspaceId,challengeId,stamp);
+  const entry = writeupCopyCache.get(key);
+  if (!entry) return null;
+  writeupCopyCache.delete(key);
+  writeupCopyCache.set(key,entry);
+  return entry.markdown;
+}
+
+function rememberWriteup(workspaceId, challengeId, stamp, markdown) {
+  const key = writeupCopyKey(workspaceId,challengeId,stamp);
+  const bytes = markdown.length * 2;
+  if (bytes > WRITEUP_COPY_CACHE_BYTES) return;
+  const previous = writeupCopyCache.get(key);
+  if (previous) writeupCopyCacheBytes -= previous.bytes;
+  writeupCopyCache.delete(key);
+  while (writeupCopyCacheBytes + bytes > WRITEUP_COPY_CACHE_BYTES) {
+    const oldest = writeupCopyCache.keys().next().value;
+    if (oldest === undefined) break;
+    writeupCopyCacheBytes -= writeupCopyCache.get(oldest).bytes;
+    writeupCopyCache.delete(oldest);
+  }
+  writeupCopyCache.set(key,{workspaceId,challengeId,stamp,markdown,bytes});
+  writeupCopyCacheBytes += bytes;
+}
+
+function replaceKnownWriteup(challenge) {
+  if (!challenge?.workspace_id || !challenge?.id) return;
+  invalidateWriteupCopy(challenge.workspace_id,challenge.id);
+  if (challenge.has_writeup && typeof challenge.writeup_markdown === 'string' && challenge.writeup_markdown) {
+    rememberWriteup(challenge.workspace_id,challenge.id,writeupStamp(challenge),challenge.writeup_markdown);
+  }
+}
+
+function pumpWriteupPrefetch() {
+  while (writeupPrefetchActive < 2 && writeupPrefetchQueue.length) {
+    const item = writeupPrefetchQueue.shift();
+    if (item.generation !== writeupPrefetchGeneration || currentWorkspace?.id !== item.workspaceId ||
+        item.epoch !== (writeupCopyEpoch.get(writeupIdentity(item.workspaceId,item.challengeId)) || 0)) continue;
+    writeupPrefetchActive++;
+    api(`${path(item.challengeId,item.workspaceId)}/writeup`).then(artifact => {
+      if (item.generation === writeupPrefetchGeneration && currentWorkspace?.id === item.workspaceId &&
+          item.epoch === (writeupCopyEpoch.get(writeupIdentity(item.workspaceId,item.challengeId)) || 0) &&
+          writeupCurrentStamp.get(writeupIdentity(item.workspaceId,item.challengeId)) === item.stamp &&
+          typeof artifact?.markdown === 'string' && artifact.markdown) {
+        rememberWriteup(item.workspaceId,item.challengeId,item.stamp,artifact.markdown);
+      }
+    }).catch(() => {}).finally(() => {
+      if (item.generation !== writeupPrefetchGeneration) return;
+      writeupPrefetchActive--;
+      pumpWriteupPrefetch();
+    });
+  }
+}
+
+function observeVisibleWriteups(area, workspaceId) {
+  if (typeof IntersectionObserver !== 'function') return;
+  if (writeupPrefetchWorkspace !== workspaceId) {
+    writeupPrefetchGeneration++;
+    writeupPrefetchWorkspace = workspaceId;
+    writeupPrefetchQueue = [];
+    writeupPrefetchRequested.clear();
+    writeupPrefetchActive = 0;
+  }
+  writeupPrefetchObserver?.disconnect();
+  writeupPrefetchObserver = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      writeupPrefetchObserver?.unobserve(entry.target);
+      const button = entry.target;
+      const challengeId = button.dataset.id, stamp = button.dataset.writeupStamp || '';
+      const key = writeupCopyKey(workspaceId,challengeId,stamp);
+      if (!challengeId || writeupCopyCache.has(key) || writeupPrefetchRequested.has(key)) continue;
+      writeupPrefetchRequested.add(key);
+      writeupPrefetchQueue.push({workspaceId,challengeId,stamp,generation:writeupPrefetchGeneration,
+        epoch:writeupCopyEpoch.get(writeupIdentity(workspaceId,challengeId)) || 0});
+    }
+    pumpWriteupPrefetch();
+  },{rootMargin:'160px'});
+  for (const button of area.querySelectorAll('[data-action="copy-list-writeup"]')) writeupPrefetchObserver.observe(button);
+}
+
 function paintChallengeListing(result, workspaceId, patchOnly = false) {
   const area = document.querySelector('#challenge-area');
   if (!area || currentWorkspace?.id !== workspaceId) return false;
@@ -1290,6 +1445,7 @@ function paintChallengeListing(result, workspaceId, patchOnly = false) {
   const counts = result?.counts && typeof result.counts === 'object' ? result.counts : {};
   const categories = Array.isArray(result?.categories) ? result.categories : [];
   const total = Object.values(counts).reduce((sum,value) => sum + Number(value || 0),0);
+  reconcileWriteupCopies(challenges,workspaceId);
   challengeFlags = new Map(challenges.filter(challenge => challenge.flag).map(challenge => [challenge.id,challenge.flag]));
   if (currentWorkspace) {
     currentWorkspace.challenge_count = total;
@@ -1307,6 +1463,7 @@ function paintChallengeListing(result, workspaceId, patchOnly = false) {
     area.innerHTML = challengeListingMarkup({challenges,counts,categories},workspaceId);
     challengeListSignatures = signatures;
     challengeListCategories = categoryKey;
+    observeVisibleWriteups(area,workspaceId);
     return true;
   }
   let changed = 0;
@@ -1330,6 +1487,7 @@ function paintChallengeListing(result, workspaceId, patchOnly = false) {
   if (footer) footer.textContent = `${challenges.length}개 문제`;
   challengeListSignatures = signatures;
   challengeListCategories = categoryKey;
+  if (changed) observeVisibleWriteups(area,workspaceId);
   if (changed) {
     const live = document.querySelector('#challenge-live-state');
     if (live) live.textContent = `문제 ${changed}개의 상태가 갱신되었습니다.`;
@@ -1340,11 +1498,31 @@ function paintChallengeListing(result, workspaceId, patchOnly = false) {
 async function copyChallengeWriteup(button) {
   const workspaceId = button.dataset.workspaceId, challengeId = button.dataset.id;
   if (!currentWorkspace || currentWorkspace.id !== workspaceId) throw new Error('문제 목록을 다시 불러와 주세요.');
+  const stamp = button.dataset.writeupStamp || '';
+  const identity = writeupIdentity(workspaceId,challengeId);
+  const epoch = writeupCopyEpoch.get(identity) || 0;
+  const ready = cachedWriteup(workspaceId,challengeId,stamp);
+  if (ready !== null) {
+    const result = await copyText(ready); copyToast(result,ready);
+    return;
+  }
   button.disabled = true; button.setAttribute('aria-busy','true');
   try {
     const artifact = await api(`${path(challengeId,workspaceId)}/writeup`);
     if (!currentWorkspace || currentWorkspace.id !== workspaceId || typeof artifact?.markdown !== 'string' || !artifact.markdown) throw new Error('write-up을 다시 불러와 주세요.');
-    const result = await copyText(artifact.markdown); copyToast(result, artifact.markdown);
+    if (epoch !== (writeupCopyEpoch.get(identity) || 0)) throw new Error('write-up이 갱신되었습니다. 다시 눌러 주세요.');
+    let expectedUpdatedAt = '';
+    try { expectedUpdatedAt = JSON.parse(stamp)[0] || ''; } catch {}
+    if (artifact.updated_at && expectedUpdatedAt && artifact.updated_at !== expectedUpdatedAt) {
+      invalidateWriteupCopy(workspaceId,challengeId);
+      refreshChallenges().catch(() => {});
+      showManualCopy(artifact.markdown);
+      return;
+    }
+    rememberWriteup(workspaceId,challengeId,stamp,artifact.markdown);
+    // Loading Markdown may outlive the click's clipboard permission. First
+    // fetch still presents the exact text; the next click can copy immediately.
+    showManualCopy(artifact.markdown);
   } finally {
     if (button.isConnected) { button.disabled = false; button.removeAttribute('aria-busy'); }
   }
@@ -1544,6 +1722,7 @@ async function openChallenge(id, focusSolverSession = false, expandSolverSession
   const c = await api(path(id,workspaceId));
   if (ticket !== challengeRendering || currentWorkspace?.id !== workspaceId) return;
   rememberNotes();
+  replaceKnownWriteup(c);
   const draft = noteDrafts.get(noteKey(c));
   const displayedNotes = draft ? draft.content : c.notes;
   if (draft) { c.notes = draft.baseline; c.notes_token = draft.token; }
@@ -1630,39 +1809,19 @@ async function saveNotes(silent = false) {
 
 async function copyText(text) {
   const value = String(text ?? '');
-  const focused = document.activeElement;
-  const selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart,focused.selectionEnd] : null;
-  const textarea = document.createElement('textarea');
-  textarea.value = value;
-  textarea.setAttribute('readonly','');
-  textarea.setAttribute('aria-hidden','true');
-  // Safari can refuse execCommand('copy') for a fully clipped .sr-only field.
-  textarea.className = 'clipboard-proxy';
-  (modal.open ? modal : detail.open ? detail : document.body).append(textarea); textarea.focus(); textarea.select();
-  textarea.setSelectionRange?.(0,textarea.value.length);
-  let success = false;
-  try { success = typeof document.execCommand === 'function' && document.execCommand('copy'); }
-  catch { success = false; }
-  finally {
-    textarea.remove();
-    if (focused?.isConnected !== false) focused?.focus?.();
-    if (selection && focused?.isConnected !== false && typeof focused?.setSelectionRange === 'function') focused.setSelectionRange(...selection);
-  }
-  // The legacy copy completes in the click handler. Some browsers write the
-  // clipboard but leave navigator.clipboard.writeText() pending indefinitely.
-  if (success) return 'unverified';
+  // Start the browser clipboard request in the click's user activation.
+  // execCommand('copy') can report true while leaving the clipboard unchanged.
   if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
     let timeout;
     try {
+      const writing = navigator.clipboard.writeText(value);
       await Promise.race([
-        navigator.clipboard.writeText(value),
-        new Promise((_,reject) => { timeout = setTimeout(() => reject(new Error('클립보드 응답이 지연되었습니다.')), 2000); }),
+        writing,
+        new Promise((_,reject) => { timeout = setTimeout(() => reject(new Error('클립보드 응답이 지연되었습니다.')), 1200); }),
       ]);
       return 'unverified';
-    } catch (error) {
-      // The browser may reject the permission prompt or leave the write
-      // unsettled. Keep the text selectable instead of claiming success.
-    } finally { clearTimeout(timeout); }
+    } catch { /* Keep a selectable copy when permission is denied or delayed. */ }
+    finally { clearTimeout(timeout); }
   }
   showManualCopy(value);
   return 'manual';
@@ -1775,6 +1934,7 @@ async function syncSolverWriteup(job, workspaceId, challengeId, generation) {
   currentChallenge.writeup_markdown = latest.writeup_markdown || job.writeup_markdown;
   currentChallenge.writeup_updated_at = latest.writeup_updated_at || currentChallenge.writeup_updated_at;
   currentChallenge.has_writeup = Boolean(currentChallenge.writeup_markdown);
+  replaceKnownWriteup(latest);
   if (editorWasSaved && editor && typeof latest.notes === 'string') editor.value = latest.notes;
   rememberNotes();
   const state = document.querySelector('#notes-save-state');
@@ -2004,6 +2164,7 @@ async function applyRefinedWriteup(workspaceId, challengeId, generation) {
   currentChallenge.writeup_markdown = latest.writeup_markdown;
   currentChallenge.writeup_updated_at = latest.writeup_updated_at;
   currentChallenge.has_writeup = true;
+  replaceKnownWriteup(latest);
   if (typeof latest.notes === 'string') currentChallenge.notes = latest.notes;
   if (typeof latest.notes_token === 'string') currentChallenge.notes_token = latest.notes_token;
   if (editorWasSaved && editor && typeof latest.notes === 'string') editor.value = latest.notes;
@@ -2176,6 +2337,7 @@ async function rejectSolverFlag() {
   currentChallenge.has_writeup = false;
   currentChallenge.writeup_markdown = '';
   currentChallenge.writeup_updated_at = null;
+  invalidateWriteupCopy(workspaceId,challengeId);
   if (typeof latest.notes === 'string') currentChallenge.notes = latest.notes;
   if (typeof latest.notes_token === 'string') currentChallenge.notes_token = latest.notes_token;
   if (editor && typeof latest.notes === 'string') {

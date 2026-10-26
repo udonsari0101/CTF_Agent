@@ -2,6 +2,11 @@
   "locale": "en",
   "name": "English",
   "messages": {
+    "서비스 업데이트 중": "Service update in progress",
+    "서비스 업데이트 중입니다. 완료 후 다시 시도하세요.": "Service update in progress. Try again when it finishes.",
+    "새 풀이 작업은 등록되지 않았습니다. 업데이트 완료 후 다시 시작해 주세요.": "No new solve was queued. Start it again after the update finishes.",
+    "서비스 업데이트 중 · 완료 후 시작": "Updating service · starts when complete",
+    "링크를 선택했습니다. Ctrl+C를 눌러 복사하세요.": "The link is selected. Press Ctrl+C to copy it.",
     "새 세션": "New session",
     "이전 분석 복원 준비 중": "Preparing prior analysis",
     "이전 분석으로 이어감": "Continuing from prior analysis",
