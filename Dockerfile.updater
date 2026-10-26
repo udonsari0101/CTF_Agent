@@ -1,0 +1,6 @@
+FROM docker:29-cli
+
+RUN apk add --no-cache bash python3 coreutils && docker compose version
+COPY ctf_agent/release_updates.py /usr/local/libexec/ctf-agent-release-updates.py
+
+CMD ["python3", "/usr/local/libexec/ctf-agent-release-updates.py"]

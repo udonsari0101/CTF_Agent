@@ -37,7 +37,7 @@ from .solver_worker import (
     REQUIRED_CLAUDE_VERSION,
     REQUIRED_CODEX_VERSION,
     runtime_tree_digest,
-    valid_korean_writeup,
+    valid_writeup,
 )
 from .process_lock import account_lifecycle_lock
 from .solver_retry import (
@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     solver_artifact_json TEXT,
     retry_checkpoint_json TEXT,
     writeup_instruction TEXT NOT NULL DEFAULT '',
+    writeup_locale TEXT NOT NULL DEFAULT 'ko' CHECK(writeup_locale IN ('ko','en')),
     source_writeup_sha256 TEXT,
     source_solver_job_id TEXT,
     challenge_input_sha256 TEXT,
@@ -490,6 +491,8 @@ class SolverExchangeCoordinator:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN job_mode TEXT NOT NULL DEFAULT 'solve'")
             if "writeup_instruction" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN writeup_instruction TEXT NOT NULL DEFAULT ''")
+            if "writeup_locale" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN writeup_locale TEXT NOT NULL DEFAULT 'ko' CHECK(writeup_locale IN ('ko','en'))")
             if "source_writeup_sha256" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN source_writeup_sha256 TEXT")
             if "source_solver_job_id" not in columns:
@@ -665,6 +668,7 @@ class SolverExchangeCoordinator:
         max_reasoning_available: bool = False,
         job_mode: str = "solve",
         writeup_instruction: str | None = None,
+        writeup_locale: str = "ko",
     ) -> dict[str, Any]:
         _require_id(workspace_id, "workspace")
         _require_id(challenge_id, "challenge")
@@ -674,6 +678,8 @@ class SolverExchangeCoordinator:
                 "작업 유형을 확인할 수 없습니다.",
                 category="safety",
             )
+        if writeup_locale not in {"ko", "en"}:
+            raise ExchangeError("invalid_writeup_locale", "지원하지 않는 write-up 언어입니다.", category="output")
         instruction = normalize_writeup_refinement_instruction(writeup_instruction)
         if job_mode == "solve" and instruction:
             raise ExchangeError(
@@ -1022,13 +1028,13 @@ class SolverExchangeCoordinator:
                     """INSERT INTO solver_jobs
                        (id,job_mode,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,model,
                         reasoning_effort,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
-                        retry_checkpoint_json,writeup_instruction,source_writeup_sha256,source_solver_job_id,
+                        retry_checkpoint_json,writeup_instruction,writeup_locale,source_writeup_sha256,source_solver_job_id,
                         challenge_input_sha256,challenge_base_sha256,remote_mode,status,previous_challenge_status,flag,private_notes,
                         solver_artifact_json,flag_hooked,created_at,updated_at)
                        VALUES(:id,:job_mode,:owner_user_id,:workspace_id,:challenge_id,:account_id,
                                :account_label,:provider,:model,:reasoning_effort,:max_reasoning_available,:service_tier,:codex_version,
                               :codex_runtime_sha256,:claude_version,:claude_runtime_sha256,:retry_checkpoint_json,
-                              :writeup_instruction,:source_writeup_sha256,:source_solver_job_id,
+                              :writeup_instruction,:writeup_locale,:source_writeup_sha256,:source_solver_job_id,
                               :challenge_input_sha256,:challenge_base_sha256,:remote_mode,'queued',:previous_challenge_status,:flag,
                               :private_notes,:solver_artifact_json,:flag_hooked,:created_at,:updated_at)""",
                     {
@@ -1053,6 +1059,7 @@ class SolverExchangeCoordinator:
                         "claude_runtime_sha256": claude_runtime_sha256,
                         "retry_checkpoint_json": retry_checkpoint_json,
                         "writeup_instruction": instruction,
+                        "writeup_locale": writeup_locale,
                         "source_writeup_sha256": source_writeup_sha256,
                         "source_solver_job_id": source_solver_job_id,
                         "challenge_input_sha256": challenge_input_sha256,
@@ -1097,6 +1104,7 @@ class SolverExchangeCoordinator:
         challenge_id: str,
         *,
         instruction: str | None = None,
+        writeup_locale: str = "ko",
         provider: str = "codex",
         codex_version: str = REQUIRED_CODEX_VERSION,
         codex_runtime_sha256: str | None = None,
@@ -1118,6 +1126,7 @@ class SolverExchangeCoordinator:
             expected_account_id=expected_account_id,
             job_mode="writeup_refine",
             writeup_instruction=instruction,
+            writeup_locale=writeup_locale,
         )
 
     def get(self, job_id: str, owner_user_id: str, *, after: int = 0, limit: int = 200) -> dict[str, Any]:
@@ -2380,6 +2389,7 @@ class SolverExchangeCoordinator:
         reservation = "solver:" + job["id"]
         try:
             record, attachments = self._stage_records(job)
+            related_context = record.pop("_related_context", "")
             attachment_bytes = _attachment_total(attachments)
             source_writeup = record.pop("_source_writeup", None)
             source_writeup_bytes = (
@@ -2457,8 +2467,10 @@ class SolverExchangeCoordinator:
                     "protocol": EXCHANGE_PROTOCOL,
                     "job_id": job["id"],
                     "job_mode": job["job_mode"],
+                    "writeup_locale": job["writeup_locale"],
                     "challenge_name": record["name"],
                     "challenge_text": record["description"],
+                    "related_context": related_context,
                     "category": record.get("category") or "",
                     "flag_format": record.get("workspace_flag_format") or "",
                     "remote": "" if is_refinement else (record.get("remote") or ""),
@@ -2556,6 +2568,32 @@ class SolverExchangeCoordinator:
                     (job["workspace_id"], job["challenge_id"]),
                 ).fetchall()
             )
+            related_context = ""
+            if job["job_mode"] == "solve":
+                related_rows = db.execute(
+                    """SELECT c.id,c.name,c.category,c.description,c.completion_source,c.flag,c.notes,w.markdown
+                         FROM challenge_relations r
+                         JOIN challenges c ON c.id=r.prerequisite_id AND c.workspace_id=r.workspace_id
+                         LEFT JOIN challenge_writeups w ON w.challenge_id=c.id
+                        WHERE r.workspace_id=? AND r.dependent_id=? AND c.status='solved'
+                        ORDER BY r.created_at,c.id LIMIT 6""",
+                    (job["workspace_id"], job["challenge_id"]),
+                ).fetchall()
+                if related_rows:
+                    related_data = [
+                        {"id": row["id"], "name": row["name"], "completion_source": row["completion_source"],
+                         "category": row["category"], "description": (row["description"] or "")[:1200],
+                         "flag": row["flag"], "notes": (row["notes"] or "")[:1800],
+                         "writeup": (row["markdown"] or "")[:1800]}
+                        for row in related_rows
+                    ]
+                    while related_data:
+                        related_context = json.dumps(related_data, ensure_ascii=False)
+                        if len(related_context.encode("utf-8")) <= 32_768:
+                            break
+                        related_data.pop()
+                    if not related_data:
+                        related_context = ""
             current_input_sha256 = _challenge_input_sha256(
                 db,
                 job["owner_user_id"],
@@ -2665,6 +2703,7 @@ class SolverExchangeCoordinator:
                 category="safety",
             )
         result = dict(record)
+        result["_related_context"] = related_context
         if source_writeup is not None:
             result["_source_writeup"] = source_writeup
         return result, [dict(item) for item in attachments]
@@ -2922,8 +2961,8 @@ class SolverExchangeCoordinator:
                     output_valid = bool(
                         challenge
                         and isinstance(current["flag"], str)
-                        and valid_korean_writeup(
-                            event["writeup_markdown"], challenge["name"], current["flag"]
+                        and valid_writeup(
+                            event["writeup_markdown"], challenge["name"], current["flag"], current["writeup_locale"]
                         )
                     )
                     if not source_matches:
@@ -2935,7 +2974,7 @@ class SolverExchangeCoordinator:
                     elif not output_valid:
                         refinement_error = ExchangeError(
                             "writeup_style_invalid",
-                            "보완 결과가 한국어 여섯 섹션 write-up 형식을 충족하지 않아 폐기했습니다.",
+                            "보완 결과가 선택한 언어의 여섯 섹션 write-up 형식을 충족하지 않아 폐기했습니다.",
                             category="output",
                             retryable=True,
                         ).public(stage="writeup")
@@ -3198,8 +3237,8 @@ class SolverExchangeCoordinator:
                             release_matches
                             and challenge
                             and isinstance(current["flag"], str)
-                            and valid_korean_writeup(
-                                candidate, challenge["name"], current["flag"]
+                            and valid_writeup(
+                                candidate, challenge["name"], current["flag"], current["writeup_locale"]
                             )
                         )
                         if not source_matches:
@@ -4417,6 +4456,7 @@ def _public_job(
     result = {
         "id": row["id"],
         "job_mode": row["job_mode"],
+        "writeup_locale": row["writeup_locale"],
         "workspace_id": row["workspace_id"],
         "challenge_id": row["challenge_id"],
         "account_label": row["account_label"],

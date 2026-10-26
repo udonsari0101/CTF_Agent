@@ -42,6 +42,7 @@ jobs:
           with ZipFile(archive) as bundle:
               names = set(bundle.namelist())
               required = {'Install.cmd', 'Install.ps1', 'installer/install.sh',
+                          'app/Dockerfile.updater', 'app/ctf_agent/release_updates.py',
                           'app/ctf_agent/main.py', 'app/ctf_agent/web/i18n/en.json',
                           'app/ctf_agent/web/i18n/ko.json'}
               assert all(prefix + name in names for name in required)
@@ -58,4 +59,4 @@ jobs:
             "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" \
             "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip.sha256" \
             --title "CTF Agent $RELEASE_TAG" \
-            --notes "Windows Docker Desktop + WSL 2 installer. Extract the ZIP and run Install.cmd, then create the first administrator in the browser. Choose a WSL data directory during setup; upgrades preserve it. The web interface supports English and Korean."
+            --generate-notes

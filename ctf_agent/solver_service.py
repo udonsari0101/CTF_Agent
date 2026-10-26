@@ -37,6 +37,7 @@ class SolveInput(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=200)
     reasoning_effort: str | None = Field(default=None, min_length=1, max_length=40)
     service_tier: Literal["fast"] | None = None
+    writeup_locale: Literal["ko", "en"] = "ko"
 
 
 class WriteupRefineInput(SolveInput):
@@ -803,6 +804,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         configuration_override=configuration_override,
                         expected_account_id=expected_account_id,
                         max_reasoning_available=max_reasoning_available,
+                        writeup_locale=(payload.writeup_locale if payload else "ko"),
                     )
                     service.runtime_ready, service.runtime_error = True, None
                 else:
@@ -820,6 +822,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         configuration_override=configuration_override,
                         expected_account_id=expected_account_id,
                         max_reasoning_available=max_reasoning_available,
+                        writeup_locale=(payload.writeup_locale if payload else "ko"),
                     )
             service.notify()
             capacity = await asyncio.to_thread(service.capacity_snapshot)
@@ -866,6 +869,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         workspace_id,
                         challenge_id,
                         instruction=instruction,
+                        writeup_locale=payload.writeup_locale,
                         provider=provider,
                         codex_version=runtime["version"],
                         codex_runtime_sha256=runtime["sha256"],
@@ -883,6 +887,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         workspace_id,
                         challenge_id,
                         instruction=instruction,
+                        writeup_locale=payload.writeup_locale,
                         provider=provider,
                         claude_version=runtime["version"],
                         claude_runtime_sha256=runtime["sha256"],

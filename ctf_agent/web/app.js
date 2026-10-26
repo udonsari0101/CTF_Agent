@@ -28,6 +28,8 @@ let challengeListPollTimer = null, challengeListPollGeneration = 0, challengeLis
 let currentSolverEvents = [], currentSolverGuidance = [], solverEventCursor = 0, solverListedFlag = '', solverSyncedWriteup = '', solverGuidanceDraft = '';
 let writeupRefineJob = null, writeupRefineEvents = [], writeupRefineTimer = null;
 let writeupRefineError = null, writeupRefineInstruction = '';
+let relatedCandidates = [];
+let releaseUpdateTimer = null;
 let solverProvider = (() => { try { return localStorage.getItem('ctf-solver-provider') === 'claude' ? 'claude' : 'codex'; } catch { return 'codex'; } })();
 let solverAccounts = [], solverAccountId = '', solverModels = [], solverModel = '';
 let solverReasoning = '', solverServiceTier = null, solverOptionsState = 'idle', solverOptionsError = '';
@@ -1087,7 +1089,7 @@ async function startListSolver(button) {
   let started = false;
   try {
     const payload = await api(`${path(challengeId,workspaceId)}/solver`,{
-      method:'POST',body:{provider:solverProvider},
+      method:'POST',body:{provider:solverProvider,writeup_locale:i18n.locale},
     });
     started = true;
     if (payload.capacity?.warning && payload.capacity.warning_message) toast(payload.capacity.warning_message);
@@ -1213,6 +1215,44 @@ function challengeStatusMarkup(challenge) {
     ${challenge.status === 'solved' ? '<button data-action="reopen" class="primary">완료 취소</button>' : `<label class="sr-only" for="status-select">기록할 상태</label><select id="status-select">${Object.entries(statuses).filter(([key]) => key !== 'solved').map(([key,label]) => `<option value="${key}" ${challenge.status === key ? 'selected' : ''}>${label}</option>`).join('')}</select><button data-action="complete" class="primary">✓ 수동 완료</button>`}`;
 }
 
+function relatedChallengeLabel(challenge) {
+  const source = challenge.ctfd_id != null ? `CTFd #${challenge.ctfd_id}` : challenge.id.slice(0,8);
+  return `${challenge.name} · ${challenge.category || i18n.t('분야 미지정')} · ${source}`;
+}
+
+function relatedChallengeMarkup(challenge) {
+  const linked = challenge.prerequisites || [];
+  const linkedIds = new Set(linked.map(item => item.id));
+  const available = relatedCandidates.filter(item => item.id !== challenge.id && !linkedIds.has(item.id));
+  return `<h3>선행 문제</h3><div class="related-challenge-list">${linked.length ? linked.map(item =>
+    `<div class="file-item"><div><button type="button" class="small ghost" data-action="open-related-challenge" data-id="${esc(item.id)}">${esc(relatedChallengeLabel(item))}</button><small>${esc(statuses[item.status] || item.status)}</small></div><button type="button" class="small danger icon-action" data-action="remove-prerequisite" data-id="${esc(item.id)}" aria-label="선행 문제 연결 해제" title="선행 연결 해제">×</button></div>`).join('') : '<p class="muted">없음</p>'}</div>
+    ${available.length ? `<div class="related-add"><label class="sr-only" for="related-challenge-select">선행 문제 선택</label><select id="related-challenge-select"><option value="">문제 선택</option>${available.map(item => `<option value="${esc(item.id)}">${esc(relatedChallengeLabel(item))}</option>`).join('')}</select><button type="button" class="small ghost" data-action="add-prerequisite">연결</button></div>` : ''}`;
+}
+
+async function loadRelatedChallenges(challenge) {
+  relatedCandidates = [];
+  const area = detail.querySelector('#challenge-relations');
+  if (area) area.innerHTML = relatedChallengeMarkup(challenge);
+  const result = await api(`${path(challenge.id,challenge.workspace_id)}/prerequisites/candidates`);
+  if (currentChallenge !== challenge || !detail.open) return;
+  relatedCandidates = result.challenges || [];
+  const current = detail.querySelector('#challenge-relations');
+  if (current) current.innerHTML = relatedChallengeMarkup(challenge);
+}
+
+async function changePrerequisite(removeId = null) {
+  const challenge = currentChallenge;
+  const prerequisiteId = removeId || detail.querySelector('#related-challenge-select')?.value;
+  if (!challenge || !prerequisiteId) return;
+  const endpoint = `${path(challenge.id,challenge.workspace_id)}/prerequisites`;
+  const result = await api(removeId ? `${endpoint}/${encodeURIComponent(prerequisiteId)}` : endpoint,
+    removeId ? {method:'DELETE'} : {method:'POST',body:{prerequisite_id:prerequisiteId}});
+  if (currentChallenge !== challenge) return;
+  challenge.prerequisites = result.prerequisites || [];
+  const area = detail.querySelector('#challenge-relations');
+  if (area) area.innerHTML = relatedChallengeMarkup(challenge);
+}
+
 async function openChallenge(id, focusSolverSession = false, expandSolverSession = false) {
   rememberNotes();
   stopSolverPolling();
@@ -1245,9 +1285,14 @@ async function openChallenge(id, focusSolverSession = false, expandSolverSession
     ${ctfdRefreshButton ? `<section class="ctfd-source-tools"><div class="section-head"><h3>CTFd 원본</h3></div><p id="ctfd-refresh-help" class="form-hint">CTFd 내용·첨부 갱신 · 로컬 기록 유지</p><div class="actions"><button type="button" class="small ghost" data-action="ctfd-refresh-auth">다시 인증</button><button type="button" class="small ghost" data-action="ctfd-submit-settings">연결 설정</button></div><p id="ctfd-refresh-state" class="form-hint ${refreshingFromCTFd ? '' : 'hidden'}" role="status">${refreshingFromCTFd ? 'CTFd 문제 갱신 중…' : ''}</p></section>` : ''}
     <section><h3>첨부파일 <span class="muted">${c.attachments.length}</span></h3><div class="file-list">${c.attachments.map(f => `<div class="file-item"><div><a href="${path(c.id,c.workspace_id)}/attachments/${f.id}" target="_blank" rel="noopener" download>${esc(f.original_name)}</a><small>${size(f.size)}</small></div><button class="small danger icon-action" data-action="delete-attachment" data-id="${f.id}" aria-label="${esc(f.original_name)} 삭제" title="${esc(f.original_name)} 삭제">×</button></div>`).join('')}</div><div id="upload-progress"></div><label class="sr-only" for="attachment-files">첨부파일 추가</label><input id="attachment-files" class="file-input" type="file" multiple title="대용량 파일 이어 올리기 지원"></section>
     <section><button class="danger small ghost icon-action" data-action="delete-challenge" aria-label="문제 삭제" title="문제 삭제">⌫</button></section></aside></div>`;
+  const relationsSection = document.createElement('section');
+  relationsSection.id = 'challenge-relations';
+  relationsSection.innerHTML = relatedChallengeMarkup(c);
+  detail.querySelector('.file-list')?.closest('section')?.before(relationsSection);
   if (!detail.open) detail.showModal();
   detail.scrollTop = 0;
   refreshUploads(c.workspace_id,c.id).catch(error => toast(error.message,true));
+  loadRelatedChallenges(c).catch(error => toast(error.message,true));
   const solverLoad = loadSolver(c.workspace_id,c.id);
   if (focusSolverSession) {
     await solverLoad;
@@ -1561,7 +1606,7 @@ async function startSolver() {
   try {
     const payload = await api(`/api/workspaces/${workspaceId}/challenges/${challengeId}/solver`,{method:'POST',body:{
       provider:solverProvider, account_id:solverAccountId, model:solverModel,
-      reasoning_effort:solverReasoning, service_tier:solverServiceTier,
+      reasoning_effort:solverReasoning, service_tier:solverServiceTier, writeup_locale:i18n.locale,
     }});
     if (payload.capacity?.warning && payload.capacity.warning_message) {
       toast(payload.capacity.warning_message);
@@ -1686,7 +1731,7 @@ async function startWriteupRefinement() {
   const input = document.querySelector('#writeup-refine-instruction');
   writeupRefineInstruction = normalizeWriteupRefinementInstruction(input ? input.value : writeupRefineInstruction);
   writeupRefineError = null;
-  const body = {provider:solverProvider,account_id:solverAccountId,model:solverModel,reasoning_effort:solverReasoning,service_tier:solverServiceTier};
+  const body = {provider:solverProvider,account_id:solverAccountId,model:solverModel,reasoning_effort:solverReasoning,service_tier:solverServiceTier,writeup_locale:i18n.locale};
   try {
     if (writeupRefinementInstructionBytes(writeupRefineInstruction) > writeupRefinementInstructionLimit) {
       const error = new Error('추가 요청은 UTF-8 기준 12 KiB 이하로 입력하세요.');
@@ -1934,6 +1979,43 @@ function renderSettings() {
   import('/assets/telegram.js').then(async module => { const dispose = await module.renderTelegram(container,api,{user:sessionUser}); if (container.isConnected) disposeTelegram = dispose; else dispose?.(); }).catch(() => { if (container.isConnected) container.textContent = '알림 설정을 불러올 수 없습니다. 잠시 후 다시 시도하세요.'; });
 }
 
+async function refreshReleaseUpdatePanel() {
+  const area = document.querySelector('#release-update-panel');
+  if (!area) return;
+  try {
+    const info = await api('/api/admin/updates');
+    if (!area.isConnected) return;
+    const phase = info.status?.phase || 'idle';
+    const active = ['queued','downloading','verifying','installing','health_check','rolling_back'].includes(phase);
+    const labels = {idle:'대기',queued:'대기 중',downloading:'다운로드 중',verifying:'검증 중',installing:'설치 중',health_check:'상태 확인 중',rolling_back:'이전 버전 복구 중',completed:'완료',failed:'실패'};
+    area.innerHTML = `<h2>서비스 업데이트</h2><p>${i18n.locale === 'en' ? 'Current' : '현재'} ${esc(info.current)} · ${i18n.locale === 'en' ? 'Latest' : '최신'} ${esc(info.latest?.tag || i18n.t('조회 불가'))}</p>
+      ${info.latest?.notes ? `<details><summary>업데이트 내역</summary><pre class="release-notes">${esc(info.latest.notes)}</pre></details>` : ''}
+      ${info.error ? `<p class="form-hint" role="status">${esc(info.error)}</p>` : ''}
+      ${!info.helper_ready ? '<p class="form-hint">이 설치 방식에는 웹 업데이트 실행기가 연결되어 있지 않습니다.</p>' : ''}
+      ${phase !== 'idle' ? `<p class="form-hint" role="status">${esc(i18n.t(labels[phase] || phase))}${info.status?.message ? ` · ${esc(info.status.message)}` : ''}</p>` : ''}
+      <button type="button" class="primary" data-action="install-release-update" ${info.available && info.helper_ready && !active ? '' : 'disabled'}>업데이트</button>`;
+    if (releaseUpdateTimer) clearTimeout(releaseUpdateTimer);
+    if (active) releaseUpdateTimer = setTimeout(refreshReleaseUpdatePanel,5000);
+  } catch (error) {
+    if (area.isConnected) {
+      area.innerHTML = `<h2>서비스 업데이트</h2><p class="form-hint" role="status">${esc(error.message || '업데이트 상태를 불러오지 못했습니다.')}</p><button type="button" class="small ghost" data-action="refresh-release-update">새로고침</button>`;
+      if (releaseUpdateTimer) clearTimeout(releaseUpdateTimer);
+      releaseUpdateTimer = setTimeout(refreshReleaseUpdatePanel,5000);
+    }
+  }
+}
+
+async function installReleaseUpdate(button) {
+  button.disabled = true;
+  button.setAttribute('aria-busy','true');
+  try {
+    const result = await api('/api/admin/updates',{method:'POST'});
+    toast(`${result.tag} 업데이트를 시작했습니다.`);
+  } finally {
+    await refreshReleaseUpdatePanel();
+  }
+}
+
 function adminUserActiveButton(user, activeAdminCount) {
   const reason = user.role === 'admin' && user.active && activeAdminCount <= 1
     ? '마지막 활성 관리자는 비활성화할 수 없습니다.'
@@ -1966,7 +2048,8 @@ async function renderAdmin() {
     const content = shell('admin','관리자 설정');
     content.innerHTML = `<div class="page-head"><div><div class="eyebrow">ADMIN SETTINGS</div><h1>관리자 설정</h1></div></div>
       ${solverCapacityAdminMarkup(capacity)}<div class="divider"></div>
-      <section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section>`;
+      <section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section id="release-update-panel" class="settings-card"></section>`;
+    refreshReleaseUpdatePanel();
     return;
   }
   const result = await api('/api/admin/users');
@@ -1975,7 +2058,8 @@ async function renderAdmin() {
   content.innerHTML = `<div class="page-head"><div><div class="eyebrow">ADMIN SETTINGS</div><h1>사용자 관리</h1></div><button class="primary" data-action="new-user">＋ 사용자 추가</button></div>
     <div class="table-wrap"><table class="challenge-table"><thead><tr><th>아이디</th><th>권한</th><th>상태</th><th>최근 로그인</th><th>작업공간 / 계정</th><th>Telegram</th><th>관리</th></tr></thead><tbody>${result.users.map(user => `<tr><td class="challenge-title">${esc(user.username)}${user.id === sessionUser.id ? ' <span class="tag">나</span>' : ''}</td><td><select data-action="user-role" data-id="${user.id}" aria-label="${esc(user.username)} 권한"><option value="user" ${user.role === 'user' ? 'selected' : ''}>일반 사용자</option><option value="admin" ${user.role === 'admin' ? 'selected' : ''}>관리자</option></select></td><td>${user.active ? '활성' : '비활성'}</td><td>${user.last_login_at ? date(user.last_login_at) : '기록 없음'}</td><td>${user.workspace_count} / ${user.account_count}</td><td>${user.telegram_linked ? (user.telegram_enabled ? '알림 켜짐' : '연결됨 · 알림 꺼짐') : '미연결'}${user.telegram_last_failure_at ? '<br><small>최근 전송 오류 기록</small>' : ''}</td><td><div class="actions">${adminUserActiveButton(user,activeAdminCount)}<button class="small" data-action="user-password" data-id="${user.id}" data-name="${esc(user.username)}">비밀번호 초기화</button></div></td></tr>`).join('')}</tbody></table></div>
     <div class="divider"></div>${solverCapacityAdminMarkup(capacity)}
-    <div class="divider"></div><section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section>`;
+    <div class="divider"></div><section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section id="release-update-panel" class="settings-card"></section>`;
+  refreshReleaseUpdatePanel();
 }
 
 function newUserForm() {
@@ -2461,6 +2545,11 @@ document.addEventListener('click', event => {
     'new-workspace': () => workspaceForm(), 'edit-workspace': () => workspaceForm(true),
     'new-challenge': () => challengeForm(), 'edit-challenge': async () => { const c = currentChallenge; await saveNotes(true); if (currentChallenge === c && currentWorkspace?.id === c.workspace_id) challengeForm(true); },
     'clone-challenge': () => cloneChallenge(),
+    'add-prerequisite': () => changePrerequisite(),
+    'install-release-update': () => installReleaseUpdate(button),
+    'refresh-release-update': () => refreshReleaseUpdatePanel(),
+    'remove-prerequisite': () => changePrerequisite(button.dataset.id),
+    'open-related-challenge': () => openChallenge(button.dataset.id),
     'remove-challenge-file': () => {
       const form = activeChallengeUploadForm(), index = Number(button.dataset.index);
       if (!form || !Number.isInteger(index)) return;

@@ -36,13 +36,16 @@ elif [[ "$(cat -- "$target/.release-revision" 2>/dev/null || true)" != "$revisio
     exit 2
 fi
 
-export CTF_AUTH_MODE=password
+export CTF_AUTH_MODE="${CTF_LOCAL_AUTH_MODE:-password}"
 export CTF_ALLOW_WEB_BOOTSTRAP=true
-export CTF_LOCAL_UID="$(id -u)"
-export CTF_LOCAL_GID="$(id -g)"
-export CTF_LOCAL_DATA="$home_dir/ctf_agent_data"
-export CTF_LOCAL_DATABASE="$home_dir/Database/CTF_Agent"
+export CTF_LOCAL_UID="${CTF_LOCAL_UID:-$(id -u)}"
+export CTF_LOCAL_GID="${CTF_LOCAL_GID:-$(id -g)}"
+export CTF_LOCAL_DATA="${CTF_LOCAL_DATA:-$home_dir/ctf_agent_data}"
+export CTF_LOCAL_DATABASE="${CTF_LOCAL_DATABASE:-$home_dir/Database/CTF_Agent}"
+export CTF_LOCAL_FS_DATA="${CTF_LOCAL_FS_DATA:-$home_dir/ctf_agent_data}"
+export CTF_LOCAL_FS_DATABASE="${CTF_LOCAL_FS_DATABASE:-$home_dir/Database/CTF_Agent}"
 export CTF_RELEASE_SHA="$revision"
+export CTF_RELEASE_VERSION="$version"
 cd -- "$target"
 toolchain_stamp="$home_dir/.toolchain-image"
 toolchain_fingerprint="$(sha256sum Dockerfile.toolchain toolchain.lock requirements.txt requirements-ctf.txt deploy/DecompileAll.java deploy/DecompileFn.java | sha256sum | cut -d ' ' -f 1)"
@@ -53,10 +56,33 @@ if [[ -z "$toolchain_image" || "$(cat -- "$toolchain_stamp" 2>/dev/null || true)
     [[ -n "$toolchain_image" ]] || { echo 'Toolchain image inspection failed.' >&2; exit 1; }
     stamp_temp="$(mktemp "$home_dir/.toolchain-image.XXXXXXXX")"
     printf '%s %s\n' "$toolchain_fingerprint" "$toolchain_image" > "$stamp_temp"
+    chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$stamp_temp"
     mv -f -- "$stamp_temp" "$toolchain_stamp"
 else
     echo 'Reusing the existing CTF toolchain image.'
 fi
 python3 deploy/local-compose.py up -d --build
+if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
+    current_temp="$(mktemp "$home_dir/.current-release.XXXXXXXX")"
+    printf '%s\n' "$version" > "$current_temp"
+    chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$current_temp"
+    mv -f -- "$current_temp" "$home_dir/.current-release"
+fi
+install -d -m 0700 -o "$CTF_LOCAL_UID" -g "$CTF_LOCAL_GID" "$home_dir/ctf_agent_data/update-control"
+if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
+    updater_fingerprint="$(sha256sum Dockerfile.updater ctf_agent/release_updates.py | sha256sum | cut -d ' ' -f 1)"
+    updater_stamp="$home_dir/.updater-image"
+    if ! docker image inspect ctf-agent-updater:local >/dev/null 2>&1 ||
+       [[ "$(cat -- "$updater_stamp" 2>/dev/null || true)" != "$updater_fingerprint" ]]; then
+        docker build --file Dockerfile.updater --tag ctf-agent-updater:local .
+        printf '%s\n' "$updater_fingerprint" > "$updater_stamp"
+    fi
+    docker rm -f ctf_agent_local_updater >/dev/null 2>&1 || true
+    docker run -d --name ctf_agent_local_updater --restart unless-stopped \
+        --memory 1g --cpus 1 --security-opt no-new-privileges \
+        -e "CTF_LOCAL_HOME=$home_dir" -e "CTF_LOCAL_UID=$CTF_LOCAL_UID" -e "CTF_LOCAL_GID=$CTF_LOCAL_GID" \
+        -v "$home_dir:$home_dir" -v /var/run/docker.sock:/var/run/docker.sock \
+        ctf-agent-updater:local >/dev/null
+fi
 printf '\nCTF Agent %s installed. Open http://127.0.0.1:5050\n' "$version"
 printf 'Data: %s\n' "$CTF_LOCAL_DATA"

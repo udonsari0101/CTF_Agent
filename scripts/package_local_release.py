@@ -15,6 +15,7 @@ FIXED_APP_FILES = {
     ".dockerignore",
     "Dockerfile",
     "Dockerfile.toolchain",
+    "Dockerfile.updater",
     "toolchain.lock",
     "compose.local.yaml",
     "requirements.txt",

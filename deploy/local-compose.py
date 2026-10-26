@@ -38,7 +38,7 @@ def prepare_readable_storage(environment: dict[str, str]) -> Path:
     """Create the bind-mounted readable root as the invoking WSL user."""
 
     data_root = _local_path(
-        environment.get("CTF_LOCAL_DATA", "./.local/ctf_agent_data")
+        environment.get("CTF_LOCAL_FS_DATA", environment.get("CTF_LOCAL_DATA", "./.local/ctf_agent_data"))
     )
     target = data_root / "workspace_files"
     for path in (data_root, target):
@@ -52,8 +52,8 @@ def protected_solver_ceiling(environment: dict[str, str] | None = None) -> int:
     """Keep every slot that may still contain an in-flight credential copy."""
 
     env = environment or os.environ
-    data_root = _local_path(env.get("CTF_LOCAL_DATA", "./.local/ctf_agent_data"))
-    database_root = _local_path(env.get("CTF_LOCAL_DATABASE", "./.local/Database/CTF_Agent"))
+    data_root = _local_path(env.get("CTF_LOCAL_FS_DATA", env.get("CTF_LOCAL_DATA", "./.local/ctf_agent_data")))
+    database_root = _local_path(env.get("CTF_LOCAL_FS_DATABASE", env.get("CTF_LOCAL_DATABASE", "./.local/Database/CTF_Agent")))
     database = database_root / "sqlite" / "ctf_agent.sqlite3"
     protected = 1
     if database.is_file():

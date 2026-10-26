@@ -8,7 +8,7 @@ The installer checks WSL 2, recommends an installed Linux distribution or offers
 
 Open <http://127.0.0.1:5050> after installation. Create the first administrator account there. That setup page is available only before an administrator exists. Later visits use the login page.
 
-To upgrade, extract a newer release and run its `Install.cmd`. Data and the database stay in the selected directory; application releases are stored separately. The first install builds a large toolchain image. Later updates reuse it when the toolchain files have not changed.
+To upgrade, use **Administration → Service updates** in the web interface. Release v0.3.0 has no web update worker, so run the newer release's `Install.cmd` once to enable this feature. It checks the public GitHub release, shows its notes, downloads the installer ZIP, verifies its SHA-256 checksum, and updates the local Docker stack. If the new container does not become healthy, the update worker attempts to restore the previous installed release. You can also extract a newer release and run its `Install.cmd`. Data and the database stay in the selected directory; application releases are stored separately. The first install builds a large toolchain image. Later updates reuse it when the toolchain files have not changed.
 
 If the installer asks you to enable WSL integration, open **Docker Desktop → Settings → Resources → WSL Integration**, enable the selected distribution, and retry. Follow any Windows restart prompt before rerunning the installer.
 
@@ -32,7 +32,7 @@ git clone https://github.com/udonsari0101/CTF_Agent.git ~/CTF_Agent && cd ~/CTF_
 
 For a single-user installation without login, set `CTF_AUTH_MODE=nologin` and omit `CTF_ALLOW_WEB_BOOTSTRAP`. This mode should be selected explicitly.
 
-To stop the source installation, run `python3 deploy/local-compose.py down` in the checkout. To update it, run `git pull --ff-only` and repeat the startup command. The release installer uses a separate data path from a source checkout unless you select the same path.
+To stop the source installation, run `python3 deploy/local-compose.py down` in the checkout. To update it, run `git pull --ff-only` and repeat the startup command. The web update worker is installed by the release installer; source checkouts use the source update command. The release installer uses a separate data path from a source checkout unless you select the same path.
 
 The solver count starts from local CPU and memory recommendations, then grows with queued work. The web administration page can set a maximum. Resource warnings appear when demand exceeds the recommendation.
 

@@ -226,6 +226,7 @@ services:
       CTF_CONFIG_DIR: /data/config
       CTF_LOG_DIR: /database/logs
       CTF_RELEASE_SHA: ${CTF_RELEASE_SHA:-local}
+      CTF_RELEASE_VERSION: ${CTF_RELEASE_VERSION:-local}
       CTF_AUTH_MODE: ${CTF_AUTH_MODE:-nologin}
       CTF_ALLOW_WEB_BOOTSTRAP: ${CTF_ALLOW_WEB_BOOTSTRAP:-false}
       CTF_CTFD_ALLOW_INSECURE_HTTP: ${CTF_CTFD_ALLOW_INSECURE_HTTP:-false}

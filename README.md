@@ -12,10 +12,10 @@ The screenshots use synthetic challenges and account data.
 
 ## Features
 
-- Keep each CTF in a separate workspace. Add challenges manually or import selected challenges from CTFd; sync new or changed challenges later.
+- Keep each CTF in a separate workspace. Add challenges manually or import selected challenges from CTFd; sync new or changed challenges later. Link prerequisite challenges by ID, including challenges with duplicate names.
 - Connect Codex and Claude Code accounts. Choose an account, model, and reasoning level for each challenge, then watch the session log and send follow-up instructions while it runs.
 - Upload multiple files, including large binaries with resumable transfers. Challenge files and the database use separate data directories.
-- See flags as soon as they are found. Review, copy, and download Korean Markdown write-ups; request a revised write-up when needed.
+- See flags as soon as they are found. Review, copy, and download Markdown write-ups in the selected interface language; request a revised write-up when needed.
 - Each user can register a Telegram bot token in **Personal settings**, connect a chat through a one-time link, and receive flag, write-up, error, and input-request notifications. No bot token is bundled or required during installation. CTFd flag submission is off by default.
 - Use the first-run administrator setup for a multi-user installation. A separate no-login mode is available for explicitly configured single-user instances.
 - Switch the web interface between English and Korean. Interface translations live in [language packs](docs/localization.md) so more languages can be added.
@@ -36,7 +36,7 @@ The screenshots use synthetic challenges and account data.
 2. Run `Install.cmd`. The installer checks WSL 2, suggests a suitable Linux distribution, checks Docker Desktop and available disk space, then asks where to keep your data inside WSL.
 3. Open <http://127.0.0.1:5050> and create the first administrator account. Connect a Codex or Claude Code account in **Agents**.
 
-Run `Install.cmd` from a newer release to upgrade. The installer preserves the selected data directory. The first image build downloads a large CTF toolchain; subsequent application updates reuse it when the toolchain has not changed. See the [installation guide](docs/docker-desktop.md) for requirements, troubleshooting, and Windows Explorer access to challenge files.
+Open **Administration → Service updates** to check public releases, read release notes, and install an update. Release v0.3.0 predates the web updater; run `Install.cmd` once from a newer release to enable it. Later updates can also use `Install.cmd`. Both paths preserve the selected data directory. The first image build downloads a large CTF toolchain; subsequent application updates reuse it when the toolchain has not changed. See the [installation guide](docs/docker-desktop.md) for requirements, troubleshooting, and Windows Explorer access to challenge files.
 
 To open your challenge files from Windows, use Explorer at `\\wsl.localhost\<distribution>\<Linux data path>\ctf_agent_data\workspace_files`.
 

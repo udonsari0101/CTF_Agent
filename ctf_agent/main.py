@@ -374,6 +374,7 @@ class ChallengePatch(BaseModel):
     remote_mode: str | None = Field(default=None, pattern=r"^(unknown|none|endpoint)$")
     flag: str | None = Field(default=None, max_length=4000)
 
+
     @field_validator("name", "category", "description", "remote")
     @classmethod
     def not_null(cls, value: str | None) -> str:
@@ -393,6 +394,10 @@ class ChallengePatch(BaseModel):
     @classmethod
     def mode_not_null(cls, value: str | None) -> str:
         return WorkspacePatch.not_null(value)
+
+
+class ChallengeRelationInput(BaseModel):
+    prerequisite_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
 def normalize_remote_pair(mode: str | None, remote: str) -> tuple[str, str]:
@@ -534,6 +539,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return result
 
+    def challenge_relations(db, workspace_id: str, challenge_id: str) -> list[dict]:
+        return [dict(row) for row in db.execute(
+            """SELECT c.id,c.name,c.category,c.status,c.ctfd_id,c.ctfd_url
+                 FROM challenge_relations r
+                 JOIN challenges c ON c.id=r.prerequisite_id AND c.workspace_id=r.workspace_id
+                WHERE r.workspace_id=? AND r.dependent_id=?
+                ORDER BY r.created_at,c.id""",
+            (workspace_id, challenge_id),
+        )]
+
     def latest_solver_summary(db, workspace_id: str, challenge_id: str) -> dict | None:
         """Return the current owner's newest safe run metadata for list cards."""
 
@@ -616,6 +631,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from .auth import register_auth
     require_auth, require_admin = register_auth(app, settings, database, password_hash, password_matches, CURRENT_USER)
+
+    from .release_updates import control_root, latest_release, queue_update, read_status, version_tuple
+
+    @app.get("/api/admin/updates", dependencies=[Depends(require_admin)])
+    def release_update_info():
+        current = os.environ.get("CTF_RELEASE_VERSION", "")
+        root = control_root(settings.data_dir)
+        status = read_status(root)
+        if (root / "request.json").exists():
+            status = {**status, "phase": "queued"}
+        helper_ready = time.time() - float(status.get("updated_at") or 0) < 20
+        try:
+            latest = latest_release()
+            error = None
+        except Exception:
+            latest = None
+            error = "최신 릴리스를 조회하지 못했습니다."
+        available = bool(
+            latest and version_tuple(current) and
+            version_tuple(latest["tag"]) > version_tuple(current)
+        )
+        return {
+            "current": current or "unknown", "latest": latest,
+            "available": available, "helper_ready": helper_ready,
+            "status": status, "error": error,
+        }
+
+    @app.post("/api/admin/updates", status_code=202, dependencies=[Depends(require_admin)])
+    def begin_release_update():
+        current = os.environ.get("CTF_RELEASE_VERSION", "")
+        if version_tuple(current) is None:
+            raise HTTPException(409, "이 설치 방식에서는 웹 업데이트를 사용할 수 없습니다.")
+        root = control_root(settings.data_dir)
+        status = read_status(root)
+        if time.time() - float(status.get("updated_at") or 0) >= 20:
+            raise HTTPException(503, "업데이트 실행기를 확인할 수 없습니다.")
+        if status.get("phase") in {"downloading", "verifying", "installing", "health_check", "rolling_back"}:
+            raise HTTPException(409, "업데이트가 이미 진행 중입니다.")
+        try:
+            latest = latest_release()
+        except Exception:
+            raise HTTPException(503, "최신 릴리스를 확인하지 못했습니다.") from None
+        if version_tuple(latest["tag"]) <= version_tuple(current):
+            raise HTTPException(409, "이미 최신 버전입니다.")
+        try:
+            request_id = queue_update(root, latest["tag"])
+        except FileExistsError:
+            raise HTTPException(409, "업데이트가 이미 대기 중입니다.") from None
+        return {"request_id": request_id, "tag": latest["tag"], "status": "queued"}
 
     def owner_id():
         user = CURRENT_USER.get()
@@ -1224,7 +1288,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sync_challenge_storage(db, workspace_id, challenge_id)
             result = challenge_response(db, challenge_row(db, workspace_id, challenge_id))
             result["attachments"] = [dict(row) for row in db.execute("SELECT id,original_name,size,created_at FROM attachments WHERE workspace_id=? AND challenge_id=? ORDER BY created_at,id", (workspace_id, challenge_id))]
+            result["prerequisites"] = challenge_relations(db, workspace_id, challenge_id)
         return result
+
+    @app.get("/api/workspaces/{workspace_id}/challenges/{challenge_id}/prerequisites/candidates", dependencies=[Depends(require_auth)])
+    def prerequisite_candidates(workspace_id: str, challenge_id: str):
+        with database() as db:
+            challenge_row(db, workspace_id, challenge_id)
+            return {"challenges": [dict(row) for row in db.execute(
+                """SELECT id,name,category,status,ctfd_id,ctfd_url
+                     FROM challenges WHERE workspace_id=? AND id<>?
+                     ORDER BY name COLLATE NOCASE,id""", (workspace_id, challenge_id),
+            )]}
+
+    @app.post("/api/workspaces/{workspace_id}/challenges/{challenge_id}/prerequisites", status_code=201, dependencies=[Depends(require_auth)])
+    def add_prerequisite(workspace_id: str, challenge_id: str, payload: ChallengeRelationInput):
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            challenge_row(db, workspace_id, challenge_id)
+            challenge_row(db, workspace_id, payload.prerequisite_id)
+            if challenge_id == payload.prerequisite_id:
+                raise HTTPException(400, "문제를 자기 자신과 연결할 수 없습니다.")
+            cycle = db.execute(
+                """WITH RECURSIVE descendants(id) AS (
+                       SELECT dependent_id FROM challenge_relations
+                        WHERE workspace_id=? AND prerequisite_id=?
+                       UNION
+                       SELECT r.dependent_id FROM challenge_relations r
+                       JOIN descendants d ON d.id=r.prerequisite_id
+                        WHERE r.workspace_id=?
+                   ) SELECT 1 FROM descendants WHERE id=? LIMIT 1""",
+                (workspace_id, challenge_id, workspace_id, payload.prerequisite_id),
+            ).fetchone()
+            if cycle:
+                raise HTTPException(409, "연관 문제에 순환 관계를 만들 수 없습니다.")
+            try:
+                db.execute(
+                    """INSERT INTO challenge_relations(workspace_id,prerequisite_id,dependent_id,created_at)
+                       VALUES(?,?,?,?)""",
+                    (workspace_id, payload.prerequisite_id, challenge_id, now()),
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(409, "이미 연결된 문제입니다.") from None
+            return {"prerequisites": challenge_relations(db, workspace_id, challenge_id)}
+
+    @app.delete("/api/workspaces/{workspace_id}/challenges/{challenge_id}/prerequisites/{prerequisite_id}", dependencies=[Depends(require_auth)])
+    def remove_prerequisite(workspace_id: str, challenge_id: str, prerequisite_id: str):
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            challenge_row(db, workspace_id, challenge_id)
+            result = db.execute(
+                """DELETE FROM challenge_relations WHERE workspace_id=? AND dependent_id=? AND prerequisite_id=?""",
+                (workspace_id, challenge_id, prerequisite_id),
+            )
+            if result.rowcount != 1:
+                raise HTTPException(404, "연관 문제를 찾을 수 없습니다.")
+            return {"prerequisites": challenge_relations(db, workspace_id, challenge_id)}
 
     @app.patch("/api/workspaces/{workspace_id}/challenges/{challenge_id}", dependencies=[Depends(require_auth)])
     def edit_challenge(workspace_id: str, challenge_id: str, payload: ChallengePatch, if_match: str | None = Header(default=None)):

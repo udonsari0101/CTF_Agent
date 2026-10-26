@@ -81,6 +81,16 @@ CREATE TABLE IF NOT EXISTS challenges (
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_challenges_workspace ON challenges(workspace_id, status);
+CREATE TABLE IF NOT EXISTS challenge_relations (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    prerequisite_id TEXT NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+    dependent_id TEXT NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id,prerequisite_id,dependent_id),
+    CHECK(prerequisite_id <> dependent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_challenge_relations_dependent
+    ON challenge_relations(workspace_id,dependent_id,prerequisite_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_challenges_ctfd ON challenges(workspace_id, ctfd_url, ctfd_id)
     WHERE ctfd_id IS NOT NULL AND ctfd_url IS NOT NULL;
 CREATE TABLE IF NOT EXISTS attachments (

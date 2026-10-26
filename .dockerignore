@@ -2,6 +2,7 @@
 # Explicit allowlist: .git, logs, test output, caches and local data never enter either build.
 !Dockerfile
 !Dockerfile.toolchain
+!Dockerfile.updater
 !toolchain.lock
 !requirements.txt
 !requirements-ctf.txt
