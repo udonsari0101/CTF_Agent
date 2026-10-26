@@ -45,6 +45,9 @@ jobs:
                           'Uninstall.cmd', 'Uninstall.ps1', 'installer/install.sh',
                           'installer/start.sh', 'installer/uninstall.py',
                           'app/Dockerfile.updater', 'app/ctf_agent/release_updates.py',
+                          'app/deploy/production-update.py', 'app/deploy/bootstrap-production-update.sh',
+                          'app/deploy/PRODUCTION_UPDATE.md',
+                          'app/.github/scripts/remote-rollout.sh',
                           'app/ctf_agent/main.py', 'app/ctf_agent/web/i18n/en.json',
                           'app/ctf_agent/web/i18n/ko.json'}
               assert all(prefix + name in names for name in required)

@@ -637,18 +637,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from .auth import register_auth
     require_auth, require_admin = register_auth(app, settings, database, password_hash, password_matches, CURRENT_USER)
 
-    from .release_updates import control_root, latest_release, queue_update, read_status, version_tuple
+    from .release_updates import (
+        REPOSITORY, control_root, invalidate_release_cache, latest_release, production_release_profile,
+        queue_update, read_status, version_tuple,
+    )
+
+    def installed_release_profile() -> tuple[str, str]:
+        configured = os.environ.get("CTF_RELEASE_VERSION", "")
+        if version_tuple(configured):
+            return configured, REPOSITORY
+        profile = production_release_profile(
+            control_root(settings.data_dir), os.environ.get("CTF_RELEASE_SHA", "")
+        )
+        return profile.get("tag", ""), profile.get("repository", REPOSITORY)
 
     @app.get("/api/admin/updates", dependencies=[Depends(require_admin)])
-    def release_update_info():
-        current = os.environ.get("CTF_RELEASE_VERSION", "")
+    def release_update_info(refresh: bool = False):
+        current, repository = installed_release_profile()
         root = control_root(settings.data_dir)
         status = read_status(root)
         if (root / "request.json").exists():
             status = {**status, "phase": "queued"}
         helper_ready = time.time() - float(status.get("updated_at") or 0) < 20
         try:
-            latest = latest_release()
+            if refresh:
+                invalidate_release_cache(repository)
+            latest = latest_release() if repository == REPOSITORY else latest_release(repository)
             error = None
         except Exception:
             latest = None
@@ -665,7 +679,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/admin/updates", status_code=202, dependencies=[Depends(require_admin)])
     def begin_release_update():
-        current = os.environ.get("CTF_RELEASE_VERSION", "")
+        current, repository = installed_release_profile()
         if version_tuple(current) is None:
             raise HTTPException(409, "이 설치 방식에서는 웹 업데이트를 사용할 수 없습니다.")
         root = control_root(settings.data_dir)
@@ -675,7 +689,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if status.get("phase") in {"downloading", "verifying", "installing", "health_check", "rolling_back"}:
             raise HTTPException(409, "업데이트가 이미 진행 중입니다.")
         try:
-            latest = latest_release()
+            invalidate_release_cache(repository)
+            latest = latest_release() if repository == REPOSITORY else latest_release(repository)
         except Exception:
             raise HTTPException(503, "최신 릴리스를 확인하지 못했습니다.") from None
         if version_tuple(latest["tag"]) <= version_tuple(current):

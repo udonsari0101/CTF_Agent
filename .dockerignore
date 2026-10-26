@@ -14,6 +14,12 @@ deploy/*
 !deploy/ctf-browser
 !deploy/DecompileAll.java
 !deploy/DecompileFn.java
+!deploy/production-update.py
+!.github/
+.github/*
+!.github/scripts/
+.github/scripts/*
+!.github/scripts/remote-rollout.sh
 !ctf_agent/
 !ctf_agent/**
 **/__pycache__/

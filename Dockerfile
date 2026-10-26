@@ -25,6 +25,8 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Seoul
 WORKDIR /app
 COPY ctf_agent ./ctf_agent
+COPY --chown=0:0 --chmod=0444 deploy/production-update.py /app/deploy/production-update.py
+COPY --chown=0:0 --chmod=0444 .github/scripts/remote-rollout.sh /app/deploy/remote-rollout.sh
 USER 10001:10001
 EXPOSE 5050
 CMD ["python", "-m", "uvicorn", "ctf_agent.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "5050", "--workers", "1", "--no-proxy-headers"]

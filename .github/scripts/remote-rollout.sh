@@ -11,7 +11,9 @@ image_ref=$2
 release_root=$3
 case "$revision" in *[!0-9a-f]*|'') exit 1 ;; esac
 [ "${#revision}" -eq 40 ] || exit 1
-case "$image_ref" in ghcr.io/udonsari0101/ctf-agent-public@sha256:*) ;; *) exit 1 ;; esac
+expected_image=${CTF_EXPECTED_IMAGE_REPOSITORY:-ghcr.io/udonsari0101/ctf-agent-public}
+case "$expected_image" in *[!A-Za-z0-9./:_-]*|'') exit 1 ;; esac
+case "$image_ref" in "$expected_image"@sha256:*) ;; *) exit 1 ;; esac
 digest=${image_ref##*@sha256:}
 case "$digest" in *[!0-9a-f]*|'') exit 1 ;; esac
 [ "${#digest}" -eq 64 ] || exit 1
@@ -71,8 +73,8 @@ if [ ! -e "$target_dir" ]; then
 fi
 [ -d "$target_dir" ] && [ ! -L "$target_dir" ] || exit 1
 [ -f "$target_dir/release.sh" ] && [ ! -L "$target_dir/release.sh" ] || exit 1
-grep -q 'ctf-agent-public@sha256' "$target_dir/release.sh" || {
-    echo 'The host release script does not support the public image registry.' >&2
+grep -Eq 'ctf-agent-public@sha256|CTF_EXPECTED_IMAGE_REPOSITORY' "$target_dir/release.sh" || {
+    echo 'The host release script does not support the configured image registry.' >&2
     exit 1
 }
 if [ -f "$target_dir/image-ref" ] &&

@@ -18,11 +18,11 @@ from pathlib import Path
 
 
 REPOSITORY = "udonsari0101/CTF_Agent"
-LATEST_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
 MAX_ARCHIVE_BYTES = 150 * 1024 * 1024
 MAX_UNPACKED_BYTES = 300 * 1024 * 1024
-_LATEST_CACHE: tuple[float, dict] | None = None
+_LATEST_CACHE: dict[str, tuple[float, dict]] = {}
 _LATEST_LOCK = threading.Lock()
 
 
@@ -31,13 +31,18 @@ def version_tuple(value: str) -> tuple[int, int, int] | None:
     return tuple(map(int, matched.groups())) if matched else None
 
 
-def latest_release() -> dict:
+def latest_release(repository: str = REPOSITORY, *, force: bool = False) -> dict:
     global _LATEST_CACHE
+    if not REPOSITORY_PATTERN.fullmatch(repository):
+        raise ValueError("Invalid release repository")
     with _LATEST_LOCK:
-        if _LATEST_CACHE and time.monotonic() - _LATEST_CACHE[0] < 300:
-            return dict(_LATEST_CACHE[1])
+        if not isinstance(_LATEST_CACHE, dict):
+            _LATEST_CACHE = {}
+        cached = _LATEST_CACHE.get(repository)
+        if not force and cached and time.monotonic() - cached[0] < 300:
+            return dict(cached[1])
         request = urllib.request.Request(
-            LATEST_URL,
+            f"https://api.github.com/repos/{repository}/releases/latest",
             headers={"Accept": "application/vnd.github+json", "User-Agent": "ctf-agent-release-check"},
         )
         with urllib.request.urlopen(request, timeout=12) as response:
@@ -56,14 +61,49 @@ def latest_release() -> dict:
             "tag": tag,
             "notes": str(payload.get("body") or "")[:16_000],
             "published_at": payload.get("published_at"),
-            "url": f"https://github.com/{REPOSITORY}/releases/tag/{tag}",
+            "url": f"https://github.com/{repository}/releases/tag/{tag}",
         }
-        _LATEST_CACHE = (time.monotonic(), result)
+        _LATEST_CACHE[repository] = (time.monotonic(), result)
         return dict(result)
+
+
+def invalidate_release_cache(repository: str = REPOSITORY) -> None:
+    with _LATEST_LOCK:
+        if isinstance(_LATEST_CACHE, dict):
+            _LATEST_CACHE.pop(repository, None)
 
 
 def control_root(data_dir: Path) -> Path:
     return data_dir / "update-control"
+
+
+def production_release_profile(root: Path, revision: str) -> dict[str, str]:
+    """Read the host updater's profile only for the running image."""
+
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        return {}
+    marker = root / "current-version.json"
+    try:
+        if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 512:
+            return {}
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or set(value) != {"tag", "revision", "repository"}:
+            return {}
+        tag = value["tag"]
+        repository = value["repository"]
+        if (
+            isinstance(tag, str) and version_tuple(tag)
+            and isinstance(repository, str) and REPOSITORY_PATTERN.fullmatch(repository)
+            and value["revision"] == revision
+        ):
+            return {"tag": tag, "repository": repository}
+        return {}
+    except (OSError, ValueError, UnicodeError):
+        return {}
+
+
+def production_current_version(root: Path, revision: str) -> str:
+    return production_release_profile(root, revision).get("tag", "")
 
 
 def read_status(root: Path) -> dict:

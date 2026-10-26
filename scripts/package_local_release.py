@@ -27,6 +27,10 @@ FIXED_APP_FILES = {
     "deploy/ctf-browser",
     "deploy/DecompileAll.java",
     "deploy/DecompileFn.java",
+    "deploy/production-update.py",
+    "deploy/bootstrap-production-update.sh",
+    "deploy/PRODUCTION_UPDATE.md",
+    ".github/scripts/remote-rollout.sh",
 }
 INSTALLER_FILES = {
     "installer/Install.cmd": "Install.cmd",
