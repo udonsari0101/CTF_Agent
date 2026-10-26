@@ -420,6 +420,12 @@ input:focus, textarea:focus, select:focus {
 .telegram-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 0 0 18px; color: var(--muted); font-size: 11px; }
 .error-text { color: #ff9eaa; }
 .clipboard-proxy { position: fixed; inset: 0 auto auto 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.copy-select-action { margin-left: 10px; padding: 2px 7px; border-color: currentColor; color: inherit; }
+.copy-select-dialog { width: min(760px, calc(100vw - 24px)); padding: 20px; }
+.copy-select-dialog::backdrop { background: #000b; }
+.copy-select-dialog h2 { margin: 0 0 8px; }
+.copy-select-dialog p { margin: 0 0 12px; font-size: 12px; }
+.copy-select-dialog textarea { display: block; width: 100%; min-height: 150px; max-height: 55dvh; margin-bottom: 12px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 
 .solver-panel { display: grid; gap: 11px; }
 .solver-panel > * { margin-top: 0; margin-bottom: 0; }

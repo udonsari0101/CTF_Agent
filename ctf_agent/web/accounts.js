@@ -9,10 +9,6 @@ const el = (tag, text, className) => {
 
 async function copyText(value) {
   const text = String(value ?? '');
-  if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
-    try { await navigator.clipboard.writeText(text); return; }
-    catch { /* Permission may be denied; use the selection fallback. */ }
-  }
   const focused = document.activeElement;
   const selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart,focused.selectionEnd] : null;
   const area = document.createElement('textarea');
@@ -32,7 +28,19 @@ async function copyText(value) {
     if (focused?.isConnected !== false) focused?.focus?.();
     if (selection && focused?.isConnected !== false && typeof focused?.setSelectionRange === 'function') focused.setSelectionRange(...selection);
   }
-  if (!copied) throw new Error('클립보드 권한이 차단되었습니다. 브라우저의 클립보드 권한을 허용하거나 로그인 링크를 직접 여세요.');
+  if (copied) return 'unverified';
+  if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
+    let timeout;
+    try {
+      await Promise.race([
+        navigator.clipboard.writeText(text),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('클립보드 응답이 지연되었습니다. 복사 여부를 확인하고 다시 시도하세요.')), 2000); }),
+      ]);
+      return 'unverified';
+    } catch { /* Clipboard permission may be denied or the response may stall. */ }
+    finally { clearTimeout(timeout); }
+  }
+  throw new Error('클립보드 권한이 차단되었거나 응답이 지연되었습니다. 복사 여부를 확인하거나 로그인 링크를 직접 여세요.');
 }
 
 const date = seconds => seconds != null ? new Date(seconds * 1000).toLocaleString(i18n.locale === 'ko' ? 'ko-KR' : 'en-US', {timeZone: 'Asia/Seoul'}) + ' KST' : i18n.t('미제공');
@@ -171,7 +179,7 @@ export async function renderAccounts(container, api, options = {}) {
       link.href = state.verification_url; link.target = '_blank'; link.rel = 'noopener noreferrer';
       claudeLink.append(link, button('링크 복사', async () => {
         await copyText(state.verification_url);
-        setFeedback('로그인 링크를 복사했습니다.');
+        setFeedback('복사를 시도했습니다. 링크가 필요하면 직접 열어 주소를 복사하세요.');
       }));
     };
     if (isClaudeLogin) {

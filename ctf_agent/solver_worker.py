@@ -4136,7 +4136,7 @@ same workspace. Submit the verified flag through submit-flag yourself.
         elif getattr(configuration, "provider", None) == "claude" and getattr(configuration, "ultracode", False):
             result_bridge += """
 
-Ultracode is enabled. Use Agent or Workflow subagents for independent
+Ultracode is enabled. Use the available Agent or Task subagent tool, or Workflow, for independent
 analysis or verification when parallel work is useful. Assign separate files
 or remote actions to avoid conflicts, collect their evidence, and submit the
 verified flag from this session with submit-flag.
@@ -4615,6 +4615,9 @@ class ClaudePrintDriver(CodexAppServer):
     """Claude Code print-mode driver with one resumable, job-scoped session."""
 
     structured_discovery = True
+    # Current Claude Code reports Task for the Agent CLI alias; earlier
+    # installable versions may still report Agent. Keep the CLI request
+    # compatible and normalize exactly one alias in the event contract.
     ALLOWED_TOOLS = ("Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent")
     ALLOWED_MODELS = {"default", "best", "fable", "opus", "sonnet", "haiku",
                       "claude-fable-5-1", "claude-fable-5", "claude-opus-5-5",
@@ -4855,6 +4858,7 @@ class ClaudePrintDriver(CodexAppServer):
         allowed_tools = () if writeup_only else (
             *self.ALLOWED_TOOLS, *(("Workflow",) if ultracode else ())
         )
+        permission_tools = (*allowed_tools, "Task") if "Agent" in allowed_tools else allowed_tools
         tools = ",".join(allowed_tools)
         settings_payload = (
             {
@@ -4872,7 +4876,7 @@ class ClaudePrintDriver(CodexAppServer):
                 "disableWorkflows": not ultracode,
                 "permissions": {
                     **self.SETTINGS["permissions"],
-                    "allow": list(allowed_tools),
+                    "allow": list(permission_tools),
                 },
             }
         )
@@ -4934,7 +4938,7 @@ class ClaudePrintDriver(CodexAppServer):
         )
         if allowed_tools:
             tools_index = arguments.index("--tools") + 2
-            arguments[tools_index:tools_index] = ["--allowedTools", tools]
+            arguments[tools_index:tools_index] = ["--allowedTools", ",".join(permission_tools)]
         return arguments
 
     @staticmethod
@@ -5034,7 +5038,7 @@ class ClaudePrintDriver(CodexAppServer):
     async def _track_claude_agent_tool(
         self, block: Mapping[str, Any], parent_id: str, manifest: JobManifest
     ) -> None:
-        if block.get("name") not in {"Agent", "Workflow"}:
+        if block.get("name") not in {"Task", "Agent", "Workflow"}:
             return
         tool_id = block.get("id")
         agent_id = _provider_agent_id("claude", tool_id)
@@ -5136,7 +5140,7 @@ class ClaudePrintDriver(CodexAppServer):
                             await self._track_claude_agent_tool(block, child_agent_id, manifest)
                             tool_input = block.get("input")
                             await self._report_activity(
-                                "started", "agent" if block.get("name") in {"Agent", "Workflow"} else "tool",
+                                "started", "agent" if block.get("name") in {"Task", "Agent", "Workflow"} else "tool",
                                 "Subagent tool", command=(
                                     tool_input.get("command") or tool_input.get("query")
                                     if isinstance(tool_input, Mapping) else None
@@ -5172,7 +5176,15 @@ class ClaudePrintDriver(CodexAppServer):
                     ),
                     "StructuredOutput",
                 }
-                if not isinstance(returned_tools, list) or set(returned_tools) != expected_tools:
+                if not isinstance(returned_tools, list) or any(not isinstance(tool, str) for tool in returned_tools):
+                    raise WorkerRefusal("tool_policy_mismatch", "Claude tool list is invalid.")
+                actual_tools = set(returned_tools)
+                if len(actual_tools) != len(returned_tools) or {"Agent", "Task"} <= actual_tools:
+                    raise WorkerRefusal("tool_policy_mismatch", "Claude tool list is ambiguous.")
+                if "Task" in actual_tools:
+                    actual_tools.remove("Task")
+                    actual_tools.add("Agent")
+                if actual_tools != expected_tools:
                     raise WorkerRefusal("tool_policy_mismatch", "Claude 도구 제한을 확인하지 못했습니다.")
                 mcp_servers = event.get("mcp_servers", [])
                 if mcp_servers not in ([], None):
@@ -5211,13 +5223,14 @@ class ClaudePrintDriver(CodexAppServer):
                             ),
                             "StructuredOutput",
                         }
-                        if name not in allowed_tools:
+                        normalized_name = "Agent" if name == "Task" else name
+                        if normalized_name not in allowed_tools:
                             raise WorkerRefusal("unexpected_remote_tool", "Claude가 허용하지 않은 도구를 요청했습니다.")
                         await self._track_claude_agent_tool(block, "root", manifest)
                         if name != "StructuredOutput":
                             self._discovery_command_execution_seen = True
                             await progress(
-                                "executing" if name in {"Bash", "Agent", "Workflow"} else "inspecting_files"
+                                "executing" if name in {"Bash", "Task", "Agent", "Workflow"} else "inspecting_files"
                             )
                             tool_input = block.get("input")
                             command = (
@@ -5234,14 +5247,14 @@ class ClaudePrintDriver(CodexAppServer):
                                 else "web_search"
                                 if name == "WebSearch"
                                 else "agent"
-                                if name in {"Agent", "Workflow"}
+                                if name in {"Task", "Agent", "Workflow"}
                                 else "file",
                                 "명령 실행"
                                 if name == "Bash"
                                 else "웹 검색"
                                 if name == "WebSearch"
                                 else "Subagent started"
-                                if name in {"Agent", "Workflow"}
+                                if name in {"Task", "Agent", "Workflow"}
                                 else "파일 검사",
                                 command=command,
                             )

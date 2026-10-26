@@ -961,7 +961,7 @@ async function api(url, options = {}) {
   return result;
 }
 
-function toast(message, error = false) {
+function toast(message, error = false, duration = error ? 8000 : 4000) {
   const node = document.createElement('div');
   node.className = `toast${error ? ' error' : ''}`;
   node.textContent = message;
@@ -970,10 +970,52 @@ function toast(message, error = false) {
   let target = topDialog ? topDialog.querySelector('.toasts') : document.querySelector('#toasts');
   if (!target) {
     target = document.createElement('div'); target.className = 'toasts'; target.setAttribute('aria-live','polite');
-    topDialog.append(target);
+    (topDialog || document.body).append(target);
   }
   target.append(node);
-  setTimeout(() => node.remove(), error ? 8000 : 4000);
+  setTimeout(() => node.remove(), duration);
+  return node;
+}
+
+function showManualCopy(value) {
+  const previous = document.querySelector('.copy-select-dialog');
+  if (previous?.open) {
+    const textarea = previous.querySelector('textarea');
+    if (textarea) { textarea.value = value; textarea.focus(); textarea.select(); }
+    return;
+  }
+  const restoreFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'modal copy-select-dialog';
+  const heading = document.createElement('h2');
+  heading.textContent = '직접 복사';
+  const guidance = document.createElement('p');
+  guidance.textContent = '내용을 선택한 상태입니다. Ctrl+C를 누르세요.';
+  const textarea = document.createElement('textarea');
+  textarea.readOnly = true;
+  textarea.value = value;
+  textarea.setAttribute('aria-label', '복사할 내용');
+  const close = document.createElement('button');
+  close.type = 'button'; close.textContent = '닫기';
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => {
+    dialog.remove();
+    if (restoreFocus?.isConnected) restoreFocus.focus?.();
+  }, {once:true});
+  dialog.append(heading, guidance, textarea, close);
+  document.body.append(dialog);
+  dialog.showModal();
+  textarea.focus(); textarea.select();
+}
+
+function copyToast(result, value) {
+  if (result === 'manual') return;
+  const node = toast('복사를 시도했습니다. 붙여넣기를 확인하세요.', false, 10000);
+  const manual = document.createElement('button');
+  manual.type = 'button'; manual.className = 'small ghost copy-select-action';
+  manual.textContent = '직접 선택';
+  manual.addEventListener('click', () => { showManualCopy(value); node.remove(); });
+  node.append(manual);
 }
 
 async function run(task, button) {
@@ -1266,7 +1308,7 @@ async function copyChallengeWriteup(button) {
   try {
     const artifact = await api(`${path(challengeId,workspaceId)}/writeup`);
     if (!currentWorkspace || currentWorkspace.id !== workspaceId || typeof artifact?.markdown !== 'string' || !artifact.markdown) throw new Error('write-up을 다시 불러와 주세요.');
-    await copyText(artifact.markdown); toast('write-up을 복사했습니다.');
+    const result = await copyText(artifact.markdown); copyToast(result, artifact.markdown);
   } finally {
     if (button.isConnected) { button.disabled = false; button.removeAttribute('aria-busy'); }
   }
@@ -1552,9 +1594,6 @@ async function saveNotes(silent = false) {
 
 async function copyText(text) {
   const value = String(text ?? '');
-  if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
-    try { await navigator.clipboard.writeText(value); return; } catch { /* Try selection-based copy if permission was denied. */ }
-  }
   const focused = document.activeElement;
   const selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart,focused.selectionEnd] : null;
   const textarea = document.createElement('textarea');
@@ -1573,7 +1612,24 @@ async function copyText(text) {
     if (focused?.isConnected !== false) focused?.focus?.();
     if (selection && focused?.isConnected !== false && typeof focused?.setSelectionRange === 'function') focused.setSelectionRange(...selection);
   }
-  if (!success) throw new Error('자동 복사를 지원하지 않는 브라우저입니다. 클립보드 권한을 허용하거나 표시된 내용을 직접 선택해 복사하세요.');
+  // The legacy copy completes in the click handler. Some browsers write the
+  // clipboard but leave navigator.clipboard.writeText() pending indefinitely.
+  if (success) return 'unverified';
+  if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
+    let timeout;
+    try {
+      await Promise.race([
+        navigator.clipboard.writeText(value),
+        new Promise((_,reject) => { timeout = setTimeout(() => reject(new Error('클립보드 응답이 지연되었습니다.')), 2000); }),
+      ]);
+      return 'unverified';
+    } catch (error) {
+      // The browser may reject the permission prompt or leave the write
+      // unsettled. Keep the text selectable instead of claiming success.
+    } finally { clearTimeout(timeout); }
+  }
+  showManualCopy(value);
+  return 'manual';
 }
 
 function downloadBlob(blob, filename) {
@@ -2850,21 +2906,21 @@ document.addEventListener('click', event => {
     },
     'open-challenge': () => openChallenge(button.dataset.id),
     'open-solver-session': () => openSolverSession(button),
-    'copy-list-flag': async () => { const flag = challengeFlags.get(button.dataset.id); if (!flag || currentWorkspace?.id !== button.dataset.workspaceId) throw new Error('Flag를 다시 불러와 주세요.'); await copyText(flag); toast('Flag를 복사했습니다.'); },
+    'copy-list-flag': async () => { const flag = challengeFlags.get(button.dataset.id); if (!flag || currentWorkspace?.id !== button.dataset.workspaceId) throw new Error('Flag를 다시 불러와 주세요.'); const result = await copyText(flag); copyToast(result, flag); },
     'copy-list-writeup': () => copyChallengeWriteup(button),
     'complete-list-challenge': () => completeListChallenge(button),
     'start-list-solver': () => startListSolver(button),
     'filter': async () => { selectedStatus = button.dataset.status; await refreshChallenges(); },
     'clear-filter': async () => { selectedStatus = ''; selectedCategory = ''; search = ''; await refreshChallenges(); },
     'save-notes': () => saveNotes(),
-    'copy-notes': async () => { await copyText(document.querySelector('#notes-editor').value); toast('클립보드에 복사했습니다.'); },
-    'copy-flag': async () => { await copyText(currentChallenge.flag || ''); toast('Flag를 복사했습니다.'); },
+    'copy-notes': async () => { const notes = document.querySelector('#notes-editor').value; const result = await copyText(notes); copyToast(result, notes); },
+    'copy-flag': async () => { const flag = currentChallenge.flag || ''; const result = await copyText(flag); copyToast(result, flag); },
     'start-solver': () => startSolver(),
     'approve-ultra-escalation': () => approveUltraEscalation(),
     'cancel-solver': () => cancelSolver(),
     'reject-solver-flag': () => rejectSolverFlag(),
-    'copy-solver-flag': async () => { if (!currentSolverJob?.flag) throw new Error('발견된 Flag가 없습니다.'); await copyText(currentSolverJob.flag); toast('Flag를 복사했습니다.'); },
-    'copy-solver-writeup': async () => { const writeup = solverWriteup(); if (!writeup) throw new Error('완성된 write-up이 없습니다.'); await copyText(writeup); toast('write-up을 복사했습니다.'); },
+    'copy-solver-flag': async () => { if (!currentSolverJob?.flag) throw new Error('발견된 Flag가 없습니다.'); const flag = currentSolverJob.flag; const result = await copyText(flag); copyToast(result, flag); },
+    'copy-solver-writeup': async () => { const writeup = solverWriteup(); if (!writeup) throw new Error('완성된 write-up이 없습니다.'); const result = await copyText(writeup); copyToast(result, writeup); },
     'download-solver-writeup': () => { const writeup = solverWriteup(); if (!writeup) throw new Error('완성된 write-up이 없습니다.'); downloadBlob(new Blob([writeup],{type:'text/markdown;charset=utf-8'}),solverFilename()); },
     'refine-writeup': () => startWriteupRefinement(),
     'cancel-writeup-refine': () => cancelWriteupRefinement(),

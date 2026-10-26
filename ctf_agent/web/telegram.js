@@ -6,10 +6,6 @@ function escapeHtml(value) {
 
 async function copyText(value) {
   const text = String(value ?? '');
-  if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
-    try { await navigator.clipboard.writeText(text); return; }
-    catch { /* Permission may be denied; use the browser selection fallback. */ }
-  }
   const focused = document.activeElement;
   const selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart,focused.selectionEnd] : null;
   const area = document.createElement('textarea');
@@ -29,7 +25,19 @@ async function copyText(value) {
     if (focused?.isConnected !== false) focused?.focus?.();
     if (selection && focused?.isConnected !== false && typeof focused?.setSelectionRange === 'function') focused.setSelectionRange(...selection);
   }
-  if (!copied) throw new Error('연결 링크를 자동으로 복사하지 못했습니다. 클립보드 권한을 허용하거나 Telegram 봇 열기 버튼을 사용하세요.');
+  if (copied) return 'unverified';
+  if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
+    let timeout;
+    try {
+      await Promise.race([
+        navigator.clipboard.writeText(text),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('클립보드 응답이 지연되었습니다. 복사 여부를 확인하고 다시 시도하세요.')), 2000); }),
+      ]);
+      return 'unverified';
+    } catch { /* Clipboard permission may be denied or the response may stall. */ }
+    finally { clearTimeout(timeout); }
+  }
+  throw new Error('연결 링크를 자동으로 복사하지 못했습니다. 복사 여부를 확인하거나 Telegram 봇 열기 버튼을 사용하세요.');
 }
 
 function dateText(value) {
@@ -139,7 +147,7 @@ export async function renderTelegram(container, api) {
         const copying = copyText(link.deep_link);
         control.disabled = true;
         await copying;
-        message('연결 링크를 복사했습니다.');
+        message('복사를 시도했습니다. 링크를 직접 열어 주소를 복사할 수도 있습니다.');
       } else if (action === 'refresh') {
         const state = await load();
         if (state && !state.linked) message('아직 봇 인증을 기다리고 있습니다.');

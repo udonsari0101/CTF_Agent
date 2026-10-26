@@ -2158,19 +2158,26 @@ class SolverExchangeCoordinator:
                 self.last_block = None
             return True
 
-    def _claim_next(self, worker_instance_id: str) -> dict[str, Any] | None:
-        # A deployment waits for claimed work to finish before recreating the
-        # worker containers. Queued work remains durable and starts afterward.
+    def _deployment_draining(self) -> bool:
         try:
             drain = (self.data_dir / "deployment-drain").lstat()
         except FileNotFoundError:
-            pass
-        else:
-            if stat.S_ISREG(drain.st_mode) and 0 <= self.clock() - drain.st_mtime < 7200:
-                return None
+            return False
+        return stat.S_ISREG(drain.st_mode) and 0 <= self.clock() - drain.st_mtime < 7200
+
+    def _claim_next(self, worker_instance_id: str) -> dict[str, Any] | None:
+        # A deployment waits for claimed work to finish before recreating the
+        # worker containers. Queued work remains durable and starts afterward.
+        if self._deployment_draining():
+            return None
         timestamp = self.clock()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # The rollout takes the same SQLite writer lock while checking for
+            # empty slots. Recheck after acquiring it so a drain published
+            # between the first check and this transaction cannot be missed.
+            if self._deployment_draining():
+                return None
             if db.execute(
                 "SELECT 1 FROM solver_slots WHERE slot_id=?", (self.slot_id,)
             ).fetchone():

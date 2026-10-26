@@ -57,7 +57,9 @@ trap 'rm -f "$drain_file"' EXIT
 trap 'exit 1' HUP INT TERM
 deadline=$(($(date +%s) + 2700))
 while :; do
-    claimed=$(docker exec ctf_agent python -c 'import sqlite3; db=sqlite3.connect("/database/sqlite/ctf_agent.sqlite3", timeout=15); print(db.execute("SELECT COUNT(*) FROM solver_slots").fetchone()[0]); db.close()') || exit 1
+    # Share the writer lock used by solver claims so a pre-drain claim cannot
+    # commit after the last empty-slot observation.
+    claimed=$(docker exec ctf_agent python -c 'import sqlite3; db=sqlite3.connect("/database/sqlite/ctf_agent.sqlite3", timeout=15); db.execute("BEGIN IMMEDIATE"); count=db.execute("SELECT COUNT(*) FROM solver_slots").fetchone()[0]; db.commit(); print(count); db.close()') || exit 1
     case "$claimed" in *[!0-9]*|'') exit 1 ;; esac
     [ "$claimed" -eq 0 ] && break
     [ "$(date +%s)" -lt "$deadline" ] || {
