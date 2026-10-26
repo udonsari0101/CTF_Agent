@@ -258,14 +258,42 @@ if ($saved -and ($saved.distro -ne $distro -or $saved.home -ne $linuxHome) -and
     throw 'Installation cancelled; existing data was not changed.'
 }
 Assert-StorageCapacity $distro $linuxHome
+$autoStartDefault = if ($saved -and $null -ne $saved.autoStart) { [bool]$saved.autoStart } else { $true }
+$autoStart = Ask-YesNo 'Start CTF Agent automatically when you sign in to Windows?' $autoStartDefault
+$loginDefault = -not ($saved -and $saved.authMode -eq 'nologin')
+$requireLogin = Ask-YesNo 'Require account login on this computer?' $loginDefault
+$authMode = if ($requireLogin) { 'password' } else { 'nologin' }
 Ensure-DockerDesktop $distro
 $linuxPath = @(& wsl.exe --distribution $distro --exec wslpath -a -u $installer 2>$null)
 if ($LASTEXITCODE -ne 0 -or -not $linuxPath.Count -or -not $linuxPath[0].StartsWith('/')) {
     throw 'The selected WSL distribution cannot access the extracted release folder.'
 }
-& wsl.exe --distribution $distro --exec env "CTF_LOCAL_HOME=$linuxHome" bash $linuxPath[0]
+& wsl.exe --distribution $distro --exec env "CTF_LOCAL_HOME=$linuxHome" "CTF_LOCAL_AUTOSTART=$($autoStart.ToString().ToLowerInvariant())" "CTF_LOCAL_AUTH_MODE=$authMode" bash $linuxPath[0]
 if ($LASTEXITCODE -ne 0) { throw "Local installation failed (exit code $LASTEXITCODE)." }
-New-Item -ItemType Directory -Path (Split-Path -Parent $stateFile) -Force | Out-Null
-@{distro=$distro;home=$linuxHome} | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
-Write-Host 'Open http://127.0.0.1:5050 to create the first administrator account.'
+$stateDir = Split-Path -Parent $stateFile
+New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1')) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $stateDir $name) -Force
+}
+@{distro=$distro;home=$linuxHome;autoStart=$autoStart;authMode=$authMode} | ConvertTo-Json |
+    Set-Content -LiteralPath $stateFile -Encoding UTF8
+$shortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'CTF Agent Local.lnk'
+$targetPath = Join-Path $stateDir 'Start.cmd'
+$shell = New-Object -ComObject WScript.Shell
+if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
+    $existing = $shell.CreateShortcut($shortcutPath)
+    if ($existing.TargetPath -ne $targetPath) { throw 'A different startup shortcut uses the CTF Agent name.' }
+    if (-not $autoStart) { Remove-Item -LiteralPath $shortcutPath }
+}
+if ($autoStart) {
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $targetPath
+    $shortcut.WorkingDirectory = $stateDir
+    $shortcut.WindowStyle = 7
+    $shortcut.Save()
+}
+Write-Host "Start: $(Join-Path $stateDir 'Start.cmd')"
+Write-Host "Uninstall: $(Join-Path $stateDir 'Uninstall.cmd')"
+if ($requireLogin) { Write-Host 'Open http://127.0.0.1:5050 to create the first administrator account.' }
+else { Write-Host 'Open http://127.0.0.1:5050.' }
 Write-Host "Files in Explorer: \\wsl.localhost\$distro\$($linuxHome.TrimStart('/') -replace '/', '\')\ctf_agent_data\workspace_files"

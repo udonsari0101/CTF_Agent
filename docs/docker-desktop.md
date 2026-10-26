@@ -4,6 +4,8 @@
 
 Download and extract the latest [Windows release ZIP](https://github.com/udonsari0101/CTF_Agent/releases/latest), then run `Install.cmd`.
 
+During installation choose whether CTF Agent starts when you sign in to Windows and whether local users must log in. The installer creates Start.cmd and Uninstall.cmd in the CTF Agent folder under your local Windows app data directory. Click Start.cmd whenever you want to run the service manually. Uninstall.cmd confirms the two retained data paths, then removes only CTF Agent containers, its image tags, and its installed release files. It does not unregister WSL, uninstall Docker Desktop, remove other containers, or delete the selected data and database folders. If Docker is unavailable, removal stops before deleting release files so you can retry after Docker Desktop starts.
+
 The installer checks WSL 2, recommends an installed Linux distribution or offers to install Ubuntu, checks Docker Desktop and its WSL integration, and verifies at least 15 GB of free space in WSL and on the backing Windows volume. Choose an absolute path inside the WSL Linux filesystem for your data. The suggested path is `~/.local/share/ctf-agent` in the selected distribution. The installer stores your choice for upgrades.
 
 Open <http://127.0.0.1:5050> after installation. Create the first administrator account there. That setup page is available only before an administrator exists. Later visits use the login page.

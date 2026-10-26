@@ -38,6 +38,8 @@ The screenshots use synthetic challenges and account data.
 
 Open **Administration → Service updates** to check public releases, read release notes, and install an update. Release v0.3.0 predates the web updater; run `Install.cmd` once from a newer release to enable it. Later updates can also use `Install.cmd`. Both paths preserve the selected data directory. The first image build downloads a large CTF toolchain; subsequent application updates reuse it when the toolchain has not changed. See the [installation guide](docs/docker-desktop.md) for requirements, troubleshooting, and Windows Explorer access to challenge files.
 
+The installer asks whether to start CTF Agent when you sign in to Windows. You can always use Start.cmd to start it manually and Uninstall.cmd to remove its containers, images, and installed release files. Both launchers are placed in your Windows user profile under CTF Agent. Uninstall keeps the selected data and database folders, WSL distribution, and Docker Desktop.
+
 To open your challenge files from Windows, use Explorer at `\\wsl.localhost\<distribution>\<Linux data path>\ctf_agent_data\workspace_files`.
 
 ### Install from source

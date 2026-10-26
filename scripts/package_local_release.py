@@ -31,8 +31,14 @@ FIXED_APP_FILES = {
 INSTALLER_FILES = {
     "installer/Install.cmd": "Install.cmd",
     "installer/Install.ps1": "Install.ps1",
+    "installer/Start.cmd": "Start.cmd",
+    "installer/Start.ps1": "Start.ps1",
+    "installer/Uninstall.cmd": "Uninstall.cmd",
+    "installer/Uninstall.ps1": "Uninstall.ps1",
     "installer/README.txt": "README.txt",
     "installer/installer/install.sh": "installer/install.sh",
+    "installer/installer/start.sh": "installer/start.sh",
+    "installer/installer/uninstall.py": "installer/uninstall.py",
 }
 
 
@@ -69,6 +75,7 @@ def create_archive(version: str, revision: str, output: Path) -> str:
     payload["COMMIT"] = (revision + "\n").encode()
     # Windows checkouts may use CRLF; the WSL entrypoint must always be LF.
     payload["installer/install.sh"] = payload["installer/install.sh"].replace(b"\r\n", b"\n")
+    payload["installer/start.sh"] = payload["installer/start.sh"].replace(b"\r\n", b"\n")
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name in sorted(payload):

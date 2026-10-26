@@ -1,4 +1,5 @@
 FROM docker:29-cli
+LABEL io.github.ctf-agent.local-install="true"
 
 RUN apk add --no-cache bash python3 coreutils && docker compose version
 COPY ctf_agent/release_updates.py /usr/local/libexec/ctf-agent-release-updates.py

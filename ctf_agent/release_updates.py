@@ -141,7 +141,10 @@ def _verify_and_extract(archive: Path, checksum: Path, tag: str, destination: Pa
             total += item.file_size
             if total > MAX_UNPACKED_BYTES:
                 raise ValueError("Release archive expands beyond limit")
-        required = {prefix + value for value in ("VERSION", "COMMIT", "installer/install.sh", "app/compose.local.yaml")}
+        required = {prefix + value for value in (
+            "VERSION", "COMMIT", "installer/install.sh", "installer/start.sh",
+            "installer/uninstall.py", "app/compose.local.yaml",
+        )}
         if not required.issubset(names):
             raise ValueError("Release archive is incomplete")
         for item in bundle.infolist():
@@ -208,6 +211,9 @@ def _compose_mount_environment(home: Path) -> dict[str, str]:
         auth_mode = current_env["CTF_AUTH_MODE"]
         if auth_mode not in {"password", "nologin"}:
             raise ValueError("Unsupported auth mode")
+        restart_policy = container["HostConfig"]["RestartPolicy"]["Name"]
+        if restart_policy not in {"no", "unless-stopped"}:
+            raise ValueError("Unsupported restart policy")
     except (ValueError, KeyError, TypeError) as exc:
         raise RuntimeError("Installed container mounts are invalid") from exc
     return {
@@ -217,6 +223,8 @@ def _compose_mount_environment(home: Path) -> dict[str, str]:
         "CTF_LOCAL_FS_DATABASE": str(home / "Database" / "CTF_Agent"),
         "CTF_LOCAL_AUTH_MODE": auth_mode,
         "CTF_AUTH_MODE": auth_mode,
+        "CTF_LOCAL_AUTOSTART": "true" if restart_policy == "unless-stopped" else "false",
+        "CTF_LOCAL_RESTART_POLICY": restart_policy,
     }
 
 
@@ -244,7 +252,13 @@ def _rollback(home: Path, previous: str, root: Path, request: dict, mount_enviro
     if not _run_with_heartbeat(["python3", str(target / "deploy" / "local-compose.py"), "up", "-d", "--no-build", "--force-recreate"],
                                root, request, "rolling_back", env=env):
         return False
-    return _healthy(root, request)
+    healthy = _healthy(root, request)
+    if healthy:
+        launcher = target / "installer"
+        for name in ("start.sh", "uninstall.py"):
+            if (launcher / name).is_file():
+                shutil.copy2(launcher / name, home / ".launcher" / name)
+    return healthy
 
 
 def _apply(home: Path, root: Path, request: dict) -> None:

@@ -55,7 +55,9 @@ jobs:
       - name: Check scripts and local stack
         run: |
           python -m compileall -q ctf_agent deploy/local-compose.py scripts/package_local_release.py
+          python -m py_compile installer/installer/uninstall.py
           for script in ctf_agent/web/*.js ctf_agent/web/i18n/*.js; do node --check "$script"; done
           bash -n installer/installer/install.sh
+          bash -n installer/installer/start.sh
           sh -n deploy/submit-flag deploy/request-remote deploy/connect-remote deploy/ctf-browser
           docker compose -f compose.local.yaml config --quiet

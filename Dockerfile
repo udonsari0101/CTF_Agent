@@ -2,8 +2,10 @@
 ARG TOOLCHAIN_IMAGE
 FROM ${TOOLCHAIN_IMAGE}
 ARG RELEASE_SHA
+ARG LOCAL_INSTALL=false
 LABEL org.opencontainers.image.source="https://github.com/udonsari0101/CTF_Agent" \
-      org.opencontainers.image.revision=$RELEASE_SHA
+      org.opencontainers.image.revision=$RELEASE_SHA \
+      io.github.ctf-agent.local-install=$LOCAL_INSTALL
 
 COPY --chown=0:0 --chmod=0555 deploy/submit-flag /usr/local/libexec/ctf-command/submit-flag
 COPY --chown=0:0 --chmod=0555 deploy/request-remote /usr/local/libexec/ctf-command/request-remote

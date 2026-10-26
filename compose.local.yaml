@@ -6,6 +6,7 @@ x-app-image: &app-image
     context: .
     args:
       RELEASE_SHA: ${CTF_RELEASE_SHA:-local}
+      LOCAL_INSTALL: "true"
       TOOLCHAIN_IMAGE: ${CTF_TOOLCHAIN_IMAGE:-ctf-agent-toolchain:local}
 
 x-local-volumes: &local-volumes
@@ -18,7 +19,7 @@ x-local-volumes: &local-volumes
 
 x-solver-common: &solver-common
   <<: *app-image
-  restart: unless-stopped
+  restart: ${CTF_LOCAL_RESTART_POLICY:-unless-stopped}
   user: "${CTF_LOCAL_UID:-1000}:${CTF_LOCAL_GID:-1000}"
   command: [python, -m, ctf_agent.solver_worker]
   environment:
@@ -214,7 +215,7 @@ services:
   web:
     <<: *app-image
     container_name: ctf_agent_local
-    restart: unless-stopped
+    restart: ${CTF_LOCAL_RESTART_POLICY:-unless-stopped}
     init: true
     user: "${CTF_LOCAL_UID:-1000}:${CTF_LOCAL_GID:-1000}"
     ports:
@@ -265,7 +266,7 @@ services:
   solver-autoscaler:
     <<: *app-image
     container_name: ctf_agent_local_solver_autoscaler
-    restart: unless-stopped
+    restart: ${CTF_LOCAL_RESTART_POLICY:-unless-stopped}
     user: "0:0"
     command: [python, -m, ctf_agent.solver_autoscaler]
     environment:

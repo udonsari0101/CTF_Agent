@@ -41,7 +41,9 @@ jobs:
           prefix = f'CTF_Agent-{tag}/'
           with ZipFile(archive) as bundle:
               names = set(bundle.namelist())
-              required = {'Install.cmd', 'Install.ps1', 'installer/install.sh',
+              required = {'Install.cmd', 'Install.ps1', 'Start.cmd', 'Start.ps1',
+                          'Uninstall.cmd', 'Uninstall.ps1', 'installer/install.sh',
+                          'installer/start.sh', 'installer/uninstall.py',
                           'app/Dockerfile.updater', 'app/ctf_agent/release_updates.py',
                           'app/ctf_agent/main.py', 'app/ctf_agent/web/i18n/en.json',
                           'app/ctf_agent/web/i18n/ko.json'}
@@ -50,6 +52,7 @@ jobs:
               assert bundle.testzip() is None
           PY
           unzip -p "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" "CTF_Agent-${RELEASE_TAG}/installer/install.sh" | bash -n
+          unzip -p "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" "CTF_Agent-${RELEASE_TAG}/installer/start.sh" | bash -n
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

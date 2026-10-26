@@ -28,6 +28,8 @@ if [[ ! -d "$target" ]]; then
     staging="$(mktemp -d "$releases/.staging.XXXXXXXX")"
     trap 'rm -rf -- "$staging"' EXIT
     cp -R -- "$bundle_root/app/." "$staging/"
+    mkdir -p -- "$staging/installer"
+    cp -- "$bundle_root/installer/start.sh" "$bundle_root/installer/uninstall.py" "$staging/installer/"
     printf '%s\n' "$revision" > "$staging/.release-revision"
     mv -- "$staging" "$target"
     trap - EXIT
@@ -37,9 +39,15 @@ elif [[ "$(cat -- "$target/.release-revision" 2>/dev/null || true)" != "$revisio
 fi
 
 export CTF_AUTH_MODE="${CTF_LOCAL_AUTH_MODE:-password}"
+[[ "$CTF_AUTH_MODE" == password || "$CTF_AUTH_MODE" == nologin ]] || { echo 'Invalid authentication mode.' >&2; exit 2; }
 export CTF_ALLOW_WEB_BOOTSTRAP=true
 export CTF_LOCAL_UID="${CTF_LOCAL_UID:-$(id -u)}"
 export CTF_LOCAL_GID="${CTF_LOCAL_GID:-$(id -g)}"
+case "${CTF_LOCAL_AUTOSTART:-true}" in
+    true) export CTF_LOCAL_RESTART_POLICY=unless-stopped ;;
+    false) export CTF_LOCAL_RESTART_POLICY=no ;;
+    *) echo 'CTF_LOCAL_AUTOSTART must be true or false.' >&2; exit 2 ;;
+esac
 export CTF_LOCAL_DATA="${CTF_LOCAL_DATA:-$home_dir/ctf_agent_data}"
 export CTF_LOCAL_DATABASE="${CTF_LOCAL_DATABASE:-$home_dir/Database/CTF_Agent}"
 export CTF_LOCAL_FS_DATA="${CTF_LOCAL_FS_DATA:-$home_dir/ctf_agent_data}"
@@ -62,6 +70,16 @@ else
     echo 'Reusing the existing CTF toolchain image.'
 fi
 python3 deploy/local-compose.py up -d --build
+install -d -m 0750 -o "$CTF_LOCAL_UID" -g "$CTF_LOCAL_GID" "$home_dir/.launcher"
+for name in start.sh uninstall.py; do
+    cp -- "$target/installer/$name" "$home_dir/.launcher/$name"
+    chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$home_dir/.launcher/$name"
+    chmod 0644 "$home_dir/.launcher/$name"
+done
+local_config_temp="$(mktemp "$home_dir/.local-config.XXXXXXXX")"
+printf '{"auth_mode":"%s","auto_start":%s}\n' "$CTF_AUTH_MODE" "${CTF_LOCAL_AUTOSTART:-true}" > "$local_config_temp"
+chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$local_config_temp"
+mv -f -- "$local_config_temp" "$home_dir/.local-config.json"
 if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
     current_temp="$(mktemp "$home_dir/.current-release.XXXXXXXX")"
     printf '%s\n' "$version" > "$current_temp"
@@ -78,7 +96,7 @@ if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
         printf '%s\n' "$updater_fingerprint" > "$updater_stamp"
     fi
     docker rm -f ctf_agent_local_updater >/dev/null 2>&1 || true
-    docker run -d --name ctf_agent_local_updater --restart unless-stopped \
+    docker run -d --name ctf_agent_local_updater --restart "$CTF_LOCAL_RESTART_POLICY" \
         --memory 1g --cpus 1 --security-opt no-new-privileges \
         -e "CTF_LOCAL_HOME=$home_dir" -e "CTF_LOCAL_UID=$CTF_LOCAL_UID" -e "CTF_LOCAL_GID=$CTF_LOCAL_GID" \
         -v "$home_dir:$home_dir" -v /var/run/docker.sock:/var/run/docker.sock \
