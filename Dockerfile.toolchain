@@ -1,0 +1,122 @@
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS node
+
+FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+ARG CODEX_VERSION=0.153.4
+ARG CLAUDE_VERSION=2.1.310
+ARG RADARE2_VERSION=6.2.2
+ARG RADARE2_SHA256=09234e4139bf8dfcbb7fc1fdb2519859ad516e63c19d3c27d92aaecdf463b1ad
+ARG FFUF_VERSION=2.2.1
+ARG FFUF_SHA256=86307885810d3c36ba4a3e9ba5178c2d9027bba0dd7f4ea39e39e7c972b62396
+ARG STEGSEEK_VERSION=0.6
+ARG STEGSEEK_SHA256=7218c0e0d0cc81e31678eac6d63d1af46eccd6a0d4a9299e3b68b11e7bfc92f3
+ARG PWNDBG_VERSION=2026.10.22
+ARG PWNDBG_SHA256=7888bb986d63fc230d29fa96bdf6152b9ce123b2a3b1f333d31f80684363848a
+ARG WEBSOCAT_VERSION=1.14.1
+ARG WEBSOCAT_SHA256=66f8dd3a0394761556339117f8bb5123bddefd44e087af2a72ec22b0bd08d514
+ARG JDK21_VERSION=21.0.13_9
+ARG JDK21_SHA256=d7f5d5cf865a2902b70ff549b97586a7d3f234e016f041ab447ea740c7d66d1c
+ARG GHIDRA_VERSION=12.1.4
+ARG GHIDRA_SHA256=ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db
+ARG JADX_VERSION=1.5.6
+ARG JADX_SHA256=545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974
+LABEL org.opencontainers.image.source="https://github.com/udonsari0101/CTF_Agent"
+
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+        apktool apparmor bash binutils binwalk build-essential ca-certificates chromium cpio curl \
+        dnsutils ffmpeg file fonts-liberation fonts-noto-cjk foremost gdb gdb-multiarch gdbserver git john jq \
+        libffi-dev libgmp-dev libimage-exiftool-perl libmagic1 \
+        libmpfr-dev libssl-dev ltrace mediainfo multimon-ng netcat-openbsd nmap openssl p7zip-full pari-gp patchelf \
+        pkg-config pngcheck poppler-utils procps qemu-system-x86 qemu-user ripgrep sleuthkit sqlmap \
+        socat sox steghide strace tesseract-ocr testdisk tshark tmux unzip wabt whois xz-utils yara zbar-tools \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/radare2.deb \
+        "https://github.com/radareorg/radare2/releases/download/${RADARE2_VERSION}/radare2_${RADARE2_VERSION}_amd64.deb" \
+    && echo "${RADARE2_SHA256}  /tmp/radare2.deb" | sha256sum --check --strict \
+    && dpkg --install /tmp/radare2.deb \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/ffuf.tar.gz \
+        "https://github.com/ffuf/ffuf/releases/download/v${FFUF_VERSION}/ffuf_${FFUF_VERSION}_linux_amd64.tar.gz" \
+    && echo "${FFUF_SHA256}  /tmp/ffuf.tar.gz" | sha256sum --check --strict \
+    && tar --extract --gzip --file /tmp/ffuf.tar.gz --directory /tmp ffuf LICENSE \
+    && install -o root -g root -m 0555 /tmp/ffuf /usr/local/bin/ffuf \
+    && install -D -o root -g root -m 0444 /tmp/LICENSE /usr/share/doc/ffuf/copyright \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/stegseek.deb \
+        "https://github.com/RickdeJager/stegseek/releases/download/v${STEGSEEK_VERSION}/stegseek_${STEGSEEK_VERSION}-1.deb" \
+    && echo "${STEGSEEK_SHA256}  /tmp/stegseek.deb" | sha256sum --check --strict \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends /tmp/stegseek.deb \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/pwndbg.deb \
+        "https://github.com/pwndbg/pwndbg/releases/download/${PWNDBG_VERSION}/pwndbg_${PWNDBG_VERSION}_amd64.deb" \
+    && echo "${PWNDBG_SHA256}  /tmp/pwndbg.deb" | sha256sum --check --strict \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends /tmp/pwndbg.deb \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/websocat \
+        "https://github.com/vi/websocat/releases/download/v${WEBSOCAT_VERSION}/websocat.x86_64-unknown-linux-musl" \
+    && echo "${WEBSOCAT_SHA256}  /tmp/websocat" | sha256sum --check --strict \
+    && install -o root -g root -m 0555 /tmp/websocat /usr/local/bin/websocat \
+    && rm -f /tmp/radare2.deb /tmp/ffuf.tar.gz /tmp/ffuf /tmp/LICENSE /tmp/stegseek.deb /tmp/pwndbg.deb /tmp/websocat \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && npm install --global --no-audit --no-fund "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
+    && set -- /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host \
+    && [ "$#" -eq 1 ] \
+    && [ -f "$1" ] \
+    && [ ! -L "$1" ] \
+    && chown root:root "$1" \
+    && chmod 0555 "$1" \
+    && npm cache clean --force \
+    && install -d -o root -g root -m 0755 /usr/local/libexec/ctf-command \
+    && cp --dereference "$(command -v python)" /usr/local/libexec/ctf-agent-codex-launcher \
+    && cp --dereference "$(command -v python)" /usr/local/libexec/ctf-agent-claude-launcher \
+    && cp --dereference "$(command -v python)" /usr/local/libexec/ctf-agent-archive-launcher \
+    && cp --dereference "$(command -v python)" /usr/local/libexec/ctf-command/python \
+    && cp --dereference /bin/bash /usr/local/libexec/ctf-command/bash \
+    && chown root:root /usr/local/libexec/ctf-agent-codex-launcher /usr/local/libexec/ctf-agent-claude-launcher /usr/local/libexec/ctf-agent-archive-launcher /usr/local/libexec/ctf-command/python /usr/local/libexec/ctf-command/bash \
+    && chmod 0555 /usr/local/libexec/ctf-agent-codex-launcher /usr/local/libexec/ctf-agent-claude-launcher /usr/local/libexec/ctf-agent-archive-launcher /usr/local/libexec/ctf-command/python /usr/local/libexec/ctf-command/bash \
+    && groupadd --gid 10001 ctf_agent \
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /data/config/home \
+        --shell /usr/local/libexec/ctf-command/bash ctf_agent
+
+# Use the last Ghidra 12.1 release with its supported JDK 21. Keep each
+# upstream archive immutable by checksum, and expose only headless CLI tools.
+RUN curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/jdk-21.tar.gz \
+        "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jdk_x64_linux_hotspot_${JDK21_VERSION}.tar.gz" \
+    && echo "${JDK21_SHA256}  /tmp/jdk-21.tar.gz" | sha256sum --check --strict \
+    && tar --extract --gzip --file /tmp/jdk-21.tar.gz --directory /opt \
+    && mv /opt/jdk-21.0.13+9 /opt/jdk-21 \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/ghidra.zip \
+        "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_20260921.zip" \
+    && echo "${GHIDRA_SHA256}  /tmp/ghidra.zip" | sha256sum --check --strict \
+    && unzip -q /tmp/ghidra.zip -d /opt \
+    && mv /opt/ghidra_${GHIDRA_VERSION}_PUBLIC /opt/ghidra \
+    && chmod 0555 /opt/ghidra/support/analyzeHeadless \
+    && ln -s /opt/ghidra/support/analyzeHeadless /usr/local/bin/ghidra_headless \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/jadx.zip \
+        "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
+    && echo "${JADX_SHA256}  /tmp/jadx.zip" | sha256sum --check --strict \
+    && mkdir /opt/jadx \
+    && unzip -q /tmp/jadx.zip -d /opt/jadx \
+    && chmod 0555 /opt/jadx/bin/jadx \
+    && ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx \
+    && rm -f /tmp/jdk-21.tar.gz /tmp/ghidra.zip /tmp/jadx.zip
+
+ENV JAVA_HOME=/opt/jdk-21 GHIDRA=/opt/ghidra GHIDRA_INSTALL_DIR=/opt/ghidra GHIDRA_HEADLESS_MAXMEM=4G \
+    PATH="/opt/jdk-21/bin:${PATH}"
+
+COPY --chown=0:0 --chmod=0444 deploy/DecompileAll.java deploy/DecompileFn.java /opt/ghidra/Ghidra/Features/Decompiler/ghidra_scripts/
+
+WORKDIR /app
+COPY requirements.txt requirements-ctf.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-ctf.txt
+
+ENV CTF_IMAGE_CODEX_VERSION=$CODEX_VERSION \
+    CTF_IMAGE_CLAUDE_VERSION=$CLAUDE_VERSION

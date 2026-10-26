@@ -1,0 +1,1 @@
+"""CTF workspace management application."""

@@ -1,0 +1,4 @@
+# Fingerprint this file with Dockerfile.toolchain, requirements.txt,
+# requirements-ctf.txt, and the two Ghidra scripts for the base image tag.
+# Binary versions and SHA256 digests are pinned in Dockerfile.toolchain.
+toolchain_version=1

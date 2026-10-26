@@ -1,0 +1,301 @@
+name: ctf_agent_local
+
+x-app-image: &app-image
+  image: ctf-agent-local:latest
+  build:
+    context: .
+    args:
+      RELEASE_SHA: ${CTF_RELEASE_SHA:-local}
+      TOOLCHAIN_IMAGE: ${CTF_TOOLCHAIN_IMAGE:-ctf-agent-toolchain:local}
+
+x-local-volumes: &local-volumes
+  - type: bind
+    source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}
+    target: /data
+  - type: bind
+    source: ${CTF_LOCAL_DATABASE:-./.local/Database/CTF_Agent}
+    target: /database
+
+x-solver-common: &solver-common
+  <<: *app-image
+  restart: unless-stopped
+  user: "${CTF_LOCAL_UID:-1000}:${CTF_LOCAL_GID:-1000}"
+  command: [python, -m, ctf_agent.solver_worker]
+  environment:
+    TZ: Asia/Seoul
+    HOME: /solver-scratch/worker-home
+    CODEX_HOME: /solver-scratch/codex-home
+    TMPDIR: /solver-scratch
+    SHELL: /usr/local/libexec/ctf-command/bash
+    CTF_SOLVER_SCRATCH: /solver-scratch
+    CTF_SOLVER_INPUT: /solver-input
+    CTF_SOLVER_LOCAL_DESKTOP: "true"
+    CTF_SOLVER_EXTERNAL_SANDBOX: "false"
+    CTF_SOLVER_DISK_SCRATCH: "true"
+    CTF_SOLVER_MAX_SECONDS: ${CTF_SOLVER_MAX_SECONDS:-0}
+    CTF_SOLVER_MAX_NUDGES: ${CTF_SOLVER_MAX_NUDGES:-3}
+    CTF_SOLVER_ARCHIVE_MAX_BYTES: ${CTF_SOLVER_ARCHIVE_MAX_BYTES:-0}
+    CTF_SOLVER_ARCHIVE_MAX_MEMBERS: ${CTF_SOLVER_ARCHIVE_MAX_MEMBERS:-0}
+    CTF_SOLVER_ARCHIVE_MAX_SECONDS: ${CTF_SOLVER_ARCHIVE_MAX_SECONDS:-0}
+    CTF_SOLVER_ARCHIVE_MAX_RATIO: ${CTF_SOLVER_ARCHIVE_MAX_RATIO:-0}
+    CTF_SOLVER_ARCHIVE_MAX_MEMORY: ${CTF_SOLVER_ARCHIVE_MAX_MEMORY:-0}
+    CTF_SOLVER_MIN_FREE_BYTES: ${CTF_SOLVER_MIN_FREE_BYTES:-268435456}
+  read_only: true
+  tmpfs:
+    - /dev/shm:ro,nosuid,nodev,noexec,size=64k,mode=000
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  stop_grace_period: 30s
+  depends_on:
+    init-storage:
+      condition: service_completed_successfully
+
+services:
+  init-storage:
+    <<: *app-image
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        uid="$${LOCAL_UID}"
+        gid="$${LOCAL_GID}"
+        for root in /data /database; do
+          mkdir -p "$$root"
+        done
+        install -d -o "$$uid" -g "$$gid" -m 0700 /data/config
+        install -d -o "$$uid" -g "$$gid" -m 0750 /data/workspaces /data/workspace_files /data/runtime /data/claude-runtime
+        install -d -o 0 -g "$$gid" -m 1770 /data/solver-exchange
+        install -d -o 0 -g "$$gid" -m 0750 /data/solver-exchange/slots /data/solver-scratch
+        for index in 1 2 3 4 5 6; do
+          install -d -o 0 -g "$$gid" -m 1770 "/data/solver-exchange/slots/solver-$$index"
+          install -d -o "$$uid" -g "$$gid" -m 0700 "/data/solver-scratch/solver-$$index"
+        done
+        for index in 1 2 3 4 5 6; do
+          install -d -o 0 -g "$$gid" -m 0770 "/data/solver-exchange/slots/solver-$$index/runtime"
+        done
+        install -d -o "$$uid" -g "$$gid" -m 0700 /database/sqlite /database/logs
+        lock=/data/.storage-budget.lock
+        if [ -L "$$lock" ]; then echo 'invalid storage lock' >&2; exit 1; fi
+        if [ -e "$$lock" ]; then
+          [ -f "$$lock" ] && [ "$$(stat -c '%h' "$$lock")" = 1 ] || { echo 'invalid storage lock' >&2; exit 1; }
+        else
+          (umask 077; : > "$$lock")
+        fi
+        chown "$$uid":"$$gid" "$$lock"
+        chmod 0600 "$$lock"
+        chown 0:"$$gid" /data /database
+        chmod 0750 /data /database
+    environment:
+      LOCAL_UID: ${CTF_LOCAL_UID:-1000}
+      LOCAL_GID: ${CTF_LOCAL_GID:-1000}
+    volumes: *local-volumes
+    restart: "no"
+
+  solver:
+    <<: *solver-common
+    container_name: ctf_agent_local_solver
+    volumes:
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-1
+        target: /solver-exchange
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-1
+        target: /solver-input
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-1/runtime
+        target: /solver-exchange/runtime
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-scratch/solver-1
+        target: /solver-scratch
+
+  solver-2:
+    <<: *solver-common
+    container_name: ctf_agent_local_solver_2
+    profiles: [solver-2]
+    volumes:
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-2
+        target: /solver-exchange
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-2
+        target: /solver-input
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-1/runtime
+        target: /solver-exchange/runtime
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-scratch/solver-2
+        target: /solver-scratch
+
+  solver-3:
+    <<: *solver-common
+    container_name: ctf_agent_local_solver_3
+    profiles: [solver-3]
+    volumes:
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-3
+        target: /solver-exchange
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-3
+        target: /solver-input
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-1/runtime
+        target: /solver-exchange/runtime
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-scratch/solver-3
+        target: /solver-scratch
+
+  solver-4:
+    <<: *solver-common
+    container_name: ctf_agent_local_solver_4
+    profiles: [solver-4]
+    volumes:
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-4
+        target: /solver-exchange
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-4
+        target: /solver-input
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-1/runtime
+        target: /solver-exchange/runtime
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-scratch/solver-4
+        target: /solver-scratch
+
+  solver-5:
+    <<: *solver-common
+    container_name: ctf_agent_local_solver_5
+    profiles: [solver-5]
+    volumes:
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-5
+        target: /solver-exchange
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-5
+        target: /solver-input
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-1/runtime
+        target: /solver-exchange/runtime
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-scratch/solver-5
+        target: /solver-scratch
+
+  solver-6:
+    <<: *solver-common
+    container_name: ctf_agent_local_solver_6
+    profiles: [solver-6]
+    volumes:
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-6
+        target: /solver-exchange
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-6
+        target: /solver-input
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange/slots/solver-1/runtime
+        target: /solver-exchange/runtime
+        read_only: true
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-scratch/solver-6
+        target: /solver-scratch
+
+  web:
+    <<: *app-image
+    container_name: ctf_agent_local
+    restart: unless-stopped
+    init: true
+    user: "${CTF_LOCAL_UID:-1000}:${CTF_LOCAL_GID:-1000}"
+    ports:
+      - "${CTF_LOCAL_BIND:-127.0.0.1}:${CTF_LOCAL_PORT:-5050}:5050"
+    environment:
+      TZ: Asia/Seoul
+      CTF_DATA_DIR: /data
+      CTF_DB_DIR: /database/sqlite
+      CTF_CONFIG_DIR: /data/config
+      CTF_LOG_DIR: /database/logs
+      CTF_RELEASE_SHA: ${CTF_RELEASE_SHA:-local}
+      CTF_AUTH_MODE: ${CTF_AUTH_MODE:-nologin}
+      CTF_ALLOW_WEB_BOOTSTRAP: ${CTF_ALLOW_WEB_BOOTSTRAP:-false}
+      CTF_TELEGRAM_BOT_TOKEN_FILE: /data/config/telegram_bot_token
+      CTF_CTFD_ALLOW_INSECURE_HTTP: ${CTF_CTFD_ALLOW_INSECURE_HTTP:-false}
+      CTF_COOKIE_SECURE: "false"
+      CTF_PUBLIC_ORIGIN: ${CTF_LOCAL_ORIGIN:-http://127.0.0.1:5050}
+      CTF_TRUST_CF_CONNECTING_IP: "false"
+      CTF_SOLVER_EXCHANGE_WEB: /data/solver-exchange
+      CTF_SOLVER_MAX_CONCURRENT: ${CTF_SOLVER_MAX_CONCURRENT:-1}
+      CTF_SOLVER_RECOMMENDED_CONCURRENT: ${CTF_SOLVER_RECOMMENDED_CONCURRENT:-1}
+      CTF_SOLVER_AUTOSCALE_MAX: ${CTF_SOLVER_AUTOSCALE_MAX:-0}
+      CTF_SOLVER_AUTOSCALER_REQUIRED: "true"
+      CTF_SOLVER_MAX_OPEN_PER_USER: ${CTF_SOLVER_MAX_OPEN_PER_USER:-0}
+      CTF_WEB_PIDS_LIMIT: ${CTF_WEB_PIDS_LIMIT:-0}
+      CTF_STORAGE_MIN_FREE_BYTES: ${CTF_STORAGE_MIN_FREE_BYTES:-268435456}
+    volumes: *local-volumes
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: ${CTF_WEB_PIDS_LIMIT:--1}
+    mem_limit: ${CTF_LOCAL_WEB_MEMORY:-2g}
+    stop_grace_period: 30s
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5050/readyz', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 90s
+      retries: 12
+    depends_on:
+      init-storage:
+        condition: service_completed_successfully
+      solver:
+        condition: service_started
+
+  solver-autoscaler:
+    <<: *app-image
+    container_name: ctf_agent_local_solver_autoscaler
+    restart: unless-stopped
+    user: "0:0"
+    command: [python, -m, ctf_agent.solver_autoscaler]
+    environment:
+      TZ: Asia/Seoul
+      CTF_SOLVER_CONTROL: /managed-data/solver-exchange/pool-control.json
+      CTF_SOLVER_AUTOSCALE_STATUS: /managed-data/solver-exchange/autoscaler.json
+      CTF_SOLVER_STORAGE_ROOT: /managed-data
+      CTF_SOLVER_TEMPLATE_CONTAINER: ctf_agent_local_solver
+      CTF_SOLVER_CONTAINER_PREFIX: ctf_agent_local_autosolver_
+      CTF_SOLVER_STATIC_PREFIX: ctf_agent_local_solver_
+      CTF_SOLVER_STATIC_COUNT: ${CTF_SOLVER_STATIC_COUNT:-1}
+    volumes:
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange
+        target: /managed-data/solver-exchange
+      - type: bind
+        source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-scratch
+        target: /managed-data/solver-scratch
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    depends_on:
+      web:
+        condition: service_started
+      solver:
+        condition: service_started

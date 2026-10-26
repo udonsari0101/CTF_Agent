@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/local/libexec/ctf-command/python /app/ctf_agent/submit_flag.py "$@"

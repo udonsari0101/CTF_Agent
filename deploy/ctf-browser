@@ -1,0 +1,199 @@
+#!/usr/local/libexec/ctf-command/python
+"""Run headless Chromium with all mutable state inside the current solve job."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+CHROMIUM = "/usr/bin/chromium"
+SCRATCH_ROOT = Path("/solver-scratch")
+JOB_NAME = re.compile(r"ctf-(?:job|attest)-[A-Za-z0-9_-]+\Z")
+PROTECTED_OPTIONS = (
+    "--crash-dumps-dir",
+    "--disk-cache-dir",
+    "--disable-dev-shm-usage",
+    "--disable-setuid-sandbox",
+    "--headless",
+    "--no-sandbox",
+    "--remote-debugging-address",
+    "--remote-debugging-pipe",
+    "--user-data-dir",
+)
+
+
+def _real_directory(path: Path) -> bool:
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def job_workdir(cwd: Path, scratch_root: Path = SCRATCH_ROOT) -> Path:
+    """Return this job's immutable workdir path or reject an unsafe location."""
+
+    try:
+        root = scratch_root.resolve(strict=True)
+        current = cwd.resolve(strict=True)
+        relative = current.relative_to(root)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError("ctf-browser must run inside an active solve job") from error
+    if not relative.parts or not JOB_NAME.fullmatch(relative.parts[0]):
+        raise ValueError("ctf-browser must run inside an active solve job")
+
+    job = root / relative.parts[0]
+    workdir = job / "competition" / "challenge" / "codex-workdir"
+    for path in (
+        root,
+        job,
+        job / "competition",
+        job / "competition" / "challenge",
+        workdir,
+    ):
+        if not _real_directory(path):
+            raise ValueError("solve job directories are unavailable or unsafe")
+    try:
+        current.relative_to(job)
+    except ValueError as error:
+        raise ValueError("ctf-browser must run inside an active solve job") from error
+    return workdir
+
+
+def validate_options(arguments: list[str]) -> None:
+    for argument in arguments:
+        name = argument.split("=", 1)[0]
+        if name in PROTECTED_OPTIONS:
+            raise ValueError(f"ctf-browser manages {name} itself")
+
+
+def browser_command(arguments: list[str], runtime: Path) -> list[str]:
+    validate_options(arguments)
+    return [
+        CHROMIUM,
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-breakpad",
+        "--disable-crash-reporter",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--no-default-browser-check",
+        "--no-first-run",
+        "--password-store=basic",
+        # A solve may request a DevTools port for automation, but the listener
+        # must never be reachable from another container or the host.
+        "--remote-debugging-address=127.0.0.1",
+        f"--user-data-dir={runtime / 'profile'}",
+        f"--disk-cache-dir={runtime / 'cache'}",
+        f"--crash-dumps-dir={runtime / 'crashes'}",
+        *arguments,
+    ]
+
+
+def browser_environment(runtime: Path) -> dict[str, str]:
+    environment = {
+        "HOME": str(runtime / "home"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "PATH": os.environ.get(
+            "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ),
+        "TMP": str(runtime / "tmp"),
+        "TEMP": str(runtime / "tmp"),
+        "TMPDIR": str(runtime / "tmp"),
+        "TZ": os.environ.get("TZ", "Asia/Seoul"),
+        "XDG_CACHE_HOME": str(runtime / "xdg-cache"),
+        "XDG_CONFIG_HOME": str(runtime / "xdg-config"),
+        "XDG_RUNTIME_DIR": str(runtime / "xdg-runtime"),
+    }
+    if "LC_ALL" in os.environ:
+        environment["LC_ALL"] = os.environ["LC_ALL"]
+    return environment
+
+
+def _make_runtime(workdir: Path) -> Path:
+    # Chromium creates a SingletonSocket below TMPDIR. Keep this job-local but
+    # close to /solver-scratch so the Unix socket stays below Linux's 108-byte
+    # sockaddr_un limit even when the challenge workdir is deeply nested.
+    parent = workdir.parents[2]
+    if not _real_directory(parent):
+        raise ValueError("the solve job temporary directory is unsafe")
+    runtime = Path(tempfile.mkdtemp(prefix=".ctf-browser-", dir=parent))
+    for name in (
+        "cache",
+        "crashes",
+        "home",
+        "profile",
+        "tmp",
+        "xdg-cache",
+        "xdg-config",
+        "xdg-runtime",
+    ):
+        (runtime / name).mkdir(mode=0o700)
+    return runtime
+
+
+def run(arguments: list[str]) -> int:
+    if arguments == ["--help"]:
+        print("usage: ctf-browser [CHROMIUM_OPTION ...] [URL]")
+        print("Runs headless Chromium with an ephemeral profile in the solve job.")
+        return 0
+    if arguments == ["--version"]:
+        return subprocess.run([CHROMIUM, "--version"], check=False).returncode
+
+    try:
+        workdir = job_workdir(Path.cwd())
+        runtime = _make_runtime(workdir)
+        command = browser_command(arguments, runtime)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+    process: subprocess.Popen[bytes] | None = None
+    previous_handlers: dict[int, object] = {}
+
+    def forward(signum: int, _frame: object) -> None:
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    try:
+        process = subprocess.Popen(
+            command,
+            env=browser_environment(runtime),
+            start_new_session=True,
+        )
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, forward)
+        return process.wait()
+    except OSError:
+        print("ctf-browser could not start Chromium", file=sys.stderr)
+        return 127
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        shutil.rmtree(runtime, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(run(sys.argv[1:]))

@@ -1,0 +1,53 @@
+.account-management > p { color: var(--muted); line-height: 1.7; }
+.account-management .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 1.3rem; min-width: 0; }
+.account-management .account-create { display: flex; align-items: center; gap: .7rem; flex-wrap: wrap; margin: 1.4rem 0 .5rem; }
+.account-create input { flex: 1; min-width: 190px; }
+.account-create button { background: var(--accent); color: #10200d; font-weight: 700; }
+.account-management .notice { color: #f3c38e; }
+.account-management .notice:empty, .account-management .notice[hidden] { display: none; margin: 0; padding: 0; border: 0; }
+.account-list .model-help { color: var(--muted); font-size: .85rem; }
+.account-list .model-help p { margin: .35rem 0; }
+.account-list .quota-limited { border-color: #6f3038; box-shadow: inset 2px 0 #ff7382; }
+.account-list .quota-alert, .account-list .quota-reason { color: #ff9da7; }
+.account-list .quota-reset-credits { color: #f3c38e; margin: 2rem 0 .4rem; padding: 1rem 0 0; border-top: 1px solid var(--border); }
+.account-list .model-fields { display: grid; grid-template-columns: minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr); gap: .65rem; margin-top: 1rem; }
+.account-list .model-fields label { min-width: 0; color: #c6d5da; }
+.account-list .model-fields select { width: 100%; margin: .25rem 0 0; }
+.account-list .auth-upload { padding-top: .8rem; border-top: 1px solid var(--border); margin-top: .8rem; }
+.account-list .auth-upload label { flex: 1 1 210px; }
+.account-list .claude-login-guide { margin: .8rem 0; padding: .8rem 1rem; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
+.account-list .claude-login-guide p { margin: .35rem 0; }
+.account-list .claude-login-link { display: flex; align-items: center; flex-wrap: wrap; gap: .6rem; min-width: 0; }
+.account-list .claude-login-link a { margin: .3rem 0; overflow-wrap: anywhere; }
+.account-list .claude-login-link button { flex: 0 0 auto; }
+.account-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 350px), 1fr)); gap: 1rem; }
+.account-list h3 { font-size: 1.05rem; margin: 0 0 .8rem; overflow-wrap: anywhere; }
+.account-list p { font-size: .91rem; line-height: 1.65; overflow-wrap: anywhere; }
+.account-list small { display: block; color: var(--muted); margin: .8rem 0 1rem; }
+.account-list strong { display: block; color: var(--accent); margin-top: 1rem; font-size: .82rem; }
+.account-list progress { display: block; width: 100%; height: 7px; accent-color: var(--accent); margin: -.25rem 0 1rem; border: 0; border-radius: 6px; overflow: hidden; }
+.account-list progress::-webkit-progress-bar { background: var(--surface2); }
+.account-list progress::-webkit-progress-value { background: var(--accent); border-radius: 6px; }
+.account-list .account-model-summary { display: flex; align-items: center; width: 100%; min-height: 2.4rem; margin: 1rem 0 0; line-height: 1.55; overflow-wrap: anywhere; }
+.account-list .actions { display: flex; flex-wrap: wrap; gap: .45rem; border-top: 1px solid var(--border); padding-top: 1rem; margin-top: 1rem; }
+.account-list .account-model-summary + .actions { margin-top: .65rem; padding-top: 0; border-top: 0; }
+.account-list button { font-size: .83rem; }
+.account-list a { display: inline-block; color: var(--accent); margin: .8rem .6rem .8rem 0; }
+.account-list pre { padding: .8rem; border: 1px solid var(--border); background: var(--bg); border-radius: 7px; font-size: 1.3rem; letter-spacing: .15em; color: var(--accent); text-align: center; }
+.account-list form { display: flex; gap: .5rem; flex-wrap: wrap; margin: .8rem 0; }
+.account-list form input { min-width: 160px; flex: 1; }
+.account-list select { max-width: 100%; margin: .8rem .5rem .5rem 0; }
+.account-management .account-runtime { margin-top: 1.5rem; }
+.account-runtime .runtime-provider + .runtime-provider { border-top: 1px solid var(--border); margin-top: 1.5rem; padding-top: 1.5rem; }
+.account-runtime h3 { margin: 0 0 .6rem; }
+.account-runtime p { color: var(--muted); margin: .4rem 0 .7rem; }
+.account-runtime .runtime-controls { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
+.account-runtime .runtime-controls input { flex: 1 1 220px; min-width: 0; max-width: 350px; margin: 0; }
+.account-runtime .runtime-controls button { margin: 0; }
+.account-runtime .runtime-controls :disabled { cursor: not-allowed; opacity: .55; }
+.account-runtime .runtime-progress { display: flex; align-items: center; gap: .55rem; color: var(--accent); }
+.account-runtime .runtime-progress::before { content: ''; width: .8rem; height: .8rem; flex: 0 0 auto; border: 2px solid var(--accent); border-top-color: transparent; border-radius: 50%; animation: runtime-spin .8s linear infinite; }
+.account-runtime progress { display: block; width: min(100%, 350px); height: 5px; margin: .35rem 0 1rem; accent-color: var(--accent); }
+@keyframes runtime-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .account-runtime .runtime-progress::before { animation: none; } }
+@media (max-width: 620px) { .account-create > * { width: 100%; } .account-management .card { padding: 1rem; } .account-list .model-fields { grid-template-columns: 1fr; } .account-list .actions button { flex: 1 1 130px; } }

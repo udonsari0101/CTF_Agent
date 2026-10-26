@@ -1,0 +1,21 @@
+*
+# Explicit allowlist: .git, logs, test output, caches and local data never enter either build.
+!Dockerfile
+!Dockerfile.toolchain
+!toolchain.lock
+!requirements.txt
+!requirements-ctf.txt
+!deploy/
+deploy/*
+!deploy/submit-flag
+!deploy/request-remote
+!deploy/connect-remote
+!deploy/ctf-browser
+!deploy/DecompileAll.java
+!deploy/DecompileFn.java
+!ctf_agent/
+!ctf_agent/**
+**/__pycache__/
+**/*.pyc
+**/auth.json
+**/.credentials.json
