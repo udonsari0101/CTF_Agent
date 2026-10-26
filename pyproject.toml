@@ -4,22 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ctf-agent-workspace"
-version = "0.2.0"
-description = "Private CTF workspace, attachment and notes management"
+version = "0.3.0"
+description = "CTF workspace, solver, attachment and notes management"
 requires-python = ">=3.12"
 dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "python-multipart>=0.0.20,<1", "httpx>=0.28,<1", "cryptography>=50,<51", "py7zr>=1,<2"]
 
 [project.scripts]
 submit-flag = "ctf_agent.submit_flag:main"
 
-[project.optional-dependencies]
-test = ["pytest>=8,<10"]
-
 [tool.setuptools.packages.find]
 include = ["ctf_agent*"]
 
 [tool.setuptools.package-data]
-ctf_agent = ["web/*", "agent_assets/prompts/*.md", "agent_assets/scaffolds/*.md"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+ctf_agent = ["web/*", "web/i18n/*", "agent_assets/prompts/*.md", "agent_assets/scaffolds/*.md"]

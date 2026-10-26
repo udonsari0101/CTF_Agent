@@ -4,9 +4,9 @@
 
 <p align="center">A workspace for CTF challenges, solver sessions, files, flags, and write-ups.</p>
 
-<p align="center"><a href="https://github.com/udonsari0101/CTF_Agent/releases/latest">Download</a> · <a href="docs/docker-desktop.md">Windows installation</a> · <a href="#한국어">한국어</a></p>
+<p align="center"><a href="https://github.com/udonsari0101/CTF_Agent/releases/latest">Download</a> · <a href="docs/docker-desktop.md">Windows installation</a> · <a href="README.ko.md">한국어</a></p>
 
-![Challenge board with synthetic example data](docs/images/challenge-board.png)
+![Challenge board with synthetic example data](docs/images/en/challenge-board.png)
 
 The screenshots use synthetic challenges and account data.
 
@@ -24,11 +24,11 @@ The screenshots use synthetic challenges and account data.
 
 | Workspaces | Live solver session |
 | --- | --- |
-| ![Workspace overview](docs/images/workspaces.png) | ![Challenge details and live log](docs/images/live-session.png) |
+| ![Workspace overview](docs/images/en/workspaces.png) | ![Challenge details and live log](docs/images/en/live-session.png) |
 | Write-up preview | Agent accounts |
-| ![Markdown write-up preview](docs/images/writeup-preview.png) | ![Agent account management](docs/images/agents.png) |
+| ![Markdown write-up preview](docs/images/en/writeup-preview.png) | ![Agent account management](docs/images/en/agents.png) |
 | Personal settings | Administration |
-| ![Personal settings](docs/images/settings.png) | ![User administration](docs/images/admin.png) |
+| ![Personal settings](docs/images/en/settings.png) | ![User administration](docs/images/en/admin.png) |
 
 ## Install on Windows
 
@@ -62,18 +62,3 @@ Each solver runs in a separate container with its own scratch space. The challen
 | Network and misc | `dig`, `whois`, `nmap`, Scapy, `socat`, `tesseract`, `zbarimg`, Python: protocol inspection, automation, and OCR. |
 
 See the [toolchain inventory](docs/ctf-toolchain.md) for version and availability details. Optional host features such as GPU and KVM depend on the local Docker setup.
-
-## Development
-
-```sh
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-```
-
-## 한국어
-
-CTF Agent는 대회별 작업공간에서 문제, 첨부파일, 풀이 세션, Flag, write-up을 관리하는 웹 서비스입니다. 문제는 직접 등록하거나 CTFd에서 선택해 가져올 수 있습니다. Codex와 Claude Code 계정·모델을 문제별로 지정하고, 풀이 로그를 보거나 실행 중 추가 지시를 보낼 수 있습니다.
-
-웹 화면은 영어와 한국어를 전환할 수 있습니다. 추가 언어는 [언어팩 안내](docs/localization.md)에 따라 등록합니다.
-
-Windows에서는 [최신 릴리스](https://github.com/udonsari0101/CTF_Agent/releases/latest)의 ZIP을 풀고 `Install.cmd`를 실행하세요. 설치 중 WSL 배포판과 데이터 경로를 선택합니다. 첫 접속에서 관리자 계정을 만듭니다. 자세한 내용은 [설치 안내](docs/docker-desktop.md)를 참고하세요.

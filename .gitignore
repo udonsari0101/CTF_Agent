@@ -46,6 +46,9 @@ Desktop.ini
 *.rej
 release-staging/
 todo.md
+tests/
+requirements-dev.txt
+scripts/capture_readme_screenshots.py
 *.tar
 *.tar.gz
 *.7z

@@ -327,13 +327,13 @@ export async function renderAccounts(container, api, options = {}) {
       const snapshot = account.snapshot || {};
       card.append(el('h3', `${account.label} · ${account.provider}${account.selected ? ` · ${i18n.t('현재 선택')}` : ''}`));
       const identity = snapshot.identity || {};
-      const modelSummary = [`모델: ${account.model || '계정 기본'}`, `추론: ${account.reasoning_effort || '계정 기본'}`,
-        `속도: ${account.service_tier === 'fast' ? 'Fast 1.5×' : '기본'}`];
-      card.append(el('p', [labels[snapshot.status] || '아직 조회하지 않음', identity.email,
+      const modelSummary = [`${i18n.t('모델')}: ${account.model || i18n.t('계정 기본')}`, `${i18n.t('추론')}: ${account.reasoning_effort || i18n.t('계정 기본')}`,
+        `${i18n.t('속도')}: ${account.service_tier === 'fast' ? 'Fast 1.5×' : i18n.t('기본')}`];
+      card.append(el('p', [i18n.t(labels[snapshot.status] || '아직 조회하지 않음'), identity.email,
         identity.planType || identity.subscriptionType].filter(Boolean).join(' · ')));
       if (snapshot.message) card.append(el('p', snapshot.message));
       if (snapshot.error) card.append(el('p', errorText({...snapshot.error,message:snapshot.error.message || '계정 정보를 조회하지 못했습니다.'}), 'error-text'));
-      card.append(el('small', `마지막 조회: ${date(account.checked_at)}${account.stale ? ' · 새로고침 필요' : ''}`));
+      card.append(el('small', `${i18n.t('마지막 조회')}: ${date(account.checked_at)}${account.stale ? ` · ${i18n.t('새로고침 필요')}` : ''}`));
       const quota = snapshot.quota;
       if (quota) {
         if (quota.stale) card.append(el('p', '최근 조회 실패: 아래 사용량은 이전 조회 값입니다.'));
@@ -355,23 +355,23 @@ export async function renderAccounts(container, api, options = {}) {
           for (const window of bucket.windows) {
             const used = window.used_percent;
             const remaining = typeof used === 'number' && Number.isFinite(used) ? Math.max(0, Math.min(100, 100 - used)) : null;
-            list.append(el('p', `${window.label}: ${remaining == null ? '남은 사용량 미제공' : `${remaining}% 남음`} · 초기화 ${date(window.resets_at)}`));
+            list.append(el('p', `${i18n.t(window.label)}: ${remaining == null ? i18n.t('남은 사용량 미제공') : `${remaining}% ${i18n.t('남음')}`} · ${i18n.t('초기화')} ${date(window.resets_at)}`));
             if (remaining != null) {
               const meter = el('progress'); meter.max = 100; meter.value = remaining;
               meter.setAttribute('aria-label', `${window.label} 남은 사용량`);
-              meter.setAttribute('aria-valuetext', `${remaining}% 남음`); list.append(meter);
+              meter.setAttribute('aria-valuetext', `${remaining}% ${i18n.t('남음')}`); list.append(meter);
             }
           }
           if (bucket.individual_limit) {
             const remaining = bucket.individual_limit.remaining_percent;
-            list.append(el('p', `개인 사용 한도: ${remaining == null ? '잔여량 미제공' : `${remaining}% 남음`} · 초기화 ${date(bucket.individual_limit.resets_at)}`));
+            list.append(el('p', `${i18n.t('개인 사용 한도')}: ${remaining == null ? i18n.t('잔여량 미제공') : `${remaining}% ${i18n.t('남음')}`} · ${i18n.t('초기화')} ${date(bucket.individual_limit.resets_at)}`));
           }
           if (bucket.credits?.unlimited === true) list.append(el('p', '워크스페이스 크레딧: 무제한'));
           else if (bucket.credits?.has_credits === false) list.append(el('p', '워크스페이스 추가 크레딧: 없음'));
           card.append(list);
         }
         if (quota.reset_credits?.available_count > 0) {
-          card.append(el('p', `사용 가능한 Codex 한도 초기화 크레딧: ${quota.reset_credits.available_count}개`, 'quota-reset-credits'));
+          card.append(el('p', `${i18n.t('사용 가능한 Codex 한도 초기화 크레딧')}: ${quota.reset_credits.available_count}${i18n.locale === 'ko' ? '개' : ''}`, 'quota-reset-credits'));
         }
         if (!quota.buckets?.length && !quota.message) card.append(el('p', '조회 가능한 사용량 정보가 없습니다.'));
       }

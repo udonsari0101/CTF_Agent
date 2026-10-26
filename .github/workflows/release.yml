@@ -31,7 +31,23 @@ jobs:
           git checkout --detach "$revision"
           python3 scripts/package_local_release.py --version "$RELEASE_TAG" --commit "$revision"
           (cd dist && sha256sum --check "CTF_Agent-${RELEASE_TAG}-local-windows.zip.sha256")
-          python3 -m unittest discover -s tests -p 'test_local_release.py'
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          tag = os.environ['RELEASE_TAG']
+          archive = Path('dist') / f'CTF_Agent-{tag}-local-windows.zip'
+          prefix = f'CTF_Agent-{tag}/'
+          with ZipFile(archive) as bundle:
+              names = set(bundle.namelist())
+              required = {'Install.cmd', 'Install.ps1', 'installer/install.sh',
+                          'app/ctf_agent/main.py', 'app/ctf_agent/web/i18n/en.json',
+                          'app/ctf_agent/web/i18n/ko.json'}
+              assert all(prefix + name in names for name in required)
+              assert not any('/tests/' in name or name.endswith('/requirements-dev.txt') for name in names)
+              assert bundle.testzip() is None
+          PY
           unzip -p "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" "CTF_Agent-${RELEASE_TAG}/installer/install.sh" | bash -n
       - name: Publish GitHub Release
         env:

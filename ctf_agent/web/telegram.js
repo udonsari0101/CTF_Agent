@@ -97,7 +97,7 @@ export async function renderTelegram(container, api) {
         <small>${escapeHtml(dateText(link.expires_at))}까지 유효</small>
       </div>` : '';
     container.innerHTML = `
-      <div class="section-head"><div><h2>Telegram 알림</h2></div><span class="connection-state ${linked ? 'connected' : ''}">${linked ? '연결됨' : '연결 안 됨'}</span></div>
+      <div class="section-head"><div><h2>Telegram 알림</h2></div><span class="connection-state ${linked ? 'connected' : ''}">${i18n.t(linked ? '연결됨' : '연결 안 됨')}</span></div>
       <form class="telegram-bot-form" data-telegram-bot-form autocomplete="off">
         <label for="telegram-bot-token">봇 토큰</label>
         <div class="line-actions">
@@ -105,7 +105,7 @@ export async function renderTelegram(container, api) {
           <button type="submit" class="small primary" data-telegram-save>${configured ? '토큰 교체' : '토큰 등록'}</button>
           ${configured ? '<button type="button" class="small danger" data-telegram-action="delete-bot">토큰 삭제</button>' : ''}
         </div>
-        ${configured ? `<small>@${escapeHtml(state.bot_username)} · 토큰은 다시 표시되지 않습니다.</small>` : '<small><a href="https://t.me/BotFather" target="_blank" rel="noopener noreferrer">BotFather</a>에서 봇 토큰을 발급받으세요.</small>'}
+        ${configured ? `<small>@${escapeHtml(state.bot_username)} · ${i18n.t('토큰은 다시 표시되지 않습니다.')}</small>` : '<small><a href="https://t.me/BotFather" target="_blank" rel="noopener noreferrer">BotFather</a>에서 봇 토큰을 발급받으세요.</small>'}
       </form>
       ${state.configuration_error ? `<p class="notice error-notice">${unavailable}</p>` : ''}
       ${configured && !linked ? '<p>Chat ID는 일회용 링크로 연결합니다.</p>' : ''}
@@ -113,7 +113,7 @@ export async function renderTelegram(container, api) {
       ${linkPanel}
       ${linked ? `
         <label class="telegram-toggle"><input type="checkbox" data-telegram-action="toggle" ${state.enabled ? 'checked' : ''}> Flag·write-up 알림 받기</label>
-        <div class="telegram-meta"><span>연결 시각 ${escapeHtml(dateText(state.linked_at))}</span><span>최근 전송 ${escapeHtml(dateText(state.last_success_at))}</span>${state.last_failure_at ? `<span class="error-text">최근 실패 ${escapeHtml(dateText(state.last_failure_at))} · ${escapeHtml(state.last_failure_code || '전송 오류')}</span>` : ''}</div>
+        <div class="telegram-meta"><span>${i18n.t('연결 시각')} ${escapeHtml(dateText(state.linked_at))}</span><span>${i18n.t('최근 전송')} ${escapeHtml(dateText(state.last_success_at))}</span>${state.last_failure_at ? `<span class="error-text">${i18n.t('최근 실패')} ${escapeHtml(dateText(state.last_failure_at))} · ${escapeHtml(state.last_failure_code || i18n.t('전송 오류'))}</span>` : ''}</div>
         <button type="button" class="small danger" data-telegram-action="unlink">Telegram 연결 해제</button>` : ''}
       <p class="notice" data-telegram-notice hidden></p>`;
   };

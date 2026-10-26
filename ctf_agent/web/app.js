@@ -435,7 +435,7 @@ function solverEventLabel(event) {
   const code = event.progress?.code || event.progress_code || event.code;
   const phase = event.phase || event.status;
   const kinds = {flag:'Flag 발견',writeup:'write-up 완성',error:'오류',cancelled:'취소됨',released:'격리 정리 완료',activity:'도구 실행',guidance:'추가 명령'};
-  return code ? (solverProgress[code] || code) : (kinds[event.kind] || solverPhases[phase] || phase || event.kind || '상태 변경');
+  return i18n.t(code ? (solverProgress[code] || code) : (kinds[event.kind] || solverPhases[phase] || phase || event.kind || '상태 변경'));
 }
 
 function solverEventTime(event) {
@@ -488,7 +488,7 @@ function solverGuidanceMarkup(job, active) {
   const allowed = job?.guidance_allowed === true || (job?.guidance_allowed === undefined && ['queued','staging','awaiting_credential','running'].includes(job?.phase));
   if (!active || !allowed) return '';
   return `<form id="solver-guidance-form" class="solver-guidance" data-job-id="${esc(solverJobId(job))}">
-    <label for="solver-guidance-message">추가 명령<textarea id="solver-guidance-message" name="message" rows="2" maxlength="16384" placeholder="풀이 방향이나 확인할 내용을 입력" required>${esc(solverGuidanceDraft)}</textarea></label>
+    <label for="solver-guidance-message">추가 명령<textarea id="solver-guidance-message" name="message" rows="2" maxlength="16384" placeholder="${esc(i18n.t('풀이 방향이나 확인할 내용을 입력'))}" required>${esc(solverGuidanceDraft)}</textarea></label>
     <button type="submit" class="small">전송</button>
     <div class="solver-guidance-history-slot">${solverGuidanceHistoryMarkup()}</div>
   </form>`;
@@ -607,7 +607,7 @@ function solverPanelMarkup(job, events = [], loading = false) {
   const progressCode = progress.code || job.progress_code;
   const percent = Number(progress.percent ?? job.percent);
   const progressText = progressCode ? (solverProgress[progressCode] || progressCode) : '';
-  const modelText = [job.account_label, model.provider, model.model, model.reasoning_effort && `추론 ${model.reasoning_effort}`, model.service_tier === 'fast' ? 'Fast 1.5×' : null].filter(Boolean).join(' · ');
+  const modelText = [job.account_label, model.provider, model.model, model.reasoning_effort && `${i18n.t('추론')} ${model.reasoning_effort}`, model.service_tier === 'fast' ? 'Fast 1.5×' : null].filter(Boolean).join(' · ');
   const flag = typeof job.flag === 'string' && job.flag ? job.flag : '';
   const usableFlag = flag && !job.flag_rejected;
   const retryCount = Number(job.retry_checkpoint?.rejected_count || 0);
@@ -886,7 +886,7 @@ function renderOverview() {
   content.innerHTML = `<div class="page-head"><div><div class="eyebrow">WORKSPACES</div><h1>작업공간</h1></div><button class="primary" data-action="new-workspace">＋ 작업공간 만들기</button></div>
     <div class="stats"><div class="stat"><div class="stat-label">전체 작업공간</div><div class="stat-value">${workspaces.length}</div></div><div class="stat"><div class="stat-label">등록된 문제</div><div class="stat-value">${total}</div></div><div class="stat"><div class="stat-label">작업 중</div><div class="stat-value">${running}</div></div><div class="stat"><div class="stat-label">완료한 문제</div><div class="stat-value accent">${solved}</div><div class="stat-note">${total ? Math.round(solved / total * 100) : 0}%</div></div></div>
     <div class="section-head"><h2>내 작업공간 <span class="muted">${workspaces.length}</span></h2></div>
-    ${workspaces.length ? `<div class="cards">${workspaces.map(w => `<a class="workspace-card" href="#w/${w.id}"><div class="card-top"><span class="folder-icon">⚑</span><span class="tag ${w.running_count ? '' : 'muted'}">${w.running_count ? `${w.running_count}개 작업 중` : 'WORKSPACE'}</span></div><h3>${esc(w.name)}</h3>${w.description ? `<p>${esc(w.description)}</p>` : ''}<div class="card-bottom"><span>문제 ${w.challenge_count}</span><span>완료 ${w.solved_count}</span><span class="card-arrow">↗</span></div></a>`).join('')}</div>` : `<div class="empty"><div class="empty-icon">⚑</div><h2>작업공간이 없습니다.</h2><button class="primary" data-action="new-workspace">＋ 새 작업공간</button></div>`}`;
+    ${workspaces.length ? `<div class="cards">${workspaces.map(w => `<a class="workspace-card" href="#w/${w.id}"><div class="card-top"><span class="folder-icon">⚑</span><span class="tag ${w.running_count ? '' : 'muted'}">${w.running_count ? `${w.running_count} ${i18n.t('작업 중')}` : 'WORKSPACE'}</span></div><h3>${esc(w.name)}</h3>${w.description ? `<p>${esc(w.description)}</p>` : ''}<div class="card-bottom"><span>${i18n.t('문제')} ${w.challenge_count}</span><span>${i18n.t('완료')} ${w.solved_count}</span><span class="card-arrow">↗</span></div></a>`).join('')}</div>` : `<div class="empty"><div class="empty-icon">⚑</div><h2>작업공간이 없습니다.</h2><button class="primary" data-action="new-workspace">＋ 새 작업공간</button></div>`}`;
 }
 
 async function renderWorkspace() {
@@ -908,7 +908,7 @@ function challengeRunSummary(challenge) {
   if (!configuration || typeof configuration !== 'object') return '';
   const phase = run?.phase || run?.status;
   const parts = [run?.account_label, configuration.provider, configuration.model,
-    configuration.reasoning_effort && `추론 ${configuration.reasoning_effort}`,
+    configuration.reasoning_effort && `${i18n.t('추론')} ${configuration.reasoning_effort}`,
     configuration.service_tier === 'fast' ? 'Fast 1.5×' : null,
     phase && (solverPhases[phase] || statuses[phase] || phase)];
   return parts.filter(Boolean).map(esc).join('<span aria-hidden="true">/</span>');
@@ -918,6 +918,11 @@ function challengeElapsedText(run) {
   const value = run?.elapsed_seconds;
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '';
   const seconds = Math.floor(value);
+  if (i18n.locale === 'en') {
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m${seconds % 60 ? ` ${seconds % 60}s` : ''}`;
+    return `${Math.floor(seconds / 3600)}h${Math.floor(seconds % 3600 / 60) ? ` ${Math.floor(seconds % 3600 / 60)}m` : ''}`;
+  }
   if (seconds < 60) return `${seconds}초`;
   const minutes = Math.floor(seconds / 60), remainder = seconds % 60;
   if (minutes < 60) return remainder ? `${minutes}분 ${remainder}초` : `${minutes}분`;
@@ -1945,7 +1950,7 @@ function solverCapacityAdminMarkup(capacity) {
     ? `<p class="notice error-notice" role="status">${esc(capacity.warning_message)}</p>`
     : '';
   const summary = i18n.locale === 'en'
-    ? `Running ${esc(capacity.configured)} · jobs ${esc(capacity.open_jobs)} · recommended ${esc(capacity.recommended)} · maximum ${esc(limit)} · estimated web PIDs ${esc(capacity.estimated_web_pids)} / ${capacity.web_pids_limit ? esc(capacity.web_pids_limit) : i18n.t('제한 없음')}`
+    ? `Running ${esc(capacity.configured)} · jobs ${esc(capacity.open_jobs)} · recommended ${esc(capacity.recommended)} · maximum ${esc(i18n.t(limit))} · estimated web PIDs ${esc(capacity.estimated_web_pids)} / ${capacity.web_pids_limit ? esc(capacity.web_pids_limit) : i18n.t('제한 없음')}`
     : `실행 ${esc(capacity.configured)} · 작업 ${esc(capacity.open_jobs)} · 권장 ${esc(capacity.recommended)} · 최대 ${esc(limit)} · 웹 PID 예상 ${esc(capacity.estimated_web_pids)} / ${capacity.web_pids_limit ? esc(capacity.web_pids_limit) : '제한 없음'}`;
   return `<section class="settings-card"><h2>솔버 자동 확장</h2>
     <p class="form-hint">${summary}</p>

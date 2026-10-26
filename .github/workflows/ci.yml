@@ -21,10 +21,37 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-      - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt
-      - name: Test application
-        run: python -m pytest -q
+      - name: Install application dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Smoke check application and documentation
+        run: |
+          python - <<'PY'
+          import json
+          import tempfile
+          from pathlib import Path
+          from fastapi.testclient import TestClient
+          from ctf_agent.db import Settings
+          from ctf_agent.main import create_app
+
+          with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+              root = Path(temp)
+              settings = Settings(root / 'data', root / 'db', root / 'config', root / 'logs',
+                                  storage_min_free_bytes=0, auth_mode='nologin')
+              with TestClient(create_app(settings)) as client:
+                  assert client.get('/healthz').json()['status'] == 'ok'
+                  assert client.get('/api/auth/state').json()['authenticated'] is True
+
+          for locale, readme in [('en', 'README.md'), ('ko', 'README.ko.md')]:
+              content = Path(readme).read_text(encoding='utf-8')
+              for name in ('challenge-board', 'workspaces', 'live-session', 'writeup-preview',
+                           'agents', 'settings', 'admin'):
+                  path = Path('docs/images') / locale / f'{name}.png'
+                  assert path.is_file() and path.stat().st_size > 10000, path
+                  assert path.as_posix() in content, path
+              pack = json.loads((Path('ctf_agent/web/i18n') / f'{locale}.json').read_text(encoding='utf-8'))
+              assert pack['locale'] == locale and pack['messages']
+          assert not Path('tests').exists()
+          PY
       - name: Check scripts and local stack
         run: |
           python -m compileall -q ctf_agent deploy/local-compose.py scripts/package_local_release.py
