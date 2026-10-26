@@ -1,0 +1,86 @@
+name: Deploy published image
+
+on:
+  workflow_run:
+    workflows: [Publish container image]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Published 40-character commit SHA
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: ctf-agent-production-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Resolve the immutable image digest
+        env:
+          REQUESTED_REVISION: ${{ github.event_name == 'workflow_dispatch' && inputs.revision || github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ctf-agent-public"
+          digest="$(docker manifest inspect --verbose "$image:$REQUESTED_REVISION" | jq -er '.Descriptor.digest')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'REVISION=%s\nIMAGE_REF=%s@%s\n' "$REQUESTED_REVISION" "$image" "$digest" >> "$GITHUB_ENV"
+      - name: Install verified Cloudflare client
+        env:
+          CLOUDFLARED_VERSION: 2026.8.3
+          CLOUDFLARED_SHA256: f29324fe934d1e100617484c78deef803c4dc2cd351d645bbde42e96b4fccc5e
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
+            --output "$RUNNER_TEMP/cloudflared"
+          printf '%s  %s\n' "$CLOUDFLARED_SHA256" "$RUNNER_TEMP/cloudflared" | sha256sum --check --strict
+          chmod 0700 "$RUNNER_TEMP/cloudflared"
+      - name: Deploy through Cloudflare Access
+        env:
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+          DEPLOY_CF_ACCESS_ID: ${{ secrets.DEPLOY_CF_ACCESS_ID }}
+          DEPLOY_CF_ACCESS_SECRET: ${{ secrets.DEPLOY_CF_ACCESS_SECRET }}
+          DEPLOY_RELEASE_ROOT: ${{ secrets.DEPLOY_RELEASE_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in DEPLOY_SSH_HOST DEPLOY_SSH_USER DEPLOY_SSH_KEY DEPLOY_SSH_KNOWN_HOSTS \
+                      DEPLOY_CF_ACCESS_ID DEPLOY_CF_ACCESS_SECRET DEPLOY_RELEASE_ROOT; do
+            test -n "${!name}"
+          done
+          [[ "$DEPLOY_SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$DEPLOY_SSH_USER" =~ ^[A-Za-z0-9_-]+$ ]]
+          [[ "$DEPLOY_RELEASE_ROOT" =~ ^/[A-Za-z0-9/_-]+$ ]]
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/deploy-key"
+          printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/known-hosts"
+          chmod 0600 "$RUNNER_TEMP/deploy-key" "$RUNNER_TEMP/known-hosts"
+          export TUNNEL_SERVICE_TOKEN_ID="$DEPLOY_CF_ACCESS_ID"
+          export TUNNEL_SERVICE_TOKEN_SECRET="$DEPLOY_CF_ACCESS_SECRET"
+          ssh -i "$RUNNER_TEMP/deploy-key" \
+            -o "ProxyCommand=$RUNNER_TEMP/cloudflared access ssh --hostname %h" \
+            -o "UserKnownHostsFile=$RUNNER_TEMP/known-hosts" \
+            -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            -o ConnectionAttempts=1 -o ConnectTimeout=30 \
+            -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
+            "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST" \
+            "sh -s -- '$REVISION' '$IMAGE_REF' '$DEPLOY_RELEASE_ROOT'" \
+            < .github/scripts/remote-rollout.sh
