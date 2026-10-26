@@ -466,6 +466,12 @@ input:focus, textarea:focus, select:focus {
 .solver-phase-needs_input { border-color: #735d26; background: #1e1705; color: #ffd978; }
 .solver-phase-failed, .solver-phase-refused, .solver-phase-cleanup_blocked { border-color: #65313b; background: #1a090d; color: #ff9eaa; }
 .solver-model { overflow-wrap: anywhere; font: 10px ui-monospace, "Cascadia Code", Consolas, monospace; color: #91a7b2; }
+.solver-continuation { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 9px; min-width: 0; color: #91a7b2; font: 10px ui-monospace, "Cascadia Code", Consolas, monospace; }
+.solver-continuation strong { color: #81b8c2; font-weight: 600; }
+.solver-continuation-checkpoint strong { color: #e2c57a; }
+.solver-continuation-workspace strong { color: #77c9ec; }
+.solver-continuation-session strong { color: #60d8bb; }
+.solver-continuation span { overflow-wrap: anywhere; }
 .solver-progress { display: grid; gap: 4px; color: #bfd0d5; font-size: 11px; }
 .solver-progress progress { margin: 0; width: 100%; }
 .solver-artifact { display: grid; gap: 8px; border: 1px solid #25463b; border-radius: 8px; padding: 10px; background: #03110d; }

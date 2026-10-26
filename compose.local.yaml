@@ -67,6 +67,7 @@ services:
         install -d -o "$$uid" -g "$$gid" -m 0700 /data/config
         install -d -o "$$uid" -g "$$gid" -m 0750 /data/workspaces /data/workspace_files /data/runtime /data/claude-runtime
         install -d -o 0 -g "$$gid" -m 1770 /data/solver-exchange
+        install -d -o "$$uid" -g "$$gid" -m 0700 /data/solver-exchange/continuations
         install -d -o 0 -g "$$gid" -m 0750 /data/solver-exchange/slots /data/solver-scratch
         for index in 1 2 3 4 5 6; do
           install -d -o 0 -g "$$gid" -m 1770 "/data/solver-exchange/slots/solver-$$index"

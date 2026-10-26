@@ -40,8 +40,16 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 from .codex_native import native_codex_binary as _native_codex_binary
-from .agent_workspace import INITIAL_GOAL, NUDGE, POISON_REGOAL, prepare_agent_workspace
+from .agent_workspace import INITIAL_GOAL, NUDGE, POISON_REGOAL, _asset_text, prepare_agent_workspace
 from .archive_workspace import ArchiveSafetyError
+from .solver_continuation import (
+    ContinuationInput,
+    ContinuationInvalid,
+    capture_snapshot,
+    read_input as read_continuation_input,
+    restore_snapshot,
+    workspace_baseline,
+)
 from .solver import (
     ModelConfiguration,
     SolverError,
@@ -565,6 +573,7 @@ class JobManifest:
     source_solver_artifact: SolverArtifact | None = field(default=None, repr=False)
     source_writeup_sha256: str | None = field(default=None, repr=False)
     source_solver_job_id: str | None = None
+    challenge_input_sha256: str = ""
 
     @classmethod
     def load(cls, active: Path) -> "JobManifest":
@@ -602,6 +611,7 @@ class JobManifest:
             "network_policy",
             "retry_checkpoint",
             "refinement_context",
+            "challenge_input_sha256",
         }
         if set(payload) - allowed or payload.get("protocol") != EXCHANGE_PROTOCOL:
             raise WorkerRefusal("invalid_manifest", "작업 교환 형식을 확인할 수 없습니다.")
@@ -615,6 +625,12 @@ class JobManifest:
         remote = payload.get("remote", "")
         remote_mode = payload.get("remote_mode", "endpoint" if remote else "unknown")
         digest = payload.get("auth_sha256")
+        challenge_input_sha256 = payload.get("challenge_input_sha256", "")
+        if not isinstance(challenge_input_sha256, str) or (
+            challenge_input_sha256
+            and not re.fullmatch(r"[0-9a-f]{64}", challenge_input_sha256)
+        ):
+            raise WorkerRefusal("invalid_manifest", "Challenge input digest is invalid.")
         codex_version = payload.get("codex_version")
         runtime_digest = payload.get("codex_runtime_sha256")
         claude_version = payload.get("claude_version")
@@ -867,6 +883,7 @@ class JobManifest:
             source_solver_artifact=source_solver_artifact,
             source_writeup_sha256=source_writeup_sha256,
             source_solver_job_id=source_solver_job_id,
+            challenge_input_sha256=challenge_input_sha256,
         )
 
 
@@ -886,8 +903,10 @@ class ClaudeFileCredential:
 
     raw: bytearray = field(repr=False)
 
-    def install(self, config_dir: Path) -> Path:
-        config_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+    def install(self, config_dir: Path, *, allow_existing: bool = False) -> Path:
+        if config_dir.is_symlink():
+            raise OSError("Claude config directory is a link")
+        config_dir.mkdir(parents=True, mode=0o700, exist_ok=allow_existing)
         if os.name == "posix":
             config_dir.chmod(0o700)
         target = config_dir / ".credentials.json"
@@ -1520,16 +1539,28 @@ def _restore_solver_artifact(workdir: Path, artifact: SolverArtifact) -> Path:
         temporary.unlink(missing_ok=True)
 
 
-def _solver_notes(workdir: Path, maximum: int = 1_000_000) -> str:
+def _solver_notes(
+    workdir: Path,
+    maximum: int = 1_000_000,
+    *,
+    names: tuple[str, ...] = ("ANALYSIS.md", "VULN.md", "NEXT.md"),
+    scaffold_challenge_name: str | None = None,
+) -> str:
     """Collect the original ANALYSIS/VULN/NEXT handoff for the write-up turn."""
 
     sections: list[str] = []
     remaining = maximum
-    for name in ("ANALYSIS.md", "VULN.md", "NEXT.md"):
+    for name in names:
         text = _read_solver_text(workdir / "notes" / name, remaining)
         if text is None:
             continue
         text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if scaffold_challenge_name is not None:
+            scaffold = _asset_text("scaffolds", name).replace(
+                "{{CHAL}}", scaffold_challenge_name
+            ).strip()
+            if text == scaffold:
+                continue
         if _CONTROL.search(text):
             raise WorkerRefusal("invalid_solver_output", "solver 분석 노트 형식을 확인할 수 없습니다.", stage="solve")
         section = f"## {name}\n\n{text}" if text else f"## {name}"
@@ -1538,6 +1569,41 @@ def _solver_notes(workdir: Path, maximum: int = 1_000_000) -> str:
         sections.append(section)
         remaining -= len(section) + 2
     return "\n\n".join(sections)
+
+
+def _capture_retry_progress(
+    workdir: Path | None,
+    private_notes: str,
+    solver_artifact: dict[str, Any] | None,
+    challenge_name: str | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Keep bounded agent-written work when a provider turn fails mid-flight.
+
+    A quota or transport error can arrive before run_discovery returns, so its
+    normal checkpoint callback has not yet read notes/ or solver.py. Capture
+    the same validated files before the ephemeral scratch tree is removed.
+    Invalid files must not replace the original provider error.
+    """
+
+    if workdir is None:
+        return private_notes, solver_artifact
+    try:
+        written = _solver_notes(
+            workdir,
+            names=("NEXT.md", "VULN.md", "ANALYSIS.md"),
+            scaffold_challenge_name=challenge_name,
+        )
+        if written and written not in private_notes:
+            private_notes = bounded_checkpoint_notes(
+                f"{written}\n\n# Previous notes\n\n{private_notes}"
+                if private_notes else written
+            )
+    except (OSError, ValueError, WorkerRefusal):
+        pass
+    current_artifact = _capture_solver_artifact(workdir / "solver.py")
+    if current_artifact is not None:
+        solver_artifact = current_artifact.payload()
+    return private_notes, solver_artifact
 
 
 def _validated_flag_candidate(path: Path) -> str | None:
@@ -2554,6 +2620,9 @@ class CodexAppServer:
         self.notifications: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
         self.sequence = 0
         self.thread_id = None
+        self.resume_thread_id: str | None = None
+        self.restored_home = False
+        self.continuation_event: Callable[[str], None] | None = None
         self.turn_id = None
         self._flag_interrupt_requested: tuple[str, str, str] | None = None
         self._flag_interrupt_ready = asyncio.Event()
@@ -2709,7 +2778,16 @@ class CodexAppServer:
     async def start(self) -> None:
         if not self.executable:
             raise WorkerRefusal("codex_missing", "격리 worker에 Codex CLI가 설치되지 않았습니다.")
-        self.codex_home.mkdir(parents=True, mode=0o700, exist_ok=False)
+        if self.restored_home:
+            if (
+                not self.resume_thread_id
+                or self.codex_home.is_symlink()
+                or not self.codex_home.is_dir()
+                or {entry.name for entry in self.codex_home.iterdir()} != {"sessions"}
+            ):
+                raise WorkerRefusal("scratch_isolation_failed", "Restored provider home is invalid.")
+        else:
+            self.codex_home.mkdir(parents=True, mode=0o700, exist_ok=False)
         temporary = self.codex_home / "tmp"
         temporary.mkdir(mode=0o700)
         safe_env = {
@@ -3437,6 +3515,29 @@ print(json.dumps(result,separators=(",",":")))
     async def _thread(self, manifest: JobManifest) -> str:
         if self.thread_id:
             return self.thread_id
+        if self.resume_thread_id:
+            original_id = self.resume_thread_id
+            try:
+                restored = await self.request(
+                    "thread/resume", {"threadId": original_id, "excludeTurns": True}
+                )
+                thread = restored.get("thread")
+                if (
+                    not isinstance(thread, dict)
+                    or thread.get("id") != original_id
+                    or thread.get("ephemeral") is True
+                ):
+                    raise AppServerFailure({"code": "invalid_response"})
+                self.thread_id = original_id
+                if self.continuation_event:
+                    self.continuation_event("session_resumed")
+                return original_id
+            except (AppServerFailure, WorkerRefusal):
+                # A corrupt or incompatible local provider history must not
+                # discard the restored files and bounded checkpoint.
+                self.resume_thread_id = None
+                if self.continuation_event:
+                    self.continuation_event("workspace_restored")
         # Do not send ``environments: []``.  In app-server v2 an explicit
         # empty list disables environment access and therefore removes the
         # built-in shell tools.  Omission selects the cwd-bound local
@@ -3449,7 +3550,7 @@ print(json.dumps(result,separators=(",",":")))
             "model": provider_model,
             "approvalPolicy": "never",
             "sandbox": "danger-full-access" if os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true" else "workspace-write",
-            "ephemeral": True,
+            "ephemeral": False,
             "allowProviderModelFallback": False,
             "dynamicTools": [],
             "config": {
@@ -4675,6 +4776,12 @@ class ClaudePrintDriver(CodexAppServer):
         self.tool_agents: dict[str, str] = {}
         self.pid = -1
         self.session_id: str | None = None
+        self.resume_session_id: str | None = None
+        self.restored_home = False
+        self.resume_confirmed = False
+        self.resume_fallback_attempted = False
+        self._resume_fallback_guidance: tuple[GuidanceRecord, ...] = ()
+        self.continuation_event: Callable[[str], None] | None = None
         self.turn_count = 0
         self.credential_path: Path | None = None
         self.api_key: bytearray | None = None
@@ -4814,7 +4921,17 @@ class ClaudePrintDriver(CodexAppServer):
             raise WorkerRefusal("model_mismatch", "검증되지 않은 Claude 추론 수준입니다.", category="model")
         if self.configuration.service_tier is not None:
             raise WorkerRefusal("invalid_manifest", "Claude는 Fast 실행 속도를 지원하지 않습니다.", category="model")
-        self.claude_home.mkdir(parents=True, mode=0o700, exist_ok=False)
+        if self.restored_home:
+            if (
+                not self.resume_session_id
+                or self.claude_home.is_symlink()
+                or not self.claude_home.is_dir()
+                or {entry.name for entry in self.claude_home.iterdir()} != {"claude"}
+                or (self.claude_home / "claude").is_symlink()
+            ):
+                raise WorkerRefusal("scratch_isolation_failed", "Restored provider home is invalid.")
+        else:
+            self.claude_home.mkdir(parents=True, mode=0o700, exist_ok=False)
         for child in ("tmp", "config", "cache"):
             (self.claude_home / child).mkdir(mode=0o700)
         output = (await self._bounded_command(["--version"], maximum=512)).decode("utf-8", errors="replace")
@@ -4835,7 +4952,9 @@ class ClaudePrintDriver(CodexAppServer):
         if self.auth_kind != "oauth" or not isinstance(credential, ClaudeFileCredential):
             raise WorkerRefusal("invalid_auth_stage", "Claude 인증 파일 형식을 확인할 수 없습니다.", category="auth")
         try:
-            self.credential_path = credential.install(self.config_dir)
+            self.credential_path = credential.install(
+                self.config_dir, allow_existing=self.restored_home
+            )
         except OSError as exc:
             raise WorkerRefusal("external_auth_failed", "Claude 인증 파일을 격리 공간에 준비하지 못했습니다.", category="auth") from exc
         finally:
@@ -4849,7 +4968,7 @@ class ClaudePrintDriver(CodexAppServer):
             return str(uuid.uuid5(uuid.NAMESPACE_URL, "ctf-agent-solver:" + job_id))
 
     def command_arguments(self, manifest: JobManifest, schema: dict[str, Any]) -> list[str]:
-        session = self._session_uuid(manifest.job_id)
+        session = self.resume_session_id or self._session_uuid(manifest.job_id)
         if self.session_id is not None and not secrets_compare(self.session_id, session):
             raise WorkerRefusal("provider_session_mismatch", "Claude 작업 세션을 확인할 수 없습니다.")
         self.session_id = session
@@ -4901,7 +5020,7 @@ class ClaudePrintDriver(CodexAppServer):
         ]
         if not writeup_only:
             arguments.append("--forward-subagent-text")
-        if self.turn_count == 0:
+        if self.turn_count == 0 and not self.resume_session_id:
             arguments.extend(("--session-id", session))
         else:
             arguments.extend(("--resume", session))
@@ -5011,6 +5130,19 @@ class ClaudePrintDriver(CodexAppServer):
             return {"code": "provider_request_rejected", "retryable": False}
         return None
 
+    @staticmethod
+    def _resume_history_missing(value: object) -> bool:
+        """Recognize only explicit pre-init local CLI session lookup failures."""
+        pending: list[tuple[object, int]] = [(value, 0)]
+        while pending:
+            current, depth = pending.pop()
+            if isinstance(current, str) and len(current) <= 1000:
+                if re.search(r"(?:no conversation found|session not found|conversation not found)", current, re.I):
+                    return True
+            elif depth < 3 and isinstance(current, Mapping):
+                pending.extend((current.get(name), depth + 1) for name in ("error", "message", "details"))
+        return False
+
     async def _stderr_reader_claude(self, process: asyncio.subprocess.Process) -> None:
         if process.stderr is None:
             return
@@ -5114,6 +5246,12 @@ class ClaudePrintDriver(CodexAppServer):
                     policy["provider_code"] = explicit_code.upper()
                 raise AppServerFailure(policy)
             if event_type == "error":
+                if (
+                    self.resume_session_id
+                    and not initialized
+                    and self._resume_history_missing(event)
+                ):
+                    raise AppServerFailure({"code": "provider_session_not_found"})
                 raise AppServerFailure(self._api_failure(event) or {"code": "provider_error", "retryable": True})
             parent_tool_id = event.get("parent_tool_use_id")
             self._current_event_agent_id = (
@@ -5190,6 +5328,11 @@ class ClaudePrintDriver(CodexAppServer):
                 if mcp_servers not in ([], None):
                     raise WorkerRefusal("unexpected_remote_tool", "Claude MCP 도구가 활성화되어 실행을 거부했습니다.")
                 initialized = True
+                if self.resume_session_id and not self.resume_confirmed:
+                    self.resume_confirmed = True
+                    self._resume_fallback_guidance = ()
+                    if self.continuation_event:
+                        self.continuation_event("session_resumed")
                 continue
             if event_type == "assistant":
                 if not initialized:
@@ -5345,6 +5488,40 @@ class ClaudePrintDriver(CodexAppServer):
         return result
 
     async def _turn(self, manifest: JobManifest, prompt: str, schema: dict[str, Any], cancelled: asyncio.Event, progress) -> dict[str, Any]:
+        try:
+            return await self._turn_once(manifest, prompt, schema, cancelled, progress)
+        except AppServerFailure as exc:
+            explicit_failure = (
+                isinstance(exc.payload, Mapping)
+                and exc.payload.get("code") == "provider_session_not_found"
+            )
+            stderr_failure = self._resume_history_missing(self.safe_startup_stderr)
+            if not (
+                self.resume_session_id
+                and not self.resume_confirmed
+                and not self.resume_fallback_attempted
+                and (explicit_failure or stderr_failure)
+                and not cancelled.is_set()
+            ):
+                raise
+            self.resume_fallback_attempted = True
+            self.resume_session_id = None
+            self.session_id = None
+            self.safe_startup_stderr = None
+            if self._resume_fallback_guidance:
+                # The first CLI process rejected --resume before init, after
+                # stdin accepted the prompt and mailbox delivery was recorded.
+                # The instruction file is gone, so carry its exact text into
+                # the one permitted fresh-session attempt.
+                prompt = _append_solver_guidance(
+                    prompt, list(self._resume_fallback_guidance)
+                )
+                self._resume_fallback_guidance = ()
+            if self.continuation_event:
+                self.continuation_event("workspace_restored")
+            return await self._turn_once(manifest, prompt, schema, cancelled, progress)
+
+    async def _turn_once(self, manifest: JobManifest, prompt: str, schema: dict[str, Any], cancelled: asyncio.Event, progress) -> dict[str, Any]:
         if not (
             self.api_key is not None if self.auth_kind == "api_key"
             else self.credential_path is not None and self.credential_path.is_file()
@@ -5386,6 +5563,8 @@ class ClaudePrintDriver(CodexAppServer):
                 for guidance in initial_guidance:
                     self.guidance_mailbox.delivered(guidance, "next_turn")
                 guidance_delivered = True
+                if self.resume_session_id and not self.resume_confirmed:
+                    self._resume_fallback_guidance = tuple(initial_guidance)
             process.stdin.close()
             stream_task = asyncio.create_task(self._read_stream(process, manifest, progress))
             loop = asyncio.get_running_loop()
@@ -6384,12 +6563,28 @@ class SolverWorker:
         prior: dict[str, Any] = {}
         notes = ""
         solver_artifact_payload: dict[str, Any] | None = None
+        continuation_input: ContinuationInput | None = None
+        workspace_fingerprint: dict[str, tuple[int, int, int, int]] | None = None
         release_status: str | None = None
         release_payload: dict[str, Any] = {}
         needs_credential = False
         try:
             manifest = JobManifest.load(active)
             writer = EventWriter(active, manifest.job_id)
+            if (active / "continuation-input").exists():
+                try:
+                    continuation_input = read_continuation_input(
+                        active, manifest.configuration.provider
+                    )
+                    if (
+                        continuation_input is None
+                        or continuation_input.input_sha256 != manifest.challenge_input_sha256
+                        or manifest.job_mode != "solve"
+                    ):
+                        raise ContinuationInvalid("continuation input does not match")
+                except ContinuationInvalid:
+                    continuation_input = None
+                    writer.emit("progress", code="continuation_fallback")
             guidance_mailbox = GuidanceMailbox(active, manifest.job_id, writer)
             if manifest.deadline_unix is not None:
                 deadline_watcher = asyncio.create_task(
@@ -6493,7 +6688,11 @@ class SolverWorker:
             # somehow survived that boundary.
             self.process_assertion()
             assert_scratch_root_clean(self.scratch_root)
-            job_root = Path(tempfile.mkdtemp(prefix="ctf-job-", dir=self.scratch_root))
+            if continuation_input is None:
+                job_root = Path(tempfile.mkdtemp(prefix="ctf-job-", dir=self.scratch_root))
+            else:
+                job_root = self.scratch_root / continuation_input.scratch_name
+                job_root.mkdir(mode=0o700)
             home = job_root / "home"
             writer.emit("progress", code="inspecting_files")
             try:
@@ -6531,6 +6730,50 @@ class SolverWorker:
                     raise
                 if manifest.job_mode == "writeup_refine":
                     _install_refinement_project_manual(prepared.workdir, manifest.writeup_locale)
+                if manifest.job_mode == "solve":
+                    workspace_fingerprint = await asyncio.to_thread(
+                        workspace_baseline, prepared.workdir
+                    )
+                    if continuation_input is not None:
+                        restored = await asyncio.to_thread(
+                            restore_snapshot, active, job_root, continuation_input
+                        )
+                        if restored:
+                            writer.emit(
+                                "progress",
+                                code=(
+                                    "continuation_restored"
+                                    if continuation_input.mode == "session"
+                                    else "workspace_restored"
+                                ),
+                            )
+                        else:
+                            writer.emit("progress", code="continuation_fallback")
+                            continuation_input = None
+                            # A malformed archive may fail after partial writes.
+                            # Recreate the same prepared input before continuing.
+                            self._remove_job_scratch(job_root)
+                            job_root.mkdir(mode=0o700)
+                            prepared = await asyncio.to_thread(
+                                prepare_agent_workspace,
+                                job_root,
+                                active / "challenge",
+                                challenge_name=manifest.challenge_name,
+                                challenge_text=manifest.challenge_text,
+                                related_context=manifest.related_context,
+                                category=manifest.category,
+                                flag_format=manifest.flag_format,
+                                remote=manifest.remote,
+                                remote_mode=manifest.remote_mode,
+                                remote_access=manifest.network_enabled,
+                                readonly_source_view=(
+                                    self.input_root / "active" / "challenge"
+                                    if self.input_root is not None else None
+                                ),
+                            )
+                            workspace_fingerprint = await asyncio.to_thread(
+                                workspace_baseline, prepared.workdir
+                            )
             except ArchiveSafetyError as exc:
                 raise WorkerRefusal(
                     exc.code,
@@ -6586,6 +6829,15 @@ class SolverWorker:
                 manifest.claude_runtime_sha256 if manifest.configuration.provider == "claude" else manifest.codex_runtime_sha256,
                 auth_kind=manifest.auth_kind,
             )
+            if isinstance(driver, (CodexAppServer, ClaudePrintDriver)):
+                driver.continuation_event = lambda code: writer.emit("progress", code=code)
+                if continuation_input is not None and continuation_input.mode == "session":
+                    if isinstance(driver, ClaudePrintDriver):
+                        driver.resume_session_id = continuation_input.session_id
+                        driver.restored_home = True
+                    else:
+                        driver.resume_thread_id = continuation_input.session_id
+                        driver.restored_home = True
             driver.guidance_mailbox = guidance_mailbox
             await driver.start()
             await self._verify_sandbox_canary(
@@ -6787,6 +7039,10 @@ class SolverWorker:
                 flag = current.get("flag") if isinstance(current.get("flag"), str) else None
                 preserved_notes = current.get("private_notes") if isinstance(current.get("private_notes"), str) else ""
                 notes = bounded_checkpoint_notes(preserved_notes or notes)
+                notes, solver_artifact_payload = _capture_retry_progress(
+                    scratch, notes, solver_artifact_payload,
+                    manifest.challenge_name if manifest is not None else None,
+                )
                 if deadline_expired.is_set():
                     error = SolverError(
                         "timeout",
@@ -6880,6 +7136,10 @@ class SolverWorker:
                 preserved_flag = current.get("flag") if isinstance(current.get("flag"), str) else None
                 preserved_notes = current.get("private_notes") if isinstance(current.get("private_notes"), str) else ""
                 notes = bounded_checkpoint_notes(preserved_notes or notes)
+                notes, solver_artifact_payload = _capture_retry_progress(
+                    scratch, notes, solver_artifact_payload,
+                    manifest.challenge_name if manifest is not None else None,
+                )
                 if exc.error.code == "credential_required":
                     needs_credential = True
                     _write_json(
@@ -6937,6 +7197,10 @@ class SolverWorker:
                 flag = current.get("flag") if isinstance(current.get("flag"), str) else None
                 preserved_notes = current.get("private_notes") if isinstance(current.get("private_notes"), str) else ""
                 notes = bounded_checkpoint_notes(preserved_notes or notes)
+                notes, solver_artifact_payload = _capture_retry_progress(
+                    scratch, notes, solver_artifact_payload,
+                    manifest.challenge_name if manifest is not None else None,
+                )
                 release_status = "flag_found" if flag else "failed"
                 release_payload = {"error": error.public()}
                 if flag:
@@ -7005,6 +7269,28 @@ class SolverWorker:
                             current_artifact = _capture_solver_artifact(scratch / "solver.py")
                             if current_artifact is not None:
                                 solver_artifact_payload = current_artifact.payload()
+                        if (
+                            release_status != "completed"
+                            and manifest is not None
+                            and job_root is not None
+                            and driver is not None
+                        ):
+                            session_id = (
+                                driver.session_id
+                                if isinstance(driver, ClaudePrintDriver)
+                                else driver.thread_id
+                                if isinstance(driver, CodexAppServer)
+                                else None
+                            )
+                            await asyncio.to_thread(
+                                capture_snapshot,
+                                active,
+                                job_root,
+                                manifest.configuration.provider,
+                                session_id,
+                                manifest.challenge_input_sha256,
+                                workspace_fingerprint,
+                            )
                         self._remove_job_scratch(job_root)
                         assert_scratch_root_clean(self.scratch_root)
                 except Exception:

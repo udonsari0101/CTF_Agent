@@ -1,6 +1,8 @@
 """Exercise the packaged image with disposable data and no network access."""
 import asyncio
+import hashlib
 import importlib
+import json
 import os
 from pathlib import Path
 import pwd
@@ -16,6 +18,7 @@ from ctf_agent.main import create_app
 from ctf_agent.codex_native import native_codex_binary
 from ctf_agent.providers.codex import CodexAccount
 from ctf_agent.solver_worker import REQUIRED_CLAUDE_VERSION, REQUIRED_CODEX_VERSION, resolve_codex_command
+from ctf_agent.solver_exchange import _continuation_bundle
 
 
 with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
@@ -61,6 +64,23 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
             assert result.status_code == 200 and result.content
         assert client.delete(base).status_code == 200
     print("Packaged application auth, storage, status, notes and assets verified")
+
+    # The release image must retain the bounded native-session handoff parser.
+    continuation = root / "continuation-smoke"
+    continuation.mkdir(mode=0o700)
+    archive = b"offline continuation fixture"
+    (continuation / "snapshot.tar.gz").write_bytes(archive)
+    metadata = {
+        "version": 1, "provider": "codex",
+        "session_id": "11111111-2222-3333-4444-555555555555",
+        "scratch_name": "ctf-job-smoke123456",
+        "workdir_rel": "competition/challenge/codex-workdir",
+        "archive_sha256": hashlib.sha256(archive).hexdigest(),
+        "archive_size": len(archive), "input_sha256": "a" * 64,
+    }
+    (continuation / "meta.json").write_text(json.dumps(metadata), encoding="utf-8")
+    assert _continuation_bundle(continuation, provider="codex") == (metadata, len(archive))
+    print("Private solver continuation schema verified offline")
 
     for executable in ("node", "codex", "claude"):
         result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=15)

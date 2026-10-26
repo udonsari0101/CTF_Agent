@@ -996,6 +996,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.storage_layout.forget_workspace(db, workspace_id)
             db.execute("DELETE FROM workspaces WHERE id=?", (workspace_id,))
         app.state.storage_layout.finish_deletions()
+        if solver_jobs:
+            try:
+                solver_jobs.prune_continuations()
+            except Exception:
+                logging.exception("Failed to prune obsolete solver continuations")
         return {"ok": True}
 
     @app.get("/api/workspaces/{workspace_id}/challenges", dependencies=[Depends(require_auth)])
@@ -1436,6 +1441,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.storage_layout.forget_challenge(db, challenge_id)
             db.execute("DELETE FROM challenges WHERE workspace_id=? AND id=?", (workspace_id, challenge_id))
         app.state.storage_layout.finish_deletions()
+        if solver_jobs:
+            try:
+                solver_jobs.prune_continuations()
+            except Exception:
+                logging.exception("Failed to prune obsolete solver continuations")
         return {"ok": True}
 
     @app.patch("/api/workspaces/{workspace_id}/challenges/{challenge_id}/status", dependencies=[Depends(require_auth)])

@@ -81,6 +81,14 @@ _MAX_EVENT_BYTES = MAX_OUTPUT_TEXT + 256 * 1024
 _MIN_FREE_BYTES_AFTER_STAGE = 512 * 1024 * 1024
 _STAGE_CONTROL_RESERVE = 2 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 512 * 1024
+_MAX_CONTINUATION_BYTES = 512 * 1024 * 1024
+_MAX_OWNER_CONTINUATIONS_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_GLOBAL_CONTINUATIONS_BYTES = 16 * 1024 * 1024 * 1024
+_MAX_CONTINUATION_META_BYTES = 4096
+_CONTINUATION_WORKDIR = "competition/challenge/codex-workdir"
+_CONTINUATION_SESSION = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
+_CONTINUATION_SCRATCH = re.compile(r"ctf-job-[A-Za-z0-9_-]{6,64}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _VERSION = re.compile(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}\Z")
 _MAX_REMOTE_CHARS = 2000
 MAX_WRITEUP_REFINEMENT_INSTRUCTION_BYTES = 12 * 1024
@@ -143,6 +151,9 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     private_notes TEXT,
     solver_artifact_json TEXT,
     retry_checkpoint_json TEXT,
+    continuation_mode TEXT NOT NULL DEFAULT 'fresh' CHECK(continuation_mode IN ('fresh','checkpoint','workspace','session')),
+    continuation_source_job_id TEXT,
+    continuation_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(continuation_confirmed IN (0,1)),
     writeup_instruction TEXT NOT NULL DEFAULT '',
     writeup_locale TEXT NOT NULL DEFAULT 'ko' CHECK(writeup_locale IN ('ko','en')),
     source_writeup_sha256 TEXT,
@@ -230,6 +241,19 @@ CREATE TABLE IF NOT EXISTS solver_retry_checkpoints (
 );
 CREATE INDEX IF NOT EXISTS idx_solver_retry_checkpoint_owner
     ON solver_retry_checkpoints(owner_user_id,workspace_id,challenge_id);
+CREATE TABLE IF NOT EXISTS solver_continuations (
+    challenge_id TEXT PRIMARY KEY REFERENCES challenges(id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    source_job_id TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL,
+    archive_sha256 TEXT NOT NULL,
+    archive_size INTEGER NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_solver_continuation_owner
+    ON solver_continuations(owner_user_id,workspace_id,challenge_id);
 CREATE TABLE IF NOT EXISTS solver_flag_hook_deliveries (
     job_id TEXT NOT NULL REFERENCES solver_jobs(id) ON DELETE CASCADE,
     flag_sha256 TEXT NOT NULL,
@@ -444,6 +468,19 @@ class SolverExchangeCoordinator:
     ):
         self.database_path = Path(database_path)
         self.data_dir = Path(data_dir)
+        continuation_parent = self.data_dir / "solver-exchange"
+        continuation_parent.mkdir(mode=0o700, exist_ok=True)
+        if continuation_parent.is_symlink() or not continuation_parent.is_dir():
+            raise ExchangeError("invalid_continuation_store", "Private solver continuation storage is unavailable.", category="safety")
+        self.continuations_dir = continuation_parent / "continuations"
+        self.continuations_dir.mkdir(mode=0o700, exist_ok=True)
+        continuation_root = self.continuations_dir.lstat()
+        if (
+            not stat.S_ISDIR(continuation_root.st_mode)
+            or stat.S_ISLNK(continuation_root.st_mode)
+            or (os.name == "posix" and continuation_root.st_mode & 0o077)
+        ):
+            raise ExchangeError("invalid_continuation_store", "Private solver continuation storage is unavailable.", category="safety")
         self.accounts_dir = Path(accounts_dir)
         self.exchange = Path(exchange_dir)
         self.on_flag_committed = on_flag_committed
@@ -544,6 +581,12 @@ class SolverExchangeCoordinator:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN solver_artifact_json TEXT")
             if "retry_checkpoint_json" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN retry_checkpoint_json TEXT")
+            if "continuation_mode" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN continuation_mode TEXT NOT NULL DEFAULT 'fresh' CHECK(continuation_mode IN ('fresh','checkpoint','workspace','session'))")
+            if "continuation_source_job_id" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN continuation_source_job_id TEXT")
+            if "continuation_confirmed" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN continuation_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(continuation_confirmed IN (0,1))")
             if "challenge_input_sha256" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN challenge_input_sha256 TEXT")
             if "challenge_base_sha256" not in columns:
@@ -628,6 +671,11 @@ class SolverExchangeCoordinator:
                 db.execute(
                     "ALTER TABLE solver_retry_checkpoints ADD COLUMN source_remote_mode TEXT NOT NULL DEFAULT 'unknown'"
                 )
+            continuation_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(solver_continuations)")
+            }
+            if "session_id" not in continuation_columns:
+                db.execute("ALTER TABLE solver_continuations ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
         # ``solver_slots`` remains additive and FK-free so generation-one
         # databases can migrate in place. A crash or restore can therefore
         # leave a claim whose job row no longer exists. Remove only that
@@ -1105,6 +1153,10 @@ class SolverExchangeCoordinator:
                             "DELETE FROM solver_retry_checkpoints WHERE challenge_id=?",
                             (challenge_id,),
                         )
+                        db.execute(
+                            "DELETE FROM solver_continuations WHERE challenge_id=?",
+                            (challenge_id,),
+                        )
                         checkpoint_row = None
                         checkpoint = None
                     elif checkpoint and checkpoint.reason == "needs_remote" and remote_mode == "unknown":
@@ -1131,6 +1183,55 @@ class SolverExchangeCoordinator:
                                     challenge_id,
                                 ),
                             )
+                continuation_mode = "checkpoint" if retry_checkpoint_json else "fresh"
+                continuation_source_job_id = (
+                    checkpoint_row["source_job_id"] if retry_checkpoint_json and checkpoint_row else None
+                )
+                if job_mode == "solve" and retry_checkpoint_json:
+                    saved = db.execute(
+                        """SELECT * FROM solver_continuations
+                           WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?""",
+                        (owner_user_id, workspace_id, challenge_id),
+                    ).fetchone()
+                    if saved and _ID.fullmatch(saved["source_job_id"]):
+                        source = db.execute(
+                            """SELECT * FROM solver_jobs
+                               WHERE id=? AND owner_user_id=? AND workspace_id=?
+                                 AND challenge_id=? AND released_ingested=1
+                                 AND job_mode='solve'""",
+                            (saved["source_job_id"], owner_user_id, workspace_id, challenge_id),
+                        ).fetchone()
+                        saved_exact = bool(
+                            source and saved["input_sha256"] == source["challenge_input_sha256"]
+                            and saved["input_sha256"] == challenge_input_sha256
+                        )
+                        saved_remote = bool(
+                            source and remote_resume and checkpoint and checkpoint.reason == "needs_remote"
+                            and checkpoint_row and checkpoint_row["input_sha256"] == saved["input_sha256"]
+                            and saved["input_sha256"] == source["challenge_input_sha256"]
+                            and source["challenge_base_sha256"] == challenge_base_sha256
+                            and source["remote_mode"] in {"unknown", "none", "endpoint"}
+                            and remote_mode in {"none", "endpoint"}
+                        )
+                        if saved_exact or saved_remote:
+                            continuation_source_job_id = saved["source_job_id"]
+                            runtime_match = (
+                                source["codex_version"] == codex_version
+                                and source["codex_runtime_sha256"] == codex_runtime_sha256
+                                and source["claude_version"] == claude_version
+                                and source["claude_runtime_sha256"] == claude_runtime_sha256
+                            )
+                            exact_configuration = (
+                                source["account_id"] == selected.account_id
+                                and source["provider"] == configuration.provider
+                                and source["auth_kind"] == auth_kind
+                                and source["model"] == configuration.model
+                                and source["reasoning_effort"] == configuration.reasoning_effort
+                                and source["service_tier"] == configuration.service_tier
+                                and bool(source["ultracode"]) == bool(configuration.ultracode)
+                                and runtime_match
+                            )
+                            continuation_mode = "session" if saved_exact and exact_configuration and saved["session_id"] else "workspace"
                 if ultra_source_job_id is not None:
                     source = db.execute(
                         "SELECT * FROM solver_jobs WHERE id=? AND owner_user_id=? AND workspace_id=? AND challenge_id=?",
@@ -1166,12 +1267,12 @@ class SolverExchangeCoordinator:
                     """INSERT INTO solver_jobs
                        (id,job_mode,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,auth_kind,model,
                         reasoning_effort,ultra_escalation_mode,ultra_source_job_id,ultracode,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
-                        retry_checkpoint_json,writeup_instruction,writeup_locale,source_writeup_sha256,source_solver_job_id,
+                         retry_checkpoint_json,continuation_mode,continuation_source_job_id,writeup_instruction,writeup_locale,source_writeup_sha256,source_solver_job_id,
                         challenge_input_sha256,challenge_base_sha256,remote_mode,status,previous_challenge_status,flag,private_notes,
                         solver_artifact_json,flag_hooked,created_at,updated_at)
                        VALUES(:id,:job_mode,:owner_user_id,:workspace_id,:challenge_id,:account_id,
                                :account_label,:provider,:auth_kind,:model,:reasoning_effort,:ultra_escalation_mode,:ultra_source_job_id,:ultracode,:max_reasoning_available,:service_tier,:codex_version,
-                              :codex_runtime_sha256,:claude_version,:claude_runtime_sha256,:retry_checkpoint_json,
+                               :codex_runtime_sha256,:claude_version,:claude_runtime_sha256,:retry_checkpoint_json,:continuation_mode,:continuation_source_job_id,
                               :writeup_instruction,:writeup_locale,:source_writeup_sha256,:source_solver_job_id,
                               :challenge_input_sha256,:challenge_base_sha256,:remote_mode,'queued',:previous_challenge_status,:flag,
                               :private_notes,:solver_artifact_json,:flag_hooked,:created_at,:updated_at)""",
@@ -1200,6 +1301,8 @@ class SolverExchangeCoordinator:
                         "claude_version": claude_version,
                         "claude_runtime_sha256": claude_runtime_sha256,
                         "retry_checkpoint_json": retry_checkpoint_json,
+                        "continuation_mode": continuation_mode,
+                        "continuation_source_job_id": continuation_source_job_id,
                         "writeup_instruction": instruction,
                         "writeup_locale": writeup_locale,
                         "source_writeup_sha256": source_writeup_sha256,
@@ -2571,6 +2674,8 @@ class SolverExchangeCoordinator:
                     else "provider_failure" if code in resumable_refusals
                     else None
                 )
+        if reason is not None:
+            self._store_continuation(job, active)
         timestamp = self.clock()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2579,6 +2684,8 @@ class SolverExchangeCoordinator:
                 (notes, artifact_json, timestamp, job["id"]),
             )
             if reason is None:
+                if status == "completed":
+                    db.execute("DELETE FROM solver_continuations WHERE challenge_id=?", (job["challenge_id"],))
                 return
             input_sha256 = job.get("challenge_input_sha256")
             base_sha256 = job.get("challenge_base_sha256")
@@ -2633,6 +2740,142 @@ class SolverExchangeCoordinator:
                     timestamp,
                 ),
             )
+        self.prune_continuations()
+
+    def _store_continuation(self, job: Mapping[str, Any], active: Path) -> dict[str, Any] | None:
+        """Keep one owner-bound snapshot only when disk and retention caps permit."""
+
+        source = active / "continuation"
+        if not _ID.fullmatch(str(job["id"])):
+            return None
+        input_sha256 = job.get("challenge_input_sha256")
+        if not isinstance(input_sha256, str) or not _SHA256.fullmatch(input_sha256):
+            return None
+        destination = self.continuations_dir / job["id"]
+        try:
+            source_present = source.exists() or source.is_symlink()
+            candidate = source if source_present else destination
+            metadata, archive_size = _continuation_bundle(candidate, provider=job["provider"])
+            if not secrets.compare_digest(metadata["input_sha256"], input_sha256):
+                return None
+            with self.storage_budget.exclusive(), self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                existing = db.execute(
+                    "SELECT owner_user_id,archive_size,source_job_id FROM solver_continuations WHERE challenge_id=?",
+                    (job["challenge_id"],),
+                ).fetchone()
+                if existing and existing["owner_user_id"] != job["owner_user_id"]:
+                    return None
+                old_size = int(existing["archive_size"]) if existing else 0
+                owner_bytes = db.execute(
+                    "SELECT COALESCE(SUM(archive_size),0) FROM solver_continuations WHERE owner_user_id=?",
+                    (job["owner_user_id"],),
+                ).fetchone()[0]
+                global_bytes = db.execute(
+                    "SELECT COALESCE(SUM(archive_size),0) FROM solver_continuations"
+                ).fetchone()[0]
+                physical_global = 0
+                physical_owner = 0
+                for retained in self.continuations_dir.iterdir():
+                    if not _ID.fullmatch(retained.name) or retained.is_symlink() or not retained.is_dir():
+                        continue
+                    archive = retained / "snapshot.tar.gz"
+                    try:
+                        details = archive.lstat()
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(details.st_mode):
+                        continue
+                    physical_global += details.st_size
+                    owner_row = db.execute(
+                        "SELECT owner_user_id FROM solver_jobs WHERE id=?",
+                        (retained.name,),
+                    ).fetchone()
+                    if owner_row and owner_row["owner_user_id"] == job["owner_user_id"]:
+                        physical_owner += details.st_size
+                incoming = 0 if destination.exists() else archive_size
+                if (
+                    owner_bytes - old_size + archive_size > _MAX_OWNER_CONTINUATIONS_BYTES
+                    or global_bytes - old_size + archive_size > _MAX_GLOBAL_CONTINUATIONS_BYTES
+                    or physical_owner + incoming > _MAX_OWNER_CONTINUATIONS_BYTES
+                    or physical_global + incoming > _MAX_GLOBAL_CONTINUATIONS_BYTES
+                ):
+                    return None
+                if (
+                    self.storage_budget._free() - self.storage_budget._total(db)
+                    < self.storage_budget.minimum_free_bytes
+                ):
+                    return None
+                if source_present:
+                    if destination.exists():
+                        previous, _ = _continuation_bundle(destination, provider=job["provider"])
+                        if previous != metadata:
+                            return None
+                    else:
+                        if destination.is_symlink() or source.resolve().parent != active.resolve():
+                            return None
+                        os.replace(source, destination)
+                        _fsync(active)
+                        _fsync(self.continuations_dir)
+                db.execute(
+                    """INSERT INTO solver_continuations
+                           (challenge_id,workspace_id,owner_user_id,source_job_id,input_sha256,
+                            archive_sha256,archive_size,session_id,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(challenge_id) DO UPDATE SET
+                         workspace_id=excluded.workspace_id,
+                         owner_user_id=excluded.owner_user_id,
+                         source_job_id=excluded.source_job_id,
+                         input_sha256=excluded.input_sha256,
+                         archive_sha256=excluded.archive_sha256,
+                         archive_size=excluded.archive_size,
+                         session_id=excluded.session_id,
+                         created_at=excluded.created_at""",
+                    (
+                        job["challenge_id"], job["workspace_id"], job["owner_user_id"],
+                        job["id"], input_sha256, metadata["archive_sha256"],
+                        archive_size, metadata["session_id"], self.clock(),
+                    ),
+                )
+            return metadata
+        except (OSError, ExchangeError, StorageBudgetError, sqlite3.Error):
+            # A native snapshot is optional. The bounded checkpoint remains
+            # available, including when a full session exceeds disk capacity.
+            return None
+
+    def prune_continuations(self) -> None:
+        """Remove only stale, unreferenced bundles in the dedicated private store."""
+
+        with self.storage_budget.exclusive():
+            self._prune_continuations_locked()
+
+    def _prune_continuations_locked(self) -> None:
+
+        with self._connect() as db:
+            referenced = {
+                row[0] for row in db.execute("SELECT source_job_id FROM solver_continuations")
+            }
+            referenced.update(
+                row[0] for row in db.execute(
+                    "SELECT continuation_source_job_id FROM solver_jobs "
+                    "WHERE continuation_source_job_id IS NOT NULL AND status IN "
+                    "('queued','staging','awaiting_credential','running','flag_found','writing','cleanup_blocked')"
+                )
+            )
+        threshold = self.clock() - 120.0
+        for path in self.continuations_dir.iterdir():
+            if path.name in referenced or not _ID.fullmatch(path.name):
+                continue
+            try:
+                if path.lstat().st_mtime > threshold:
+                    continue
+                if path.is_symlink():
+                    path.unlink()
+                    _fsync(self.continuations_dir)
+                elif path.is_dir():
+                    _safe_remove_tree(path, self.continuations_dir)
+            except OSError:
+                continue
 
     def _recover_orphan_active(self, active: Path) -> bool:
         if active.is_symlink() or not active.is_dir() or active.resolve().parent != self.exchange.resolve():
@@ -2669,6 +2912,77 @@ class SolverExchangeCoordinator:
         self.last_block = ExchangeError("orphan_active_job", "소유 정보를 확인할 수 없는 solver 작업이 남아 새 작업을 차단했습니다.", category="safety").public(stage="worker")
         return False
 
+    def _continuation_for_stage(
+        self, job: Mapping[str, Any]
+    ) -> tuple[Path, dict[str, Any], int, str] | None:
+        source_id = job.get("continuation_source_job_id")
+        if job.get("job_mode") != "solve" or not isinstance(source_id, str) or not _ID.fullmatch(source_id):
+            return None
+        with self._connect() as db:
+            saved = db.execute(
+                """SELECT * FROM solver_continuations
+                   WHERE source_job_id=? AND owner_user_id=? AND workspace_id=?
+                     AND challenge_id=?""",
+                (source_id, job["owner_user_id"], job["workspace_id"],
+                 job["challenge_id"]),
+            ).fetchone()
+            source = db.execute(
+                """SELECT * FROM solver_jobs WHERE id=? AND owner_user_id=?
+                     AND workspace_id=? AND challenge_id=? AND released_ingested=1""",
+                (source_id, job["owner_user_id"], job["workspace_id"], job["challenge_id"]),
+            ).fetchone()
+        if not saved or not source or source["challenge_input_sha256"] != saved["input_sha256"]:
+            return None
+        exact_input = saved["input_sha256"] == job["challenge_input_sha256"]
+        if not exact_input:
+            try:
+                checkpoint = decode_checkpoint(job.get("retry_checkpoint_json"))
+            except (TypeError, ValueError):
+                return None
+            if not (
+                checkpoint and checkpoint.reason == "needs_remote"
+                and source["challenge_base_sha256"] == job["challenge_base_sha256"]
+                and source["remote_mode"] in {"unknown", "none", "endpoint"}
+                and job["remote_mode"] in {"none", "endpoint"}
+                and job["continuation_mode"] == "workspace"
+            ):
+                return None
+        location = self.continuations_dir / source_id
+        try:
+            metadata, size = _continuation_bundle(location, provider=source["provider"])
+        except ExchangeError:
+            return None
+        if (
+            metadata["input_sha256"] != saved["input_sha256"]
+            or metadata["archive_sha256"] != saved["archive_sha256"]
+            or size != saved["archive_size"]
+            or metadata["session_id"] != saved["session_id"]
+        ):
+            return None
+        mode = "session" if exact_input and job["continuation_mode"] == "session" and metadata["session_id"] else "workspace"
+        staged_meta = dict(metadata)
+        if not exact_input:
+            # Only the workdir is restored when a confirmed needs_remote URL
+            # changes the full input digest. Rebind the copied control record
+            # to the current problem input after owner/base/archive checks.
+            staged_meta["input_sha256"] = job["challenge_input_sha256"]
+        return location, staged_meta, size, mode
+
+    def _downgrade_continuation(self, job: Mapping[str, Any]) -> None:
+        fallback = "checkpoint" if job.get("retry_checkpoint_json") else "fresh"
+        with self._connect() as db:
+            source = db.execute(
+                """SELECT source_job_id FROM solver_retry_checkpoints
+                   WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?""",
+                (job["owner_user_id"], job["workspace_id"], job["challenge_id"]),
+            ).fetchone()
+            db.execute(
+                """UPDATE solver_jobs SET continuation_mode=?,continuation_source_job_id=?,
+                   continuation_confirmed=0,updated_at=? WHERE id=?""",
+                (fallback, source["source_job_id"] if fallback == "checkpoint" and source else None,
+                 self.clock(), job["id"]),
+            )
+
     def _stage_initial(self, job: Mapping[str, Any], worker_instance_id: str) -> None:
         active = self.exchange / "active"
         if active.exists():
@@ -2691,26 +3005,42 @@ class SolverExchangeCoordinator:
                 maximum_size=MAX_AUTH_BYTES,
                 require_private=True,
             )
+            continuation = self._continuation_for_stage(job)
+            if continuation is not None and continuation[3] == "workspace" and job["continuation_mode"] == "session":
+                with self._connect() as db:
+                    db.execute(
+                        "UPDATE solver_jobs SET continuation_mode='workspace',continuation_confirmed=0,updated_at=? WHERE id=?",
+                        (self.clock(), job["id"]),
+                    )
+            continuation_bytes = continuation[2] + _MAX_CONTINUATION_META_BYTES if continuation else 0
             total = _checked_total(
                 attachment_bytes,
                 auth_size,
                 len(source_writeup_bytes),
                 _STAGE_CONTROL_RESERVE,
+                continuation_bytes,
             )
 
             def prepare_stage() -> None:
                 staging.mkdir(mode=0o700)
                 (staging / "challenge").mkdir(mode=0o700)
 
-            self.storage_budget.reserve(
-                reservation,
-                "solver",
-                job["owner_user_id"],
-                job["workspace_id"],
-                job["challenge_id"],
-                total,
-                prepare=prepare_stage,
-            )
+            try:
+                self.storage_budget.reserve(
+                    reservation, "solver", job["owner_user_id"], job["workspace_id"],
+                    job["challenge_id"], total, prepare=prepare_stage,
+                )
+            except StorageBudgetError:
+                if continuation is None:
+                    raise
+                continuation = None
+                total -= continuation_bytes
+                self.storage_budget.reserve(
+                    reservation, "solver", job["owner_user_id"], job["workspace_id"],
+                    job["challenge_id"], total, prepare=prepare_stage,
+                )
+            if continuation is None and job.get("continuation_source_job_id"):
+                self._downgrade_continuation(job)
             challenge = staging / "challenge"
             self._copy_attachments(job["id"], job["workspace_id"], job["challenge_id"], attachments, challenge)
             _write_json_file(staging / "attachment-index.json", {"ids": [row["id"] for row in attachments]})
@@ -2736,6 +3066,25 @@ class SolverExchangeCoordinator:
 
             self.storage_budget.commit_reserved_write(reservation, auth_size, copy_auth)
             digest = digest_box["value"]
+            if continuation is not None:
+                source_dir, metadata, archive_size, restore_mode = continuation
+                transfer = staging / "continuation-input"
+                try:
+                    transfer.mkdir(mode=0o700)
+                    copied_digest = _copy_regular_file(
+                        source_dir / "snapshot.tar.gz", transfer / "snapshot.tar.gz",
+                        expected_size=archive_size, cancelled=lambda: self._is_cancelled(job["id"]),
+                        maximum_size=_MAX_CONTINUATION_BYTES, space_reserved=True,
+                        return_digest=True, source_root=source_dir,
+                    )
+                    if not secrets.compare_digest(copied_digest, metadata["archive_sha256"]):
+                        raise ExchangeError("invalid_continuation_snapshot", "The saved solver session changed during staging.", category="safety")
+                    _write_json_file(transfer / "meta.json", metadata)
+                    _write_json_file(transfer / "mode.json", {"version": 1, "mode": restore_mode})
+                except (OSError, ExchangeError, StorageBudgetError):
+                    _safe_remove_tree(transfer, staging)
+                    continuation = None
+                    self._downgrade_continuation(job)
             configuration = ModelConfiguration(
                 provider=job["provider"],
                 model=job["model"],
@@ -2790,6 +3139,7 @@ class SolverExchangeCoordinator:
                     "network_enabled": not is_refinement,
                     "network_policy": "offline" if is_refinement else "general_internet",
                     "retry_checkpoint": retry_checkpoint.payload() if retry_checkpoint else None,
+                    "challenge_input_sha256": job["challenge_input_sha256"],
                 }
             if is_refinement:
                 manifest["refinement_context"] = {
@@ -3325,6 +3675,30 @@ class SolverExchangeCoordinator:
                     writeup_hooked=1,
                     cancel_requested=1,
                 )
+            elif kind == "progress" and event.get("code") in {
+                "continuation_restored", "session_resumed", "workspace_restored", "continuation_fallback"
+            }:
+                code = event["code"]
+                if code == "session_resumed":
+                    if current["continuation_mode"] != "session":
+                        raise ExchangeError("invalid_worker_event", "Unexpected session resume confirmation.", category="safety")
+                    updates["continuation_confirmed"] = 1
+                elif code == "workspace_restored":
+                    updates.update(continuation_mode="workspace", continuation_confirmed=0)
+                elif code == "continuation_fallback":
+                    checkpoint_source = db.execute(
+                        """SELECT source_job_id FROM solver_retry_checkpoints
+                           WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?""",
+                        (current["owner_user_id"], current["workspace_id"], current["challenge_id"]),
+                    ).fetchone()
+                    updates.update(
+                        continuation_mode="checkpoint" if current["retry_checkpoint_json"] else "fresh",
+                        continuation_source_job_id=(
+                            checkpoint_source["source_job_id"]
+                            if current["retry_checkpoint_json"] and checkpoint_source else None
+                        ),
+                        continuation_confirmed=0,
+                    )
             elif kind == "progress" and event.get("code") == "reasoning_escalated":
                 if (
                     current["job_mode"] != "solve"
@@ -4031,6 +4405,7 @@ class SolverCoordinatorPool:
         self._hook_future: concurrent.futures.Future[bool] | None = None
         self._hook_block: dict[str, Any] | None = None
         self._stopping = False
+        self._continuation_prune_at = 0.0
         self._write_capacity_control(open_jobs=0)
 
     def _ensure_coordinators(self, count: int) -> None:
@@ -4518,6 +4893,14 @@ class SolverCoordinatorPool:
                         "solver 알림 처리를 다시 시도합니다.",
                         retryable=True,
                     ).public(stage="coordinator")
+        if time.monotonic() >= self._continuation_prune_at:
+            self._continuation_prune_at = time.monotonic() + 60.0
+            try:
+                self.primary.prune_continuations()
+            except (OSError, sqlite3.Error, ExchangeError):
+                # A later tick retries stale bundle cleanup. Never interrupt
+                # an active solve because an old snapshot could not be pruned.
+                pass
         blocks = [
             item.last_block
             for item in self.coordinators[: self.max_concurrent]
@@ -4820,6 +5203,9 @@ def _public_job(
         "challenge_id": row["challenge_id"],
         "account_label": row["account_label"],
         "status": row["status"],
+        "continuation_mode": row["continuation_mode"],
+        "continuation_source_job_id": row["continuation_source_job_id"],
+        "continuation_confirmed": bool(row["continuation_confirmed"]),
         "cancel_requested": bool(row["cancel_requested"]),
         "configuration": {
             "provider": row["provider"],
@@ -4964,6 +5350,7 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
         "provider_quota_retry", "provider_rate_limit_retry",
         "provider_overloaded_retry", "provider_connection_retry",
         "provider_retrying", "reasoning_escalated", "researching",
+        "continuation_restored", "session_resumed", "workspace_restored", "continuation_fallback",
     }:
         raise ExchangeError("invalid_worker_event", "worker 진행 이벤트를 확인할 수 없습니다.", category="safety")
     if kind == "progress":
@@ -5203,6 +5590,67 @@ def _regular_file_size(source: Path, *, maximum_size: int, require_private: bool
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _continuation_bundle(directory: Path, *, provider: str | None = None) -> tuple[dict[str, Any], int]:
+    """Validate the small worker handoff without extracting untrusted archive data."""
+
+    try:
+        directory_stat = directory.lstat()
+        if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
+            raise ValueError("continuation directory is not regular")
+        if {entry.name for entry in directory.iterdir()} != {"meta.json", "snapshot.tar.gz"}:
+            raise ValueError("continuation file set is invalid")
+        meta_path = directory / "meta.json"
+        meta_stat = meta_path.lstat()
+        if not stat.S_ISREG(meta_stat.st_mode) or meta_stat.st_nlink != 1 or meta_stat.st_size > _MAX_CONTINUATION_META_BYTES:
+            raise ValueError("continuation metadata is invalid")
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict) or set(metadata) != {
+            "version", "provider", "session_id", "scratch_name", "workdir_rel",
+            "archive_sha256", "archive_size", "input_sha256",
+        }:
+            raise ValueError("continuation metadata fields are invalid")
+        if (
+            type(metadata["version"]) is not int
+            or metadata["version"] != 1
+            or metadata["provider"] not in {"codex", "claude"}
+            or (provider is not None and metadata["provider"] != provider)
+            or not isinstance(metadata["session_id"], str)
+            or (metadata["session_id"] != "" and not _CONTINUATION_SESSION.fullmatch(metadata["session_id"]))
+            or not isinstance(metadata["scratch_name"], str)
+            or not _CONTINUATION_SCRATCH.fullmatch(metadata["scratch_name"])
+            or metadata["workdir_rel"] != _CONTINUATION_WORKDIR
+            or not isinstance(metadata["archive_sha256"], str)
+            or not _SHA256.fullmatch(metadata["archive_sha256"])
+            or not isinstance(metadata["input_sha256"], str)
+            or not _SHA256.fullmatch(metadata["input_sha256"])
+            or type(metadata["archive_size"]) is not int
+            or not 1 <= metadata["archive_size"] <= _MAX_CONTINUATION_BYTES
+        ):
+            raise ValueError("continuation metadata values are invalid")
+        archive = directory / "snapshot.tar.gz"
+        descriptor = os.open(archive, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_nlink != 1
+                or details.st_size != metadata["archive_size"]
+            ):
+                raise ValueError("continuation archive is invalid")
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            if not secrets.compare_digest(digest.hexdigest(), metadata["archive_sha256"]):
+                raise ValueError("continuation archive digest differs")
+        finally:
+            os.close(descriptor)
+        return metadata, details.st_size
+    except (OSError, ValueError, TypeError, UnicodeError) as exc:
+        raise ExchangeError(
+            "invalid_continuation_snapshot", "The saved solver session could not be verified.", category="safety"
+        ) from exc
 
 
 def _runtime_files(root: Path, version: str,

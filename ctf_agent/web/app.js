@@ -210,6 +210,8 @@ const solverProgress = {
   provider_quota_retry:'계정 사용량 제한 확인',provider_rate_limit_retry:'공급자 요청 제한 재시도',
   provider_overloaded_retry:'공급자 과부하 재시도',provider_connection_retry:'공급자 연결 재시도',
   provider_retrying:'공급자 응답 재시도',reasoning_escalated:'추론 max 자동 승격',
+  continuation_restored:'이전 작업 파일 복원',session_resumed:'이전 세션 재개',
+  workspace_restored:'이전 작업 파일 복원',continuation_fallback:'이전 분석으로 전환',
 };
 const solverTerminalPhases = new Set(['completed','cancelled','failed','refused','needs_input']);
 const writeupRefinementInstructionLimit = 12 * 1024;
@@ -793,6 +795,43 @@ function solverProviderSelector() {
   </div>`;
 }
 
+function solverContinuationMarkup(job) {
+  if (!job) return '';
+  const mode = job.continuation_mode;
+  const retryCount = Number(job.retry_checkpoint?.rejected_count || 0);
+  const checkpointReason = job.retry_checkpoint?.reason;
+  const checkpointLabels = {rejected_flag:'오답',needs_remote:'원격 정보 요청',timeout:'시간 제한',cancelled:'사용자 중단',provider_failure:'모델 오류',turn_limit:'풀이 회차 종료',ultra_escalation:'Ultra 전환'};
+  const legacy = job.retry_checkpoint
+    ? `${i18n.t('체크포인트')} · ${i18n.t(checkpointLabels[checkpointReason] || '이전 작업')}${retryCount ? ` · ${i18n.locale === 'en' ? `${retryCount} incorrect flags` : `오답 ${retryCount}개`}` : ''}`
+    : '';
+  if (!['fresh','checkpoint','workspace','session'].includes(mode)) {
+    return legacy ? `<p class="notice muted solver-retry-context">${esc(legacy)}</p>` : '';
+  }
+  if (mode === 'fresh' && !job.retry_checkpoint && !job.continuation_source_job_id) return '';
+  const waiting = ['queued','staging','awaiting_credential','validating'].includes(job.phase);
+  let label = '새 세션';
+  if (mode === 'checkpoint') label = waiting ? '이전 분석 복원 준비 중' : '이전 분석으로 이어감';
+  if (mode === 'workspace') label = waiting ? '이전 작업 파일 복원 준비 중' : '이전 작업 파일로 이어감';
+  if (mode === 'session') label = (job.continuation_confirmed === true || job.continuation_confirmed === 1)
+    ? '동일 세션 이어감'
+    : waiting ? '동일 세션 재개 준비 중' : solverTerminalPhases.has(job.phase) ? '동일 세션 재개 미확인' : '동일 세션 재개 확인 중';
+  const details = legacy ? `<span>${esc(legacy)}</span>` : '';
+  return `<p class="solver-continuation solver-continuation-${mode}"><strong>${esc(i18n.t(label))}</strong>${details}</p>`;
+}
+
+function refreshSolverContinuation(panel, job) {
+  const markup = solverContinuationMarkup(job);
+  const current = panel.querySelector('.solver-continuation, .solver-retry-context');
+  if (current) {
+    if (markup) current.outerHTML = markup;
+    else current.remove();
+    return;
+  }
+  if (!markup) return;
+  const anchor = panel.querySelector('.solver-model') || panel.querySelector('.solver-panel-head');
+  anchor?.insertAdjacentHTML('afterend',markup);
+}
+
 function solverPanelMarkup(job, events = [], loading = false) {
   if (loading) return '<div class="solver-panel-head"><h3>문제 풀이</h3><span class="connection-state">확인 중</span></div>';
   const writeup = job?.flag_rejected ? '' : solverWriteup(job);
@@ -808,9 +847,6 @@ function solverPanelMarkup(job, events = [], loading = false) {
   const modelText = [job.account_label, model.provider, model.model, model.reasoning_effort && `${i18n.t('추론')} ${model.reasoning_effort}`, model.ultracode ? 'Ultracode' : null, model.service_tier === 'fast' ? 'Fast 1.5×' : null].filter(Boolean).join(' · ');
   const flag = typeof job.flag === 'string' && job.flag ? job.flag : '';
   const usableFlag = flag && !job.flag_rejected;
-  const retryCount = Number(job.retry_checkpoint?.rejected_count || 0);
-  const checkpointReason = job.retry_checkpoint?.reason;
-  const checkpointLabels = {rejected_flag:'오답',needs_remote:'원격 정보 요청',timeout:'시간 제한',cancelled:'사용자 중단',provider_failure:'모델 오류',turn_limit:'풀이 회차 종료',ultra_escalation:'Ultra 전환'};
   const controls = active
     ? `<button class="danger" data-action="cancel-solver" ${job.cancel_requested ? 'disabled' : ''}>${job.cancel_requested ? '중단 처리 중' : '풀이 중단'}</button>`
     : job.error?.code === 'ultra_escalation_requested'
@@ -825,7 +861,7 @@ function solverPanelMarkup(job, events = [], loading = false) {
   return `<div class="solver-panel-head"><h3>문제 풀이</h3><span class="solver-phase solver-phase-${esc(job.phase)}">${esc(active && job.cancel_requested ? '중단 요청 중' : (solverPhases[job.phase] || job.phase))}</span></div>
     ${modelText ? `<p class="solver-model">${esc(modelText)}</p>` : ''}
     ${job.network_policy === 'general_internet' ? '<p class="form-hint solver-limit">인터넷 사용 가능</p>' : ''}
-    ${job.retry_checkpoint ? `<p class="notice muted solver-retry-context">체크포인트 · ${esc(checkpointLabels[checkpointReason] || '이전 작업')}${retryCount ? ` · 오답 ${retryCount}개` : ''}</p>` : ''}
+    ${solverContinuationMarkup(job)}
     ${job.phase === 'queued' && Number.isFinite(Number(job.queue_position)) ? `<p class="form-hint">대기 순서 ${Math.max(1,Number(job.queue_position))}번째</p>` : ''}
     ${progressText ? `<div class="solver-progress"><span>${esc(progressText)}</span>${Number.isFinite(percent) ? `<progress max="100" value="${Math.max(0,Math.min(100,percent))}" aria-label="${esc(progressText)} 진행률"></progress>` : ''}</div>` : ''}
     ${usableFlag ? `<div class="solver-artifact solver-flag-found" role="status" aria-live="assertive"><strong>Flag를 발견했습니다</strong><code>${esc(flag)}</code><div class="actions"><button type="button" class="small ghost icon-action" data-action="copy-solver-flag" aria-label="Flag 복사" title="Flag 복사">⚑</button>${!active && currentChallenge?.completion_source !== 'manual' ? '<button type="button" class="small danger ghost" data-action="reject-solver-flag">오답으로 제외</button>' : ''}</div></div>` : ''}
@@ -1672,6 +1708,7 @@ function paintSolver(job, events, workspaceId, challengeId, generation, guidance
   const guidanceFocused = document.activeElement?.id === 'solver-guidance-message' && solverIsActive(job);
   if (!guidanceFocused) panel.innerHTML = solverPanelMarkup(job,currentSolverEvents);
   else {
+    refreshSolverContinuation(panel,job);
     const console = panel.querySelector('.solver-live-console');
     if (console) console.innerHTML = solverEventMarkup(currentSolverEvents);
     const count = panel.querySelector('.solver-session-log summary b');
