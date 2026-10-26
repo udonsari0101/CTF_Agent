@@ -241,20 +241,20 @@ class TelegramService:
 
     async def start(self) -> None:
         self.start_count += 1
-        if self.client:
+        if self.start_count > 1:
             return
         self.bot_username = ""
         self.identity_verified = False
         self.configuration_error = None
         self.loop = asyncio.get_running_loop()
         self.wakeup = asyncio.Event()
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10))
         if self.token:
             try:
                 await self._discover_bot_identity()
             except TelegramAPIError as error:
                 self.configuration_error = error.code
-                await self.client.aclose()
+                if self.client:
+                    await self.client.aclose()
                 self.client = None
                 self.loop = None
                 return
@@ -314,7 +314,7 @@ class TelegramService:
 
     async def _api(self, method: str, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
         if not self.client:
-            raise TelegramAPIError("client_unavailable")
+            self.client = httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10))
         bot_token = token if token is not None else self.token
         if not bot_token:
             raise TelegramAPIError("bot_not_configured")
