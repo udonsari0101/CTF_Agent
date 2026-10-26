@@ -4467,6 +4467,7 @@ class ClaudePrintDriver(CodexAppServer):
             else {
                 **self.SETTINGS,
                 "ultracode": ultracode,
+                "disableWorkflows": not ultracode,
                 "permissions": {
                     **self.SETTINGS["permissions"],
                     "allow": list(allowed_tools),
