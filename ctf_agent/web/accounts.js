@@ -243,6 +243,7 @@ export async function renderAccounts(container, api, options = {}) {
     const model = el('select'); model.setAttribute('aria-label', '모델');
     const effort = el('select'); effort.setAttribute('aria-label', '추론 수준');
     const tier = el('select'); tier.setAttribute('aria-label', '응답 속도');
+    const ultracode = el('input'); ultracode.type = 'checkbox'; ultracode.setAttribute('aria-label', 'Ultracode');
     const help = el('div', undefined, 'model-help');
     model.append(Object.assign(el('option', '계정 기본 모델'), {value: ''}));
     for (const item of data.models) {
@@ -255,10 +256,12 @@ export async function renderAccounts(container, api, options = {}) {
       const efforts = selected?.supportedReasoningEfforts || [];
       const desiredEffort = model.value === account.model ? account.reasoning_effort : selected?.defaultReasoningEffort;
       for (const value of efforts) {
-        const option = el('option', value.reasoningEffort === 'ultracode' ? 'Ultracode · xhigh' : value.reasoningEffort); option.value = value.reasoningEffort;
+        const option = el('option', value.reasoningEffort); option.value = value.reasoningEffort;
         option.selected = value.reasoningEffort === desiredEffort; effort.append(option);
       }
       effort.disabled = !selected;
+      ultracode.disabled = account.provider !== 'claude' || selected?.supportsUltracode !== true;
+      ultracode.checked = !ultracode.disabled && model.value === account.model && account.ultracode === true;
       tier.replaceChildren(Object.assign(el('option', '기본 속도'), {value: ''}));
       const fast = selected?.serviceTiers?.find(item => item.id === 'fast');
       if (fast) tier.append(Object.assign(el('option', fast.name || '1.5배 Fast'), {value: 'fast', selected: model.value === account.model && account.service_tier === 'fast'}));
@@ -282,9 +285,15 @@ export async function renderAccounts(container, api, options = {}) {
     const effortField = el('label', '추론 수준'); effortField.append(effort);
     const tierField = el('label', '응답 속도'); tierField.append(tier);
     const fields = el('div', undefined, 'model-fields'); fields.append(modelField,effortField,tierField);
+    if (account.provider === 'claude') {
+      const ultracodeField = el('label', undefined, 'model-ultracode-toggle');
+      ultracodeField.append(ultracode, el('span', 'Ultracode'));
+      fields.append(ultracodeField);
+    }
     const save = button('모델 설정 저장', async () => {
       await api(`/api/accounts/${account.id}`, {method: 'PATCH', body: {model: model.value || null,
-        reasoning_effort: model.value && effort.value || null, service_tier: model.value && tier.value || null}});
+        reasoning_effort: model.value && effort.value || null, service_tier: model.value && tier.value || null,
+        ultracode: account.provider === 'claude' && ultracode.checked}});
       await load();
     });
     save.className = 'model-save';
@@ -329,6 +338,7 @@ export async function renderAccounts(container, api, options = {}) {
       const identity = snapshot.identity || {};
       const modelSummary = [`${i18n.t('모델')}: ${account.model || i18n.t('계정 기본')}`, `${i18n.t('추론')}: ${account.reasoning_effort || i18n.t('계정 기본')}`,
         `${i18n.t('속도')}: ${account.service_tier === 'fast' ? 'Fast 1.5×' : i18n.t('기본')}`];
+      if (account.provider === 'claude') modelSummary.push(`Ultracode: ${account.ultracode ? (i18n.locale === 'en' ? 'On' : '켜짐') : (i18n.locale === 'en' ? 'Off' : '꺼짐')}`);
       card.append(el('p', [i18n.t(labels[snapshot.status] || '아직 조회하지 않음'), identity.email,
         identity.planType || identity.subscriptionType].filter(Boolean).join(' · ')));
       if (snapshot.message) card.append(el('p', snapshot.message));

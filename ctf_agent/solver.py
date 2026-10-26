@@ -192,6 +192,7 @@ class ModelConfiguration:
     model: str
     reasoning_effort: str
     service_tier: str | None = None
+    ultracode: bool = False
 
     def __post_init__(self) -> None:
         for name, value, maximum in (
@@ -201,20 +202,27 @@ class ModelConfiguration:
         ):
             if not isinstance(value, str) or len(value) > maximum or not _SAFE_SETTING.fullmatch(value):
                 raise ValueError(f"invalid {name}")
+        if self.reasoning_effort == "ultracode":
+            raise ValueError("ultracode is separate from reasoning effort")
         if self.service_tier is not None and (
             not isinstance(self.service_tier, str)
             or len(self.service_tier) > 40
             or not _SAFE_SETTING.fullmatch(self.service_tier)
         ):
             raise ValueError("invalid service_tier")
+        if type(self.ultracode) is not bool or (self.ultracode and self.provider != "claude"):
+            raise ValueError("invalid ultracode")
 
-    def public(self) -> dict[str, str | None]:
-        return {
+    def public(self) -> dict[str, str | bool | None]:
+        result: dict[str, str | bool | None] = {
             "provider": self.provider,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "service_tier": self.service_tier,
         }
+        if self.ultracode:
+            result["ultracode"] = True
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +270,7 @@ class SelectedAccount:
                 model=str(values["model"]),
                 reasoning_effort=str(values["reasoning_effort"]),
                 service_tier=values.get("service_tier"),
+                ultracode=bool(values.get("ultracode", False)),
             ),
         )
 

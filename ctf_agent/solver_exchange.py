@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
     model TEXT NOT NULL,
     reasoning_effort TEXT NOT NULL,
+    ultracode INTEGER NOT NULL DEFAULT 0 CHECK(ultracode IN (0,1)),
     max_reasoning_available INTEGER NOT NULL DEFAULT 0 CHECK(max_reasoning_available IN (0,1)),
     service_tier TEXT,
     codex_version TEXT NOT NULL DEFAULT '0.164.0',
@@ -503,6 +504,15 @@ class SolverExchangeCoordinator:
                     "ALTER TABLE solver_jobs ADD COLUMN max_reasoning_available "
                     "INTEGER NOT NULL DEFAULT 0 CHECK(max_reasoning_available IN (0,1))"
                 )
+            if "ultracode" not in columns:
+                db.execute(
+                    "ALTER TABLE solver_jobs ADD COLUMN ultracode INTEGER NOT NULL "
+                    "DEFAULT 0 CHECK(ultracode IN (0,1))"
+                )
+            db.execute(
+                "UPDATE solver_jobs SET reasoning_effort='xhigh',ultracode=1 "
+                "WHERE provider='claude' AND reasoning_effort='ultracode'"
+            )
             guidance_columns = {row[1] for row in db.execute("PRAGMA table_info(solver_job_guidance)")}
             if "requested_delivery" not in guidance_columns:
                 db.execute(
@@ -1034,12 +1044,12 @@ class SolverExchangeCoordinator:
                 db.execute(
                     """INSERT INTO solver_jobs
                        (id,job_mode,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,model,
-                        reasoning_effort,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
+                        reasoning_effort,ultracode,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
                         retry_checkpoint_json,writeup_instruction,writeup_locale,source_writeup_sha256,source_solver_job_id,
                         challenge_input_sha256,challenge_base_sha256,remote_mode,status,previous_challenge_status,flag,private_notes,
                         solver_artifact_json,flag_hooked,created_at,updated_at)
                        VALUES(:id,:job_mode,:owner_user_id,:workspace_id,:challenge_id,:account_id,
-                               :account_label,:provider,:model,:reasoning_effort,:max_reasoning_available,:service_tier,:codex_version,
+                               :account_label,:provider,:model,:reasoning_effort,:ultracode,:max_reasoning_available,:service_tier,:codex_version,
                               :codex_runtime_sha256,:claude_version,:claude_runtime_sha256,:retry_checkpoint_json,
                               :writeup_instruction,:writeup_locale,:source_writeup_sha256,:source_solver_job_id,
                               :challenge_input_sha256,:challenge_base_sha256,:remote_mode,'queued',:previous_challenge_status,:flag,
@@ -1055,6 +1065,7 @@ class SolverExchangeCoordinator:
                         "provider": configuration.provider,
                         "model": configuration.model,
                         "reasoning_effort": configuration.reasoning_effort,
+                        "ultracode": int(configuration.ultracode),
                         "max_reasoning_available": int(
                             max_reasoning_available
                             and configuration.reasoning_effort not in {"max", "ultra"}
@@ -2540,6 +2551,7 @@ class SolverExchangeCoordinator:
                 model=job["model"],
                 reasoning_effort=job["reasoning_effort"],
                 service_tier=job["service_tier"],
+                ultracode=bool(job["ultracode"]),
             )
             try:
                 retry_checkpoint = decode_checkpoint(job.get("retry_checkpoint_json"))
@@ -4561,6 +4573,7 @@ def _public_job(
             "model": row["model"],
             "reasoning_effort": row["reasoning_effort"],
             "service_tier": row["service_tier"],
+            **({"ultracode": True} if row["ultracode"] else {}),
         },
         "max_reasoning_available": bool(row["max_reasoning_available"]),
         "runtime_version": row["claude_version"] if row["provider"] == "claude" else row["codex_version"],

@@ -285,7 +285,8 @@ class ClaudeAccount:
                         {"reasoningEffort": value}
                         for value in CLAUDE_EFFORTS
                         if value != "xhigh" or model in CLAUDE_ULTRACODE_MODELS
-                    ] + ([{"reasoningEffort": "ultracode"}] if model in CLAUDE_ULTRACODE_MODELS else []),
+                    ],
+                    "supportsUltracode": model in CLAUDE_ULTRACODE_MODELS,
                     "serviceTiers": [],
                 }
                 for model, label in CLAUDE_MODEL_ALIASES

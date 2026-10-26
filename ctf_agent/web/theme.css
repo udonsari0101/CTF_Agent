@@ -423,6 +423,10 @@ input:focus, textarea:focus, select:focus {
 .solver-provider-choice .form-hint { grid-column: 1 / -1; }
 .solver-provider-choice select { width: 100%; }
 .solver-configuration { align-content: start; }
+.solver-configuration .solver-ultracode-choice { grid-column: 1/-1; display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #315366; border-radius: 8px; background: #0b1821; color: #a4ddf5; }
+.solver-ultracode-choice input { width: auto; margin: 0; accent-color: #59c9f4; }
+.account-list .model-ultracode-toggle { display: flex; align-items: center; gap: 8px; grid-column: 1/-1; }
+.account-list .model-ultracode-toggle input { width: auto; margin: 0; accent-color: #59c9f4; }
 .solver-fast-placeholder { grid-column: 1/-1; display: block; min-height: 38px; }
 .solver-configuration-loading select { color: #58707a; }
 .solver-configuration-loading .solver-fast-placeholder {

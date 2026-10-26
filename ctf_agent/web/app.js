@@ -32,7 +32,7 @@ let relatedCandidates = [];
 let releaseUpdateTimer = null;
 let solverProvider = (() => { try { return localStorage.getItem('ctf-solver-provider') === 'claude' ? 'claude' : 'codex'; } catch { return 'codex'; } })();
 let solverAccounts = [], solverAccountId = '', solverModels = [], solverModel = '';
-let solverReasoning = '', solverServiceTier = null, solverOptionsState = 'idle', solverOptionsError = '';
+let solverReasoning = '', solverServiceTier = null, solverUltracode = false, solverOptionsState = 'idle', solverOptionsError = '';
 let solverOptionsGeneration = 0;
 let sidebarCollapsed = (() => { try { return localStorage.getItem('ctf-sidebar-collapsed') === 'true'; } catch { return false; } })();
 let solverLogExpanded = false, solverConsoleDialog = null;
@@ -286,7 +286,7 @@ function stopSolverPolling() {
   solverListedFlag = '';
   solverSyncedWriteup = '';
   solverAccounts = []; solverAccountId = ''; solverModels = []; solverModel = '';
-  solverReasoning = ''; solverServiceTier = null; solverOptionsState = 'idle'; solverOptionsError = '';
+  solverReasoning = ''; solverServiceTier = null; solverUltracode = false; solverOptionsState = 'idle'; solverOptionsError = '';
   writeupRefineJob = null; writeupRefineEvents = []; writeupRefineError = null; writeupRefineInstruction = '';
 }
 
@@ -640,13 +640,14 @@ function solverProviderSelector() {
   const modelOptions = solverModels.map(item => { const value = item.model || item.id; return value ? `<option value="${esc(value)}" ${value === solverModel ? 'selected' : ''}>${esc(item.displayName || value)}</option>` : ''; }).join('');
   const chosen = solverSelectedModel();
   const efforts = Array.isArray(chosen?.supportedReasoningEfforts) ? chosen.supportedReasoningEfforts.map(item => item?.reasoningEffort).filter(Boolean) : [];
-  const effortOptions = efforts.map(value => `<option value="${esc(value)}" ${value === solverReasoning ? 'selected' : ''}>${value === 'ultracode' ? 'Ultracode · xhigh' : esc(value)}</option>`).join('');
+  const effortOptions = efforts.map(value => `<option value="${esc(value)}" ${value === solverReasoning ? 'selected' : ''}>${esc(value)}</option>`).join('');
   const supportsFast = solverProvider === 'codex' && Array.isArray(chosen?.serviceTiers) && chosen.serviceTiers.some(item => item?.id === 'fast');
+  const supportsUltracode = solverProvider === 'claude' && chosen?.supportsUltracode === true;
   return `<div class="solver-configuration">${provider}
     <label>실행 계정<select id="solver-account-select" aria-label="문제 풀이 계정">${accountOptions}</select></label>
     <label>모델<select id="solver-model-select" aria-label="문제 풀이 모델" ${modelOptions ? '' : 'disabled'}>${modelOptions || '<option>사용 가능한 모델 없음</option>'}</select></label>
     <label>추론 수준<select id="solver-reasoning-select" aria-label="문제 풀이 추론 수준" ${effortOptions ? '' : 'disabled'}>${effortOptions || '<option>지원 정보 없음</option>'}</select></label>
-    ${supportsFast ? `<label class="solver-fast-choice"><input id="solver-fast-toggle" type="checkbox" ${solverServiceTier === 'fast' ? 'checked' : ''}>1.5배 Fast 실행</label>` : '<span class="solver-fast-placeholder" aria-hidden="true"></span>'}
+    ${supportsFast ? `<label class="solver-fast-choice"><input id="solver-fast-toggle" type="checkbox" ${solverServiceTier === 'fast' ? 'checked' : ''}>1.5배 Fast 실행</label>` : supportsUltracode ? `<label class="solver-ultracode-choice"><input id="solver-ultracode-toggle" type="checkbox" ${solverUltracode ? 'checked' : ''}>Ultracode</label>` : '<span class="solver-fast-placeholder" aria-hidden="true"></span>'}
     <span class="form-hint solver-config-help">이번 실행에만 적용</span>
   </div>`;
 }
@@ -663,7 +664,7 @@ function solverPanelMarkup(job, events = [], loading = false) {
   const progressCode = progress.code || job.progress_code;
   const percent = Number(progress.percent ?? job.percent);
   const progressText = progressCode ? (solverProgress[progressCode] || progressCode) : '';
-  const modelText = [job.account_label, model.provider, model.model, model.reasoning_effort && `${i18n.t('추론')} ${model.reasoning_effort}`, model.service_tier === 'fast' ? 'Fast 1.5×' : null].filter(Boolean).join(' · ');
+  const modelText = [job.account_label, model.provider, model.model, model.reasoning_effort && `${i18n.t('추론')} ${model.reasoning_effort}`, model.ultracode ? 'Ultracode' : null, model.service_tier === 'fast' ? 'Fast 1.5×' : null].filter(Boolean).join(' · ');
   const flag = typeof job.flag === 'string' && job.flag ? job.flag : '';
   const usableFlag = flag && !job.flag_rejected;
   const retryCount = Number(job.retry_checkpoint?.rejected_count || 0);
@@ -966,6 +967,7 @@ function challengeRunSummary(challenge) {
   const phase = run?.phase || run?.status;
   const parts = [run?.account_label, configuration.provider, configuration.model,
     configuration.reasoning_effort && `${i18n.t('추론')} ${configuration.reasoning_effort}`,
+    configuration.ultracode ? 'Ultracode' : null,
     configuration.service_tier === 'fast' ? 'Fast 1.5×' : null,
     phase && (solverPhases[phase] || statuses[phase] || phase)];
   return parts.filter(Boolean).map(esc).join('<span aria-hidden="true">/</span>');
@@ -1594,7 +1596,7 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
       || available[0]
       || null;
     solverAccountId = account?.id || '';
-    solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null;
+    solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null; solverUltracode = false;
     if (!account) {
       solverOptionsState = 'ready';
       repaintSolverConfiguration(workspaceId,challengeId,generation);
@@ -1616,10 +1618,12 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
       : efforts[0] || '';
     const tiers = Array.isArray(chosen?.serviceTiers) ? chosen.serviceTiers.map(item => item?.id).filter(Boolean) : [];
     solverServiceTier = account.service_tier === 'fast' && tiers.includes('fast') ? 'fast' : null;
+    solverUltracode = solverProvider === 'claude' && chosen?.supportsUltracode === true
+      && (chosen.model || chosen.id) === account.model && account.ultracode === true;
     solverOptionsState = 'ready';
   } catch (error) {
     if (!solverContext(workspaceId,challengeId,generation) || ticket !== solverOptionsGeneration) return;
-    solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null;
+    solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null; solverUltracode = false;
     solverOptionsState = 'error';
     solverOptionsError = error.message || '계정 설정을 불러오지 못했습니다.';
   }
@@ -1664,7 +1668,7 @@ async function startSolver() {
   try {
     const payload = await api(`/api/workspaces/${workspaceId}/challenges/${challengeId}/solver`,{method:'POST',body:{
       provider:solverProvider, account_id:solverAccountId, model:solverModel,
-      reasoning_effort:solverReasoning, service_tier:solverServiceTier, writeup_locale:i18n.locale,
+      reasoning_effort:solverReasoning, service_tier:solverServiceTier, ultracode:solverUltracode, writeup_locale:i18n.locale,
     }});
     if (payload.capacity?.warning && payload.capacity.warning_message) {
       toast(payload.capacity.warning_message);
@@ -1789,7 +1793,7 @@ async function startWriteupRefinement() {
   const input = document.querySelector('#writeup-refine-instruction');
   writeupRefineInstruction = normalizeWriteupRefinementInstruction(input ? input.value : writeupRefineInstruction);
   writeupRefineError = null;
-  const body = {provider:solverProvider,account_id:solverAccountId,model:solverModel,reasoning_effort:solverReasoning,service_tier:solverServiceTier,writeup_locale:i18n.locale};
+  const body = {provider:solverProvider,account_id:solverAccountId,model:solverModel,reasoning_effort:solverReasoning,service_tier:solverServiceTier,ultracode:solverUltracode,writeup_locale:i18n.locale};
   try {
     if (writeupRefinementInstructionBytes(writeupRefineInstruction) > writeupRefinementInstructionLimit) {
       const error = new Error('추가 요청은 UTF-8 기준 12 KiB 이하로 입력하세요.');
@@ -2800,6 +2804,7 @@ document.addEventListener('change', event => {
       : efforts[0] || '';
     const supportsFast = Array.isArray(chosen?.serviceTiers) && chosen.serviceTiers.some(item => item?.id === 'fast');
     if (!supportsFast) solverServiceTier = null;
+    if (solverProvider !== 'claude' || chosen?.supportsUltracode !== true) solverUltracode = false;
     repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
   }
   if (input.id === 'solver-reasoning-select') {
@@ -2807,6 +2812,9 @@ document.addEventListener('change', event => {
   }
   if (input.id === 'solver-fast-toggle') {
     solverServiceTier = input.checked ? 'fast' : null;
+  }
+  if (input.id === 'solver-ultracode-toggle') {
+    solverUltracode = input.checked;
   }
   if (input.id === 'category-filter') run(async () => { selectedCategory = input.value; await refreshChallenges(); });
   if (input.id === 'sort-order') run(async () => { selectedSort = input.value; await refreshChallenges(); });

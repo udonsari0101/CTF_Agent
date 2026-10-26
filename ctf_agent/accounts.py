@@ -36,6 +36,7 @@ class AccountUpdate(BaseModel):
     model: str | None = Field(default=None, max_length=200)
     reasoning_effort: str | None = Field(default=None, max_length=40)
     service_tier: Literal["fast"] | None = None
+    ultracode: bool = False
 
 
 class VersionInput(BaseModel):
@@ -82,7 +83,8 @@ class AccountManager:
                     id TEXT PRIMARY KEY, provider TEXT NOT NULL, label TEXT NOT NULL,
                     selected INTEGER NOT NULL DEFAULT 0, model TEXT, reasoning_effort TEXT,
                     snapshot TEXT, checked_at REAL, created_at REAL NOT NULL,
-                    owner_user_id TEXT NOT NULL DEFAULT 'legacy', service_tier TEXT
+                    owner_user_id TEXT NOT NULL DEFAULT 'legacy', service_tier TEXT,
+                    ultracode INTEGER NOT NULL DEFAULT 0 CHECK(ultracode IN (0,1))
                 );
                 CREATE TABLE IF NOT EXISTS account_lifecycle_blocks (
                     owner_user_id TEXT PRIMARY KEY,
@@ -98,11 +100,14 @@ class AccountManager:
                 db.execute("ALTER TABLE provider_accounts ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT 'legacy'")
             if "service_tier" not in columns:
                 db.execute("ALTER TABLE provider_accounts ADD COLUMN service_tier TEXT")
+            if "ultracode" not in columns:
+                db.execute("ALTER TABLE provider_accounts ADD COLUMN ultracode INTEGER NOT NULL DEFAULT 0 CHECK(ultracode IN (0,1))")
+            db.execute("UPDATE provider_accounts SET reasoning_effort='xhigh',ultracode=1 WHERE provider='claude' AND reasoning_effort='ultracode'")
             db.execute("UPDATE provider_accounts SET owner_user_id=? WHERE owner_user_id='legacy'", (self.legacy_owner_id,))
             db.execute("DROP INDEX IF EXISTS one_selected_account_per_provider")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_selected_account_per_owner_provider ON provider_accounts(owner_user_id,provider) WHERE selected=1")
             if has_meta:
-                db.execute("INSERT INTO meta(key,value) VALUES('accounts_schema_version','2') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                db.execute("INSERT INTO meta(key,value) VALUES('accounts_schema_version','3') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
         self._recover_lifecycle_blocks()
         self._cleanup_deleted_account_dirs()
 
@@ -174,6 +179,7 @@ class AccountManager:
             raise HTTPException(404, "계정을 찾을 수 없습니다.")
         result = dict(row)
         result["selected"] = bool(result["selected"])
+        result["ultracode"] = bool(result["ultracode"])
         result["snapshot"] = json.loads(result["snapshot"]) if result["snapshot"] else None
         result["stale"] = result["checked_at"] is None or time.time() - result["checked_at"] > 300
         adapter = self.adapters.get(account_id)
@@ -343,7 +349,7 @@ class AccountManager:
         account = self.get(account_id, owner_id)
         if "label" in values and (not values["label"] or not values["label"].strip()):
             raise HTTPException(422, "계정 이름을 입력해 주세요.")
-        if any(key in values for key in ("model", "reasoning_effort", "service_tier")):
+        if any(key in values for key in ("model", "reasoning_effort", "service_tier", "ultracode")):
             adapter = self.adapter(account_id, owner_id)
             if adapter.login.get("status") in ("starting", "pending"):
                 raise ProviderError("로그인을 마친 뒤 모델 설정을 변경해 주세요.", "busy", stage="model")
@@ -353,6 +359,9 @@ class AccountManager:
             model = values.get("model", account["model"])
             effort = values.get("reasoning_effort", account["reasoning_effort"])
             tier = values.get("service_tier", account["service_tier"])
+            ultracode = values.get("ultracode", account["ultracode"] if model == account["model"] else False)
+            if model != account["model"] and "ultracode" not in values:
+                values["ultracode"] = False
             if model:
                 chosen = next((item for item in response["models"] if model in (item.get("id"), item.get("model"))), None)
                 if not chosen:
@@ -362,14 +371,16 @@ class AccountManager:
                     raise HTTPException(422, "선택한 모델에서 지원하지 않는 추론 수준입니다.")
                 if tier and tier not in [item.get("id") for item in (chosen.get("serviceTiers") or [])]:
                     raise HTTPException(422, "이 계정과 모델에서 Fast 지원을 확인할 수 없습니다.")
-            elif effort or tier:
+                if ultracode and (account["provider"] != "claude" or chosen.get("supportsUltracode") is not True):
+                    raise HTTPException(422, "이 Claude 모델에서는 Ultracode를 사용할 수 없습니다.")
+            elif effort or tier or ultracode:
                 raise HTTPException(422, "모델을 먼저 선택해 주세요.")
         if values:
-            keys = [key for key in ("label", "model", "reasoning_effort", "service_tier") if key in values]
+            keys = [key for key in ("label", "model", "reasoning_effort", "service_tier", "ultracode") if key in values]
             with self.connect() as db:
                 db.execute(f"UPDATE provider_accounts SET {','.join(key + '=?' for key in keys)} WHERE id=?",
                            (*[values[key].strip() if isinstance(values[key], str) else values[key] for key in keys], account_id))
-            if any(key in values for key in ("model", "reasoning_effort", "service_tier")) and account_id in self.adapters:
+            if any(key in values for key in ("model", "reasoning_effort", "service_tier", "ultracode")) and account_id in self.adapters:
                 await self.adapters.pop(account_id).close()
         return self.get(account_id, owner_id)
 

@@ -574,6 +574,7 @@ class JobManifest:
             "provider",
             "model",
             "reasoning_effort",
+            "ultracode",
             "max_reasoning_available",
             "service_tier",
             "codex_version",
@@ -685,11 +686,17 @@ class JobManifest:
         ):
             raise WorkerRefusal("invalid_manifest", "원격 네트워크 정책 형식을 확인할 수 없습니다.")
         try:
+            legacy_ultracode = (
+                payload.get("provider") == "claude"
+                and payload.get("reasoning_effort") == "ultracode"
+                and "ultracode" not in payload
+            )
             configuration = ModelConfiguration(
                 provider=payload.get("provider"),
                 model=payload.get("model"),
-                reasoning_effort=payload.get("reasoning_effort"),
+                reasoning_effort="xhigh" if legacy_ultracode else payload.get("reasoning_effort"),
                 service_tier=payload.get("service_tier"),
+                ultracode=payload.get("ultracode", legacy_ultracode),
             )
         except (TypeError, ValueError) as exc:
             raise WorkerRefusal("invalid_manifest", "모델 설정 형식을 확인할 수 없습니다.") from exc
@@ -3837,7 +3844,7 @@ subagents when that can reduce wall-clock time. Keep a single owner for each
 file or remote action, collect the results, and continue the solve in this
 same workspace. Submit the verified flag through submit-flag yourself.
 """
-        elif getattr(configuration, "provider", None) == "claude" and getattr(configuration, "reasoning_effort", None) == "ultracode":
+        elif getattr(configuration, "provider", None) == "claude" and getattr(configuration, "ultracode", False):
             result_bridge += """
 
 Ultracode is enabled. Use Agent or Workflow subagents for independent
@@ -4281,7 +4288,7 @@ class ClaudePrintDriver(CodexAppServer):
                       "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
                       "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5",
                       "claude-sonnet-4-6", "claude-haiku-5-5", "claude-haiku-4-5-20251001"}
-    ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultracode"}
+    ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
     SETTINGS = {
         "permissions": {
             "defaultMode": "dontAsk",
@@ -4442,7 +4449,7 @@ class ClaudePrintDriver(CodexAppServer):
             raise WorkerRefusal("provider_session_mismatch", "Claude 작업 세션을 확인할 수 없습니다.")
         self.session_id = session
         writeup_only = getattr(manifest, "job_mode", "solve") == "writeup_refine"
-        ultracode = manifest.configuration.reasoning_effort == "ultracode" and not writeup_only
+        ultracode = manifest.configuration.ultracode and not writeup_only
         allowed_tools = () if writeup_only else (
             *self.ALLOWED_TOOLS, *(("Workflow",) if ultracode else ())
         )
@@ -4638,8 +4645,8 @@ class ClaudePrintDriver(CodexAppServer):
                     initialized
                     or event_session != session
                     or not self._model_matches(manifest.configuration.model, event.get("model"))
-                    or event.get("effort", "xhigh" if manifest.configuration.reasoning_effort == "ultracode" else manifest.configuration.reasoning_effort)
-                    != ("xhigh" if manifest.configuration.reasoning_effort == "ultracode" else manifest.configuration.reasoning_effort)
+                    or event.get("effort", manifest.configuration.reasoning_effort)
+                    != manifest.configuration.reasoning_effort
                 ):
                     raise WorkerRefusal("model_mismatch", "Claude가 선택한 모델과 다른 모델을 반환했습니다.", category="model")
                 if event.get("claude_code_version") != self.expected_version:
@@ -4651,7 +4658,7 @@ class ClaudePrintDriver(CodexAppServer):
                     *(
                         ()
                         if getattr(manifest, "job_mode", "solve") == "writeup_refine"
-                        else (*self.ALLOWED_TOOLS, *(("Workflow",) if manifest.configuration.reasoning_effort == "ultracode" else ()))
+                        else (*self.ALLOWED_TOOLS, *(("Workflow",) if manifest.configuration.ultracode else ()))
                     ),
                     "StructuredOutput",
                 }
@@ -4693,7 +4700,7 @@ class ClaudePrintDriver(CodexAppServer):
                             *(
                                 ()
                                 if getattr(manifest, "job_mode", "solve") == "writeup_refine"
-                                else (*self.ALLOWED_TOOLS, *(("Workflow",) if manifest.configuration.reasoning_effort == "ultracode" else ()))
+                                else (*self.ALLOWED_TOOLS, *(("Workflow",) if manifest.configuration.ultracode else ()))
                             ),
                             "StructuredOutput",
                         }

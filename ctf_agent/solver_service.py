@@ -37,6 +37,7 @@ class SolveInput(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=200)
     reasoning_effort: str | None = Field(default=None, min_length=1, max_length=40)
     service_tier: Literal["fast"] | None = None
+    ultracode: bool = False
     writeup_locale: Literal["ko", "en"] = "ko"
 
 
@@ -70,6 +71,7 @@ async def _validated_configuration_override(
         payload.model is not None
         or payload.reasoning_effort is not None
         or "service_tier" in fields
+        or "ultracode" in fields
     )
 
     listed = accounts.listing(owner_id).get("accounts", [])
@@ -142,12 +144,18 @@ async def _validated_configuration_override(
             service_tier = None
         else:
             service_tier = account.get("service_tier")
+        ultracode = (
+            payload.ultracode if "ultracode" in fields
+            else False if model_changed
+            else bool(account.get("ultracode", False))
+        )
         try:
             requested_configuration = ModelConfiguration(
                 provider=payload.provider,
                 model=model,
                 reasoning_effort=reasoning_effort,
                 service_tier=service_tier,
+                ultracode=ultracode,
             )
         except ValueError as exc:
             raise ExchangeError(
@@ -220,6 +228,12 @@ async def _validated_configuration_override(
         for item in (chosen.get("supportedReasoningEfforts") or [])
         if isinstance(item, Mapping) and isinstance(item.get("reasoningEffort"), str)
     }
+    if requested_configuration.ultracode and not chosen.get("supportsUltracode"):
+        raise ExchangeError(
+            "invalid_model_configuration",
+            "선택한 Claude 모델은 Ultracode를 지원하지 않습니다.",
+            category="model",
+        )
     if not has_override:
         return (
             None,
@@ -262,6 +276,7 @@ async def _validated_configuration_override(
             model=canonical_model,
             reasoning_effort=requested_configuration.reasoning_effort,
             service_tier=requested_configuration.service_tier,
+            ultracode=requested_configuration.ultracode,
         )
     except ValueError as exc:
         raise ExchangeError(
