@@ -23,6 +23,7 @@ import json
 import os
 import platform
 import re
+import select
 import secrets
 import signal
 import shutil
@@ -111,7 +112,14 @@ MAX_CLAUDE_PROMPT_BYTES = 10 * 1024 * 1024
 MAX_CLAUDE_STREAM_BYTES = 64 * 1024 * 1024
 MAX_CLAUDE_EVENTS = 20_000
 MAX_SOLVER_GUIDANCE_BYTES = 16 * 1024
+MAX_ULTRA_REQUEST_BYTES = 8 * 1024
 MAX_LIVE_ACTIVITY_EVENTS = 2_000
+# Keep the first part of a solve lossless, then reserve enough bounded slots
+# for one fresh UI update per minute during long-running work.
+LIVE_ACTIVITY_FULL_FIDELITY_EVENTS = 1_500
+LIVE_ACTIVITY_SAMPLE_INTERVAL_SECONDS = 60.0
+MAX_LIVE_AGENT_EVENTS = 256
+MAX_LIVE_AGENT_NODES = 64
 MAX_LIVE_COMMAND_BYTES = 2_048
 MAX_LIVE_OUTPUT_BYTES = 8 * 1_024
 MAX_LIVE_MESSAGE_BYTES = 4 * 1_024
@@ -540,9 +548,11 @@ class JobManifest:
     claude_version: str | None
     claude_runtime_sha256: str | None
     credential_file: str
+    auth_kind: str
     auth_sha256: str = field(repr=False)
     created_at: float
     deadline_unix: float | None
+    ultra_escalation_mode: str = "off"
     writeup_locale: str = "ko"
     related_context: str = field(default="", repr=False)
     network_enabled: bool = False
@@ -582,6 +592,8 @@ class JobManifest:
             "claude_version",
             "claude_runtime_sha256",
             "credential_file",
+            "auth_kind",
+            "ultra_escalation_mode",
             "auth_sha256",
             "max_seconds",
             "created_at",
@@ -712,8 +724,24 @@ class JobManifest:
             raise WorkerRefusal("invalid_manifest", "자동 추론 승격 설정을 확인할 수 없습니다.")
         if configuration.provider not in {"codex", "claude"}:
             raise WorkerRefusal("provider_not_supported", "지원하지 않는 공급자입니다.")
-        credential_file = payload.get("credential_file", "auth.json" if configuration.provider == "codex" else None)
-        if credential_file != ("auth.json" if configuration.provider == "codex" else ".credentials.json"):
+        auth_kind = payload.get("auth_kind", "oauth")
+        if auth_kind not in {"oauth", "api_key"}:
+            raise WorkerRefusal("invalid_manifest", "계정 인증 방식이 올바르지 않습니다.", category="auth")
+        ultra_mode = payload.get("ultra_escalation_mode", "off")
+        if ultra_mode not in {"off", "ask", "auto"} or (
+            ultra_mode != "off" and (
+                job_mode != "solve" or configuration.provider != "codex"
+                or configuration.reasoning_effort not in {"high", "xhigh"}
+            )
+        ):
+            raise WorkerRefusal("invalid_manifest", "Ultra 전환 설정을 확인할 수 없습니다.")
+        expected_credential = (
+            "auth.json" if configuration.provider == "codex"
+            else ".api-key" if auth_kind == "api_key"
+            else ".credentials.json"
+        )
+        credential_file = payload.get("credential_file", expected_credential)
+        if credential_file != expected_credential:
             raise WorkerRefusal("invalid_manifest", "인증 파일 교환 형식을 확인할 수 없습니다.")
         if configuration.provider == "claude":
             if not isinstance(claude_version, str) or not _VERSION.fullmatch(claude_version):
@@ -824,9 +852,11 @@ class JobManifest:
             claude_version=claude_version,
             claude_runtime_sha256=claude_runtime_digest,
             credential_file=credential_file,
+            auth_kind=auth_kind,
             auth_sha256=digest,
             created_at=float(created_at),
             deadline_unix=float(deadline) if deadline is not None else None,
+            ultra_escalation_mode=ultra_mode,
             network_enabled=network_enabled,
             network_policy=network_policy,
             retry_checkpoint=retry_checkpoint,
@@ -878,10 +908,22 @@ class ClaudeFileCredential:
         self.raw.clear()
 
 
+@dataclass(slots=True)
+class ClaudeApiCredential:
+    """An API key whose ownership moves to the private Claude driver."""
+
+    raw: bytearray = field(repr=False)
+
+    def erase(self) -> None:
+        for index in range(len(self.raw)):
+            self.raw[index] = 0
+        self.raw.clear()
+
+
 def _consume_staged_bytes(active: Path, expected_sha256: str, filename: str) -> bytearray:
     """Read one no-follow auth file, unlink it, fsync, then parse in memory."""
 
-    if filename not in {"auth.json", ".credentials.json"}:
+    if filename not in {"auth.json", ".credentials.json", ".api-key"}:
         raise WorkerRefusal("invalid_auth_stage", "임시 인증 파일 이름을 확인할 수 없습니다.")
     target = active / filename
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -971,6 +1013,19 @@ def consume_staged_claude_credential(active: Path, expected_sha256: str) -> Clau
         raise
 
 
+def consume_staged_claude_api_key(active: Path, expected_sha256: str) -> ClaudeApiCredential:
+    raw = _consume_staged_bytes(active, expected_sha256, ".api-key")
+    try:
+        key = raw.decode("ascii", errors="strict")
+        if not re.fullmatch(r"[!-~]{20,8192}", key):
+            raise WorkerRefusal("invalid_auth_stage", "Claude API 키 형식이 올바르지 않습니다.", category="auth")
+        return ClaudeApiCredential(raw)
+    except BaseException:
+        for index in range(len(raw)):
+            raw[index] = 0
+        raise
+
+
 def discard_credential_before_runtime_attestation(exchange: Path) -> bool:
     """Remove a credential left by an interrupted worker without reading it.
 
@@ -982,7 +1037,7 @@ def discard_credential_before_runtime_attestation(exchange: Path) -> bool:
     """
 
     removed = False
-    for name in ("auth.json", ".credentials.json"):
+    for name in ("auth.json", ".credentials.json", ".api-key"):
         target = exchange / "active" / name
         try:
             info = target.lstat()
@@ -1051,7 +1106,7 @@ def assert_runtime_exchange_inventory(exchange: Path) -> None:
     active = exchange / "active"
     if active.exists() and (active.is_symlink() or not active.is_dir() or active.resolve().parent != exchange.resolve()):
         raise WorkerRefusal("invalid_exchange_inventory", "solver 활성 디렉터리를 확인할 수 없습니다.")
-    if any((active / name).exists() for name in ("auth.json", ".credentials.json")):
+    if any((active / name).exists() for name in ("auth.json", ".credentials.json", ".api-key")):
         raise WorkerRefusal("auth_cleanup_failed", "자체 점검 전에 인증 파일을 제거하지 못했습니다.", category="auth")
 
 
@@ -1070,6 +1125,14 @@ def _scratch_entry_owned(details: os.stat_result, current_uid: int | None) -> bo
     """Return whether mode changes are permitted for a scratch entry."""
 
     return current_uid is None or details.st_uid == current_uid
+
+
+def _recoverable_scratch_tree(name: str) -> bool:
+    """Recognize only worker-created, disposable top-level scratch trees."""
+
+    return name in {"worker-home", "codex-home"} or bool(
+        re.fullmatch(r"ctf-(?:job|attest)-[A-Za-z0-9_-]{6,64}", name)
+    )
 
 
 def recover_crash_scratch(root: Path) -> None:
@@ -1149,7 +1212,7 @@ def recover_crash_scratch(root: Path) -> None:
                             raise invalid() from exc
 
             for name in names:
-                if not re.fullmatch(r"ctf-(?:job|attest)-[A-Za-z0-9_-]{6,64}", name):
+                if not _recoverable_scratch_tree(name):
                     raise WorkerRefusal(
                         "scratch_cleanup_failed",
                         "알 수 없는 solver 임시 파일이 남아 있습니다.",
@@ -1197,7 +1260,7 @@ def recover_crash_scratch(root: Path) -> None:
         root_resolved = root.resolve(strict=True)
         entries = list(root.iterdir())
         for entry in entries:
-            if not re.fullmatch(r"ctf-(?:job|attest)-[A-Za-z0-9_-]{6,64}", entry.name):
+            if not _recoverable_scratch_tree(entry.name):
                 raise WorkerRefusal(
                     "scratch_cleanup_failed",
                     "알 수 없는 solver 임시 파일이 남아 있습니다.",
@@ -1528,6 +1591,53 @@ def _max_reasoning_requested(workdir: Path) -> bool:
     if note is None:
         return False
     return any(line.strip() == "MAX_REQUIRED" for line in note.splitlines())
+
+
+def _ultra_request_evidence(workdir: Path) -> str | None:
+    """Accept a bounded, specific reason for a fresh parallel ultra attempt."""
+
+    raw = _read_solver_text(workdir / "notes" / "ULTRA_REQUEST.json", MAX_ULTRA_REQUEST_BYTES)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, dict) or set(value) != {"blocker", "attempts", "parallel_tracks"}:
+        return None
+
+    def meaningful(text: object, minimum: int = 20, maximum: int = 600) -> bool:
+        return (
+            isinstance(text, str) and minimum <= len(text.strip()) <= maximum
+            and not _CONTROL.search(text)
+        )
+
+    blocker = value["blocker"]
+    attempts = value["attempts"]
+    tracks = value["parallel_tracks"]
+    if not meaningful(blocker, 60, 1200):
+        return None
+    if not isinstance(attempts, list) or not 2 <= len(attempts) <= 5:
+        return None
+    if not isinstance(tracks, list) or not 2 <= len(tracks) <= 4:
+        return None
+    if any(
+        not isinstance(item, dict) or set(item) != {"hypothesis", "result"}
+        or not meaningful(item["hypothesis"])
+        or not meaningful(item["result"])
+        for item in attempts
+    ):
+        return None
+    if any(
+        not isinstance(item, dict) or set(item) != {"goal", "independent_reason"}
+        or not meaningful(item["goal"])
+        or not meaningful(item["independent_reason"])
+        for item in tracks
+    ):
+        return None
+    if len({item["goal"].strip().casefold() for item in tracks}) != len(tracks):
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _consume_max_reasoning_request(workdir: Path) -> bool:
@@ -2321,6 +2431,56 @@ def _safe_activity_text(value: object, maximum: int = MAX_LIVE_COMMAND_BYTES) ->
     return _bounded_utf8(text, maximum)
 
 
+def _provider_agent_id(provider: str, raw_id: object) -> str | None:
+    """Use a bounded, opaque UI id rather than exposing provider thread ids."""
+
+    if not isinstance(raw_id, str) or not 1 <= len(raw_id) <= 256:
+        return None
+    if _WRITEUP_INSTRUCTION_CONTROL.search(raw_id):
+        return None
+    return f"{provider}:{hashlib.sha256(raw_id.encode('utf-8')).hexdigest()[:24]}"
+
+
+async def _emit_agent_event(
+    driver: object,
+    agent_id: str,
+    parent_id: str,
+    label: str,
+    status: str,
+    provider: str,
+    model: str | None = None,
+) -> bool:
+    """Persist a bounded child lifecycle independently of the activity cap."""
+
+    reporter = getattr(driver, "agent_reporter", None)
+    nodes = driver.agent_nodes
+    prior = nodes.get(agent_id)
+    if prior is None and len(nodes) >= MAX_LIVE_AGENT_NODES:
+        return False
+    if prior is not None and prior["parent_id"] != parent_id:
+        return False
+    if prior is not None and prior["status"] in {"completed", "failed", "interrupted"}:
+        status = prior["status"]
+    safe_label = _safe_activity_text(label, 120) or "Subagent"
+    safe_model = _safe_activity_text(model, 120) if isinstance(model, str) else None
+    node = {
+        "agent_id": agent_id,
+        "parent_id": parent_id,
+        "label": safe_label,
+        "status": status,
+        "provider": provider,
+        **({"model": safe_model} if safe_model else {}),
+    }
+    if prior == node:
+        return True
+    if reporter is None or driver.agent_events >= MAX_LIVE_AGENT_EVENTS:
+        return False
+    nodes[agent_id] = node
+    driver.agent_events += 1
+    await reporter(**node)
+    return True
+
+
 class CodexAppServer:
     """Small v2 app-server client for the isolated challenge workspace."""
 
@@ -2405,9 +2565,16 @@ class CodexAppServer:
         self._last_refresh_account_match: bool | None = None
         self._last_turn_soft_outcome: str | None = None
         self._discovery_command_execution_seen = False
+        self._solve_tool_count = 0
+        self._first_solve_tool_at: float | None = None
         self.guidance_mailbox: GuidanceMailbox | None = None
         self.activity_reporter: Callable[..., Awaitable[None]] | None = None
         self.activity_events = 0
+        self._next_activity_sample_at: float | None = None
+        self.agent_reporter: Callable[..., Awaitable[None]] | None = None
+        self.agent_events = 0
+        self.agent_nodes: dict[str, dict[str, Any]] = {}
+        self.thread_agents: dict[str, str] = {}
         self._deferred_guidance_ids: set[str] = set()
         self.pid = -1
 
@@ -2422,14 +2589,28 @@ class CodexAppServer:
         message: object = None,
         exit_code: object = None,
         duration_ms: object = None,
+        agent_id: object = None,
     ) -> None:
         if self.activity_reporter is None or self.activity_events >= MAX_LIVE_ACTIVITY_EVENTS:
             return
+        if self.activity_events >= LIVE_ACTIVITY_FULL_FIDELITY_EVENTS:
+            now = time.monotonic()
+            if self._next_activity_sample_at is None:
+                self._next_activity_sample_at = now + LIVE_ACTIVITY_SAMPLE_INTERVAL_SECONDS
+                return
+            if now < self._next_activity_sample_at:
+                return
+            self._next_activity_sample_at = now + LIVE_ACTIVITY_SAMPLE_INTERVAL_SECONDS
         payload: dict[str, Any] = {
             "phase": phase,
             "tool": tool,
             "summary": summary,
         }
+        activity_agent_id = agent_id if agent_id is not None else getattr(self, "_current_event_agent_id", None)
+        if activity_agent_id == "root" or (
+            isinstance(activity_agent_id, str) and activity_agent_id in self.agent_nodes
+        ):
+            payload["agent_id"] = activity_agent_id
         safe_command = _safe_activity_text(command)
         if safe_command:
             payload["command"] = safe_command
@@ -2444,6 +2625,8 @@ class CodexAppServer:
         if type(duration_ms) is int and duration_ms >= 0:
             payload["duration_ms"] = duration_ms
         self.activity_events += 1
+        if self.activity_events == LIVE_ACTIVITY_FULL_FIDELITY_EVENTS:
+            self._next_activity_sample_at = time.monotonic() + LIVE_ACTIVITY_SAMPLE_INTERVAL_SECONDS
         await self.activity_reporter(**payload)
 
     def _account_digest(self, value: object) -> bytes | None:
@@ -2733,7 +2916,7 @@ class CodexAppServer:
 
         script = r'''
 import errno,hashlib,json,mmap,os,secrets,shutil,socket,subprocess,sys
-input_root,input_probe,input_control,input_auth,input_digest,worker,worker_identity,server,server_identity,exchange,scratch,challenge,sandbox_mode=sys.argv[1:]
+input_root,input_probe,input_control,input_auth,input_api_key,input_digest,worker,worker_identity,server,server_identity,exchange,scratch,challenge,sandbox_mode=sys.argv[1:]
 result={}
 mountinfo_readable=True
 try:
@@ -2753,7 +2936,10 @@ try:
 except (PermissionError,OSError):
     exchange_names=None
 result["exchange_read_denied"]=exchange_names is None
-result["auth_absent"]=exchange_names is None or not os.path.exists(os.path.join(exchange,"active","auth.json"))
+result["auth_absent"]=exchange_names is None or all(
+    not os.path.exists(os.path.join(exchange,"active",name))
+    for name in ("auth.json",".credentials.json",".api-key")
+)
 result["exchange_inventory_safe"]=exchange_names is not None and all(name in {"active","runtime","worker.json","worker.lock"} for name in exchange_names)
 try:
     profile=open("/proc/self/attr/current",encoding="ascii").read().strip()
@@ -2880,6 +3066,7 @@ if input_probe:
         except OSError as exc: return exc.errno in (errno.EPERM,errno.EACCES)
     result["input_control_read_denied"]=read_denied(input_control)
     result["input_auth_read_denied"]=read_denied(input_auth)
+    result["input_api_key_read_denied"]=read_denied(input_api_key)
     try:
         os.listdir(input_root);result["input_listing_denied"]=False
     except OSError as exc: result["input_listing_denied"]=exc.errno in (errno.EPERM,errno.EACCES)
@@ -3022,7 +3209,7 @@ print(json.dumps(result,separators=(",",":")))
 
         external = os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
         input_canary = None
-        input_arguments = ["", "", "", "", ""]
+        input_arguments = ["", "", "", "", "", ""]
         if external:
             try:
                 input_canary = Path(tempfile.mkdtemp(prefix=".input-canary-", dir=exchange))
@@ -3038,6 +3225,9 @@ print(json.dumps(result,separators=(",",":")))
                 input_auth = input_canary / "auth.json"
                 input_auth.write_text('{"canary":true}\n', encoding="ascii")
                 input_auth.chmod(0o600)
+                input_api_key = input_canary / ".api-key"
+                input_api_key.write_text("canary\n", encoding="ascii")
+                input_api_key.chmod(0o600)
                 _fsync_directory(input_challenge)
                 _fsync_directory(input_canary)
                 _fsync_directory(exchange)
@@ -3047,6 +3237,7 @@ print(json.dumps(result,separators=(",",":")))
                     str(visible_root / "challenge" / "probe.sh"),
                     str(visible_root / "control.json"),
                     str(visible_root / "auth.json"),
+                    str(visible_root / ".api-key"),
                     hashlib.sha256(probe_bytes).hexdigest(),
                 ]
             except OSError as exc:
@@ -3159,6 +3350,7 @@ print(json.dumps(result,separators=(",",":")))
                     "input_exec_denied",
                     "input_control_read_denied",
                     "input_auth_read_denied",
+                    "input_api_key_read_denied",
                     "input_listing_denied",
                     "shell_profile_enforced",
                     "toolchain_environment_writable",
@@ -3383,6 +3575,54 @@ print(json.dumps(result,separators=(",",":")))
                 return "codex_attestation_unavailable"
         return None
 
+    async def _track_codex_agent_item(
+        self, item: Mapping[str, Any], source_thread_id: str, manifest: JobManifest
+    ) -> None:
+        item_type = item.get("type")
+        if item_type == "collabAgentToolCall":
+            if manifest.configuration.reasoning_effort != "ultra" or getattr(manifest, "job_mode", "solve") != "solve":
+                raise WorkerRefusal("unexpected_multi_agent_tool", "Subagents require Codex ultra reasoning.")
+            sender = item.get("senderThreadId") or source_thread_id
+            parent_id = "root" if sender == self.thread_id else self.thread_agents.get(sender)
+            if parent_id is None:
+                return
+            receivers = item.get("receiverThreadIds")
+            if not isinstance(receivers, list):
+                return
+            for receiver in receivers[:MAX_LIVE_AGENT_NODES]:
+                child_id = _provider_agent_id("codex", receiver)
+                if child_id is None or receiver == sender:
+                    continue
+                if await _emit_agent_event(
+                    self, child_id, parent_id, "Codex subagent", "running", "codex",
+                    item.get("model") or manifest.configuration.model,
+                ):
+                    self.thread_agents[receiver] = child_id
+        elif item_type == "subAgentActivity":
+            receiver = item.get("agentThreadId")
+            child_id = self.thread_agents.get(receiver) if isinstance(receiver, str) else None
+            if child_id is None and item.get("kind") == "started":
+                parent_id = "root" if source_thread_id == self.thread_id else self.thread_agents.get(source_thread_id)
+                child_id = _provider_agent_id("codex", receiver)
+                if parent_id and child_id and await _emit_agent_event(
+                    self, child_id, parent_id, "Codex subagent", "running", "codex",
+                    item.get("model") or manifest.configuration.model,
+                ):
+                    self.thread_agents[receiver] = child_id
+                return
+            if child_id is None:
+                return
+            prior = self.agent_nodes.get(child_id)
+            if prior is None:
+                return
+            status = {
+                "completed": "completed", "interrupted": "interrupted"
+            }.get(item.get("kind"), "running")
+            await _emit_agent_event(
+                self, child_id, prior["parent_id"], prior["label"], status,
+                "codex", item.get("model") or prior.get("model"),
+            )
+
     async def _turn(
         self,
         manifest: JobManifest,
@@ -3565,6 +3805,7 @@ print(json.dumps(result,separators=(",",":")))
             method, values = message.get("method"), message.get("params", {})
             if not isinstance(values, dict):
                 continue
+            self._current_event_agent_id = "root"
             if method == "ctf/account-refresh-required":
                 self._record_refresh_account_match(values)
                 if self._last_refresh_account_match is False:
@@ -3593,20 +3834,66 @@ print(json.dumps(result,separators=(",",":")))
                 )
                 self.rate_limit_context = latest_rate_limit
             elif method in ("item/started", "item/completed"):
+                source_thread_id = values.get("threadId", thread_id)
+                if source_thread_id != thread_id and source_thread_id not in self.thread_agents:
+                    continue
+                source_agent_id = (
+                    "root" if source_thread_id == thread_id else self.thread_agents[source_thread_id]
+                )
+                self._current_event_agent_id = source_agent_id
                 item = values.get("item")
                 item_type = item.get("type") if isinstance(item, dict) else None
+                if (
+                    method == "item/completed" and source_agent_id == "root"
+                    and item_type in {"commandExecution", "webSearch"}
+                ):
+                    self._solve_tool_count += 1
+                    if self._first_solve_tool_at is None:
+                        self._first_solve_tool_at = time.monotonic()
                 refusal_code = self.DISALLOWED_ITEM_CODES.get(item_type)
                 if refusal_code:
                     raise WorkerRefusal(refusal_code, "오프라인 worker에서 허용하지 않는 도구가 요청되었습니다.")
                 if item_type == "collabAgentToolCall":
-                    if manifest.configuration.reasoning_effort != "ultra" or getattr(manifest, "job_mode", "solve") != "solve":
-                        raise WorkerRefusal("unexpected_multi_agent_tool", "Subagents require Codex ultra reasoning.")
+                    prior_children = set(self.thread_agents)
+                    await self._track_codex_agent_item(item, source_thread_id, manifest)
+                    receivers = item.get("receiverThreadIds") if isinstance(item, Mapping) else None
+                    reported_children: set[str] = set()
+                    for child_thread in receivers if isinstance(receivers, list) else ():
+                        if (
+                            not isinstance(child_thread, str)
+                            or child_thread in prior_children
+                            or child_thread in reported_children
+                            or child_thread not in self.thread_agents
+                        ):
+                            continue
+                        reported_children.add(child_thread)
+                        await self._report_activity(
+                            "started", "agent", "Subagent assigned",
+                            message=item.get("prompt"), agent_id=self.thread_agents[child_thread],
+                        )
                     await self._report_activity(
                         "started" if method == "item/started" else "completed",
                         "agent",
-                        "Subagent started" if method == "item/started" else "Subagent finished",
+                        "Subagent dispatch started" if method == "item/started" else "Subagent handoff completed",
                         message=item.get("prompt") if isinstance(item, Mapping) else None,
+                        agent_id=source_agent_id,
                     )
+                elif item_type == "subAgentActivity":
+                    await self._track_codex_agent_item(item, source_thread_id, manifest)
+                    child_thread = item.get("agentThreadId")
+                    child_id = self.thread_agents.get(child_thread) if isinstance(child_thread, str) else None
+                    # Codex emits this instantaneous state as an item/started +
+                    # item/completed pair with the same kind. Persist the node
+                    # idempotently above, but show one activity row per state.
+                    if child_id is not None and method == "item/completed":
+                        child_state = item.get("kind")
+                        await self._report_activity(
+                            "completed" if child_state in {"completed", "interrupted"} else "started",
+                            "agent", "Subagent " + (
+                                child_state if child_state in {"started", "interacted", "interrupted", "completed"}
+                                else "update"
+                            ), agent_id=child_id,
+                        )
                 if (
                     getattr(manifest, "job_mode", "solve") == "writeup_refine"
                     and item_type in {"commandExecution", "fileChange"}
@@ -3663,7 +3950,7 @@ print(json.dumps(result,separators=(",",":")))
                     await progress("executing")
                 if method == "item/started" and item_type == "webSearch":
                     await progress("researching")
-                if method == "item/completed" and item_type == "agentMessage":
+                if method == "item/completed" and item_type == "agentMessage" and source_agent_id == "root":
                     text = item.get("text")
                     if isinstance(text, str) and len(text) <= MAX_OUTPUT_TEXT:
                         last_message = text
@@ -3727,6 +4014,8 @@ print(json.dumps(result,separators=(",",":")))
                 if terminal or provider_retry_events >= MAX_PROVIDER_RETRY_EVENTS:
                     raise AppServerFailure(last_provider_error)
             elif method == "turn/completed":
+                if values.get("threadId", thread_id) != thread_id:
+                    continue
                 completed = values.get("turn")
                 if not isinstance(completed, dict) or completed.get("id") != self.turn_id:
                     continue
@@ -3862,6 +4151,25 @@ put `MAX_REQUIRED` on its own line. Keep working normally until the worker
 accepts the request; do not use this marker merely because a flag is not yet
 available.
 """
+        if getattr(manifest, "ultra_escalation_mode", "off") != "off":
+            result_bridge += """
+
+If independent parallel work would materially help after substantial stalled
+analysis, you may request one fresh Codex ultra attempt. Do not request it just
+because the flag is missing. First complete at least two distinct tool-backed
+experiments and document their outcomes in notes/ANALYSIS.md and notes/NEXT.md.
+Only when you can assign at least two genuinely independent next investigations,
+write notes/ULTRA_REQUEST.json with exactly these fields:
+{"blocker":"specific unresolved obstacle (at least 60 characters)",
+ "attempts":[{"hypothesis":"tested hypothesis","result":"observed result"},
+             {"hypothesis":"different tested hypothesis","result":"observed result"}],
+ "parallel_tracks":[{"goal":"first independent investigation","independent_reason":"why it can run separately"},
+                    {"goal":"second independent investigation","independent_reason":"why it can run separately"}]}
+The worker accepts this only after two completed turns, two tool calls, and
+three minutes since the first tool call without a flag. Continue solving until
+that evidence threshold is met. If accepted, the current attempt stops and
+its verified notes and solver.py are handed to a new isolated ultra attempt.
+"""
         schema = {
             "type": "object",
             "additionalProperties": False,
@@ -3966,6 +4274,31 @@ is a fresh isolated job; do not repeat completed work.
                 objective_evidence = bool(
                     self._discovery_command_execution_seen or current_attempt > 0
                 )
+                ultra_evidence = (
+                    _ultra_request_evidence(challenge)
+                    if getattr(manifest, "ultra_escalation_mode", "off") != "off"
+                    else None
+                )
+                if (
+                    ultra_evidence is not None
+                    and current_attempt >= 1
+                    and self._solve_tool_count >= 2
+                    and self._first_solve_tool_at is not None
+                    and time.monotonic() - self._first_solve_tool_at >= 180
+                    and checkpoint is not None
+                    and not cancelled.is_set()
+                ):
+                    handoff = bounded_checkpoint_notes(
+                        cycle_notes + "\n\n# Ultra escalation evidence\n\n" + ultra_evidence
+                    )
+                    await checkpoint(handoff)
+                    raise WorkerRefusal(
+                        "ultra_escalation_requested",
+                        "독립적으로 진행할 풀이 경로가 확인됐습니다. Ultra 전환을 승인하거나 현재 설정으로 다시 시작하세요.",
+                        category="input",
+                        retryable=False,
+                        stage="solve",
+                    )
                 if (
                     not reasoning_escalated
                     and getattr(manifest, "max_reasoning_available", False)
@@ -4307,6 +4640,7 @@ class ClaudePrintDriver(CodexAppServer):
         challenge: Path,
         configuration: ModelConfiguration,
         *,
+        auth_kind: str = "oauth",
         executable: str | None = None,
         command_prefix: list[str] | None = None,
         expected_version: str = REQUIRED_CLAUDE_VERSION,
@@ -4315,6 +4649,9 @@ class ClaudePrintDriver(CodexAppServer):
         self.config_dir = claude_home / "claude"
         self.challenge = challenge
         self.configuration = configuration
+        if auth_kind not in {"oauth", "api_key"}:
+            raise ValueError("invalid Claude auth kind")
+        self.auth_kind = auth_kind
         chosen = executable or shutil.which("claude") or ""
         self.command_prefix = list(command_prefix) if command_prefix is not None else ([chosen] if chosen else [])
         self.executable = self.command_prefix[0] if self.command_prefix else ""
@@ -4328,10 +4665,16 @@ class ClaudePrintDriver(CodexAppServer):
         self.guidance_mailbox: GuidanceMailbox | None = None
         self.activity_reporter: Callable[..., Awaitable[None]] | None = None
         self.activity_events = 0
+        self._next_activity_sample_at: float | None = None
+        self.agent_reporter: Callable[..., Awaitable[None]] | None = None
+        self.agent_events = 0
+        self.agent_nodes: dict[str, dict[str, Any]] = {}
+        self.tool_agents: dict[str, str] = {}
         self.pid = -1
         self.session_id: str | None = None
         self.turn_count = 0
         self.credential_path: Path | None = None
+        self.api_key: bytearray | None = None
 
     def _safe_env(self) -> dict[str, str]:
         safe = {
@@ -4368,28 +4711,78 @@ class ClaudePrintDriver(CodexAppServer):
             command = hardened_solver_exec_command(command, CLAUDE_LAUNCHER)
         return command
 
-    async def _spawn_exact(self, command: list[str], *, cwd: Path | None = None) -> asyncio.subprocess.Process:
+    @staticmethod
+    def _write_key_pipe(descriptor: int, key: bytearray) -> None:
+        os.set_blocking(descriptor, False)
+        offset = 0
+        deadline = time.monotonic() + 5
+        while offset < len(key):
+            try:
+                written = os.write(descriptor, memoryview(key)[offset:])
+                if written <= 0:
+                    raise OSError("Claude credential pipe closed")
+                offset += written
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([], [descriptor], [], remaining)[1]:
+                    raise TimeoutError("Claude credential pipe was not consumed")
+
+    async def _spawn_exact(
+        self, command: list[str], *, cwd: Path | None = None, use_api_key: bool = False
+    ) -> asyncio.subprocess.Process:
+        read_fd = write_fd = None
+        process = None
         try:
+            safe_env = self._safe_env()
+            spawn_options: dict[str, Any] = {}
+            if use_api_key:
+                if self.auth_kind != "api_key" or self.api_key is None or os.name != "posix":
+                    raise WorkerRefusal("invalid_auth_stage", "Claude API 키를 안전하게 전달할 수 없습니다.", category="auth")
+                read_fd, write_fd = os.pipe()
+                safe_env["CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"] = str(read_fd)
+                spawn_options["pass_fds"] = (read_fd,)
             process = await asyncio.create_subprocess_exec(
                 *self._launch_command(command),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd or self.challenge,
-                env=self._safe_env(),
+                env=safe_env,
                 limit=MAX_RPC_LINE,
+                **spawn_options,
             )
-        except OSError as exc:
+            if read_fd is not None:
+                os.close(read_fd)
+                read_fd = None
+            self.process = process
+            self.pid = process.pid
+            if write_fd is not None:
+                await asyncio.to_thread(self._write_key_pipe, write_fd, self.api_key)
+        except (OSError, TimeoutError) as exc:
+            if process is not None:
+                await self._stop_current(interrupt=False)
             raise WorkerRefusal("claude_start_failed", "Claude Code를 시작하지 못했습니다.") from exc
-        self.process = process
-        self.pid = process.pid
+        except BaseException:
+            if process is not None:
+                await self._stop_current(interrupt=False)
+            raise
+        finally:
+            if read_fd is not None:
+                os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
         return process
 
     async def _spawn(self, arguments: list[str], *, cwd: Path | None = None) -> asyncio.subprocess.Process:
-        return await self._spawn_exact([*self.command_prefix, *arguments], cwd=cwd)
+        return await self._spawn_exact(
+            [*self.command_prefix, *arguments], cwd=cwd,
+            use_api_key=self.auth_kind == "api_key" and self.api_key is not None,
+        )
 
     async def _bounded_command(self, arguments: list[str], *, maximum: int = 8192) -> bytes:
-        process = await self._spawn(arguments)
+        # Version probes do not need credentials.  The one-shot pipe belongs
+        # only to a real model turn, not to CLI probes or sandbox canaries.
+        process = await self._spawn_exact([*self.command_prefix, *arguments])
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
         except TimeoutError as exc:
@@ -4407,7 +4800,12 @@ class ClaudePrintDriver(CodexAppServer):
             raise WorkerRefusal("claude_missing", "격리 worker에 Claude Code CLI가 설치되지 않았습니다.")
         if self.configuration.provider != "claude":
             raise WorkerRefusal("invalid_manifest", "Claude 공급자 설정을 확인할 수 없습니다.")
-        if self.configuration.model not in self.ALLOWED_MODELS:
+        model_allowed = (
+            bool(re.fullmatch(r"claude-[A-Za-z0-9.-]{1,120}", self.configuration.model))
+            if self.auth_kind == "api_key"
+            else self.configuration.model in self.ALLOWED_MODELS
+        )
+        if not model_allowed:
             raise WorkerRefusal("model_mismatch", "검증되지 않은 Claude 모델 선택입니다.", category="model")
         if self.configuration.reasoning_effort not in self.ALLOWED_EFFORTS:
             raise WorkerRefusal("model_mismatch", "검증되지 않은 Claude 추론 수준입니다.", category="model")
@@ -4426,8 +4824,12 @@ class ClaudePrintDriver(CodexAppServer):
         self.process = None
         self.pid = -1
 
-    async def login_memory(self, credential: MemoryCredential | ClaudeFileCredential) -> None:
-        if not isinstance(credential, ClaudeFileCredential):
+    async def login_memory(self, credential: MemoryCredential | ClaudeFileCredential | ClaudeApiCredential) -> None:
+        if self.auth_kind == "api_key" and isinstance(credential, ClaudeApiCredential):
+            self.api_key = credential.raw
+            credential.raw = bytearray()
+            return
+        if self.auth_kind != "oauth" or not isinstance(credential, ClaudeFileCredential):
             raise WorkerRefusal("invalid_auth_stage", "Claude 인증 파일 형식을 확인할 수 없습니다.", category="auth")
         try:
             self.credential_path = credential.install(self.config_dir)
@@ -4561,6 +4963,50 @@ class ClaudePrintDriver(CodexAppServer):
                         return True
         return False
 
+    @staticmethod
+    def _api_failure(event: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Reduce Claude API diagnostics to reviewed codes without raw text."""
+
+        candidates: list[Mapping[str, Any]] = [event]
+        first = event.get("error")
+        if isinstance(first, Mapping):
+            candidates.append(first)
+            nested = first.get("error")
+            if isinstance(nested, Mapping):
+                candidates.append(nested)
+        status = None
+        kinds: set[str] = set()
+        if isinstance(first, str) and len(first) <= 80:
+            kinds.add(first.lower())
+        for candidate in candidates:
+            for field in ("api_error_status", "status", "status_code", "http_status"):
+                value = candidate.get(field)
+                if value in (400, 401, 402, 403, 404, 429, 500, 503, 504, 529):
+                    status = value
+                elif isinstance(value, str) and value.isascii() and value.isdigit():
+                    number = int(value)
+                    if number in (400, 401, 402, 403, 404, 429, 500, 503, 504, 529):
+                        status = number
+            for field in ("type", "code"):
+                value = candidate.get(field)
+                if isinstance(value, str) and len(value) <= 80:
+                    kinds.add(value.lower())
+        if status == 401 or kinds & {"authentication_error", "authentication_failed", "auth_required", "invalid_auth"}:
+            return {"code": "auth_required", "retryable": False}
+        if status == 402 or "billing_error" in kinds:
+            return {"code": "billing_required", "retryable": False}
+        if status == 403 or "permission_error" in kinds:
+            return {"code": "access_denied", "retryable": False}
+        if kinds & {"model_not_found", "model_unavailable"}:
+            return {"code": "model_unavailable", "retryable": False}
+        if status == 429 or kinds & {"rate_limit", "rate_limit_error", "quota_exceeded"}:
+            return {"code": "quota_exceeded", "retryable": True}
+        if status in {500, 503, 504, 529} or kinds & {"overloaded_error", "api_error", "timeout_error"}:
+            return {"code": "provider_unavailable", "retryable": True}
+        if status == 400 or "invalid_request_error" in kinds:
+            return {"code": "provider_request_rejected", "retryable": False}
+        return None
+
     async def _stderr_reader_claude(self, process: asyncio.subprocess.Process) -> None:
         if process.stderr is None:
             return
@@ -4584,6 +5030,43 @@ class ClaudePrintDriver(CodexAppServer):
                 retained.extend(chunk[: 1024 - len(retained)])
         if retained:
             self.safe_startup_stderr = sanitize_startup_stderr(bytes(retained))
+
+    async def _track_claude_agent_tool(
+        self, block: Mapping[str, Any], parent_id: str, manifest: JobManifest
+    ) -> None:
+        if block.get("name") not in {"Agent", "Workflow"}:
+            return
+        tool_id = block.get("id")
+        agent_id = _provider_agent_id("claude", tool_id)
+        if agent_id is None:
+            return
+        tool_input = block.get("input")
+        label = (
+            tool_input.get("description")
+            if isinstance(tool_input, Mapping) and isinstance(tool_input.get("description"), str)
+            else "Claude subagent"
+        )
+        model = (
+            tool_input.get("model")
+            if isinstance(tool_input, Mapping) and isinstance(tool_input.get("model"), str)
+            else manifest.configuration.model
+        )
+        if await _emit_agent_event(self, agent_id, parent_id, label, "running", "claude", model):
+            self.tool_agents[tool_id] = agent_id
+
+    async def _complete_claude_agent_tool(self, block: Mapping[str, Any]) -> None:
+        tool_id = block.get("tool_use_id")
+        agent_id = self.tool_agents.get(tool_id) if isinstance(tool_id, str) else None
+        if agent_id is None:
+            return
+        node = self.agent_nodes.get(agent_id)
+        if node is None:
+            return
+        await _emit_agent_event(
+            self, agent_id, node["parent_id"], node["label"],
+            "failed" if block.get("is_error") is True else "completed",
+            "claude", node.get("model"),
+        )
 
     async def _read_stream(self, process: asyncio.subprocess.Process, manifest: JobManifest, progress) -> dict[str, Any]:
         if process.stdout is None:
@@ -4617,29 +5100,55 @@ class ClaudePrintDriver(CodexAppServer):
             if event_session is not None and event_session != session and not subagent_event:
                 raise WorkerRefusal("provider_session_mismatch", "Claude 작업 세션이 실행 중 변경되었습니다.")
             if self._policy_refusal(event):
-                raise AppServerFailure(
-                    {
-                        "code": "policy_security",
-                        "category": "policy_security",
-                        "provider_code": "CVP",
-                        "retryable": False,
-                    }
-                )
+                policy: dict[str, Any] = {
+                    "code": "policy_security",
+                    "category": "policy_security",
+                    "retryable": False,
+                }
+                explicit_code = event.get("provider_code")
+                if isinstance(explicit_code, str) and re.fullmatch(r"CVP(?:[-_][A-Za-z0-9]{1,12})?", explicit_code, re.I):
+                    policy["provider_code"] = explicit_code.upper()
+                raise AppServerFailure(policy)
+            if event_type == "error":
+                raise AppServerFailure(self._api_failure(event) or {"code": "provider_error", "retryable": True})
+            parent_tool_id = event.get("parent_tool_use_id")
+            self._current_event_agent_id = (
+                self.tool_agents.get(parent_tool_id)
+                if isinstance(parent_tool_id, str)
+                else "root"
+            )
             if subagent_event and event_type in {"assistant", "user"}:
+                child_agent_id = self._current_event_agent_id
+                if child_agent_id is None:
+                    continue
                 message = event.get("message")
                 content = message.get("content") if isinstance(message, Mapping) else None
-                if event_type == "assistant" and isinstance(content, list):
-                    text_parts = [
-                        block["text"] for block in content[:200]
-                        if isinstance(block, Mapping)
-                        and block.get("type") == "text"
-                        and isinstance(block.get("text"), str)
-                    ]
-                    if text_parts:
-                        await self._report_activity(
-                            "completed", "agent", "Subagent update",
-                            message="\n".join(text_parts)[:MAX_SOFT_MESSAGE_BYTES],
-                        )
+                if isinstance(content, list):
+                    for block in content[:200]:
+                        if not isinstance(block, Mapping):
+                            continue
+                        if event_type == "assistant" and block.get("type") == "text":
+                            await self._report_activity(
+                                "completed", "analysis", "Subagent update",
+                                message=block.get("text"), agent_id=child_agent_id,
+                            )
+                        elif event_type == "assistant" and block.get("type") == "tool_use":
+                            await self._track_claude_agent_tool(block, child_agent_id, manifest)
+                            tool_input = block.get("input")
+                            await self._report_activity(
+                                "started", "agent" if block.get("name") in {"Agent", "Workflow"} else "tool",
+                                "Subagent tool", command=(
+                                    tool_input.get("command") or tool_input.get("query")
+                                    if isinstance(tool_input, Mapping) else None
+                                ), agent_id=child_agent_id,
+                            )
+                        elif event_type == "user" and block.get("type") == "tool_result":
+                            await self._complete_claude_agent_tool(block)
+                            await self._report_activity(
+                                "completed", "tool", "Subagent tool result",
+                                output=block.get("content") if isinstance(block.get("content"), str) else None,
+                                agent_id=child_agent_id,
+                            )
                 continue
             if event_type == "system" and event.get("subtype") == "init":
                 if (
@@ -4674,12 +5183,9 @@ class ClaudePrintDriver(CodexAppServer):
                 if not initialized:
                     raise AppServerFailure({"code": "invalid_response"})
                 safe_error = event.get("error")
-                if safe_error in {"authentication_failed", "auth_required", "invalid_auth"}:
-                    raise AppServerFailure({"code": "auth_required", "retryable": False})
-                if safe_error in {"rate_limit", "rate_limit_error", "quota_exceeded"}:
-                    raise AppServerFailure({"code": "quota_exceeded", "retryable": True})
-                if safe_error in {"model_not_found", "model_unavailable"}:
-                    raise AppServerFailure({"code": "model_unavailable", "retryable": False})
+                if safe_error is not None:
+                    recognized = self._api_failure(event)
+                    raise AppServerFailure(recognized or {"code": "provider_error", "retryable": True})
                 message = event.get("message")
                 content = message.get("content") if isinstance(message, Mapping) else None
                 if isinstance(content, list):
@@ -4707,9 +5213,12 @@ class ClaudePrintDriver(CodexAppServer):
                         }
                         if name not in allowed_tools:
                             raise WorkerRefusal("unexpected_remote_tool", "Claude가 허용하지 않은 도구를 요청했습니다.")
+                        await self._track_claude_agent_tool(block, "root", manifest)
                         if name != "StructuredOutput":
                             self._discovery_command_execution_seen = True
-                            await progress("executing" if name == "Bash" else "inspecting_files")
+                            await progress(
+                                "executing" if name in {"Bash", "Agent", "Workflow"} else "inspecting_files"
+                            )
                             tool_input = block.get("input")
                             command = (
                                 tool_input.get("command")
@@ -4724,11 +5233,15 @@ class ClaudePrintDriver(CodexAppServer):
                                 if name == "Bash"
                                 else "web_search"
                                 if name == "WebSearch"
+                                else "agent"
+                                if name in {"Agent", "Workflow"}
                                 else "file",
                                 "명령 실행"
                                 if name == "Bash"
                                 else "웹 검색"
                                 if name == "WebSearch"
+                                else "Subagent started"
+                                if name in {"Agent", "Workflow"}
                                 else "파일 검사",
                                 command=command,
                             )
@@ -4756,6 +5269,7 @@ class ClaudePrintDriver(CodexAppServer):
                     for block in content[:200]:
                         if not isinstance(block, Mapping) or block.get("type") != "tool_result":
                             continue
+                        await self._complete_claude_agent_tool(block)
                         raw_output = block.get("content")
                         if isinstance(raw_output, list):
                             raw_output = "\n".join(
@@ -4781,11 +5295,7 @@ class ClaudePrintDriver(CodexAppServer):
                 if not initialized or result is not None or event_session != session:
                     raise AppServerFailure({"code": "invalid_response"})
                 if event.get("subtype") != "success" or event.get("is_error") is not False:
-                    if event.get("api_error_status") in {401, "401"}:
-                        raise AppServerFailure({"code": "auth_required", "retryable": False})
-                    if event.get("api_error_status") in {429, "429"}:
-                        raise AppServerFailure({"code": "quota_exceeded", "retryable": True})
-                    raise AppServerFailure({"code": "provider_error", "retryable": True})
+                    raise AppServerFailure(self._api_failure(event) or {"code": "provider_error", "retryable": True})
                 result_outcome = _bounded_soft_turn_outcome(
                     event.get("result"),
                     command_execution_seen=self._discovery_command_execution_seen,
@@ -4822,7 +5332,10 @@ class ClaudePrintDriver(CodexAppServer):
         return result
 
     async def _turn(self, manifest: JobManifest, prompt: str, schema: dict[str, Any], cancelled: asyncio.Event, progress) -> dict[str, Any]:
-        if not self.credential_path or not self.credential_path.is_file():
+        if not (
+            self.api_key is not None if self.auth_kind == "api_key"
+            else self.credential_path is not None and self.credential_path.is_file()
+        ):
             raise WorkerRefusal("credential_required", "Claude 인증정보를 다시 준비해야 합니다.", category="auth", retryable=True)
         initial_guidance: list[GuidanceRecord] = []
         if self.guidance_mailbox is not None:
@@ -5182,6 +5695,10 @@ print(json.dumps(result,separators=(",",":")))
             except OSError:
                 pass
             self.credential_path = None
+        if self.api_key is not None:
+            for index in range(len(self.api_key)):
+                self.api_key[index] = 0
+            self.api_key = None
         self.process = None
         self.pid = -1
 
@@ -5563,6 +6080,7 @@ class SolverWorker:
         configuration: ModelConfiguration | None,
         version: str,
         runtime_digest: str | None = None,
+        auth_kind: str = "oauth",
     ) -> CodexDriverProtocol:
         if self.driver_factory:
             return self.driver_factory(home, challenge, configuration, version, runtime_digest)
@@ -5572,6 +6090,7 @@ class SolverWorker:
                 home,
                 challenge,
                 configuration,
+                auth_kind=auth_kind,
                 command_prefix=command,
                 expected_version=version,
             )
@@ -6013,10 +6532,17 @@ class SolverWorker:
                     stage="writeup" if manifest.job_mode == "writeup_refine" else "solve",
                 ) from exc
             credential = (
-                consume_staged_claude_credential(active, manifest.auth_sha256)
+                consume_staged_claude_api_key(active, manifest.auth_sha256)
+                if manifest.configuration.provider == "claude" and manifest.auth_kind == "api_key"
+                else consume_staged_claude_credential(active, manifest.auth_sha256)
                 if manifest.configuration.provider == "claude"
                 else consume_staged_credential(active, manifest.auth_sha256)
             )
+            if manifest.configuration.provider == "codex" and (
+                (credential.login.get("type") == "apiKey") != (manifest.auth_kind == "api_key")
+            ):
+                credential.erase()
+                raise WorkerRefusal("invalid_auth_stage", "Codex 계정 인증 방식이 작업 설정과 다릅니다.", category="auth")
             (active / "credential-request.json").unlink(missing_ok=True)
             _fsync_directory(active)
             scratch = prepared.workdir
@@ -6045,6 +6571,7 @@ class SolverWorker:
                 manifest.configuration,
                 manifest.claude_version if manifest.configuration.provider == "claude" else manifest.codex_version,
                 manifest.claude_runtime_sha256 if manifest.configuration.provider == "claude" else manifest.codex_runtime_sha256,
+                auth_kind=manifest.auth_kind,
             )
             driver.guidance_mailbox = guidance_mailbox
             await driver.start()
@@ -6071,7 +6598,13 @@ class SolverWorker:
                     raise asyncio.CancelledError
                 writer.emit("activity", **details)
 
+            async def agent(**details: Any):
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError
+                writer.emit("agent", **details)
+
             driver.activity_reporter = activity
+            driver.agent_reporter = agent
 
             flag = prior.get("flag") if isinstance(prior.get("flag"), str) else None
             if manifest.job_mode == "writeup_refine":
@@ -6352,7 +6885,11 @@ class SolverWorker:
                     # removes the credential-free prepared workspace, then
                     # advertises a clean slot for atomic credential restaging.
                 else:
-                    release_status = "flag_found" if preserved_flag else "refused"
+                    release_status = (
+                        "flag_found" if preserved_flag
+                        else "needs_input" if exc.error.code == "ultra_escalation_requested"
+                        else "refused"
+                    )
                     writer.emit("error", error=exc.error.public(), flag=preserved_flag, terminal=False)
                     writer.state(
                         status="releasing",

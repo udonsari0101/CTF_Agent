@@ -1194,6 +1194,33 @@ def normalize_provider_failure(
             category="auth",
             retryable=False,
         )
+    # Claude Code can report Anthropic API statuses through its stream instead
+    # of the Codex error union. Keep billing, permission, and transient errors
+    # distinct from a classifier refusal; a 403 alone is not a CVP decision.
+    if code in (402, "402", "billing_error", "billing_required"):
+        return SolverError(
+            code="billing_required",
+            message="API 결제 설정을 확인해 주세요.",
+            stage=stage,
+            category="billing",
+            retryable=False,
+        )
+    if code in (403, "403", "permission_error", "access_denied"):
+        return SolverError(
+            code="access_denied",
+            message="선택한 계정에 이 모델 또는 기능의 사용 권한이 없습니다.",
+            stage=stage,
+            category="authorization",
+            retryable=False,
+        )
+    if code in (529, "529", "overloaded_error"):
+        return SolverError(
+            code="provider_unavailable",
+            message="모델 공급자가 일시적으로 혼잡합니다. 잠시 뒤 다시 시도하세요.",
+            stage=stage,
+            category="temporary",
+            retryable=True,
+        )
     if code == "codex_attestation_unavailable":
         return SolverError(
             code="codex_attestation_unavailable",

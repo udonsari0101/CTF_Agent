@@ -38,6 +38,7 @@ class SolveInput(BaseModel):
     reasoning_effort: str | None = Field(default=None, min_length=1, max_length=40)
     service_tier: Literal["fast"] | None = None
     ultracode: bool = False
+    ultra_escalation_mode: Literal["ask", "auto", "off"] = "ask"
     writeup_locale: Literal["ko", "en"] = "ko"
 
 
@@ -63,7 +64,7 @@ async def _validated_configuration_override(
     accounts,
     owner_id: str,
     payload: SolveInput,
-) -> tuple[ModelConfiguration | None, str | None, bool]:
+) -> tuple[ModelConfiguration | None, str | None, bool, bool]:
     """Resolve a one-run execution override without persisting it."""
 
     fields = payload.model_fields_set
@@ -178,7 +179,7 @@ async def _validated_configuration_override(
             catalog = await accounts.models(selected.account_id, owner_id)
     except HTTPException as exc:
         if not has_override:
-            return None, selected.account_id, False
+            return None, selected.account_id, False, False
         raise ExchangeError(
             "model_catalog_unavailable",
             "선택 계정의 모델 목록을 조회하지 못했습니다.",
@@ -187,7 +188,7 @@ async def _validated_configuration_override(
         ) from exc
     except ProviderError as exc:
         if not has_override:
-            return None, selected.account_id, False
+            return None, selected.account_id, False, False
         raise ExchangeError(
             "model_catalog_unavailable",
             "선택 계정의 모델 목록을 조회하지 못했습니다.",
@@ -196,7 +197,7 @@ async def _validated_configuration_override(
         ) from exc
     if not isinstance(catalog, Mapping) or catalog.get("status") != "available":
         if not has_override:
-            return None, selected.account_id, False
+            return None, selected.account_id, False, False
         raise ExchangeError(
             "model_catalog_unavailable",
             "선택 계정의 모델 목록을 조회하지 못했습니다.",
@@ -216,7 +217,7 @@ async def _validated_configuration_override(
         None,
     )
     if chosen is None and not has_override:
-        return None, selected.account_id, False
+        return None, selected.account_id, False, False
     if chosen is None:
         raise ExchangeError(
             "invalid_model_configuration",
@@ -242,6 +243,9 @@ async def _validated_configuration_override(
             and requested_configuration.reasoning_effort not in {"max", "ultra"}
             and requested_configuration.reasoning_effort in efforts
             and "max" in efforts,
+            payload.provider == "codex"
+            and requested_configuration.reasoning_effort in {"high", "xhigh"}
+            and "ultra" in efforts,
         )
     if requested_configuration.reasoning_effort not in efforts:
         raise ExchangeError(
@@ -289,7 +293,12 @@ async def _validated_configuration_override(
         and configuration.reasoning_effort not in {"max", "ultra"}
         and "max" in efforts
     )
-    return configuration, selected.account_id, max_reasoning_available
+    ultra_available = (
+        payload.provider == "codex"
+        and configuration.reasoning_effort in {"high", "xhigh"}
+        and "ultra" in efforts
+    )
+    return configuration, selected.account_id, max_reasoning_available, ultra_available
 
 
 class SolverService:
@@ -351,6 +360,7 @@ class SolverService:
         self.stop_event: asyncio.Event | None = None
         self.wakeup: asyncio.Event | None = None
         self.task: asyncio.Task | None = None
+        self._auto_ultra_tasks: set[asyncio.Task] = set()
         self.start_count = 0
         self.runtime_ready = False
         self.runtime_error: dict[str, Any] | None = None
@@ -682,6 +692,11 @@ class SolverService:
         if self.task:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+        auto_tasks = tuple(self._auto_ultra_tasks)
+        for task in auto_tasks:
+            task.cancel()
+        if auto_tasks:
+            await asyncio.gather(*auto_tasks, return_exceptions=True)
         joined = await asyncio.to_thread(self.coordinator.wait_quiescent, 25.0)
         if not joined:
             self.logger.error("solver_coordinator_shutdown_timeout")
@@ -689,6 +704,9 @@ class SolverService:
 
     async def _loop(self) -> None:
         assert self.stop_event is not None and self.wakeup is not None
+        auto_tasks = getattr(self, "_auto_ultra_tasks", None)
+        if auto_tasks is None:
+            auto_tasks = self._auto_ultra_tasks = set()
         while not self.stop_event.is_set():
             try:
                 changed = await asyncio.to_thread(self.coordinator.tick)
@@ -703,6 +721,22 @@ class SolverService:
                     retryable=True,
                 ).public(stage="coordinator")
                 delay = 0.5
+            try:
+                available = max(0, 4 - len(auto_tasks))
+                auto_requests = (
+                    await asyncio.to_thread(self.coordinator.claim_auto_ultra_requests, available)
+                    if available else []
+                )
+                for job_id, owner_id in auto_requests:
+                    task = asyncio.create_task(self._run_auto_ultra(job_id, owner_id))
+                    auto_tasks.add(task)
+                    task.add_done_callback(auto_tasks.discard)
+                if auto_requests:
+                    delay = min(delay, 0.05)
+            except sqlite3.Error:
+                self.logger.warning("ultra_auto_transition_storage_unavailable")
+            except Exception as exc:
+                self.logger.warning("ultra_auto_transition_unavailable type=%s", type(exc).__name__)
             solver_alerts = getattr(self.app.state, "telegram_solver_alerts", None)
             if callable(solver_alerts):
                 # The scanner runs after the coordinator transaction commits.
@@ -717,9 +751,57 @@ class SolverService:
             except TimeoutError:
                 pass
 
+    async def _run_auto_ultra(self, job_id: str, owner_id: str) -> None:
+        try:
+            await self.start_ultra(job_id, owner_id)
+        except (ExchangeError, ProviderError, HTTPException) as exc:
+            # The request remains available for explicit approval after
+            # credentials, catalog, or inputs are corrected.
+            self.logger.warning("ultra_auto_transition_unavailable code=%s", getattr(exc, "code", "provider"))
+        except Exception as exc:
+            self.logger.warning("ultra_auto_transition_unavailable type=%s", type(exc).__name__)
+
     def notify(self) -> None:
         if self.wakeup:
             self.wakeup.set()
+
+    async def start_ultra(self, job_id: str, owner_id: str) -> dict[str, Any]:
+        source = await asyncio.to_thread(self.coordinator.ultra_request_info, job_id, owner_id)
+        existing = source.get("started_job_id")
+        if isinstance(existing, str):
+            return await asyncio.to_thread(self.coordinator.get, existing, owner_id)
+        payload = SolveInput(
+            provider="codex",
+            account_id=source["account_id"],
+            model=source["model"],
+            reasoning_effort="ultra",
+            service_tier=source["service_tier"],
+            ultra_escalation_mode="off",
+            writeup_locale=source["writeup_locale"],
+        )
+        async with self.accounts.lifecycle_lock:
+            if self.accounts.runtime.busy:
+                raise ExchangeError("runtime_busy", "Codex 업데이트가 끝난 후 Ultra 전환을 다시 시도하세요.", retryable=True)
+            configuration, account_id, _, _ = await _validated_configuration_override(
+                self.accounts, owner_id, payload
+            )
+            if configuration is None or configuration.reasoning_effort != "ultra":
+                raise ExchangeError("invalid_ultra_escalation", "Ultra 모델 설정을 확인할 수 없습니다.", category="model")
+            runtime = await self.runtime_snapshot()
+            result = await asyncio.to_thread(
+                self.coordinator.enqueue,
+                owner_id, source["workspace_id"], source["challenge_id"],
+                provider="codex",
+                codex_version=runtime["version"],
+                codex_runtime_sha256=runtime["sha256"],
+                configuration_override=configuration,
+                expected_account_id=account_id,
+                ultra_escalation_mode="off",
+                ultra_source_job_id=job_id,
+                writeup_locale=source["writeup_locale"],
+            )
+        self.notify()
+        return result
 
     async def health(self) -> dict[str, Any]:
         capacity = await asyncio.to_thread(self.capacity_snapshot)
@@ -796,15 +878,23 @@ def register_solver(app, require_auth, require_admin, settings, database):
             await asyncio.to_thread(
                 sync_solver_input, user["id"], workspace_id, challenge_id
             )
-            provider = payload.provider if payload is not None else "codex"
+            payload = payload or SolveInput()
+            provider = payload.provider
             async with service.accounts.lifecycle_lock:
                 if service.accounts.runtime.busy or service.accounts.claude_runtime.busy:
                     raise ExchangeError("runtime_busy", "CLI 업데이트가 끝난 뒤 시작해 주세요.", retryable=True)
-                configuration_override, expected_account_id, max_reasoning_available = (
+                configuration_override, expected_account_id, max_reasoning_available, ultra_available = (
                     await _validated_configuration_override(
-                        service.accounts, user["id"], payload or SolveInput()
+                        service.accounts, user["id"], payload
                     )
                 )
+                if payload.ultra_escalation_mode == "auto" and not ultra_available:
+                    raise ExchangeError(
+                        "invalid_ultra_escalation",
+                        "이 계정과 모델의 High 또는 xhigh 설정에서는 Ultra 자동 전환을 사용할 수 없습니다.",
+                        category="model",
+                    )
+                ultra_mode = payload.ultra_escalation_mode if ultra_available else "off"
                 if provider == "codex":
                     if service.accounts.runtime.busy:
                         raise ExchangeError("runtime_busy", "Codex 업데이트가 끝난 뒤 시작해 주세요.", retryable=True)
@@ -820,7 +910,8 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         configuration_override=configuration_override,
                         expected_account_id=expected_account_id,
                         max_reasoning_available=max_reasoning_available,
-                        writeup_locale=(payload.writeup_locale if payload else "ko"),
+                        ultra_escalation_mode=ultra_mode,
+                        writeup_locale=payload.writeup_locale,
                     )
                     service.runtime_ready, service.runtime_error = True, None
                 else:
@@ -838,7 +929,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         configuration_override=configuration_override,
                         expected_account_id=expected_account_id,
                         max_reasoning_available=max_reasoning_available,
-                        writeup_locale=(payload.writeup_locale if payload else "ko"),
+                        writeup_locale=payload.writeup_locale,
                     )
             service.notify()
             capacity = await asyncio.to_thread(service.capacity_snapshot)
@@ -866,7 +957,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
             async with service.accounts.lifecycle_lock:
                 if service.accounts.runtime.busy or service.accounts.claude_runtime.busy:
                     raise ExchangeError("runtime_busy", "CLI 업데이트가 끝난 뒤 시작해 주세요.", retryable=True)
-                configuration_override, expected_account_id, _ = (
+                configuration_override, expected_account_id, _, _ = (
                     await _validated_configuration_override(
                         service.accounts, user["id"], payload
                     )
@@ -956,6 +1047,15 @@ def register_solver(app, require_auth, require_admin, settings, database):
     async def solver_job(job_id: str, after: int = Query(0, ge=0), user=Depends(require_auth)):
         try:
             return await asyncio.to_thread(service.coordinator.get, job_id, user["id"], after=after)
+        except ExchangeError as exc:
+            _raise_exchange(exc)
+
+    @router.post("/solver/jobs/{job_id}/ultra-escalate", status_code=202)
+    async def approve_ultra_escalation(job_id: str, user=Depends(require_auth)):
+        try:
+            result = await service.start_ultra(job_id, user["id"])
+            capacity = await asyncio.to_thread(service.capacity_snapshot)
+            return {**result, "capacity": capacity}
         except ExchangeError as exc:
             _raise_exchange(exc)
 

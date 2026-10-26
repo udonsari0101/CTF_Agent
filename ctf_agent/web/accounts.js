@@ -6,6 +6,35 @@ const el = (tag, text, className) => {
   if (className) node.className = className;
   return node;
 };
+
+async function copyText(value) {
+  const text = String(value ?? '');
+  if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
+    try { await navigator.clipboard.writeText(text); return; }
+    catch { /* Permission may be denied; use the selection fallback. */ }
+  }
+  const focused = document.activeElement;
+  const selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart,focused.selectionEnd] : null;
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly','');
+  area.setAttribute('aria-hidden','true');
+  area.className = 'clipboard-proxy';
+  document.body.append(area);
+  area.focus();
+  area.select();
+  area.setSelectionRange?.(0,area.value.length);
+  let copied = false;
+  try { copied = typeof document.execCommand === 'function' && document.execCommand('copy'); }
+  catch { copied = false; }
+  finally {
+    area.remove();
+    if (focused?.isConnected !== false) focused?.focus?.();
+    if (selection && focused?.isConnected !== false && typeof focused?.setSelectionRange === 'function') focused.setSelectionRange(...selection);
+  }
+  if (!copied) throw new Error('클립보드 권한이 차단되었습니다. 브라우저의 클립보드 권한을 허용하거나 로그인 링크를 직접 여세요.');
+}
+
 const date = seconds => seconds != null ? new Date(seconds * 1000).toLocaleString(i18n.locale === 'ko' ? 'ko-KR' : 'en-US', {timeZone: 'Asia/Seoul'}) + ' KST' : i18n.t('미제공');
 const labels = {authenticated: '로그인됨', signed_out: '로그아웃됨', cli_missing: 'CLI 미설치', provider_error: '조회 실패',
   provider_unavailable: '연결 불가', pending: '인증 대기', completed: '로그인 완료', failed: '로그인 실패', expired: '로그인 만료',
@@ -75,11 +104,16 @@ export async function renderAccounts(container, api, options = {}) {
   for (const [value, name] of [['codex', 'Codex'], ['claude', 'Claude Code']]) {
     const option = el('option', name); option.value = value; provider.append(option);
   }
+  const authKind = el('select');
+  authKind.setAttribute('aria-label', '계정 연결 방식');
+  for (const [value, name] of [['oauth', '브라우저 로그인'], ['api_key', 'API 키']]) {
+    const option = el('option', i18n.t(name)); option.value = value; authKind.append(option);
+  }
   const label = el('input');
   label.placeholder = '계정 이름 (예: 개인 Plus)'; label.required = true; label.maxLength = 100;
   label.setAttribute('aria-label', '계정 이름');
   const submit = el('button', '계정 추가'); submit.type = 'submit';
-  form.append(provider, label, submit);
+  form.append(provider, authKind, label, submit);
   if (returnActions) pageHead.append(returnActions);
   shell.append(pageHead);
   shell.append(form, feedback, accounts, runtime);
@@ -88,6 +122,7 @@ export async function renderAccounts(container, api, options = {}) {
   let loadGeneration = 0;
   let runtimeLoadGeneration = 0;
   const loginGeneration = new WeakMap();
+  const modelTargets = new Map();
   const active = () => !stopped && container.contains(accounts);
   async function action(task) {
     setFeedback('');
@@ -97,8 +132,10 @@ export async function renderAccounts(container, api, options = {}) {
   function button(text, task) {
     const node = el('button', text); node.type = 'button';
     node.addEventListener('click', () => action(async () => {
+      // Invoke first so clipboard writes retain the click's user activation.
+      const pending = task();
       node.disabled = true;
-      try { return await task(); } finally { node.disabled = false; }
+      try { return await pending; } finally { node.disabled = false; }
     }));
     return node;
   }
@@ -106,7 +143,7 @@ export async function renderAccounts(container, api, options = {}) {
     event.preventDefault();
     action(async () => {
       submit.disabled = true;
-      try { await api('/api/accounts', {method: 'POST', body: {provider: provider.value, label: label.value}}); label.value = ''; await load(); }
+      try { await api('/api/accounts', {method: 'POST', body: {provider: provider.value, auth_kind: authKind.value, label: label.value}}); label.value = ''; await load(); }
       finally { submit.disabled = false; }
     });
   });
@@ -133,7 +170,7 @@ export async function renderAccounts(container, api, options = {}) {
       const link = el('a', 'Claude 로그인 페이지 열기');
       link.href = state.verification_url; link.target = '_blank'; link.rel = 'noopener noreferrer';
       claudeLink.append(link, button('링크 복사', async () => {
-        await navigator.clipboard.writeText(state.verification_url);
+        await copyText(state.verification_url);
         setFeedback('로그인 링크를 복사했습니다.');
       }));
     };
@@ -220,7 +257,7 @@ export async function renderAccounts(container, api, options = {}) {
             target.replaceChildren(el('p', labels[result.status] || result.status));
             if (result.message) target.append(el('p', result.message));
             if (result.error) target.append(el('p', errorText(result.error), 'error-text'));
-            if (result.status === 'completed') { await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }
+            if (result.status === 'completed') { modelTargets.delete(account.id); await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }
           }
         } catch (error) {
           if (current()) {
@@ -231,6 +268,7 @@ export async function renderAccounts(container, api, options = {}) {
       };
       window.setTimeout(poll, 2500);
     } else if (result.status === 'completed' && start) {
+      modelTargets.delete(account.id);
       await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'});
       await load();
     }
@@ -238,6 +276,7 @@ export async function renderAccounts(container, api, options = {}) {
 
   async function showModels(account, target) {
     const data = await api(`/api/accounts/${account.id}/models`);
+    if (!active() || !container.contains(target)) return;
     target.replaceChildren();
     if (data.status !== 'available') { target.append(el('p', data.message || '모델 목록을 제공하지 않습니다.')); return; }
     const model = el('select'); model.setAttribute('aria-label', '모델');
@@ -294,6 +333,7 @@ export async function renderAccounts(container, api, options = {}) {
       await api(`/api/accounts/${account.id}`, {method: 'PATCH', body: {model: model.value || null,
         reasoning_effort: model.value && effort.value || null, service_tier: model.value && tier.value || null,
         ultracode: account.provider === 'claude' && ultracode.checked}});
+      modelTargets.delete(account.id);
       await load();
     });
     save.className = 'model-save';
@@ -318,7 +358,36 @@ export async function renderAccounts(container, api, options = {}) {
         try {
           const body = new FormData(); body.append('file', file);
           await api(`/api/accounts/${account.id}/auth-file`, {method: 'POST', body});
+          modelTargets.delete(account.id);
           await load(); setFeedback('auth.json을 가져오고 Codex 계정 정보를 확인했습니다.');
+        } finally { input.value = ''; submit.disabled = false; }
+      });
+    });
+  }
+
+  function showApiKey(account, target) {
+    target.replaceChildren();
+    const form = el('form', undefined, 'account-api-key');
+    const field = el('label', i18n.t('API 키'));
+    const input = el('input');
+    input.type = 'password'; input.autocomplete = 'off'; input.required = true;
+    input.minLength = 20; input.maxLength = 8192;
+    input.setAttribute('aria-label', i18n.t('API 키'));
+    field.append(input);
+    const submit = el('button', i18n.t('API 키 연결')); submit.type = 'submit';
+    form.append(field, submit);
+    target.append(form);
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      action(async () => {
+        submit.disabled = true;
+        try {
+          await api(`/api/accounts/${account.id}/api-key`, {method: 'POST', body: {key: input.value}});
+          input.value = '';
+          target.replaceChildren();
+          modelTargets.delete(account.id);
+          await load();
+          setFeedback(i18n.t('API 키가 연결되었습니다.'));
         } finally { input.value = ''; submit.disabled = false; }
       });
     });
@@ -329,6 +398,8 @@ export async function renderAccounts(container, api, options = {}) {
     const data = await api('/api/accounts');
     if (!active() || generation !== loadGeneration) return;
     const pendingLogins = [];
+    const liveAccountIds = new Set(data.accounts.map(account => account.id));
+    for (const id of modelTargets.keys()) if (!liveAccountIds.has(id)) modelTargets.delete(id);
     accounts.replaceChildren();
     if (!data.accounts.length) accounts.append(el('p', '등록된 계정이 없습니다.'));
     for (const account of data.accounts) {
@@ -339,7 +410,8 @@ export async function renderAccounts(container, api, options = {}) {
       const modelSummary = [`${i18n.t('모델')}: ${account.model || i18n.t('계정 기본')}`, `${i18n.t('추론')}: ${account.reasoning_effort || i18n.t('계정 기본')}`,
         `${i18n.t('속도')}: ${account.service_tier === 'fast' ? 'Fast 1.5×' : i18n.t('기본')}`];
       if (account.provider === 'claude') modelSummary.push(`Ultracode: ${account.ultracode ? (i18n.locale === 'en' ? 'On' : '켜짐') : (i18n.locale === 'en' ? 'Off' : '꺼짐')}`);
-      card.append(el('p', [i18n.t(labels[snapshot.status] || '아직 조회하지 않음'), identity.email,
+      card.append(el('p', [i18n.t(labels[snapshot.status] || '아직 조회하지 않음'),
+        account.auth_kind === 'api_key' ? i18n.t('API 키') : null, identity.email,
         identity.planType || identity.subscriptionType].filter(Boolean).join(' · ')));
       if (snapshot.message) card.append(el('p', snapshot.message));
       if (snapshot.error) card.append(el('p', errorText({...snapshot.error,message:snapshot.error.message || '계정 정보를 조회하지 못했습니다.'}), 'error-text'));
@@ -388,20 +460,25 @@ export async function renderAccounts(container, api, options = {}) {
       const summary = el('p', modelSummary.join(' · '), 'account-model-summary');
       summary.setAttribute('aria-label', '기본 풀이 설정');
       card.append(summary);
-      const login = el('div'); const models = el('div'); const controls = el('div', undefined, 'actions');
+      const login = el('div');
+      const models = modelTargets.get(account.id) || el('div');
+      modelTargets.set(account.id, models);
+      const controls = el('div', undefined, 'actions');
       const upload = el('div');
+      const apiKey = el('div');
       const select = button(account.selected ? '선택됨' : '이 계정 선택', async () => { await api(`/api/accounts/${account.id}/select`, {method: 'POST'}); await load(); });
       select.disabled = account.selected;
-      controls.append(select, button('사용량 새로고침', async () => { await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }),
-        button(snapshot.status === 'authenticated' ? '다시 로그인' : '로그인', () => showLogin(account, login, true)), button('모델·속도 설정', () => showModels(account, models)),
-        button('로그아웃', async () => { await api(`/api/accounts/${account.id}/logout`, {method: 'POST'}); await load(); }),
+      controls.append(select, button('사용량 새로고침', async () => { await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }));
+      if (account.auth_kind !== 'api_key') controls.append(button(snapshot.status === 'authenticated' ? '다시 로그인' : '로그인', () => showLogin(account, login, true)));
+      controls.append(button('API 키 연결', () => showApiKey(account, apiKey)), button('모델·속도 설정', () => showModels(account, models)),
+        button('로그아웃', async () => { await api(`/api/accounts/${account.id}/logout`, {method: 'POST'}); modelTargets.delete(account.id); await load(); }),
         button('계정 삭제', async () => {
           if (!window.confirm(`${account.label} 계정 등록과 서버에 저장된 로그인 정보를 삭제할까요?`)) return;
           await api(`/api/accounts/${account.id}`, {method: 'DELETE'});
           await load();
         }));
       if (account.provider === 'codex') controls.append(button('auth.json 업로드', () => authUpload(account, upload)));
-      card.append(controls, login, models, upload); accounts.append(card);
+      card.append(controls, login, models, upload, apiKey); accounts.append(card);
       if (['starting', 'pending'].includes(account.login?.status)) {
         pendingLogins.push(action(() => showLogin(account, login, false)));
       }

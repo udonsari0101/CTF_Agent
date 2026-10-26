@@ -56,6 +56,8 @@ from .writeups import merge_generated_writeup, remove_generated_writeup
 
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _JOB_ID = re.compile(r"[A-Za-z0-9_-]{20,100}\Z")
+_AGENT_ID = re.compile(r"(?:root|[A-Za-z0-9_.:-]{1,128})\Z")
+_MAX_AGENT_NODES = 64
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _OPEN_STATUSES = (
     "queued",
@@ -96,11 +98,14 @@ _GUIDANCE_OPEN_STATUSES = {
 }
 
 
-def _credential_stage_name(provider: str) -> str:
+def _credential_stage_name(provider: str, auth_kind: str = "oauth") -> str:
     if provider == "codex":
         return "auth.json"
     if provider == "claude":
-        return ".credentials.json"
+        if auth_kind == "api_key":
+            return ".api-key"
+        if auth_kind == "oauth":
+            return ".credentials.json"
     raise ExchangeError("invalid_provider", "공급자 선택을 확인할 수 없습니다.", category="model")
 
 
@@ -114,8 +119,12 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     account_id TEXT NOT NULL,
     account_label TEXT NOT NULL DEFAULT '',
     provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
+    auth_kind TEXT NOT NULL DEFAULT 'oauth' CHECK(auth_kind IN ('oauth','api_key')),
     model TEXT NOT NULL,
     reasoning_effort TEXT NOT NULL,
+    ultra_escalation_mode TEXT NOT NULL DEFAULT 'off' CHECK(ultra_escalation_mode IN ('off','ask','auto')),
+    ultra_source_job_id TEXT,
+    ultra_auto_attempted INTEGER NOT NULL DEFAULT 0 CHECK(ultra_auto_attempted IN (0,1)),
     ultracode INTEGER NOT NULL DEFAULT 0 CHECK(ultracode IN (0,1)),
     max_reasoning_available INTEGER NOT NULL DEFAULT 0 CHECK(max_reasoning_available IN (0,1)),
     service_tier TEXT,
@@ -127,6 +136,7 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     previous_challenge_status TEXT,
     cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
     last_event_sequence INTEGER NOT NULL DEFAULT 0,
+    agents_json TEXT NOT NULL DEFAULT '[]',
     released_ingested INTEGER NOT NULL DEFAULT 0 CHECK(released_ingested IN (0,1)),
     flag TEXT,
     writeup_markdown TEXT,
@@ -465,6 +475,61 @@ class SolverExchangeCoordinator:
         with self._connect() as db:
             db.executescript(SCHEMA)
             columns = {row[1] for row in db.execute("PRAGMA table_info(solver_jobs)")}
+            if "agents_json" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN agents_json TEXT NOT NULL DEFAULT '[]'")
+            if "ultra_escalation_mode" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN ultra_escalation_mode TEXT NOT NULL DEFAULT 'off' CHECK(ultra_escalation_mode IN ('off','ask','auto'))")
+            if "ultra_source_job_id" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN ultra_source_job_id TEXT")
+            if "ultra_auto_attempted" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN ultra_auto_attempted INTEGER NOT NULL DEFAULT 0 CHECK(ultra_auto_attempted IN (0,1))")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_solver_one_ultra_child ON solver_jobs(ultra_source_job_id) WHERE ultra_source_job_id IS NOT NULL")
+            if "auth_kind" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN auth_kind TEXT NOT NULL DEFAULT 'oauth' CHECK(auth_kind IN ('oauth','api_key'))")
+                account_table = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_accounts'"
+                ).fetchone()
+                if account_table:
+                    account_columns = {
+                        row[1] for row in db.execute("PRAGMA table_info(provider_accounts)")
+                    }
+                    for old_job in db.execute(
+                        "SELECT id,owner_user_id,account_id FROM solver_jobs WHERE provider='codex'"
+                    ).fetchall():
+                        if not _ID.fullmatch(old_job["account_id"]):
+                            continue
+                        fields = "auth_kind,snapshot" if "auth_kind" in account_columns else "snapshot"
+                        owner_filter = " AND owner_user_id=?" if "owner_user_id" in account_columns else ""
+                        account = db.execute(
+                            f"SELECT {fields} FROM provider_accounts WHERE id=?{owner_filter}",
+                            (old_job["account_id"], old_job["owner_user_id"])
+                            if owner_filter else (old_job["account_id"],),
+                        ).fetchone()
+                        if account is None:
+                            continue
+                        has_recorded_mode = "auth_kind" in account_columns
+                        api_key = has_recorded_mode and account["auth_kind"] == "api_key"
+                        if not has_recorded_mode and account["snapshot"]:
+                            try:
+                                snapshot = json.loads(account["snapshot"])
+                                identity = snapshot.get("identity") if isinstance(snapshot, dict) else None
+                                api_key = isinstance(identity, dict) and str(identity.get("type", "")).lower() == "apikey"
+                            except (ValueError, TypeError, RecursionError):
+                                pass
+                        if not has_recorded_mode and not api_key:
+                            auth_path = self.accounts_dir / old_job["account_id"] / "codex" / "auth.json"
+                            try:
+                                if (
+                                    not any(path.is_symlink() for path in (auth_path.parent.parent, auth_path.parent, auth_path))
+                                    and auth_path.is_file()
+                                    and auth_path.stat().st_size <= MAX_AUTH_BYTES
+                                ):
+                                    auth = json.loads(auth_path.read_bytes())
+                                    api_key = isinstance(auth, dict) and isinstance(auth.get("OPENAI_API_KEY"), str)
+                            except (OSError, ValueError, TypeError, RecursionError):
+                                pass
+                        if api_key:
+                            db.execute("UPDATE solver_jobs SET auth_kind='api_key' WHERE id=?", (old_job["id"],))
             if "codex_version" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN codex_version TEXT NOT NULL DEFAULT '0.164.0'")
             if "codex_runtime_sha256" not in columns:
@@ -683,6 +748,8 @@ class SolverExchangeCoordinator:
         configuration_override: ModelConfiguration | None = None,
         expected_account_id: str | None = None,
         max_reasoning_available: bool = False,
+        ultra_escalation_mode: str = "off",
+        ultra_source_job_id: str | None = None,
         job_mode: str = "solve",
         writeup_instruction: str | None = None,
         writeup_locale: str = "ko",
@@ -706,6 +773,16 @@ class SolverExchangeCoordinator:
             )
         if provider not in {"codex", "claude"}:
             raise ExchangeError("invalid_provider", "공급자 선택을 확인할 수 없습니다.", category="model")
+        if ultra_escalation_mode not in {"off", "ask", "auto"} or (
+            ultra_escalation_mode != "off" and (job_mode != "solve" or provider != "codex")
+        ):
+            raise ExchangeError("invalid_ultra_escalation", "Ultra 전환 설정을 확인할 수 없습니다.", category="model")
+        if ultra_source_job_id is not None and (
+            not _JOB_ID.fullmatch(ultra_source_job_id)
+            or job_mode != "solve" or provider != "codex"
+            or ultra_escalation_mode != "off"
+        ):
+            raise ExchangeError("invalid_ultra_source", "Ultra 전환 원본을 확인할 수 없습니다.", category="safety")
         if configuration_override is not None and (
             not isinstance(configuration_override, ModelConfiguration)
             or configuration_override.provider != provider
@@ -758,6 +835,14 @@ class SolverExchangeCoordinator:
         try:
             with self._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
+                if ultra_source_job_id is not None:
+                    existing_ultra = db.execute(
+                        "SELECT id FROM solver_jobs WHERE ultra_source_job_id=? AND owner_user_id=?",
+                        (ultra_source_job_id, owner_user_id),
+                    ).fetchone()
+                    if existing_ultra:
+                        db.commit()
+                        return self.get(existing_ultra["id"], owner_user_id)
                 challenge = db.execute(
                     """SELECT c.status,c.remote_mode,c.flag,c.completion_source,w.owner_user_id
                               FROM challenges c
@@ -930,6 +1015,9 @@ class SolverExchangeCoordinator:
                     ).fetchone()
                 if not account:
                     raise ExchangeError("account_required", "선택된 모델 계정이 필요합니다.", category="auth")
+                auth_kind = account["auth_kind"] if "auth_kind" in account.keys() else "oauth"
+                if auth_kind not in {"oauth", "api_key"}:
+                    raise ExchangeError("invalid_account_binding", "계정 인증 방식을 확인할 수 없습니다.", category="auth")
                 if configuration_override is not None:
                     # A per-run choice is already validated against this
                     # account's live catalog by the HTTP service.  It must not
@@ -957,6 +1045,8 @@ class SolverExchangeCoordinator:
                     except ValueError as exc:
                         raise ExchangeError("model_configuration_required", "모델과 추론 수준을 먼저 선택해 주세요.", category="model") from exc
                 configuration = configuration_override or selected.configuration
+                if ultra_escalation_mode != "off" and configuration.reasoning_effort not in {"high", "xhigh"}:
+                    raise ExchangeError("invalid_ultra_escalation", "High 또는 xhigh 실행에서만 Ultra 자동 전환을 요청할 수 있습니다.", category="model")
                 snapshot = _optional_json(account["snapshot"])
                 if snapshot.get("status") != "authenticated":
                     raise ExchangeError("account_login_required", "선택한 모델 계정에 로그인해 주세요.", category="auth")
@@ -978,7 +1068,7 @@ class SolverExchangeCoordinator:
                         retryable=True,
                     )
                 checkpoint_row = db.execute(
-                    """SELECT checkpoint_json,input_sha256,base_input_sha256,source_remote_mode
+                    """SELECT checkpoint_json,input_sha256,base_input_sha256,source_remote_mode,source_job_id
                        FROM solver_retry_checkpoints
                        WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?""",
                     (owner_user_id, workspace_id, challenge_id),
@@ -1041,15 +1131,46 @@ class SolverExchangeCoordinator:
                                     challenge_id,
                                 ),
                             )
+                if ultra_source_job_id is not None:
+                    source = db.execute(
+                        "SELECT * FROM solver_jobs WHERE id=? AND owner_user_id=? AND workspace_id=? AND challenge_id=?",
+                        (ultra_source_job_id, owner_user_id, workspace_id, challenge_id),
+                    ).fetchone()
+                    source_error = _optional_json(source["error_json"]) if source else {}
+                    latest_source = db.execute(
+                        """SELECT id FROM solver_jobs WHERE owner_user_id=? AND workspace_id=?
+                           AND challenge_id=? AND job_mode='solve'
+                           ORDER BY created_at DESC,id DESC LIMIT 1""",
+                        (owner_user_id, workspace_id, challenge_id),
+                    ).fetchone()
+                    if not (
+                        source and latest_source and latest_source["id"] == ultra_source_job_id
+                        and source["status"] == "needs_input" and source["released_ingested"]
+                        and source["job_mode"] == "solve" and source["provider"] == "codex"
+                        and source["ultra_escalation_mode"] in {"ask", "auto"}
+                        and source["ultra_source_job_id"] is None and source["flag"] is None
+                        and source_error.get("code") == "ultra_escalation_requested"
+                        and source["account_id"] == selected.account_id
+                        and source["model"] == configuration.model
+                        and configuration.reasoning_effort == "ultra"
+                        and source["challenge_input_sha256"] == challenge_input_sha256
+                        and checkpoint_row and checkpoint_row["source_job_id"] == ultra_source_job_id
+                        and retry_checkpoint_json and checkpoint and checkpoint.reason == "ultra_escalation"
+                    ):
+                        raise ExchangeError(
+                            "ultra_escalation_unavailable",
+                            "Ultra 전환 원본, 풀이 기록 또는 현재 문제 입력이 일치하지 않습니다.",
+                            category="input",
+                        )
                 db.execute(
                     """INSERT INTO solver_jobs
-                       (id,job_mode,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,model,
-                        reasoning_effort,ultracode,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
+                       (id,job_mode,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,auth_kind,model,
+                        reasoning_effort,ultra_escalation_mode,ultra_source_job_id,ultracode,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
                         retry_checkpoint_json,writeup_instruction,writeup_locale,source_writeup_sha256,source_solver_job_id,
                         challenge_input_sha256,challenge_base_sha256,remote_mode,status,previous_challenge_status,flag,private_notes,
                         solver_artifact_json,flag_hooked,created_at,updated_at)
                        VALUES(:id,:job_mode,:owner_user_id,:workspace_id,:challenge_id,:account_id,
-                               :account_label,:provider,:model,:reasoning_effort,:ultracode,:max_reasoning_available,:service_tier,:codex_version,
+                               :account_label,:provider,:auth_kind,:model,:reasoning_effort,:ultra_escalation_mode,:ultra_source_job_id,:ultracode,:max_reasoning_available,:service_tier,:codex_version,
                               :codex_runtime_sha256,:claude_version,:claude_runtime_sha256,:retry_checkpoint_json,
                               :writeup_instruction,:writeup_locale,:source_writeup_sha256,:source_solver_job_id,
                               :challenge_input_sha256,:challenge_base_sha256,:remote_mode,'queued',:previous_challenge_status,:flag,
@@ -1063,8 +1184,11 @@ class SolverExchangeCoordinator:
                         "account_id": selected.account_id,
                         "account_label": account["label"],
                         "provider": configuration.provider,
+                        "auth_kind": auth_kind,
                         "model": configuration.model,
                         "reasoning_effort": configuration.reasoning_effort,
+                        "ultra_escalation_mode": ultra_escalation_mode,
+                        "ultra_source_job_id": ultra_source_job_id,
                         "ultracode": int(configuration.ultracode),
                         "max_reasoning_available": int(
                             max_reasoning_available
@@ -1155,12 +1279,16 @@ class SolverExchangeCoordinator:
         limit = max(1, min(int(limit), 500))
         with self._connect() as db:
             row = db.execute(
-                """SELECT j.*,cp.checkpoint_json AS current_retry_checkpoint_json
+                """SELECT j.*,cp.checkpoint_json AS current_retry_checkpoint_json,
+                          cp.source_job_id AS current_retry_source_job_id,
+                          next.id AS ultra_started_job_id
                    FROM solver_jobs j
                    LEFT JOIN solver_retry_checkpoints cp
                      ON cp.challenge_id=j.challenge_id
                     AND cp.workspace_id=j.workspace_id
                     AND cp.owner_user_id=j.owner_user_id
+                   LEFT JOIN solver_jobs next
+                     ON next.ultra_source_job_id=j.id
                    WHERE j.id=? AND j.owner_user_id=?""",
                 (job_id, owner_user_id),
             ).fetchone()
@@ -1220,6 +1348,52 @@ class SolverExchangeCoordinator:
                     (owner_user_id, workspace_id, challenge_id, job_mode),
                 ).fetchone()
         return self.get(row["id"], owner_user_id) if row else None
+
+    def ultra_request_info(self, job_id: str, owner_user_id: str) -> dict[str, Any]:
+        """Return only one owner's validated escalation source for service preflight."""
+
+        source = self.get(job_id, owner_user_id)
+        if not source["ultra_escalation"]["eligible"]:
+            existing = source["ultra_escalation"]["started_job_id"]
+            if isinstance(existing, str):
+                return {"started_job_id": existing}
+            raise ExchangeError(
+                "ultra_escalation_unavailable",
+                "승인할 Ultra 전환 요청이 없습니다.", category="input",
+            )
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT account_id,model,service_tier,workspace_id,challenge_id,writeup_locale FROM solver_jobs WHERE id=? AND owner_user_id=?",
+                (job_id, owner_user_id),
+            ).fetchone()
+        if not row:
+            raise ExchangeError("job_not_found", "작업을 찾을 수 없습니다.")
+        return dict(row)
+
+    def claim_auto_ultra_requests(self, limit: int = 4) -> list[tuple[str, str]]:
+        """Claim each durable automatic request once; failed preflight stays manual."""
+
+        claimed: list[tuple[str, str]] = []
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                """SELECT j.id,j.owner_user_id,j.error_json FROM solver_jobs j
+                   WHERE j.job_mode='solve' AND j.status='needs_input'
+                     AND j.released_ingested=1 AND j.ultra_escalation_mode='auto'
+                     AND j.ultra_auto_attempted=0
+                     AND NOT EXISTS(SELECT 1 FROM solver_jobs child WHERE child.ultra_source_job_id=j.id)
+                   ORDER BY j.created_at,j.id LIMIT ?""",
+                (max(1, min(limit, 20)),),
+            ).fetchall()
+            for row in rows:
+                db.execute(
+                    "UPDATE solver_jobs SET ultra_auto_attempted=1 WHERE id=? AND ultra_auto_attempted=0",
+                    (row["id"],),
+                )
+                error = _optional_json(row["error_json"])
+                if error.get("code") == "ultra_escalation_requested":
+                    claimed.append((row["id"], row["owner_user_id"]))
+        return claimed
 
     def add_guidance(
         self,
@@ -2153,7 +2327,7 @@ class SolverExchangeCoordinator:
         request = active / "credential-request.json"
         if (
             request.is_file()
-            and not (active / _credential_stage_name(current["provider"])).exists()
+            and not (active / _credential_stage_name(current["provider"], current["auth_kind"])).exists()
             and not current["released_ingested"]
             and not current["cancel_requested"]
         ):
@@ -2370,15 +2544,24 @@ class SolverExchangeCoordinator:
         reason = None
         if not flag:
             if status == "needs_input":
-                reason = "needs_remote"
+                code = error.get("code") if isinstance(error, Mapping) else None
+                reason = "ultra_escalation" if code == "ultra_escalation_requested" else "needs_remote"
             elif status == "cancelled":
                 reason = "cancelled"
             elif status in {"failed", "refused"}:
                 code = error.get("code") if isinstance(error, Mapping) else None
+                resumable_refusals = {
+                    "policy_security", "model_unavailable", "access_denied",
+                    "daybreak_route_rejected", "provider_request_rejected",
+                    "provider_tools_unavailable", "billing_required", "quota_exceeded",
+                    "usage_limit_exceeded", "session_budget_exceeded",
+                    "rate_limit_exceeded", "provider_unavailable", "auth_required",
+                }
                 reason = (
                     "timeout" if code == "timeout"
                     else "turn_limit" if code == "flag_not_submitted"
                     else "provider_failure" if status == "failed"
+                    else "provider_failure" if code in resumable_refusals
                     else None
                 )
         timestamp = self.clock()
@@ -2582,7 +2765,9 @@ class SolverExchangeCoordinator:
                     "codex_runtime_sha256": job["codex_runtime_sha256"],
                     "claude_version": job["claude_version"],
                     "claude_runtime_sha256": job["claude_runtime_sha256"],
-                    "credential_file": _credential_stage_name(job["provider"]),
+                    "credential_file": _credential_stage_name(job["provider"], job["auth_kind"]),
+                    "auth_kind": job["auth_kind"],
+                    "ultra_escalation_mode": job["ultra_escalation_mode"],
                     "auth_sha256": digest,
                     "max_seconds": MAX_JOB_SECONDS,
                     "created_at": execution_started,
@@ -2620,7 +2805,7 @@ class SolverExchangeCoordinator:
                 manifest_size,
                 lambda: _write_json_file(staging / "manifest.json", manifest),
             )
-            os.replace(auth_temp, staging / _credential_stage_name(job["provider"]))
+            os.replace(auth_temp, staging / _credential_stage_name(job["provider"], job["auth_kind"]))
             _fsync(staging)
             if self._is_cancelled(job["id"]):
                 raise _StageCancelled
@@ -2854,7 +3039,8 @@ class SolverExchangeCoordinator:
         if job["provider"] == "codex":
             return self.accounts_dir / job["account_id"] / "codex" / "auth.json"
         if job["provider"] == "claude":
-            return self.accounts_dir / job["account_id"] / "claude" / ".credentials.json"
+            name = _credential_stage_name("claude", job["auth_kind"])
+            return self.accounts_dir / job["account_id"] / "claude" / name
         raise ExchangeError("invalid_provider", "공급자 선택을 확인할 수 없습니다.", category="model")
 
     def _copy_auth(self, job: Mapping[str, Any], destination: Path, *, expected_size: int | None = None) -> str:
@@ -2900,6 +3086,12 @@ class SolverExchangeCoordinator:
             manifest = _read_json_file(active / "manifest.json", 512 * 1024)
             if manifest.get("job_id") != job["id"]:
                 raise ExchangeError("active_job_mismatch", "활성 solver 작업이 변경되었습니다.", category="safety")
+            # A pre-auth_kind manifest can survive a deployment while its DB
+            # row is migrated.  The owned job row is authoritative when the
+            # replacement worker requests a fresh credential.
+            credential_file = _credential_stage_name(job["provider"], job["auth_kind"])
+            manifest["auth_kind"] = job["auth_kind"]
+            manifest["credential_file"] = credential_file
             manifest["auth_sha256"] = digest
             manifest_size = len(_json_bytes(manifest))
             self.storage_budget.commit_reserved_write(
@@ -2909,7 +3101,7 @@ class SolverExchangeCoordinator:
             )
             if self._is_cancelled(job["id"]):
                 raise _StageCancelled
-            os.replace(temporary, active / _credential_stage_name(job["provider"]))
+            os.replace(temporary, active / credential_file)
             _fsync(active)
         finally:
             temporary.unlink(missing_ok=True)
@@ -3022,6 +3214,12 @@ class SolverExchangeCoordinator:
             current = db.execute("SELECT * FROM solver_jobs WHERE id=?", (job["id"],)).fetchone()
             if not current or event["sequence"] != current["last_event_sequence"] + 1:
                 return
+            if event["kind"] == "activity" and event.get("agent_id") not in (None, "root"):
+                agents = _agent_nodes(current["agents_json"])
+                if not any(agent.get("id") == event["agent_id"] for agent in agents):
+                    raise ExchangeError(
+                        "invalid_worker_event", "Activity refers to an unknown subagent.", category="safety"
+                    )
             challenge = db.execute(
                 "SELECT name,status,completion_source,flag,notes FROM challenges WHERE id=? AND workspace_id=?",
                 (job["challenge_id"], job["workspace_id"]),
@@ -3219,6 +3417,9 @@ class SolverExchangeCoordinator:
                     )
             elif kind == "error":
                 updates["error_json"] = json.dumps(event["error"], ensure_ascii=False, separators=(",", ":"))
+            elif kind == "agent":
+                agents = _merge_agent_event(current["agents_json"], event, current["provider"])
+                updates["agents_json"] = json.dumps(agents, ensure_ascii=False, separators=(",", ":"))
             elif kind == "guidance":
                 guidance = db.execute(
                     """SELECT id,message,status FROM solver_job_guidance
@@ -3413,6 +3614,15 @@ class SolverExchangeCoordinator:
                     # policy failure wins the terminal outcome.
                     updates.update(writeup_markdown=None, writeup_hooked=1)
                 updates.update(status=final_status, released_ingested=1)
+                agents = _agent_nodes(current["agents_json"])
+                if agents:
+                    for agent in agents:
+                        if agent.get("status") == "running":
+                            # The job finishing is not proof that an individual
+                            # child reported success.  Preserve an explicit
+                            # terminal child event; otherwise show interruption.
+                            agent["status"] = "interrupted"
+                    updates["agents_json"] = json.dumps(agents, ensure_ascii=False, separators=(",", ":"))
                 db.execute(
                     """UPDATE solver_job_guidance
                        SET status='rejected',provider_delivery=NULL,
@@ -4534,6 +4744,42 @@ def _public_guidance(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _agent_nodes(raw: str) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list) or len(value) > _MAX_AGENT_NODES:
+        return []
+    return value if all(isinstance(node, dict) for node in value) else []
+
+
+def _merge_agent_event(raw: str, event: dict[str, Any], provider: str) -> list[dict[str, Any]]:
+    agents = _agent_nodes(raw)
+    if event["provider"] != provider:
+        raise ExchangeError("invalid_worker_event", "Invalid subagent state.", category="safety")
+    agent_id = event["agent_id"]
+    parent_id = event["parent_id"]
+    existing = next((node for node in agents if node.get("id") == agent_id), None)
+    if existing is None:
+        if len(agents) >= _MAX_AGENT_NODES or (
+            parent_id != "root" and not any(node.get("id") == parent_id for node in agents)
+        ):
+            raise ExchangeError("invalid_worker_event", "Invalid subagent parent or count.", category="safety")
+        existing = {
+            "id": agent_id, "parent_id": parent_id, "label": event["label"],
+            "status": event["status"], "provider": provider,
+        }
+        agents.append(existing)
+    elif existing.get("parent_id") != parent_id or existing.get("provider") != provider:
+        raise ExchangeError("invalid_worker_event", "Subagent identity changed.", category="safety")
+    if existing["status"] not in {"completed", "failed", "interrupted"}:
+        existing["status"] = event["status"]
+    if "model" in event:
+        existing["model"] = event["model"]
+    return agents
+
+
 def _public_job(
     row: Mapping[str, Any],
     events: list[dict[str, Any]],
@@ -4576,6 +4822,32 @@ def _public_job(
             **({"ultracode": True} if row["ultracode"] else {}),
         },
         "max_reasoning_available": bool(row["max_reasoning_available"]),
+        "ultra_escalation": {
+            "mode": row["ultra_escalation_mode"],
+            "eligible": bool(
+                row["job_mode"] == "solve"
+                and row["status"] == "needs_input"
+                and row["released_ingested"]
+                and row["ultra_escalation_mode"] in {"ask", "auto"}
+                and isinstance(error, dict)
+                and error.get("code") == "ultra_escalation_requested"
+                and checkpoint is not None
+                and checkpoint.reason == "ultra_escalation"
+                and row["current_retry_source_job_id"] == row["id"]
+                and row["ultra_started_job_id"] is None
+            ),
+            "started_job_id": row["ultra_started_job_id"],
+            "source_job_id": row["ultra_source_job_id"],
+            "auto_pending": bool(
+                row["ultra_escalation_mode"] == "auto"
+                and not row["ultra_auto_attempted"]
+                and row["status"] == "needs_input"
+                and row["released_ingested"]
+                and row["ultra_started_job_id"] is None
+                and isinstance(error, dict)
+                and error.get("code") == "ultra_escalation_requested"
+            ),
+        },
         "runtime_version": row["claude_version"] if row["provider"] == "claude" else row["codex_version"],
         "runtime_sha256": row["claude_runtime_sha256"] if row["provider"] == "claude" else row["codex_runtime_sha256"],
         "remote_mode": row["remote_mode"],
@@ -4609,6 +4881,14 @@ def _public_job(
         "released_at": row["released_at"],
         "last_event_sequence": row["last_event_sequence"],
         "events": events,
+        "agents": [
+            {
+                "id": "root", "parent_id": None, "label": "Main agent",
+                "status": row["status"],
+                "provider": row["provider"], "model": row["model"],
+            },
+            *_agent_nodes(row["agents_json"]),
+        ],
         "guidance": guidance or [],
     }
     if position is not None:
@@ -4645,8 +4925,9 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
         "progress": common | {"code", "reason", "from_effort", "to_effort"},
         "activity": common | {
             "phase", "tool", "summary", "command", "output", "message",
-            "exit_code", "duration_ms"
+            "exit_code", "duration_ms", "agent_id"
         },
+        "agent": common | {"agent_id", "parent_id", "label", "status", "provider", "model"},
         "guidance": common | {
             "guidance_id", "state", "message", "provider_delivery", "error_code"
         },
@@ -4734,6 +5015,32 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
             type(duration_ms) is not int or not 0 <= duration_ms <= 2**63 - 1
         ):
             raise ExchangeError("invalid_worker_event", "worker 활동 결과를 확인할 수 없습니다.", category="safety")
+    if kind == "activity":
+        agent_id = value.get("agent_id")
+        if agent_id is not None and (
+            not isinstance(agent_id, str) or not _AGENT_ID.fullmatch(agent_id)
+        ):
+            raise ExchangeError("invalid_worker_event", "Invalid activity agent id.", category="safety")
+    if kind == "agent":
+        agent_id = value.get("agent_id")
+        parent_id = value.get("parent_id")
+        label = value.get("label")
+        model = value.get("model")
+        if (
+            not isinstance(agent_id, str) or agent_id == "root"
+            or not _AGENT_ID.fullmatch(agent_id)
+            or not isinstance(parent_id, str) or not _AGENT_ID.fullmatch(parent_id)
+            or parent_id == agent_id
+            or not isinstance(label, str) or not label
+            or len(label.encode("utf-8")) > 120 or _WRITEUP_INSTRUCTION_CONTROL.search(label)
+            or value.get("status") not in {"running", "completed", "failed", "interrupted"}
+            or value.get("provider") not in {"codex", "claude"}
+            or (model is not None and (
+                not isinstance(model, str) or not model
+                or len(model.encode("utf-8")) > 120 or _WRITEUP_INSTRUCTION_CONTROL.search(model)
+            ))
+        ):
+            raise ExchangeError("invalid_worker_event", "Invalid subagent event.", category="safety")
     if kind == "guidance":
         state = value.get("state")
         delivery = value.get("provider_delivery")

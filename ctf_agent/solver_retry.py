@@ -24,6 +24,7 @@ RESUME_REASONS = {
     "cancelled",
     "provider_failure",
     "turn_limit",
+    "ultra_escalation",
 }
 MAX_REJECTED_FLAGS = 32
 # Together these can expand to at most about 100 KiB when JSON escaping is

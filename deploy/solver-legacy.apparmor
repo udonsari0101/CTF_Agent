@@ -151,7 +151,7 @@ profile "ctf-agent-app-server" flags=(attach_disconnected,mediate_deleted) {
   deny /solver-input/.retired-*{,/**} rm,
   deny /solver-input/worker.json rm,
   deny /solver-input/worker.lock rm,
-  deny /solver-input/*/{auth.json,.credentials.json,.auth-*.tmp,manifest.json,state.json,cancel,credential-request.json,control.json} rm,
+  deny /solver-input/*/{auth.json,.credentials.json,.api-key,.auth-*.tmp,manifest.json,state.json,cancel,credential-request.json,control.json} rm,
   deny /solver-input/*/events{,/**} rm,
   deny /solver-input{,/**} wklx,
 
@@ -201,7 +201,7 @@ profile "ctf-agent-command" flags=(attach_disconnected,mediate_deleted) {
   deny /solver-input/.retired-*{,/**} rm,
   deny /solver-input/worker.json rm,
   deny /solver-input/worker.lock rm,
-  deny /solver-input/*/{auth.json,.credentials.json,.auth-*.tmp,manifest.json,state.json,cancel,credential-request.json,control.json} rm,
+  deny /solver-input/*/{auth.json,.credentials.json,.api-key,.auth-*.tmp,manifest.json,state.json,cancel,credential-request.json,control.json} rm,
   deny /solver-input/*/events{,/**} rm,
   deny /solver-input{,/**} wklx,
   deny /solver-scratch/ctf-job-*/home{,/**} rwklmx,

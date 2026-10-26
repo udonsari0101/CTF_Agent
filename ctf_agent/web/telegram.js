@@ -5,27 +5,31 @@ function escapeHtml(value) {
 }
 
 async function copyText(value) {
-  if (navigator.clipboard && window.isSecureContext) {
-    try { await navigator.clipboard.writeText(value); return; }
+  const text = String(value ?? '');
+  if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
+    try { await navigator.clipboard.writeText(text); return; }
     catch { /* Permission may be denied; use the browser selection fallback. */ }
   }
   const focused = document.activeElement;
   const selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart,focused.selectionEnd] : null;
   const area = document.createElement('textarea');
-  area.value = value;
+  area.value = text;
   area.setAttribute('readonly', '');
+  area.setAttribute('aria-hidden', 'true');
   area.className = 'clipboard-proxy';
   document.body.append(area);
   area.focus();
   area.select();
+  area.setSelectionRange?.(0, area.value.length);
   let copied = false;
-  try { copied = document.execCommand('copy'); }
+  try { copied = typeof document.execCommand === 'function' && document.execCommand('copy'); }
+  catch { copied = false; }
   finally {
     area.remove();
-    focused?.focus();
-    if (selection) focused.setSelectionRange(...selection);
+    if (focused?.isConnected !== false) focused?.focus?.();
+    if (selection && focused?.isConnected !== false && typeof focused?.setSelectionRange === 'function') focused.setSelectionRange(...selection);
   }
-  if (!copied) throw new Error('연결 링크를 자동으로 복사하지 못했습니다. Telegram 봇 열기 버튼을 사용해 주세요.');
+  if (!copied) throw new Error('연결 링크를 자동으로 복사하지 못했습니다. 클립보드 권한을 허용하거나 Telegram 봇 열기 버튼을 사용하세요.');
 }
 
 function dateText(value) {
@@ -122,7 +126,8 @@ export async function renderTelegram(container, api) {
     const control = event.target.closest('[data-telegram-action]');
     if (!control || control.dataset.telegramAction === 'toggle') return;
     const action = control.dataset.telegramAction;
-    control.disabled = true;
+    // Preserve transient activation until a clipboard write has started.
+    if (action !== 'copy-link') control.disabled = true;
     message();
     try {
       if (action === 'link') {
@@ -131,7 +136,9 @@ export async function renderTelegram(container, api) {
         paint(state);
         schedulePoll();
       } else if (action === 'copy-link' && link) {
-        await copyText(link.deep_link);
+        const copying = copyText(link.deep_link);
+        control.disabled = true;
+        await copying;
         message('연결 링크를 복사했습니다.');
       } else if (action === 'refresh') {
         const state = await load();

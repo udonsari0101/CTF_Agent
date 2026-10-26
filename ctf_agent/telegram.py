@@ -37,6 +37,7 @@ _SAFE_JOB_SETTING = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}$")
 _COPY_TEXT_MAX_CHARACTERS = 256
 _SOLVER_ALERT_STATUSES = frozenset({"failed", "refused", "needs_input"})
 _SOLVER_ALERT_REASONS = {
+    "ultra_escalation_requested": "독립적인 분석 경로가 확인됐습니다. 문제 화면에서 Codex Ultra 전환을 승인할 수 있습니다.",
     "invalid_runtime": "Codex 실행 파일을 확인할 수 없습니다. 에이전트 업데이트 상태를 확인하세요.",
     "codex_runtime_unavailable": "선택한 Codex 버전이 풀이 작업자에 게시되지 않았습니다. 에이전트 업데이트 상태를 확인하세요.",
     "remote_input_required": "원격 접속 정보가 필요합니다. 문제 화면에서 원격 대상을 입력하거나 대상 없음을 선택한 뒤 다시 시작하세요.",
@@ -45,6 +46,7 @@ _SOLVER_ALERT_REASONS = {
     "daybreak_route_rejected": "계정의 Daybreak 권한과 선택 모델을 확인한 뒤 다시 시도하세요.",
     "codex_attestation_unavailable": "다른 지원 모델을 선택하거나 관리자에게 Codex 실행 환경 확인을 요청하세요.",
     "access_denied": "계정의 모델 권한을 확인하거나 사용 가능한 다른 모델을 선택하세요.",
+    "billing_required": "API 결제 설정을 확인한 뒤 다시 시작하세요.",
     "model_unavailable": "계정에서 사용할 수 있는 다른 모델을 선택한 뒤 다시 시도하세요.",
     "policy_security": "공급자의 보안 작업 정책으로 중단되었습니다. 다른 지원 모델이나 계정을 선택하세요.",
     "provider_tools_unavailable": "풀이 도구를 지원하는 다른 모델을 선택한 뒤 다시 시도하세요.",
@@ -959,7 +961,7 @@ class TelegramService:
             return None
         return db.execute(
             """SELECT j.id,j.owner_user_id,j.workspace_id,j.challenge_id,j.provider,j.model,
-                      j.reasoning_effort,j.service_tier,j.status,j.error_json,j.cancel_requested,
+                      j.reasoning_effort,j.service_tier,j.ultra_escalation_mode,j.status,j.error_json,j.cancel_requested,
                       j.released_ingested,j.flag,j.writeup_markdown,j.created_at,j.updated_at,
                       j.released_at,c.status AS challenge_status,
                       c.completion_source AS challenge_completion_source
@@ -1065,6 +1067,7 @@ class TelegramService:
             current.update(self._job_context(db, job, "released"))
             current["solver_status"] = job["status"]
             current["solver_error_code"] = code
+            current["solver_ultra_mode"] = job["ultra_escalation_mode"]
             return current
 
         if event_type not in {"flag_found", "writeup_ready"}:
@@ -1230,7 +1233,11 @@ class TelegramService:
                 "failed": "풀이 실패",
             }.get(status, "풀이 상태 확인 필요")
             code = row.get("solver_error_code")
+            if code == "ultra_escalation_requested":
+                title = "Ultra 자동 전환 요청" if row.get("solver_ultra_mode") == "auto" else "Ultra 전환 승인 필요"
             reason = _SOLVER_ALERT_REASONS.get(code, _SOLVER_ALERT_FALLBACK.get(status, "문제 화면에서 상태를 확인하세요."))
+            if code == "ultra_escalation_requested" and row.get("solver_ultra_mode") == "auto":
+                reason = "기록된 분석을 보존하고 Codex Ultra 자동 전환을 시도합니다. 시작되지 않으면 문제 화면에서 직접 승인하세요."
             text = (
                 f"⚠️ <b>{title}</b>\n작업공간: {html.escape(telegram_text(row['workspace_name']))}\n"
                 f"문제: {html.escape(telegram_text(row['challenge_name']))}\n"

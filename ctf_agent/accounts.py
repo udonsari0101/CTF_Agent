@@ -6,20 +6,22 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
+import httpx
 
-from .providers.claude import ClaudeAccount
+from .providers.claude import CLAUDE_API_KEY_MAX_BYTES, ClaudeAccount
 from .providers.claude_runtime import ClaudeRuntime
 from .providers.codex import CodexAccount, ProviderError, public_login_state
 from .providers.runtime import CodexRuntime
-from .providers.auth_file import install_auth_file, validate_auth_file, MAX_AUTH_BYTES
+from .providers.auth_file import install_auth_file, private_file, validate_auth_file, MAX_AUTH_BYTES
 from .process_lock import account_lifecycle_lock
 from .storage_budget import get_storage_budget
 
@@ -28,6 +30,7 @@ class AccountCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider: Literal["codex", "claude"]
     label: str = Field(min_length=1, max_length=100)
+    auth_kind: Literal["oauth", "api_key"] = "oauth"
 
 
 class AccountUpdate(BaseModel):
@@ -84,7 +87,8 @@ class AccountManager:
                     selected INTEGER NOT NULL DEFAULT 0, model TEXT, reasoning_effort TEXT,
                     snapshot TEXT, checked_at REAL, created_at REAL NOT NULL,
                     owner_user_id TEXT NOT NULL DEFAULT 'legacy', service_tier TEXT,
-                    ultracode INTEGER NOT NULL DEFAULT 0 CHECK(ultracode IN (0,1))
+                    ultracode INTEGER NOT NULL DEFAULT 0 CHECK(ultracode IN (0,1)),
+                    auth_kind TEXT NOT NULL DEFAULT 'oauth' CHECK(auth_kind IN ('oauth','api_key'))
                 );
                 CREATE TABLE IF NOT EXISTS account_lifecycle_blocks (
                     owner_user_id TEXT PRIMARY KEY,
@@ -102,12 +106,44 @@ class AccountManager:
                 db.execute("ALTER TABLE provider_accounts ADD COLUMN service_tier TEXT")
             if "ultracode" not in columns:
                 db.execute("ALTER TABLE provider_accounts ADD COLUMN ultracode INTEGER NOT NULL DEFAULT 0 CHECK(ultracode IN (0,1))")
+            if "auth_kind" not in columns:
+                db.execute("ALTER TABLE provider_accounts ADD COLUMN auth_kind TEXT NOT NULL DEFAULT 'oauth' CHECK(auth_kind IN ('oauth','api_key'))")
+                # The previous schema already supported Codex API-key auth.json
+                # files.  Recover their mode before any job can snapshot the
+                # new column; the default above applies only to OAuth rows.
+                for legacy in db.execute(
+                    "SELECT id,provider,snapshot FROM provider_accounts WHERE provider='codex'"
+                ).fetchall():
+                    try:
+                        snapshot = json.loads(legacy["snapshot"]) if legacy["snapshot"] else {}
+                    except (ValueError, TypeError, RecursionError):
+                        snapshot = {}
+                    identity = snapshot.get("identity") if isinstance(snapshot, dict) else None
+                    identity_type = identity.get("type") if isinstance(identity, dict) else None
+                    is_api_key = isinstance(identity_type, str) and identity_type.lower() == "apikey"
+                    if identity_type is None:
+                        account_home = self.home / legacy["id"]
+                        codex_home = account_home / "codex"
+                        auth_path = codex_home / "auth.json"
+                        try:
+                            if (
+                                re.fullmatch(r"[0-9a-f]{32}", legacy["id"])
+                                and not any(path.is_symlink() for path in (account_home, codex_home, auth_path))
+                                and auth_path.is_file()
+                                and auth_path.stat().st_size <= MAX_AUTH_BYTES
+                            ):
+                                auth = json.loads(validate_auth_file(auth_path.read_bytes()))
+                                is_api_key = isinstance(auth.get("OPENAI_API_KEY"), str)
+                        except (OSError, ProviderError, ValueError, TypeError):
+                            pass
+                    if is_api_key:
+                        db.execute("UPDATE provider_accounts SET auth_kind='api_key' WHERE id=?", (legacy["id"],))
             db.execute("UPDATE provider_accounts SET reasoning_effort='xhigh',ultracode=1 WHERE provider='claude' AND reasoning_effort='ultracode'")
             db.execute("UPDATE provider_accounts SET owner_user_id=? WHERE owner_user_id='legacy'", (self.legacy_owner_id,))
             db.execute("DROP INDEX IF EXISTS one_selected_account_per_provider")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_selected_account_per_owner_provider ON provider_accounts(owner_user_id,provider) WHERE selected=1")
             if has_meta:
-                db.execute("INSERT INTO meta(key,value) VALUES('accounts_schema_version','3') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                db.execute("INSERT INTO meta(key,value) VALUES('accounts_schema_version','4') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
         self._recover_lifecycle_blocks()
         self._cleanup_deleted_account_dirs()
 
@@ -206,6 +242,25 @@ class AccountManager:
             response = await adapter.models()
         if response.get("status") != "available" or account["provider"] != "codex":
             return response
+        if account.get("auth_kind") == "api_key":
+            models = [dict(item) for item in response.get("models", []) if isinstance(item, dict)]
+            # Codex app-server's model/list can omit API models that its
+            # authenticated execution path accepts. Supplement only this
+            # documented model after the same key can retrieve its API record.
+            if not any("gpt-5.4-mini" in (item.get("id"), item.get("model")) for item in models):
+                if await self._codex_api_mini_available(account_id):
+                    models.append({
+                        "id": "gpt-5.4-mini",
+                        "model": "gpt-5.4-mini",
+                        "displayName": "GPT-5.4 mini",
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": effort}
+                            for effort in ("none", "low", "medium", "high", "xhigh")
+                        ],
+                        "serviceTiers": [],
+                    })
+            return {**response, "models": models}
         identity = ((account.get("snapshot") or {}).get("identity") or {})
         account_type = re.sub(r"[^a-z]", "", str(identity.get("type", "")).lower())
         if account_type != "chatgpt":
@@ -226,8 +281,36 @@ class AccountManager:
             models.append(item)
         return {**response, "models": models}
 
-    def create(self, provider, label, owner_id=None):
+    async def _codex_api_mini_available(self, account_id: str) -> bool:
+        target = self.home / account_id / "codex" / "auth.json"
+        descriptor = None
+        try:
+            if not re.fullmatch(r"[0-9a-f]{32}", account_id) or target.parent.is_symlink():
+                return False
+            descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_AUTH_BYTES or info.st_mode & 0o077:
+                return False
+            raw = os.read(descriptor, MAX_AUTH_BYTES + 1)
+            key = json.loads(validate_auth_file(raw)).get("OPENAI_API_KEY")
+            if not isinstance(key, str):
+                return False
+            async with httpx.AsyncClient(timeout=12, follow_redirects=False, trust_env=False) as client:
+                result = await client.get(
+                    "https://api.openai.com/v1/models/gpt-5.4-mini",
+                    headers={"Authorization": "Bearer " + key},
+                )
+            return result.status_code == 200 and result.json().get("id") == "gpt-5.4-mini"
+        except (OSError, ProviderError, ValueError, TypeError, AttributeError, httpx.HTTPError):
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def create(self, provider, label, owner_id=None, *, auth_kind="oauth"):
         owner_id = self.owner(owner_id)
+        if auth_kind not in {"oauth", "api_key"}:
+            raise HTTPException(422, "계정 연결 방식을 확인해 주세요.")
         label = label.strip()
         if not label:
             raise HTTPException(422, "계정 이름을 입력해 주세요.")
@@ -241,8 +324,8 @@ class AccountManager:
             if db.execute("SELECT COUNT(*) FROM provider_accounts WHERE owner_user_id=?", (owner_id,)).fetchone()[0] >= 50:
                 raise HTTPException(409, "계정은 최대 50개까지 등록할 수 있습니다.")
             selected = not db.execute("SELECT 1 FROM provider_accounts WHERE owner_user_id=? AND provider=? AND selected=1", (owner_id, provider)).fetchone()
-            db.execute("INSERT INTO provider_accounts(id,provider,label,selected,created_at,owner_user_id) VALUES(?,?,?,?,?,?)",
-                       (account_id, provider, label, int(selected), time.time(), owner_id))
+            db.execute("INSERT INTO provider_accounts(id,provider,label,selected,created_at,owner_user_id,auth_kind) VALUES(?,?,?,?,?,?,?)",
+                       (account_id, provider, label, int(selected), time.time(), owner_id, auth_kind))
         return self.get(account_id, owner_id)
 
     def adapter(self, account_id, owner_id=None):
@@ -250,7 +333,7 @@ class AccountManager:
         if account_id not in self.adapters:
             home = self.home / account_id
             preferences = {key: account.get(key) for key in ("model", "reasoning_effort", "service_tier")}
-            self.adapters[account_id] = CodexAccount(home, self.runtime.command(), preferences) if account["provider"] == "codex" else ClaudeAccount(home, self.claude_runtime.command)
+            self.adapters[account_id] = CodexAccount(home, self.runtime.command(), preferences) if account["provider"] == "codex" else ClaudeAccount(home, self.claude_runtime.command, auth_kind=account["auth_kind"])
         return self.adapters[account_id]
 
     def lock(self, account_id):
@@ -301,7 +384,8 @@ class AccountManager:
 
     async def refresh(self, account_id, owner_id=None):
         async with self.lock(account_id):
-            previous = self.get(account_id, owner_id).get("snapshot") or {}
+            account = self.get(account_id, owner_id)
+            previous = account.get("snapshot") or {}
             try:
                 async with self.transient_adapter(account_id, owner_id) as adapter:
                     snapshot = await adapter.snapshot()
@@ -317,8 +401,14 @@ class AccountManager:
                 snapshot["quota"]["stale"] = True
             checked_at = time.time()
             with self.connect() as db:
-                db.execute("UPDATE provider_accounts SET snapshot=?,checked_at=? WHERE id=?",
-                           (json.dumps(snapshot), checked_at, account_id))
+                if account["provider"] == "codex" and snapshot.get("status") == "authenticated":
+                    identity = snapshot.get("identity") or {}
+                    auth_kind = "api_key" if str(identity.get("type", "")).lower() == "apikey" else "oauth"
+                    db.execute("UPDATE provider_accounts SET snapshot=?,checked_at=?,auth_kind=? WHERE id=?",
+                               (json.dumps(snapshot), checked_at, auth_kind, account_id))
+                else:
+                    db.execute("UPDATE provider_accounts SET snapshot=?,checked_at=? WHERE id=?",
+                               (json.dumps(snapshot), checked_at, account_id))
             return self.get(account_id, owner_id)
 
     async def select(self, account_id, owner_id=None):
@@ -620,6 +710,8 @@ class AccountManager:
                 adapter = None
                 retained = False
                 try:
+                    if _account["provider"] == "claude" and _account["auth_kind"] == "api_key":
+                        raise ProviderError("API 키 계정은 API 키 연결을 사용해 주세요. 브라우저 로그인은 별도 계정을 추가할 수 있습니다.", "unsupported", stage="auth", retryable=False)
                     provider_runtime = self.runtime if _account["provider"] == "codex" else self.claude_runtime
                     if provider_runtime.busy:
                         raise ProviderError("Codex 업데이트가 끝난 뒤 로그인해 주세요.", "busy")
@@ -797,6 +889,7 @@ class AccountManager:
         if account["provider"] != "codex":
             raise ProviderError("auth.json 업로드는 Codex 계정에서만 지원합니다.", "unsupported", stage="auth")
         validated = validate_auth_file(raw)
+        imported_kind = "api_key" if json.loads(validated).get("OPENAI_API_KEY") else "oauth"
         async with self.lifecycle_lock, self.lock(account_id):
             account, owner_id, lease, previous = self._begin_lifecycle_mutation(
                 account_id, owner_id, reuse_pending=True, mark_authenticating=True
@@ -810,15 +903,172 @@ class AccountManager:
                 adapter = self.adapter(account_id, owner_id)
                 def save_snapshot(snapshot):
                     with self.connect() as db:
-                        db.execute(
-                            "UPDATE provider_accounts SET snapshot=?,checked_at=? WHERE id=? AND owner_user_id=?",
-                            (json.dumps(snapshot), time.time(), account_id, owner_id),
-                        )
+                        if account["auth_kind"] != imported_kind:
+                            db.execute(
+                                "UPDATE provider_accounts SET snapshot=?,checked_at=?,auth_kind=?,model=NULL,reasoning_effort=NULL,service_tier=NULL,ultracode=0 WHERE id=? AND owner_user_id=?",
+                                (json.dumps(snapshot), time.time(), imported_kind, account_id, owner_id),
+                            )
+                        else:
+                            db.execute(
+                                "UPDATE provider_accounts SET snapshot=?,checked_at=?,auth_kind=? WHERE id=? AND owner_user_id=?",
+                                (json.dumps(snapshot), time.time(), imported_kind, account_id, owner_id),
+                            )
                 async with self.cli_gate:
                     await install_auth_file(adapter, validated, self.home, save_snapshot)
             except (OSError, sqlite3.Error):
                 self._restore_snapshot(account_id, owner_id, previous)
                 raise ProviderError("인증 파일 저장에 실패했습니다. 기존 인증 정보는 보존됩니다.", "auth_storage_error", stage="auth") from None
+            except BaseException:
+                self._restore_snapshot(account_id, owner_id, previous)
+                raise
+            finally:
+                try:
+                    if adapter is not None:
+                        await adapter.close()
+                        self.adapters.pop(account_id, None)
+                finally:
+                    self._release_lifecycle_lease(owner_id, lease)
+            return self.get(account_id, owner_id)
+
+    @staticmethod
+    def _validate_api_key(value: str) -> str:
+        if not isinstance(value, str) or not re.fullmatch(r"[!-~]{20,8192}", value):
+            raise ProviderError("API 키 형식을 확인해 주세요.", "invalid_api_key", stage="auth", retryable=False)
+        return value
+
+    @staticmethod
+    async def _probe_codex_api_key(key: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=False, trust_env=False) as client:
+                response = await client.get("https://api.openai.com/v1/models", headers={"Authorization": "Bearer " + key})
+        except httpx.HTTPError as exc:
+            raise ProviderError("Codex API 연결을 확인하지 못했습니다.", "provider_unavailable", stage="auth") from exc
+        if response.status_code in (401, 403):
+            raise ProviderError("Codex API 키 인증을 확인해 주세요.", "auth_required", stage="auth", retryable=False)
+        if response.status_code == 429:
+            raise ProviderError("Codex API 요청 제한에 도달했습니다.", "quota_exceeded", stage="quota", retryable=True)
+        if response.status_code != 200:
+            raise ProviderError("Codex API 연결을 확인하지 못했습니다.", "provider_unavailable", stage="auth")
+        try:
+            if len(response.content) > 4 * 1024 * 1024 or not isinstance(response.json().get("data"), list):
+                raise ValueError("invalid model catalog")
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ProviderError("Codex API 응답 형식을 확인하지 못했습니다.", "invalid_response", stage="auth", retryable=False) from exc
+
+    async def connect_api_key(self, account_id: str, key: str, owner_id=None):
+        """Replace only the owned account credential after a live provider probe."""
+        key = self._validate_api_key(key)
+        account = self.get(account_id, owner_id)
+        if account["provider"] == "codex":
+            await self._probe_codex_api_key(key)
+        else:
+            await ClaudeAccount.probe_api_key(key)
+        async with self.lifecycle_lock, self.lock(account_id):
+            account, owner_id, lease, previous = self._begin_lifecycle_mutation(
+                account_id, owner_id, mark_authenticating=True
+            )
+            adapter = None
+            try:
+                if account["provider"] == "codex":
+                    if self.runtime.busy:
+                        raise ProviderError("Codex 업데이트가 끝난 뒤 연결해 주세요.", "busy", stage="auth")
+                    validated = validate_auth_file(json.dumps({"OPENAI_API_KEY": key}).encode("utf-8"))
+                    adapter = self.adapter(account_id, owner_id)
+
+                    def save_snapshot(snapshot):
+                        with self.connect() as db:
+                            if account["auth_kind"] == "api_key":
+                                db.execute(
+                                    "UPDATE provider_accounts SET snapshot=?,checked_at=?,auth_kind='api_key' WHERE id=? AND owner_user_id=?",
+                                    (json.dumps(snapshot), time.time(), account_id, owner_id),
+                                )
+                            else:
+                                db.execute(
+                                    "UPDATE provider_accounts SET snapshot=?,checked_at=?,auth_kind='api_key',model=NULL,reasoning_effort=NULL,service_tier=NULL,ultracode=0 WHERE id=? AND owner_user_id=?",
+                                    (json.dumps(snapshot), time.time(), account_id, owner_id),
+                                )
+
+                    async with self.cli_gate:
+                        await install_auth_file(adapter, validated, self.home, save_snapshot)
+                else:
+                    if self.claude_runtime.busy:
+                        raise ProviderError("Claude Code 업데이트가 끝난 뒤 연결해 주세요.", "busy", stage="auth")
+                    adapter = self.adapters.get(account_id)
+                    if adapter is not None:
+                        await adapter.cancel_login()
+                        await adapter.close()
+                    home = self.home / account_id
+                    directory = home / "claude"
+                    target = directory / ".api-key"
+                    oauth_target = directory / ".credentials.json"
+                    if (home.is_symlink() or directory.is_symlink() or target.is_symlink()
+                            or oauth_target.is_symlink()
+                            or home.resolve().parent != self.home.resolve()
+                            or directory.resolve().parent != home.resolve()):
+                        raise ProviderError("계정 인증 저장 경로를 확인할 수 없습니다.", "invalid_auth_path", stage="auth")
+                    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    directory.chmod(0o700)
+                    old = None
+                    if target.exists():
+                        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                        try:
+                            info = os.fstat(descriptor)
+                            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > CLAUDE_API_KEY_MAX_BYTES:
+                                raise ProviderError("기존 API 키 저장 형식을 확인할 수 없습니다.", "invalid_auth_path", stage="auth")
+                            old = os.read(descriptor, CLAUDE_API_KEY_MAX_BYTES + 1)
+                        finally:
+                            os.close(descriptor)
+                    temporary = directory / f".api-key-{uuid.uuid4().hex}.tmp"
+                    try:
+                        private_file(temporary, key.encode("ascii"))
+                        os.replace(temporary, target)
+                        database_updated = False
+                        try:
+                            snapshot = {
+                                "status": "authenticated",
+                                "identity": {"authMethod": "api_key"},
+                                "quota": {"status": "unsupported", "buckets": [], "checked_at": time.time(),
+                                          "message": "API 키 사용량은 Anthropic Console에서 확인해 주세요."},
+                            }
+                            with self.connect() as db:
+                                if account["auth_kind"] == "api_key":
+                                    db.execute(
+                                        "UPDATE provider_accounts SET snapshot=?,checked_at=?,auth_kind='api_key' WHERE id=? AND owner_user_id=?",
+                                        (json.dumps(snapshot), time.time(), account_id, owner_id),
+                                    )
+                                else:
+                                    db.execute(
+                                        "UPDATE provider_accounts SET snapshot=?,checked_at=?,auth_kind='api_key',model=NULL,reasoning_effort=NULL,service_tier=NULL,ultracode=0 WHERE id=? AND owner_user_id=?",
+                                        (json.dumps(snapshot), time.time(), account_id, owner_id),
+                                    )
+                            database_updated = True
+                            # A successful mode switch must retire the old
+                            # refresh credential before releasing the account
+                            # lifecycle lease.  Failure rolls back both mode
+                            # and newly staged key below.
+                            oauth_target.unlink(missing_ok=True)
+                        except BaseException:
+                            if database_updated:
+                                with self.connect() as db:
+                                    db.execute(
+                                        "UPDATE provider_accounts SET auth_kind=?,model=?,reasoning_effort=?,service_tier=?,ultracode=? WHERE id=? AND owner_user_id=?",
+                                        (
+                                            account["auth_kind"], account["model"], account["reasoning_effort"],
+                                            account["service_tier"], int(account["ultracode"]), account_id, owner_id,
+                                        ),
+                                    )
+                            if old is None:
+                                target.unlink(missing_ok=True)
+                            else:
+                                rollback = directory / f".api-key-{uuid.uuid4().hex}.tmp"
+                                try:
+                                    private_file(rollback, old)
+                                    os.replace(rollback, target)
+                                finally:
+                                    rollback.unlink(missing_ok=True)
+                            raise
+                    finally:
+                        temporary.unlink(missing_ok=True)
             except BaseException:
                 self._restore_snapshot(account_id, owner_id, previous)
                 raise
@@ -880,7 +1130,28 @@ def register_accounts(app, require_auth, settings):
 
     @router.post("/accounts", status_code=201)
     async def create_account(body: AccountCreate, user=Depends(current_user)):
-        return manager.create(body.provider, body.label, user["id"])
+        return manager.create(body.provider, body.label, user["id"], auth_kind=body.auth_kind)
+
+    @router.post("/accounts/{account_id}/api-key")
+    async def connect_api_key(account_id: str, request: Request, user=Depends(current_user)):
+        # Framework validation errors include the rejected input. Parse this
+        # secret field ourselves so malformed requests never echo credentials.
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > 16 * 1024:
+                raise ProviderError("API 키 입력 크기를 확인해 주세요.", "invalid_api_key", stage="auth", retryable=False)
+        try:
+            body = json.loads(raw)
+            if not isinstance(body, dict) or set(body) != {"key"}:
+                raise ValueError("invalid API key request")
+            key = body["key"]
+        except (ValueError, UnicodeError, TypeError) as exc:
+            raise ProviderError("API 키 입력 형식을 확인해 주세요.", "invalid_api_key", stage="auth", retryable=False) from None
+        finally:
+            for index in range(len(raw)):
+                raw[index] = 0
+        return await manager.connect_api_key(account_id, key, user["id"])
 
     @router.get("/accounts/{account_id}")
     async def get_account(account_id: str, user=Depends(current_user)):

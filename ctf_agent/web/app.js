@@ -29,13 +29,16 @@ let currentSolverEvents = [], currentSolverGuidance = [], solverEventCursor = 0,
 let writeupRefineJob = null, writeupRefineEvents = [], writeupRefineTimer = null;
 let writeupRefineError = null, writeupRefineInstruction = '';
 let relatedCandidates = [];
-let releaseUpdateTimer = null;
+let releaseUpdateTimer = null, releaseUpdateRequestGeneration = 0;
 let solverProvider = (() => { try { return localStorage.getItem('ctf-solver-provider') === 'claude' ? 'claude' : 'codex'; } catch { return 'codex'; } })();
 let solverAccounts = [], solverAccountId = '', solverModels = [], solverModel = '';
 let solverReasoning = '', solverServiceTier = null, solverUltracode = false, solverOptionsState = 'idle', solverOptionsError = '';
+let solverUltraEscalationMode = 'ask';
 let solverOptionsGeneration = 0;
 let sidebarCollapsed = (() => { try { return localStorage.getItem('ctf-sidebar-collapsed') === 'true'; } catch { return false; } })();
 let solverLogExpanded = false, solverConsoleDialog = null;
+let solverConsoleAgentId = 'root', solverConsoleFollowLatest = true;
+const solverCollapsedAgentIds = new Set();
 const noteDrafts = new Map();
 const busyForms = new WeakSet();
 const ctfdJobMarkupCache = new WeakMap();
@@ -283,10 +286,12 @@ function stopSolverPolling() {
   currentSolverGuidance = [];
   solverEventCursor = 0;
   solverGuidanceDraft = '';
+  solverConsoleAgentId = 'root'; solverConsoleFollowLatest = true; solverCollapsedAgentIds.clear();
   solverListedFlag = '';
   solverSyncedWriteup = '';
   solverAccounts = []; solverAccountId = ''; solverModels = []; solverModel = '';
   solverReasoning = ''; solverServiceTier = null; solverUltracode = false; solverOptionsState = 'idle'; solverOptionsError = '';
+  solverUltraEscalationMode = 'ask';
   writeupRefineJob = null; writeupRefineEvents = []; writeupRefineError = null; writeupRefineInstruction = '';
 }
 
@@ -394,6 +399,9 @@ function solverQuotaMarkup(quota) {
 
 function solverErrorMarkup(error, defaultTitle = '풀이 실행 오류') {
   if (!error) return '';
+  if (error.code === 'ultra_escalation_requested') {
+    return `<div class="notice muted solver-ultra-request" role="status"><strong>Ultra 전환 제안</strong><p>${esc(error.message || '분석을 이어받아 Ultra로 계속할 수 있습니다.')}</p></div>`;
+  }
   const providerCode = String(error.provider_code || '').toUpperCase();
   const needsRemote = error.code === 'remote_input_required';
   const toolsUnavailable = error.code === 'provider_tools_unavailable';
@@ -452,6 +460,9 @@ function solverErrorMarkup(error, defaultTitle = '풀이 실행 오류') {
 function solverEventLabel(event) {
   const code = event.progress?.code || event.progress_code || event.code;
   const phase = event.phase || event.status;
+  if (event.kind === 'agent') {
+    return i18n.t({running:'하위 에이전트 시작',completed:'하위 에이전트 완료',failed:'하위 에이전트 실패',interrupted:'하위 에이전트 중단'}[event.status] || '하위 에이전트');
+  }
   const kinds = {flag:'Flag 발견',writeup:'write-up 완성',error:'오류',cancelled:'취소됨',released:'격리 정리 완료',activity:'도구 실행',guidance:'추가 명령'};
   return i18n.t(code ? (solverProgress[code] || code) : (kinds[event.kind] || solverPhases[phase] || phase || event.kind || '상태 변경'));
 }
@@ -464,7 +475,11 @@ function solverEventTime(event) {
 
 function solverEventDetail(event) {
   const parts = [];
-  const toolLabels = {shell:'shell',web_search:'web',file:'file',analysis:'analysis'};
+  const toolLabels = {shell:'shell',web_search:'web',file:'file',analysis:'analysis',agent:'하위 에이전트'};
+  if (event.kind === 'agent') {
+    if (typeof event.label === 'string' && event.label) parts.push(event.label.slice(0,120));
+    if (typeof event.model === 'string' && event.model) parts.push(event.model.slice(0,120));
+  }
   if (event.kind === 'activity' && event.tool) parts.push(toolLabels[event.tool] || event.tool);
   if (event.kind === 'activity' && event.phase) parts.push(event.phase === 'started' ? '시작' : event.phase === 'completed' ? '완료' : event.phase);
   for (const key of ['summary','command','message','output']) {
@@ -481,8 +496,11 @@ function solverEventDetail(event) {
   return parts.join(' · ');
 }
 
-function solverEventMarkup(events) {
+function solverEventMarkup(events, job = null) {
   if (!events.length) return '<p class="solver-log-empty">아직 기록이 없습니다.</p>';
+  const agentLabels = new Map((Array.isArray(job?.agents) ? job.agents : [])
+    .filter(agent => agent && typeof agent.id === 'string' && agent.id !== 'root')
+    .map(agent => [agent.id,String(agent.label || agent.id)]));
   return `<ol class="solver-events" aria-label="풀이 진행 기록">${events.map(event => {
     const code = event.progress?.code || event.progress_code || event.code;
     const label = solverEventLabel(event);
@@ -492,8 +510,64 @@ function solverEventMarkup(events) {
     const escalationSuffix = code === 'reasoning_escalated'
       ? ` · ${esc(event.from_effort || '')} → max · MAX_REQUIRED + 작업 근거 확인`
       : '';
-    return `<li class="solver-event solver-event-${esc(event.kind || 'status')}"><span><strong>${esc(label)}${percentSuffix}${escalationSuffix}</strong>${detailText ? `<code>${esc(detailText)}</code>` : ''}</span><small>${esc(solverEventTime(event))}</small></li>`;
+    const agentLabel = event.kind === 'agent' ? null : agentLabels.get(event.agent_id);
+    return `<li class="solver-event solver-event-${esc(event.kind || 'status')}"><span><strong>${agentLabel ? `<span class="solver-event-agent">${esc(agentLabel)}</span>` : ''}${esc(label)}${percentSuffix}${escalationSuffix}</strong>${detailText ? `<code>${esc(detailText)}</code>` : ''}</span><small>${esc(solverEventTime(event))}</small></li>`;
   }).join('')}</ol>`;
+}
+
+function solverAgentNodes(job) {
+  const nodes = [{id:'root',parent_id:null,label:'전체 세션'}], seen = new Set(['root']);
+  for (const agent of Array.isArray(job?.agents) ? job.agents : []) {
+    if (!agent || typeof agent.id !== 'string' || !agent.id || seen.has(agent.id)) continue;
+    seen.add(agent.id);
+    nodes.push(agent);
+  }
+  return nodes;
+}
+
+function solverConsoleEvents(job, events) {
+  if (solverConsoleAgentId === 'root') return events;
+  if (!solverAgentNodes(job).some(agent => agent.id === solverConsoleAgentId)) {
+    solverConsoleAgentId = 'root';
+    return events;
+  }
+  return events.filter(event => event.kind === 'activity' && event.agent_id === solverConsoleAgentId);
+}
+
+function solverAgentTreeMarkup(job, events) {
+  const agents = solverAgentNodes(job);
+  if (agents.length < 2) return '';
+  const ids = new Set(agents.map(agent => agent.id));
+  if (!ids.has(solverConsoleAgentId)) solverConsoleAgentId = 'root';
+  const children = new Map(), counts = new Map();
+  for (const agent of agents.slice(1)) {
+    const parentId = ids.has(agent.parent_id) && agent.parent_id !== agent.id ? agent.parent_id : 'root';
+    if (!children.has(parentId)) children.set(parentId,[]);
+    children.get(parentId).push(agent);
+  }
+  for (const event of events) {
+    if (event.kind === 'activity' && typeof event.agent_id === 'string') counts.set(event.agent_id,(counts.get(event.agent_id) || 0) + 1);
+  }
+  const visited = new Set();
+  function branch(agent) {
+    if (visited.has(agent.id)) return '';
+    visited.add(agent.id);
+    const descendants = (children.get(agent.id) || []).filter(child => !visited.has(child.id));
+    const expandable = descendants.length > 0;
+    const collapsed = solverCollapsedAgentIds.has(agent.id);
+    const status = typeof agent.status === 'string' ? agent.status : '';
+    const safeStatus = ['queued','running','completed','failed','cancelled','stopped','interrupted'].includes(status) ? status : '';
+    const statusLabel = {queued:'대기',running:'작업 중',completed:'완료',failed:'실패',cancelled:'취소',stopped:'중단',interrupted:'중단'}[status] || status;
+    const meta = [agent.provider,agent.model,statusLabel].filter(Boolean).map(esc).join(' · ');
+    const count = agent.id === 'root' ? events.length : counts.get(agent.id) || 0;
+    return `<li class="solver-agent-node"><div class="solver-agent-row">${expandable
+      ? `<button type="button" class="solver-agent-expand" data-action="toggle-solver-agent-branch" data-agent-id="${esc(agent.id)}" aria-label="${esc(agent.label || agent.id)} ${collapsed ? '펼치기' : '접기'}" aria-expanded="${!collapsed}">${collapsed ? '▸' : '▾'}</button>`
+      : '<span class="solver-agent-expand-spacer" aria-hidden="true"></span>'}
+      <button type="button" class="solver-agent-select${solverConsoleAgentId === agent.id ? ' selected' : ''}" data-action="select-solver-agent" data-agent-id="${esc(agent.id)}" aria-pressed="${solverConsoleAgentId === agent.id}"><span class="solver-agent-name">${esc(agent.id === 'root' ? '전체 세션' : agent.label || agent.id)}</span><span class="solver-agent-count">${count}</span>${safeStatus ? `<span class="solver-agent-status ${safeStatus}" title="${esc(status)}"></span>` : ''}${meta ? `<small>${meta}</small>` : ''}</button></div>${expandable ? `<ul class="solver-agent-children${collapsed ? ' hidden' : ''}">${descendants.map(branch).join('')}</ul>` : ''}</li>`;
+  }
+  let content = branch(agents[0]);
+  for (const agent of agents.slice(1)) if (!visited.has(agent.id)) content += branch(agent);
+  return `<h3>에이전트</h3><ul class="solver-agent-list">${content}</ul>`;
 }
 
 function solverGuidanceHistoryMarkup() {
@@ -542,10 +616,11 @@ function toggleSolverLogSize(button) {
   }
   const provider = (currentSolverJob.model || currentSolverJob.configuration || {}).provider;
   const active = solverIsActive(currentSolverJob) && currentSolverJob.guidance_allowed !== false;
-  solverConsoleDialog.innerHTML = `<header class="solver-console-head"><div><strong>${esc(currentChallenge?.name || '세션 로그')}</strong><small>${esc(solverJobId(currentSolverJob))}</small></div><button type="button" class="small ghost" data-action="close-solver-console" aria-label="세션 로그 닫기">닫기</button></header>
-    <div class="solver-console-stream" role="log" aria-live="polite">${solverEventMarkup(currentSolverEvents)}</div>
+  const agentTree = solverAgentTreeMarkup(currentSolverJob,currentSolverEvents);
+  solverConsoleDialog.innerHTML = `<header class="solver-console-head"><div><strong>${esc(currentChallenge?.name || '세션 로그')}</strong><small>${esc(solverJobId(currentSolverJob))}</small></div><div class="solver-console-head-actions"><button type="button" class="small ghost solver-console-bottom hidden" data-action="solver-console-bottom" aria-label="맨 아래로 이동">↓ 맨 아래</button><button type="button" class="small ghost" data-action="close-solver-console" aria-label="세션 로그 닫기">닫기</button></div></header>
+    <div class="solver-console-body"><aside class="solver-agent-tree${agentTree ? '' : ' hidden'}" aria-label="에이전트 활동">${agentTree}</aside><div class="solver-console-stream" role="log" aria-live="polite">${solverEventMarkup(solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null)}</div></div>
     <div class="solver-console-controls"><form id="solver-console-guidance-form" class="solver-console-guidance${active ? '' : ' hidden'}">
-      <label for="solver-console-message">추가 명령</label><textarea id="solver-console-message" name="message" maxlength="16384" rows="3" placeholder="풀이 방향이나 확인할 내용을 입력" required>${esc(solverGuidanceDraft)}</textarea>
+      <label for="solver-console-message">메인 세션 추가 명령</label><textarea id="solver-console-message" name="message" maxlength="16384" rows="3" placeholder="풀이 방향이나 확인할 내용을 입력" required>${esc(solverGuidanceDraft)}</textarea>
       <div class="solver-console-send"><select name="requested_delivery" aria-label="명령 전달 방식" ${provider === 'claude' ? 'disabled' : ''}><option value="same_turn">현재 턴에 개입</option><option value="next_turn" ${provider === 'claude' ? 'selected' : ''}>다음 턴에 전달</option></select><button type="submit" class="primary">전송</button></div>
     </form><label class="solver-console-upload">문제 파일 추가<input id="solver-console-files" type="file" multiple></label><small>업로드가 끝난 파일은 진행 중인 풀이의 attachments/에 추가됩니다.</small></div>`;
   solverConsoleDialog.showModal();
@@ -558,17 +633,74 @@ function toggleSolverLogSize(button) {
     toggle.setAttribute('aria-pressed','true');
   }
   const stream = solverConsoleDialog.querySelector('.solver-console-stream');
-  if (stream) stream.scrollTop = stream.scrollHeight;
+  solverConsoleFollowLatest = true;
+  if (stream) {
+    stream.addEventListener('scroll', () => {
+      solverConsoleFollowLatest = solverConsoleAtBottom(stream);
+      paintSolverConsoleBottomButton();
+    });
+    stream.scrollTop = stream.scrollHeight;
+  }
+}
+
+function solverConsoleAtBottom(stream) {
+  return stream.scrollHeight - stream.scrollTop - stream.clientHeight <= 36;
+}
+
+function paintSolverConsoleBottomButton() {
+  solverConsoleDialog?.querySelector('.solver-console-bottom')?.classList.toggle('hidden',solverConsoleFollowLatest);
+}
+
+function solverConsoleBottom() {
+  const stream = solverConsoleDialog?.querySelector('.solver-console-stream');
+  if (!stream) return;
+  solverConsoleFollowLatest = true;
+  stream.scrollTop = stream.scrollHeight;
+  paintSolverConsoleBottomButton();
+}
+
+function selectSolverAgent(button) {
+  const id = button.dataset.agentId;
+  if (!solverAgentNodes(currentSolverJob).some(agent => agent.id === id)) return;
+  solverConsoleAgentId = id;
+  solverConsoleFollowLatest = true;
+  paintSolverConsole();
+}
+
+function toggleSolverAgentBranch(button) {
+  const id = button.dataset.agentId;
+  const agents = solverAgentNodes(currentSolverJob);
+  if (!agents.some(agent => agent.id === id)) return;
+  if (solverCollapsedAgentIds.has(id)) solverCollapsedAgentIds.delete(id);
+  else {
+    solverCollapsedAgentIds.add(id);
+    const parents = new Map(agents.map(agent => [agent.id,agent.parent_id]));
+    const visited = new Set();
+    for (let selected = solverConsoleAgentId; selected && !visited.has(selected); selected = parents.get(selected)) {
+      if (selected === id) { solverConsoleAgentId = id; break; }
+      visited.add(selected);
+    }
+  }
+  paintSolverConsole();
 }
 
 function paintSolverConsole() {
   if (!solverConsoleDialog?.open) return;
   const stream = solverConsoleDialog.querySelector('.solver-console-stream');
   if (!stream) return;
-  const followLatest = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 32;
+  const tree = solverConsoleDialog.querySelector('.solver-agent-tree');
+  if (tree) {
+    const markup = solverAgentTreeMarkup(currentSolverJob,currentSolverEvents);
+    tree.classList.toggle('hidden',!markup);
+    if (tree.innerHTML !== markup) tree.innerHTML = markup;
+  }
   const scrollTop = stream.scrollTop;
-  stream.innerHTML = solverEventMarkup(currentSolverEvents);
-  stream.scrollTop = followLatest ? stream.scrollHeight : scrollTop;
+  const markup = solverEventMarkup(solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null);
+  if (stream.innerHTML !== markup) {
+    stream.innerHTML = markup;
+    stream.scrollTop = solverConsoleFollowLatest ? stream.scrollHeight : scrollTop;
+  } else if (solverConsoleFollowLatest) stream.scrollTop = stream.scrollHeight;
+  paintSolverConsoleBottomButton();
   const form = solverConsoleDialog.querySelector('#solver-console-guidance-form');
   if (form) form.classList.toggle('hidden', !solverIsActive(currentSolverJob) || currentSolverJob.guidance_allowed === false);
 }
@@ -619,6 +751,13 @@ function solverConfigurationReady() {
   return solverOptionsState === 'ready' && Boolean(solverSelectedAccount() && solverSelectedModel() && solverReasoning);
 }
 
+function solverUltraEscalationEligible() {
+  const model = solverSelectedModel();
+  return solverProvider === 'codex' && ['high','xhigh'].includes(solverReasoning)
+    && Array.isArray(model?.supportedReasoningEfforts)
+    && model.supportedReasoningEfforts.some(item => item?.reasoningEffort === 'ultra');
+}
+
 function solverProviderSelector() {
   const provider = `<label>공급자<select id="solver-provider-select" aria-label="문제 풀이 공급자"><option value="codex" ${solverProvider === 'codex' ? 'selected' : ''}>Codex</option><option value="claude" ${solverProvider === 'claude' ? 'selected' : ''}>Claude Code</option></select></label>`;
   const available = solverAccounts.filter(account => account.provider === solverProvider && account.snapshot?.status === 'authenticated');
@@ -643,11 +782,13 @@ function solverProviderSelector() {
   const effortOptions = efforts.map(value => `<option value="${esc(value)}" ${value === solverReasoning ? 'selected' : ''}>${esc(value)}</option>`).join('');
   const supportsFast = solverProvider === 'codex' && Array.isArray(chosen?.serviceTiers) && chosen.serviceTiers.some(item => item?.id === 'fast');
   const supportsUltracode = solverProvider === 'claude' && chosen?.supportsUltracode === true;
+  const ultraChoice = solverUltraEscalationEligible() ? `<label class="solver-ultra-escalation"><span>막히면 Ultra</span><select id="solver-ultra-escalation" aria-label="Ultra 전환 방식"><option value="ask" ${solverUltraEscalationMode === 'ask' ? 'selected' : ''}>전환 전 묻기</option><option value="auto" ${solverUltraEscalationMode === 'auto' ? 'selected' : ''}>조건 충족 시 자동</option><option value="off" ${solverUltraEscalationMode === 'off' ? 'selected' : ''}>사용 안 함</option></select></label>` : '';
   return `<div class="solver-configuration">${provider}
     <label>실행 계정<select id="solver-account-select" aria-label="문제 풀이 계정">${accountOptions}</select></label>
     <label>모델<select id="solver-model-select" aria-label="문제 풀이 모델" ${modelOptions ? '' : 'disabled'}>${modelOptions || '<option>사용 가능한 모델 없음</option>'}</select></label>
     <label>추론 수준<select id="solver-reasoning-select" aria-label="문제 풀이 추론 수준" ${effortOptions ? '' : 'disabled'}>${effortOptions || '<option>지원 정보 없음</option>'}</select></label>
     ${supportsFast ? `<label class="solver-fast-choice"><input id="solver-fast-toggle" type="checkbox" ${solverServiceTier === 'fast' ? 'checked' : ''}>1.5배 Fast 실행</label>` : supportsUltracode ? `<label class="solver-ultracode-choice"><input id="solver-ultracode-toggle" type="checkbox" ${solverUltracode ? 'checked' : ''}>Ultracode</label>` : '<span class="solver-fast-placeholder" aria-hidden="true"></span>'}
+    ${ultraChoice}
     <span class="form-hint solver-config-help">이번 실행에만 적용</span>
   </div>`;
 }
@@ -669,9 +810,11 @@ function solverPanelMarkup(job, events = [], loading = false) {
   const usableFlag = flag && !job.flag_rejected;
   const retryCount = Number(job.retry_checkpoint?.rejected_count || 0);
   const checkpointReason = job.retry_checkpoint?.reason;
-  const checkpointLabels = {rejected_flag:'오답',needs_remote:'원격 정보 요청',timeout:'시간 제한',cancelled:'사용자 중단',provider_failure:'모델 오류',turn_limit:'풀이 회차 종료'};
+  const checkpointLabels = {rejected_flag:'오답',needs_remote:'원격 정보 요청',timeout:'시간 제한',cancelled:'사용자 중단',provider_failure:'모델 오류',turn_limit:'풀이 회차 종료',ultra_escalation:'Ultra 전환'};
   const controls = active
     ? `<button class="danger" data-action="cancel-solver" ${job.cancel_requested ? 'disabled' : ''}>${job.cancel_requested ? '중단 처리 중' : '풀이 중단'}</button>`
+    : job.error?.code === 'ultra_escalation_requested'
+      ? `${job.ultra_escalation?.started_job_id ? '<span class="form-hint">Ultra 작업으로 이어가는 중</span>' : job.ultra_escalation?.auto_pending ? '<span class="form-hint">Ultra 전환 준비 중</span>' : job.ultra_escalation?.eligible ? '<button class="primary" data-action="approve-ultra-escalation">Ultra로 이어가기</button>' : ''}<button data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>현재 설정으로 다시 풀기</button>`
     : job.phase === 'needs_input'
       ? `<button data-action="edit-challenge">원격 접속 정보 입력</button>${currentChallenge?.remote_mode !== 'unknown' ? `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>새 작업으로 계속 풀기</button>` : ''}`
       : job.flag_rejected
@@ -834,8 +977,13 @@ function toast(message, error = false) {
 }
 
 async function run(task, button) {
-  if (button) button.disabled = true;
-  try { return await task(); } catch (error) { toast(error.message, true); }
+  // Start the action while the click still owns its transient user activation.
+  // Clipboard writes can be rejected if the clicked control is disabled first.
+  try {
+    const pending = task();
+    if (button) button.disabled = true;
+    return await pending;
+  } catch (error) { toast(error.message, true); }
   finally { if (button) button.disabled = false; }
 }
 
@@ -1403,18 +1551,29 @@ async function saveNotes(silent = false) {
 }
 
 async function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    try { await navigator.clipboard.writeText(text); return; } catch { /* Try selection-based copy if permission was denied. */ }
+  const value = String(text ?? '');
+  if (window.isSecureContext !== false && typeof navigator.clipboard?.writeText === 'function') {
+    try { await navigator.clipboard.writeText(value); return; } catch { /* Try selection-based copy if permission was denied. */ }
   }
   const focused = document.activeElement;
   const selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart,focused.selectionEnd] : null;
   const textarea = document.createElement('textarea');
-  textarea.value = text; textarea.className = 'sr-only';
+  textarea.value = value;
+  textarea.setAttribute('readonly','');
+  textarea.setAttribute('aria-hidden','true');
+  // Safari can refuse execCommand('copy') for a fully clipped .sr-only field.
+  textarea.className = 'clipboard-proxy';
   (modal.open ? modal : detail.open ? detail : document.body).append(textarea); textarea.focus(); textarea.select();
+  textarea.setSelectionRange?.(0,textarea.value.length);
   let success = false;
-  try { success = document.execCommand('copy'); }
-  finally { textarea.remove(); focused?.focus(); if (selection) focused.setSelectionRange(...selection); }
-  if (!success) throw new Error('자동 복사를 지원하지 않는 브라우저입니다. 표시된 내용을 선택해 복사하세요.');
+  try { success = typeof document.execCommand === 'function' && document.execCommand('copy'); }
+  catch { success = false; }
+  finally {
+    textarea.remove();
+    if (focused?.isConnected !== false) focused?.focus?.();
+    if (selection && focused?.isConnected !== false && typeof focused?.setSelectionRange === 'function') focused.setSelectionRange(...selection);
+  }
+  if (!success) throw new Error('자동 복사를 지원하지 않는 브라우저입니다. 클립보드 권한을 허용하거나 표시된 내용을 직접 선택해 복사하세요.');
 }
 
 function downloadBlob(blob, filename) {
@@ -1443,6 +1602,7 @@ function paintSolver(job, events, workspaceId, challengeId, generation, guidance
     currentSolverGuidance = [];
     solverEventCursor = 0;
     solverGuidanceDraft = '';
+    solverConsoleAgentId = 'root'; solverConsoleFollowLatest = true; solverCollapsedAgentIds.clear();
   }
   currentSolverJob = job;
   currentSolverEvents = mergeSolverEvents(currentSolverEvents,events);
@@ -1545,7 +1705,7 @@ function solverPollWarning(message) {
 }
 
 function scheduleSolverPoll(job, workspaceId, challengeId, generation, delay = 1500) {
-  if ((!solverIsActive(job) && !solverHasMoreEvents(job)) || !solverContext(workspaceId,challengeId,generation)) return;
+  if ((!solverIsActive(job) && !solverHasMoreEvents(job) && job?.ultra_escalation?.auto_pending !== true) || !solverContext(workspaceId,challengeId,generation)) return;
   const id = solverJobId(job);
   if (!id) return;
   if (solverPollTimer) clearTimeout(solverPollTimer);
@@ -1559,6 +1719,16 @@ async function pollSolverJob(jobId, workspaceId, challengeId, generation) {
     if (!solverContext(workspaceId,challengeId,generation)) return;
     const normalized = normalizeSolverPayload(payload);
     if (!normalized.job) throw new Error('풀이 실행 상태 응답을 확인할 수 없습니다.');
+    const linkedUltraJob = normalized.job.ultra_escalation?.started_job_id;
+    const selectedJobId = solverJobId(currentSolverJob);
+    if (selectedJobId && selectedJobId !== jobId
+        && selectedJobId !== linkedUltraJob
+        && selectedJobId !== normalized.job.ultra_escalation?.source_job_id) return;
+    if (typeof linkedUltraJob === 'string' && linkedUltraJob && linkedUltraJob !== jobId) {
+      solverEventCursor = 0;
+      await pollSolverJob(linkedUltraJob,workspaceId,challengeId,generation);
+      return;
+    }
     const events = normalized.events.length ? normalized.events : currentSolverEvents;
     paintSolver(normalized.job,events,workspaceId,challengeId,generation,normalized.guidance);
     // Opening a challenge while its job is already active skips account/model
@@ -1639,9 +1809,15 @@ async function loadSolver(workspaceId, challengeId) {
     const payload = await api(`/api/workspaces/${workspaceId}/challenges/${challengeId}/solver`);
     if (!solverContext(workspaceId,challengeId,generation)) return;
     const normalized = normalizeSolverPayload(payload);
-    paintSolver(normalized.job,normalized.events,workspaceId,challengeId,generation,normalized.guidance);
-    if (!solverIsActive(normalized.job)) await loadSolverConfiguration(workspaceId,challengeId,generation);
-    scheduleSolverPoll(normalized.job,workspaceId,challengeId,generation);
+    const linkedUltraJob = normalized.job?.ultra_escalation?.started_job_id;
+    if (typeof linkedUltraJob === 'string' && linkedUltraJob) {
+      solverEventCursor = 0;
+      await pollSolverJob(linkedUltraJob,workspaceId,challengeId,generation);
+    } else {
+      paintSolver(normalized.job,normalized.events,workspaceId,challengeId,generation,normalized.guidance);
+      if (!solverIsActive(normalized.job)) await loadSolverConfiguration(workspaceId,challengeId,generation);
+      scheduleSolverPoll(normalized.job,workspaceId,challengeId,generation);
+    }
   } catch (error) {
     if (!solverContext(workspaceId,challengeId,generation)) return;
     if (error.status === 404) {
@@ -1662,13 +1838,16 @@ async function startSolver() {
   if (solverPollTimer) clearTimeout(solverPollTimer);
   const generation = ++solverRendering;
   solverPollTimer = null; currentSolverJob = null; currentSolverEvents = []; currentSolverGuidance = []; solverEventCursor = 0; solverGuidanceDraft = ''; solverListedFlag = ''; solverSyncedWriteup = '';
+  solverConsoleAgentId = 'root'; solverConsoleFollowLatest = true; solverCollapsedAgentIds.clear();
   if (!solverContext(workspaceId,challengeId,generation)) return;
   const panel = document.querySelector('#solver-panel');
   panel.innerHTML = solverPanelMarkup(null,[],true);
   try {
     const payload = await api(`/api/workspaces/${workspaceId}/challenges/${challengeId}/solver`,{method:'POST',body:{
       provider:solverProvider, account_id:solverAccountId, model:solverModel,
-      reasoning_effort:solverReasoning, service_tier:solverServiceTier, ultracode:solverUltracode, writeup_locale:i18n.locale,
+      reasoning_effort:solverReasoning, service_tier:solverServiceTier, ultracode:solverUltracode,
+      ultra_escalation_mode:solverUltraEscalationEligible() ? solverUltraEscalationMode : 'off',
+      writeup_locale:i18n.locale,
     }});
     if (payload.capacity?.warning && payload.capacity.warning_message) {
       toast(payload.capacity.warning_message);
@@ -1683,6 +1862,23 @@ async function startSolver() {
     if (solverContext(workspaceId,challengeId,generation)) panel.innerHTML = `${solverPanelMarkup(null)}${solverErrorMarkup(error)}`;
     throw error;
   }
+}
+
+async function approveUltraEscalation() {
+  const job = currentSolverJob, jobId = solverJobId(job);
+  if (!jobId || job?.error?.code !== 'ultra_escalation_requested' || !job?.ultra_escalation?.eligible) return;
+  const workspaceId = currentWorkspace?.id, challengeId = currentChallenge?.id, generation = solverRendering;
+  const payload = await api(`/api/solver/jobs/${encodeURIComponent(jobId)}/ultra-escalate`,{method:'POST'});
+  if (!solverContext(workspaceId,challengeId,generation)) return;
+  const normalized = normalizeSolverPayload(payload);
+  if (!normalized.job) throw new Error('Ultra 작업 상태를 확인할 수 없습니다.');
+  // A source-job poll may still be in flight. Retire its rendering generation
+  // before showing the linked job so a late response cannot paint over it.
+  if (solverPollTimer) clearTimeout(solverPollTimer);
+  solverPollTimer = null;
+  const nextGeneration = ++solverRendering;
+  paintSolver(normalized.job,normalized.events,workspaceId,challengeId,nextGeneration,normalized.guidance);
+  scheduleSolverPoll(normalized.job,workspaceId,challengeId,nextGeneration,250);
 }
 
 function paintWriteupRefinement() {
@@ -2053,28 +2249,39 @@ function renderSettings() {
   import('/assets/telegram.js').then(async module => { const dispose = await module.renderTelegram(container,api,{user:sessionUser}); if (container.isConnected) disposeTelegram = dispose; else dispose?.(); }).catch(() => { if (container.isConnected) container.textContent = '알림 설정을 불러올 수 없습니다. 잠시 후 다시 시도하세요.'; });
 }
 
-async function refreshReleaseUpdatePanel() {
+async function refreshReleaseUpdatePanel(force = false) {
   const area = document.querySelector('#release-update-panel');
   if (!area) return;
+  const notesOpen = area.querySelector('details')?.open === true;
+  if (releaseUpdateTimer) clearTimeout(releaseUpdateTimer);
+  releaseUpdateTimer = null;
+  const requestGeneration = ++releaseUpdateRequestGeneration;
+  const refreshButton = area.querySelector('[data-action="refresh-release-update"]');
+  if (refreshButton) {
+    refreshButton.disabled = true;
+    refreshButton.setAttribute('aria-busy','true');
+  }
   try {
-    const info = await api('/api/admin/updates');
-    if (!area.isConnected) return;
+    const info = await api(force ? '/api/admin/updates?refresh=true' : '/api/admin/updates');
+    if (!area.isConnected || requestGeneration !== releaseUpdateRequestGeneration) return;
     const phase = info.status?.phase || 'idle';
     const active = ['queued','downloading','verifying','installing','health_check','rolling_back'].includes(phase);
     const labels = {idle:'대기',queued:'대기 중',downloading:'다운로드 중',verifying:'검증 중',installing:'설치 중',health_check:'상태 확인 중',rolling_back:'이전 버전 복구 중',completed:'완료',failed:'실패'};
-    area.innerHTML = `<h2>서비스 업데이트</h2><p>${i18n.locale === 'en' ? 'Current' : '현재'} ${esc(info.current)} · ${i18n.locale === 'en' ? 'Latest' : '최신'} ${esc(info.latest?.tag || i18n.t('조회 불가'))}</p>
+    area.innerHTML = `<div class="release-update-head"><h2>서비스 업데이트</h2><button type="button" class="small ghost" data-action="refresh-release-update">새로고침</button></div><p>${i18n.locale === 'en' ? 'Current' : '현재'} ${esc(info.current)} · ${i18n.locale === 'en' ? 'Latest' : '최신'} ${esc(info.latest?.tag || i18n.t('조회 불가'))}</p>
       ${info.latest?.notes ? `<details><summary>업데이트 내역</summary><div class="release-notes markdown-preview" data-i18n-ignore>${safeMarkdown(info.latest.notes)}</div></details>` : ''}
       ${info.error ? `<p class="form-hint" role="status">${esc(info.error)}</p>` : ''}
       ${!info.helper_ready ? '<p class="form-hint">이 설치 방식에는 웹 업데이트 실행기가 연결되어 있지 않습니다.</p>' : ''}
       ${phase !== 'idle' ? `<p class="form-hint" role="status">${esc(i18n.t(labels[phase] || phase))}${info.status?.message ? ` · ${esc(info.status.message)}` : ''}</p>` : ''}
       <button type="button" class="primary" data-action="install-release-update" ${info.available && info.helper_ready && !active ? '' : 'disabled'}>업데이트</button>`;
-    if (releaseUpdateTimer) clearTimeout(releaseUpdateTimer);
-    if (active) releaseUpdateTimer = setTimeout(refreshReleaseUpdatePanel,5000);
+    if (notesOpen) {
+      const notes = area.querySelector('details');
+      if (notes) notes.open = true;
+    }
+    if (active) releaseUpdateTimer = setTimeout(() => refreshReleaseUpdatePanel(),5000);
   } catch (error) {
-    if (area.isConnected) {
-      area.innerHTML = `<h2>서비스 업데이트</h2><p class="form-hint" role="status">${esc(error.message || '업데이트 상태를 불러오지 못했습니다.')}</p><button type="button" class="small ghost" data-action="refresh-release-update">새로고침</button>`;
-      if (releaseUpdateTimer) clearTimeout(releaseUpdateTimer);
-      releaseUpdateTimer = setTimeout(refreshReleaseUpdatePanel,5000);
+    if (area.isConnected && requestGeneration === releaseUpdateRequestGeneration) {
+      area.innerHTML = `<div class="release-update-head"><h2>서비스 업데이트</h2><button type="button" class="small ghost" data-action="refresh-release-update">새로고침</button></div><p class="form-hint" role="status">${esc(error.message || '업데이트 상태를 불러오지 못했습니다.')}</p>`;
+      releaseUpdateTimer = setTimeout(() => refreshReleaseUpdatePanel(),5000);
     }
   }
 }
@@ -2615,6 +2822,9 @@ document.addEventListener('click', event => {
     'toggle-sidebar': () => toggleSidebar(button),
     'toggle-resource-meter': () => toggleResourceMeter(button),
     'toggle-solver-log-size': () => toggleSolverLogSize(button),
+    'select-solver-agent': () => selectSolverAgent(button),
+    'toggle-solver-agent-branch': () => toggleSolverAgentBranch(button),
+    'solver-console-bottom': () => solverConsoleBottom(),
     'close-solver-console': () => solverConsoleDialog?.close(),
     'open-solver-accounts': () => openSolverAccounts(),
     'new-workspace': () => workspaceForm(), 'edit-workspace': () => workspaceForm(true),
@@ -2622,7 +2832,7 @@ document.addEventListener('click', event => {
     'clone-challenge': () => cloneChallenge(),
     'add-relation': () => changeRelation(),
     'install-release-update': () => installReleaseUpdate(button),
-    'refresh-release-update': () => refreshReleaseUpdatePanel(),
+    'refresh-release-update': () => refreshReleaseUpdatePanel(true),
     'remove-relation': () => changeRelation(button.dataset.id),
     'open-related-challenge': () => openChallenge(button.dataset.id),
     'remove-challenge-file': () => {
@@ -2650,6 +2860,7 @@ document.addEventListener('click', event => {
     'copy-notes': async () => { await copyText(document.querySelector('#notes-editor').value); toast('클립보드에 복사했습니다.'); },
     'copy-flag': async () => { await copyText(currentChallenge.flag || ''); toast('Flag를 복사했습니다.'); },
     'start-solver': () => startSolver(),
+    'approve-ultra-escalation': () => approveUltraEscalation(),
     'cancel-solver': () => cancelSolver(),
     'reject-solver-flag': () => rejectSolverFlag(),
     'copy-solver-flag': async () => { if (!currentSolverJob?.flag) throw new Error('발견된 Flag가 없습니다.'); await copyText(currentSolverJob.flag); toast('Flag를 복사했습니다.'); },
@@ -2809,12 +3020,16 @@ document.addEventListener('change', event => {
   }
   if (input.id === 'solver-reasoning-select') {
     solverReasoning = input.value;
+    repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
   }
   if (input.id === 'solver-fast-toggle') {
     solverServiceTier = input.checked ? 'fast' : null;
   }
   if (input.id === 'solver-ultracode-toggle') {
     solverUltracode = input.checked;
+  }
+  if (input.id === 'solver-ultra-escalation') {
+    solverUltraEscalationMode = ['ask','auto','off'].includes(input.value) ? input.value : 'ask';
   }
   if (input.id === 'category-filter') run(async () => { selectedCategory = input.value; await refreshChallenges(); });
   if (input.id === 'sort-order') run(async () => { selectedSort = input.value; await refreshChallenges(); });
