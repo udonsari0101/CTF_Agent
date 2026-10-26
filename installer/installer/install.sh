@@ -24,6 +24,10 @@ fi
 releases="$home_dir/releases"
 target="$releases/$version"
 mkdir -p -- "$releases" "$home_dir/ctf_agent_data" "$home_dir/Database/CTF_Agent"
+if [[ -L "$releases" || -L "$target" ]]; then
+    echo 'Release path must not be a symlink.' >&2
+    exit 2
+fi
 if [[ ! -d "$target" ]]; then
     staging="$(mktemp -d "$releases/.staging.XXXXXXXX")"
     trap 'rm -rf -- "$staging"' EXIT
@@ -43,6 +47,9 @@ export CTF_AUTH_MODE="${CTF_LOCAL_AUTH_MODE:-password}"
 export CTF_ALLOW_WEB_BOOTSTRAP=true
 export CTF_LOCAL_UID="${CTF_LOCAL_UID:-$(id -u)}"
 export CTF_LOCAL_GID="${CTF_LOCAL_GID:-$(id -g)}"
+if [[ "$(id -u)" == 0 ]]; then
+    chown -R -- "$CTF_LOCAL_UID:$CTF_LOCAL_GID" "$target"
+fi
 case "${CTF_LOCAL_AUTOSTART:-true}" in
     true) export CTF_LOCAL_RESTART_POLICY=unless-stopped ;;
     false) export CTF_LOCAL_RESTART_POLICY=no ;;
