@@ -35,6 +35,36 @@ fi
 source_dir=$release_root/$current
 target_dir=$release_root/$revision
 [ -f "$source_dir/release.sh" ] && [ ! -L "$source_dir/release.sh" ] || exit 1
+# Keep the current workers running while their claimed jobs finish. The web
+# coordinator leaves queued jobs untouched while this marker is present.
+drain_file=$release_root/../deployment-drain
+if [ -e "$drain_file" ] || [ -L "$drain_file" ]; then
+    [ -f "$drain_file" ] && [ ! -L "$drain_file" ] &&
+        [ "$(($(date +%s) - $(stat -c %Y "$drain_file")))" -ge 7200 ] || {
+        echo 'Another deployment drain is active.' >&2
+        exit 1
+    }
+    rm -f "$drain_file"
+fi
+umask 022
+if ! (set -C; : > "$drain_file"); then
+    echo 'Could not reserve the deployment drain.' >&2
+    exit 1
+fi
+trap 'rm -f "$drain_file"' EXIT
+trap 'exit 1' HUP INT TERM
+deadline=$(($(date +%s) + 2700))
+while :; do
+    claimed=$(docker exec ctf_agent python -c 'import sqlite3; db=sqlite3.connect("/database/sqlite/ctf_agent.sqlite3", timeout=15); print(db.execute("SELECT COUNT(*) FROM solver_slots").fetchone()[0]); db.close()') || exit 1
+    case "$claimed" in *[!0-9]*|'') exit 1 ;; esac
+    [ "$claimed" -eq 0 ] && break
+    [ "$(date +%s)" -lt "$deadline" ] || {
+        echo 'Active solver jobs did not finish before the deployment window expired.' >&2
+        exit 1
+    }
+    echo "Waiting for $claimed active solver job(s) before deployment."
+    sleep 10
+done
 if [ ! -e "$target_dir" ]; then
     mkdir -m 0750 "$target_dir"
     cp -a "$source_dir"/. "$target_dir"/

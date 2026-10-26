@@ -55,6 +55,7 @@ class SolverCapacityInput(BaseModel):
 class SolverGuidanceInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     message: str = Field(min_length=1, max_length=MAX_SOLVER_GUIDANCE_BYTES)
+    requested_delivery: Literal["same_turn", "next_turn"] = "same_turn"
 
 
 async def _validated_configuration_override(
@@ -224,7 +225,7 @@ async def _validated_configuration_override(
             None,
             selected.account_id,
             payload.provider == "codex"
-            and requested_configuration.reasoning_effort != "max"
+            and requested_configuration.reasoning_effort not in {"max", "ultra"}
             and requested_configuration.reasoning_effort in efforts
             and "max" in efforts,
         )
@@ -270,7 +271,7 @@ async def _validated_configuration_override(
         ) from exc
     max_reasoning_available = (
         payload.provider == "codex"
-        and configuration.reasoning_effort != "max"
+        and configuration.reasoning_effort not in {"max", "ultra"}
         and "max" in efforts
     )
     return configuration, selected.account_id, max_reasoning_available
@@ -965,6 +966,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
                 job_id,
                 user["id"],
                 message,
+                payload.requested_delivery,
             )
             service.notify()
             return result

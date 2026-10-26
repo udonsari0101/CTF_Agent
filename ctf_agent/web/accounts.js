@@ -255,7 +255,7 @@ export async function renderAccounts(container, api, options = {}) {
       const efforts = selected?.supportedReasoningEfforts || [];
       const desiredEffort = model.value === account.model ? account.reasoning_effort : selected?.defaultReasoningEffort;
       for (const value of efforts) {
-        const option = el('option', value.reasoningEffort); option.value = value.reasoningEffort;
+        const option = el('option', value.reasoningEffort === 'ultracode' ? 'Ultracode · xhigh' : value.reasoningEffort); option.value = value.reasoningEffort;
         option.selected = value.reasoningEffort === desiredEffort; effort.append(option);
       }
       effort.disabled = !selected;

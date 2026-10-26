@@ -38,6 +38,11 @@ CLAUDE_MODEL_ALIASES = (
     ("haiku", "Haiku (automatic)"),
 )
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CLAUDE_ULTRACODE_MODELS = frozenset({
+    "claude-opus-5-5", "claude-fable-5-1", "claude-fable-5",
+    "claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5",
+    "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7",
+})
 _ANSI_CSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _ANSI_OSC = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
 _ANSI_OSC_LINK = re.compile(r"\x1b\]8;;(https://[^\x07\x1b]+)(?:\x07|\x1b\\)")
@@ -268,7 +273,6 @@ class ClaudeAccount:
             return dict(self._usage_cache)
 
     async def models(self):
-        efforts = [{"reasoningEffort": value} for value in CLAUDE_EFFORTS]
         return {
             "status": "available",
             "source": "claude_code_documented_models",
@@ -277,7 +281,11 @@ class ClaudeAccount:
                     "id": model,
                     "model": model,
                     "displayName": label,
-                    "supportedReasoningEfforts": efforts,
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": value}
+                        for value in CLAUDE_EFFORTS
+                        if value != "xhigh" or model in CLAUDE_ULTRACODE_MODELS
+                    ] + ([{"reasoningEffort": "ultracode"}] if model in CLAUDE_ULTRACODE_MODELS else []),
                     "serviceTiers": [],
                 }
                 for model, label in CLAUDE_MODEL_ALIASES

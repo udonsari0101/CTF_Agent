@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS solver_job_guidance (
     job_id TEXT NOT NULL REFERENCES solver_jobs(id) ON DELETE CASCADE,
     owner_user_id TEXT NOT NULL,
     message TEXT NOT NULL,
+    requested_delivery TEXT NOT NULL DEFAULT 'same_turn' CHECK(requested_delivery IN ('same_turn','next_turn')),
     status TEXT NOT NULL CHECK(status IN ('queued','staged','delivered','rejected')),
     provider_delivery TEXT CHECK(provider_delivery IN ('same_turn','next_turn')),
     error_code TEXT,
@@ -501,6 +502,12 @@ class SolverExchangeCoordinator:
                 db.execute(
                     "ALTER TABLE solver_jobs ADD COLUMN max_reasoning_available "
                     "INTEGER NOT NULL DEFAULT 0 CHECK(max_reasoning_available IN (0,1))"
+                )
+            guidance_columns = {row[1] for row in db.execute("PRAGMA table_info(solver_job_guidance)")}
+            if "requested_delivery" not in guidance_columns:
+                db.execute(
+                    "ALTER TABLE solver_job_guidance ADD COLUMN requested_delivery TEXT "
+                    "NOT NULL DEFAULT 'same_turn' CHECK(requested_delivery IN ('same_turn','next_turn'))"
                 )
             _migrate_solver_provider_constraint(db)
             _repair_recovered_cleanup_errors(db)
@@ -1050,7 +1057,7 @@ class SolverExchangeCoordinator:
                         "reasoning_effort": configuration.reasoning_effort,
                         "max_reasoning_available": int(
                             max_reasoning_available
-                            and configuration.reasoning_effort != "max"
+                            and configuration.reasoning_effort not in {"max", "ultra"}
                         ),
                         "service_tier": configuration.service_tier,
                         "codex_version": codex_version,
@@ -1158,7 +1165,7 @@ class SolverExchangeCoordinator:
             guidance = [
                 _public_guidance(item)
                 for item in db.execute(
-                    """SELECT id,job_id,message,status,provider_delivery,error_code,
+                    """SELECT id,job_id,message,requested_delivery,status,provider_delivery,error_code,
                               created_at,staged_at,delivered_at
                        FROM solver_job_guidance
                        WHERE job_id=? AND owner_user_id=?
@@ -1208,6 +1215,7 @@ class SolverExchangeCoordinator:
         job_id: str,
         owner_user_id: str,
         message: str,
+        requested_delivery: str = "same_turn",
     ) -> dict[str, Any]:
         """Durably queue owner-authored guidance for one active solve."""
 
@@ -1225,12 +1233,14 @@ class SolverExchangeCoordinator:
                 category="auth",
             )
         normalized = normalize_solver_guidance(message)
+        if requested_delivery not in {"same_turn", "next_turn"}:
+            raise ExchangeError("invalid_guidance_delivery", "Invalid guidance delivery mode.", category="input")
         guidance_id = uuid.uuid4().hex
         timestamp = self.clock()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT id,job_mode,status FROM solver_jobs WHERE id=? AND owner_user_id=?",
+                "SELECT id,job_mode,status,provider FROM solver_jobs WHERE id=? AND owner_user_id=?",
                 (job_id, owner_user_id),
             ).fetchone()
             if not row:
@@ -1241,6 +1251,8 @@ class SolverExchangeCoordinator:
                     "추가 명령은 문제 풀이 작업에만 보낼 수 있습니다.",
                     category="input",
                 )
+            if requested_delivery == "same_turn" and row["provider"] == "claude":
+                requested_delivery = "next_turn"
             if row["status"] not in _GUIDANCE_OPEN_STATUSES:
                 raise ExchangeError(
                     "solver_guidance_unavailable",
@@ -1259,12 +1271,12 @@ class SolverExchangeCoordinator:
                 )
             db.execute(
                 """INSERT INTO solver_job_guidance(
-                       id,job_id,owner_user_id,message,status,created_at
-                   ) VALUES(?,?,?,?, 'queued',?)""",
-                (guidance_id, job_id, owner_user_id, normalized, timestamp),
+                       id,job_id,owner_user_id,message,requested_delivery,status,created_at
+                   ) VALUES(?,?,?,?,?, 'queued',?)""",
+                (guidance_id, job_id, owner_user_id, normalized, requested_delivery, timestamp),
             )
             queued = db.execute(
-                """SELECT id,job_id,message,status,provider_delivery,error_code,
+                """SELECT id,job_id,message,requested_delivery,status,provider_delivery,error_code,
                           created_at,staged_at,delivered_at
                    FROM solver_job_guidance WHERE id=?""",
                 (guidance_id,),
@@ -1962,6 +1974,15 @@ class SolverExchangeCoordinator:
             return True
 
     def _claim_next(self, worker_instance_id: str) -> dict[str, Any] | None:
+        # A deployment waits for claimed work to finish before recreating the
+        # worker containers. Queued work remains durable and starts afterward.
+        try:
+            drain = (self.data_dir / "deployment-drain").lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISREG(drain.st_mode) and 0 <= self.clock() - drain.st_mtime < 7200:
+                return None
         timestamp = self.clock()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2115,6 +2136,8 @@ class SolverExchangeCoordinator:
         if current["cancel_requested"]:
             _write_once(active / "cancel", b"cancel\n", 0o600)
         elif not current["released_ingested"] and current["status"] in _GUIDANCE_OPEN_STATUSES:
+            if current["job_mode"] == "solve":
+                changed = self._sync_live_attachments(current, active) or changed
             changed = self._sync_guidance(current, active) or changed
         request = active / "credential-request.json"
         if (
@@ -2138,6 +2161,64 @@ class SolverExchangeCoordinator:
             changed = True
         return changed
 
+    def _sync_live_attachments(self, job: Mapping[str, Any], active: Path) -> bool:
+        """Expose newly uploaded challenge files to a running solve."""
+
+        index_path = active / "attachment-index.json"
+        if not index_path.exists():
+            # Active jobs created by older releases have no index. Preserve
+            # their original snapshot; future uploads are tracked from here.
+            with self._connect() as db:
+                ids = [row["id"] for row in db.execute(
+                    "SELECT id FROM attachments WHERE workspace_id=? AND challenge_id=? ORDER BY created_at,id",
+                    (job["workspace_id"], job["challenge_id"]),
+                )]
+            _write_json_file(index_path, {"ids": ids})
+            return False
+        index = _read_json_file(index_path, 8 * 1024 * 1024)
+        known = index.get("ids")
+        if not isinstance(known, list) or any(not isinstance(item, str) or not _ID.fullmatch(item) for item in known):
+            raise ExchangeError("invalid_attachment_index", "Live attachment index is invalid.", category="safety")
+        known_set = set(known)
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id,original_name,stored_name,size FROM attachments WHERE workspace_id=? AND challenge_id=? ORDER BY created_at,id",
+                (job["workspace_id"], job["challenge_id"]),
+            ).fetchall()
+        source_root = self.data_dir / "workspaces" / job["workspace_id"] / "challenges" / job["challenge_id"] / "attachments"
+        destination = active / "challenge" / "attachments"
+        _assert_no_symlink_chain(self.data_dir, source_root)
+        if destination.is_symlink():
+            raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+        destination.mkdir(mode=0o700, exist_ok=True)
+        changed = False
+        for row in rows:
+            attachment_id = row["id"]
+            if attachment_id in known_set:
+                continue
+            stored = row["stored_name"]
+            if not isinstance(stored, str) or not _ID.fullmatch(stored):
+                raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+            name = "live-" + attachment_id + "_" + _stage_filename(0, row["original_name"])[5:]
+            target = destination / name
+            if target.exists() or target.is_symlink():
+                info = target.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != row["size"]:
+                    raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+            else:
+                _copy_regular_file(
+                    source_root / stored, target,
+                    expected_size=row["size"],
+                    cancelled=lambda: self.stop_requested.is_set() or self._is_cancelled(job["id"]),
+                    source_root=self.data_dir,
+                    allow_hardlinks=True,
+                )
+            known.append(attachment_id)
+            known_set.add(attachment_id)
+            _write_json_file(index_path, {"ids": known})
+            changed = True
+        return changed
+
     def _sync_guidance(self, job: Mapping[str, Any], active: Path) -> bool:
         """Publish durable guidance into only this job's isolated control tree."""
 
@@ -2153,7 +2234,7 @@ class SolverExchangeCoordinator:
             directory.chmod(0o700)
         with self._connect() as db:
             rows = db.execute(
-                """SELECT id,job_id,owner_user_id,message,status,created_at
+                """SELECT id,job_id,owner_user_id,message,requested_delivery,status,created_at
                    FROM solver_job_guidance
                    WHERE job_id=? AND owner_user_id=? AND status IN ('queued','staged')
                    ORDER BY created_at,id""",
@@ -2171,13 +2252,19 @@ class SolverExchangeCoordinator:
                         "추가 명령 전달 파일을 확인할 수 없습니다.",
                         category="safety",
                     ) from None
-                if payload != {
+                expected = {
                     "protocol": EXCHANGE_PROTOCOL,
                     "job_id": row["job_id"],
                     "guidance_id": row["id"],
                     "message": row["message"],
+                    "requested_delivery": row["requested_delivery"],
                     "created_at": row["created_at"],
-                }:
+                }
+                legacy = dict(expected)
+                legacy.pop("requested_delivery")
+                if payload != expected and not (
+                    row["requested_delivery"] == "same_turn" and payload == legacy
+                ):
                     raise ExchangeError(
                         "invalid_guidance_path",
                         "추가 명령 전달 파일이 저장 기록과 일치하지 않습니다.",
@@ -2191,6 +2278,7 @@ class SolverExchangeCoordinator:
                         "job_id": row["job_id"],
                         "guidance_id": row["id"],
                         "message": row["message"],
+                        "requested_delivery": row["requested_delivery"],
                         "created_at": row["created_at"],
                     },
                 )
@@ -2424,6 +2512,7 @@ class SolverExchangeCoordinator:
             )
             challenge = staging / "challenge"
             self._copy_attachments(job["id"], job["workspace_id"], job["challenge_id"], attachments, challenge)
+            _write_json_file(staging / "attachment-index.json", {"ids": [row["id"] for row in attachments]})
             if job["job_mode"] == "writeup_refine":
                 if not source_writeup_bytes:
                     raise ExchangeError(
@@ -4423,6 +4512,7 @@ def _public_guidance(row: Mapping[str, Any]) -> dict[str, Any]:
         "id": row["id"],
         "job_id": row["job_id"],
         "message": row["message"],
+        "requested_delivery": row["requested_delivery"],
         "status": row["status"],
         "provider_delivery": row["provider_delivery"],
         "error_code": row["error_code"],

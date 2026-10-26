@@ -699,7 +699,7 @@ class JobManifest:
             and (
                 job_mode != "solve"
                 or configuration.provider != "codex"
-                or configuration.reasoning_effort == "max"
+                or configuration.reasoning_effort in {"max", "ultra"}
             )
         ):
             raise WorkerRefusal("invalid_manifest", "자동 추론 승격 설정을 확인할 수 없습니다.")
@@ -2328,14 +2328,12 @@ class CodexAppServer:
         "computer_use",
         "hooks",
         "image_generation",
-        "multi_agent",
         "skill_search",
     )
 
     DISALLOWED_ITEM_CODES = {
         "mcpToolCall": "unexpected_mcp_tool",
         "dynamicToolCall": "unexpected_dynamic_tool",
-        "collabAgentToolCall": "unexpected_multi_agent_tool",
         "imageGeneration": "unexpected_image_generation",
     }
 
@@ -2494,12 +2492,23 @@ class CodexAppServer:
         }
 
     def command_arguments(self) -> list[str]:
+        multi_agent = bool(
+            self.configuration
+            and self.configuration.reasoning_effort == "ultra"
+        )
         command = [
             *self.command_prefix,
             "-c", 'cli_auth_credentials_store="file"',
             "-c", "analytics.enabled=false",
-            "-c", "agents.enabled=false",
+            "-c", f"agents.enabled={'true' if multi_agent else 'false'}",
         ]
+        if multi_agent:
+            command.extend((
+                "-c", "agents.max_concurrent_threads_per_session=4",
+                "--enable", "multi_agent",
+            ))
+        else:
+            command.extend(("--disable", "multi_agent"))
         if self.configuration and self.configuration.service_tier == "fast":
             command.extend(("-c", 'service_tier="fast"', "-c", "features.fast_mode=true"))
         for feature in self.DISABLED_FEATURES:
@@ -3247,8 +3256,11 @@ print(json.dumps(result,separators=(",",":")))
             "config": {
                 "web_search": "disabled" if is_refinement else "live",
                 "tools": {"web_search": not is_refinement},
-                "features": {"multi_agent": False},
-                "agents": {"enabled": False},
+                "features": {"multi_agent": manifest.configuration.reasoning_effort == "ultra" and not is_refinement},
+                "agents": {
+                    "enabled": manifest.configuration.reasoning_effort == "ultra" and not is_refinement,
+                    "max_concurrent_threads_per_session": 4,
+                },
             },
         }
         if is_refinement:
@@ -3496,6 +3508,10 @@ print(json.dumps(result,separators=(",",":")))
                 self.guidance_mailbox.release(guidance)
                 guidance = None
             if guidance is not None and self.guidance_mailbox is not None:
+                if guidance.requested_delivery == "next_turn":
+                    self._deferred_guidance_ids.add(guidance.guidance_id)
+                    self.guidance_mailbox.release(guidance)
+                    continue
                 try:
                     steered = await self.request(
                         "turn/steer",
@@ -3575,6 +3591,15 @@ print(json.dumps(result,separators=(",",":")))
                 refusal_code = self.DISALLOWED_ITEM_CODES.get(item_type)
                 if refusal_code:
                     raise WorkerRefusal(refusal_code, "오프라인 worker에서 허용하지 않는 도구가 요청되었습니다.")
+                if item_type == "collabAgentToolCall":
+                    if manifest.configuration.reasoning_effort != "ultra" or getattr(manifest, "job_mode", "solve") != "solve":
+                        raise WorkerRefusal("unexpected_multi_agent_tool", "Subagents require Codex ultra reasoning.")
+                    await self._report_activity(
+                        "started" if method == "item/started" else "completed",
+                        "agent",
+                        "Subagent started" if method == "item/started" else "Subagent finished",
+                        message=item.get("prompt") if isinstance(item, Mapping) else None,
+                    )
                 if (
                     getattr(manifest, "job_mode", "solve") == "writeup_refine"
                     and item_type in {"commandExecution", "fileChange"}
@@ -3804,6 +3829,22 @@ the worker owns the fixed deadline and cancellation. The read-only
 brief is authoritative about whether a remote exists. Do not write the final
 write-up in this turn.
 """
+        if getattr(configuration, "reasoning_effort", None) == "ultra":
+            result_bridge += """
+
+Ultra is enabled. Delegate independent analysis or verification to Codex
+subagents when that can reduce wall-clock time. Keep a single owner for each
+file or remote action, collect the results, and continue the solve in this
+same workspace. Submit the verified flag through submit-flag yourself.
+"""
+        elif getattr(configuration, "provider", None) == "claude" and getattr(configuration, "reasoning_effort", None) == "ultracode":
+            result_bridge += """
+
+Ultracode is enabled. Use Agent or Workflow subagents for independent
+analysis or verification when parallel work is useful. Assign separate files
+or remote actions to avoid conflicts, collect their evidence, and submit the
+verified flag from this session with submit-flag.
+"""
         if getattr(manifest, "max_reasoning_available", False):
             result_bridge += """
 
@@ -3922,7 +3963,7 @@ is a fresh isolated job; do not repeat completed work.
                     not reasoning_escalated
                     and getattr(manifest, "max_reasoning_available", False)
                     and effective_manifest.configuration.provider == "codex"
-                    and effective_manifest.configuration.reasoning_effort != "max"
+                    and effective_manifest.configuration.reasoning_effort not in {"max", "ultra"}
                     and objective_evidence
                     and _max_reasoning_requested(challenge)
                 ):
@@ -4234,13 +4275,13 @@ class ClaudePrintDriver(CodexAppServer):
     """Claude Code print-mode driver with one resumable, job-scoped session."""
 
     structured_discovery = True
-    ALLOWED_TOOLS = ("Bash", "Read", "Write", "Edit", "Glob", "Grep")
+    ALLOWED_TOOLS = ("Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent")
     ALLOWED_MODELS = {"default", "best", "fable", "opus", "sonnet", "haiku",
                       "claude-fable-5-1", "claude-fable-5", "claude-opus-5-5",
                       "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
                       "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5",
                       "claude-sonnet-4-6", "claude-haiku-5-5", "claude-haiku-4-5-20251001"}
-    ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+    ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultracode"}
     SETTINGS = {
         "permissions": {
             "defaultMode": "dontAsk",
@@ -4306,8 +4347,8 @@ class ClaudePrintDriver(CodexAppServer):
                 "DISABLE_AUTOUPDATER": "1",
                 "DISABLE_ERROR_REPORTING": "1",
                 "DISABLE_TELEMETRY": "1",
-                "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
                 "CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF": "1",
+                "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "4",
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                 "CLAUDE_CODE_MAX_RETRIES": "2",
                 "MAX_STRUCTURED_OUTPUT_RETRIES": "2",
@@ -4401,7 +4442,10 @@ class ClaudePrintDriver(CodexAppServer):
             raise WorkerRefusal("provider_session_mismatch", "Claude 작업 세션을 확인할 수 없습니다.")
         self.session_id = session
         writeup_only = getattr(manifest, "job_mode", "solve") == "writeup_refine"
-        allowed_tools = () if writeup_only else self.ALLOWED_TOOLS
+        ultracode = manifest.configuration.reasoning_effort == "ultracode" and not writeup_only
+        allowed_tools = () if writeup_only else (
+            *self.ALLOWED_TOOLS, *(("Workflow",) if ultracode else ())
+        )
         tools = ",".join(allowed_tools)
         settings_payload = (
             {
@@ -4413,7 +4457,14 @@ class ClaudePrintDriver(CodexAppServer):
                 },
             }
             if writeup_only
-            else self.SETTINGS
+            else {
+                **self.SETTINGS,
+                "ultracode": ultracode,
+                "permissions": {
+                    **self.SETTINGS["permissions"],
+                    "allow": list(allowed_tools),
+                },
+            }
         )
         settings = json.dumps(
             settings_payload,
@@ -4434,6 +4485,8 @@ class ClaudePrintDriver(CodexAppServer):
             "--json-schema",
             schema_text,
         ]
+        if not writeup_only:
+            arguments.append("--forward-subagent-text")
         if self.turn_count == 0:
             arguments.extend(("--session-id", session))
         else:
@@ -4552,7 +4605,8 @@ class ClaudePrintDriver(CodexAppServer):
             if not isinstance(event_type, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", event_type):
                 raise AppServerFailure({"code": "invalid_response"})
             event_session = event.get("session_id")
-            if event_session is not None and event_session != session:
+            subagent_event = isinstance(event.get("parent_tool_use_id"), str)
+            if event_session is not None and event_session != session and not subagent_event:
                 raise WorkerRefusal("provider_session_mismatch", "Claude 작업 세션이 실행 중 변경되었습니다.")
             if self._policy_refusal(event):
                 raise AppServerFailure(
@@ -4563,13 +4617,29 @@ class ClaudePrintDriver(CodexAppServer):
                         "retryable": False,
                     }
                 )
+            if subagent_event and event_type in {"assistant", "user"}:
+                message = event.get("message")
+                content = message.get("content") if isinstance(message, Mapping) else None
+                if event_type == "assistant" and isinstance(content, list):
+                    text_parts = [
+                        block["text"] for block in content[:200]
+                        if isinstance(block, Mapping)
+                        and block.get("type") == "text"
+                        and isinstance(block.get("text"), str)
+                    ]
+                    if text_parts:
+                        await self._report_activity(
+                            "completed", "agent", "Subagent update",
+                            message="\n".join(text_parts)[:MAX_SOFT_MESSAGE_BYTES],
+                        )
+                continue
             if event_type == "system" and event.get("subtype") == "init":
                 if (
                     initialized
                     or event_session != session
                     or not self._model_matches(manifest.configuration.model, event.get("model"))
-                    or event.get("effort", manifest.configuration.reasoning_effort)
-                    != manifest.configuration.reasoning_effort
+                    or event.get("effort", "xhigh" if manifest.configuration.reasoning_effort == "ultracode" else manifest.configuration.reasoning_effort)
+                    != ("xhigh" if manifest.configuration.reasoning_effort == "ultracode" else manifest.configuration.reasoning_effort)
                 ):
                     raise WorkerRefusal("model_mismatch", "Claude가 선택한 모델과 다른 모델을 반환했습니다.", category="model")
                 if event.get("claude_code_version") != self.expected_version:
@@ -4581,7 +4651,7 @@ class ClaudePrintDriver(CodexAppServer):
                     *(
                         ()
                         if getattr(manifest, "job_mode", "solve") == "writeup_refine"
-                        else self.ALLOWED_TOOLS
+                        else (*self.ALLOWED_TOOLS, *(("Workflow",) if manifest.configuration.reasoning_effort == "ultracode" else ()))
                     ),
                     "StructuredOutput",
                 }
@@ -4623,7 +4693,7 @@ class ClaudePrintDriver(CodexAppServer):
                             *(
                                 ()
                                 if getattr(manifest, "job_mode", "solve") == "writeup_refine"
-                                else self.ALLOWED_TOOLS
+                                else (*self.ALLOWED_TOOLS, *(("Workflow",) if manifest.configuration.reasoning_effort == "ultracode" else ()))
                             ),
                             "StructuredOutput",
                         }
@@ -5134,6 +5204,7 @@ class GuidanceRecord:
     guidance_id: str
     message: str
     created_at: float
+    requested_delivery: str = "same_turn"
 
 
 def _single_solver_guidance_prompt(record: GuidanceRecord) -> str:
@@ -5198,13 +5269,12 @@ class GuidanceMailbox:
                 "추가 명령 전달 파일을 확인할 수 없습니다.",
             )
         payload = _read_json(path, MAX_SOLVER_GUIDANCE_BYTES + 1024)
-        if set(payload) != {
-            "protocol",
-            "job_id",
-            "guidance_id",
-            "message",
-            "created_at",
-        }:
+        if set(payload) not in ({
+            "protocol", "job_id", "guidance_id", "message", "created_at",
+        }, {
+            "protocol", "job_id", "guidance_id", "message",
+            "requested_delivery", "created_at",
+        }):
             raise WorkerRefusal(
                 "invalid_guidance_file",
                 "추가 명령 전달 파일 형식을 확인할 수 없습니다.",
@@ -5220,6 +5290,7 @@ class GuidanceMailbox:
             or message != message.replace("\r\n", "\n").replace("\r", "\n").strip()
             or _WRITEUP_INSTRUCTION_CONTROL.search(message)
             or len(message.encode("utf-8")) > MAX_SOLVER_GUIDANCE_BYTES
+            or payload.get("requested_delivery", "same_turn") not in {"same_turn", "next_turn"}
             or not isinstance(created_at, (int, float))
             or isinstance(created_at, bool)
         ):
@@ -5227,7 +5298,7 @@ class GuidanceMailbox:
                 "invalid_guidance_file",
                 "추가 명령 전달 파일 형식을 확인할 수 없습니다.",
             )
-        return GuidanceRecord(path.stem, message, float(created_at))
+        return GuidanceRecord(path.stem, message, float(created_at), payload.get("requested_delivery", "same_turn"))
 
     def take_nowait_many(
         self,
@@ -5761,6 +5832,7 @@ class SolverWorker:
         credential = None
         cancel_event = asyncio.Event()
         cancel_watcher = None
+        attachment_watcher = None
         remote_request_watcher = None
         remote_requested = asyncio.Event()
         remote_request_result: dict[str, Any] = {}
@@ -5940,6 +6012,18 @@ class SolverWorker:
             (active / "credential-request.json").unlink(missing_ok=True)
             _fsync_directory(active)
             scratch = prepared.workdir
+            if manifest.job_mode == "solve":
+                attachment_watcher = asyncio.create_task(
+                    _watch_live_attachments(
+                        active / "challenge" / "attachments",
+                        scratch / "attachments",
+                        (
+                            self.input_root / "active" / "challenge" / "attachments"
+                            if self.input_root is not None else None
+                        ),
+                        writer,
+                    )
+                )
             if manifest.job_mode == "writeup_refine" and manifest.source_solver_artifact:
                 _restore_solver_artifact(scratch, manifest.source_solver_artifact)
             elif manifest.retry_checkpoint and manifest.retry_checkpoint.solver_artifact:
@@ -6074,7 +6158,7 @@ class SolverWorker:
                     getattr(driver, "effective_reasoning_effort", None) == "max"
                     and manifest.max_reasoning_available
                     and manifest.configuration.provider == "codex"
-                    and manifest.configuration.reasoning_effort != "max"
+                    and manifest.configuration.reasoning_effort not in {"max", "ultra"}
                 ):
                     manifest = replace(
                         manifest,
@@ -6315,6 +6399,9 @@ class SolverWorker:
             if cancel_watcher:
                 cancel_watcher.cancel()
                 await asyncio.gather(cancel_watcher, return_exceptions=True)
+            if attachment_watcher:
+                attachment_watcher.cancel()
+                await asyncio.gather(attachment_watcher, return_exceptions=True)
             if remote_request_watcher:
                 remote_request_watcher.cancel()
                 await asyncio.gather(remote_request_watcher, return_exceptions=True)
@@ -6568,6 +6655,74 @@ async def _watch_cancel(path: Path, event: asyncio.Event) -> None:
             event.set()
             return
         await asyncio.sleep(0.2)
+
+
+def _install_live_attachments(source: Path, destination: Path, visible: Path | None) -> int:
+    """Add uploaded files to an existing solve without replacing agent work."""
+
+    if not source.exists():
+        return 0
+    if source.is_symlink() or not source.is_dir() or destination.is_symlink():
+        raise ValueError("live attachment directory is invalid")
+    destination.mkdir(mode=0o700, exist_ok=True)
+    if not destination.is_dir():
+        raise ValueError("live attachment directory is invalid")
+    if visible is not None:
+        if visible.is_symlink() or not visible.is_dir() or not os.path.samefile(source, visible):
+            raise ValueError("read-only attachment view does not match")
+    added = 0
+    for item in source.iterdir():
+        if not item.name.startswith("live-"):
+            continue
+        info = item.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("live attachment is not a regular file")
+        target = destination / item.name
+        if target.exists() or target.is_symlink():
+            continue
+        if visible is not None:
+            readonly = visible / item.name
+            view_info = readonly.lstat()
+            if (
+                not stat.S_ISREG(view_info.st_mode)
+                or view_info.st_nlink != 1
+                or view_info.st_size != info.st_size
+                or not os.path.samefile(item, readonly)
+            ):
+                raise ValueError("read-only attachment file does not match")
+            target.symlink_to(readonly)
+        else:
+            with item.open("rb") as input_stream, target.open("xb") as output_stream:
+                shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
+            target.chmod(0o600)
+        added += 1
+    return added
+
+
+async def _watch_live_attachments(
+    source: Path, destination: Path, visible: Path | None, writer: EventWriter
+) -> None:
+    last_error = None
+    while True:
+        install = asyncio.create_task(
+            asyncio.to_thread(_install_live_attachments, source, destination, visible)
+        )
+        try:
+            added = await asyncio.shield(install)
+        except asyncio.CancelledError:
+            # A copy running in a thread must finish before scratch cleanup.
+            await asyncio.gather(install, return_exceptions=True)
+            raise
+        except (OSError, ValueError) as exc:
+            error = str(exc)
+            if error != last_error:
+                writer.emit("activity", phase="attachment_sync_failed", summary=error)
+                last_error = error
+        else:
+            last_error = None
+            if added:
+                writer.emit("activity", phase="attachment_added", summary=f"{added} new attachment(s) available in attachments/")
+        await asyncio.sleep(0.5)
 
 
 async def _enforce_deadline(

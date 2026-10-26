@@ -76,6 +76,54 @@ if [[ -z "$toolchain_image" || "$(cat -- "$toolchain_stamp" 2>/dev/null || true)
 else
     echo 'Reusing the existing CTF toolchain image.'
 fi
+# The installed web coordinator stops claiming queued work while this file
+# exists. Wait for every claimed solve to finish before Compose recreates its
+# worker; a timed-out update leaves the current workers running.
+drain_file="$CTF_LOCAL_FS_DATA/deployment-drain"
+if [[ -L "$CTF_LOCAL_FS_DATA" ]]; then
+    echo 'The data path must not be a symlink.' >&2
+    exit 1
+fi
+mkdir -p -- "$CTF_LOCAL_FS_DATA"
+if [[ -e "$drain_file" || -L "$drain_file" ]]; then
+    if [[ -f "$drain_file" && ! -L "$drain_file" ]] &&
+       (( $(date +%s) - $(stat -c %Y -- "$drain_file") >= 7200 )); then
+        rm -f -- "$drain_file"
+    else
+        echo 'Another deployment drain is active.' >&2
+        exit 1
+    fi
+fi
+if ! (set -C; : > "$drain_file"); then
+    echo 'Could not reserve the deployment drain.' >&2
+    exit 1
+fi
+trap 'rm -f -- "$drain_file"' EXIT
+drain_deadline=$(( $(date +%s) + 3300 ))
+while :; do
+    claimed="$(python3 - "$CTF_LOCAL_FS_DATABASE/sqlite/ctf_agent.sqlite3" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    print(0)
+else:
+    with sqlite3.connect(path, timeout=15) as db:
+        table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='solver_slots'").fetchone()
+        print(db.execute("SELECT COUNT(*) FROM solver_slots").fetchone()[0] if table else 0)
+PY
+)"
+    [[ "$claimed" =~ ^[0-9]+$ ]] || exit 1
+    if (( claimed == 0 )); then break; fi
+    if (( $(date +%s) >= drain_deadline )); then
+        echo 'Active solver jobs did not finish before the update window expired.' >&2
+        exit 1
+    fi
+    echo "Waiting for $claimed active solver job(s) before update."
+    sleep 10
+done
 python3 deploy/local-compose.py up -d --build
 install -d -m 0750 -o "$CTF_LOCAL_UID" -g "$CTF_LOCAL_GID" "$home_dir/.launcher"
 for name in start.sh uninstall.py; do

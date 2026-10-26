@@ -58,8 +58,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
+          set -euo pipefail
+          revision="$(git rev-list -n 1 "$RELEASE_TAG")"
+          previous="$(git describe --tags --match 'v[0-9]*' --abbrev=0 "$revision^" 2>/dev/null || true)"
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            printf '## Changes\n\n'
+            if [ -n "$previous" ]; then
+              git log --no-merges --reverse --max-count=50 --format='- %s' "$previous..$revision"
+              printf '\n[Full changelog](https://github.com/%s/compare/%s...%s)\n' "$GITHUB_REPOSITORY" "$previous" "$RELEASE_TAG"
+            else
+              git log --no-merges --reverse --max-count=50 --format='- %s' "$revision"
+            fi
+          } > "$notes"
           gh release create "$RELEASE_TAG" \
             "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" \
             "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip.sha256" \
             --title "CTF Agent $RELEASE_TAG" \
-            --generate-notes
+            --notes-file "$notes"

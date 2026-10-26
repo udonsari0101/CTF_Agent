@@ -35,7 +35,7 @@ let solverAccounts = [], solverAccountId = '', solverModels = [], solverModel = 
 let solverReasoning = '', solverServiceTier = null, solverOptionsState = 'idle', solverOptionsError = '';
 let solverOptionsGeneration = 0;
 let sidebarCollapsed = (() => { try { return localStorage.getItem('ctf-sidebar-collapsed') === 'true'; } catch { return false; } })();
-let solverLogExpanded = (() => { try { return localStorage.getItem('ctf-solver-log-expanded') === 'true'; } catch { return false; } })();
+let solverLogExpanded = false, solverConsoleDialog = null;
 const noteDrafts = new Map();
 const busyForms = new WeakSet();
 const ctfdJobMarkupCache = new WeakMap();
@@ -127,10 +127,26 @@ function toggleResourceMeter(button) {
 }
 
 function markdownInline(value) {
-  return esc(value)
+  const source = String(value ?? '');
+  const format = segment => esc(segment)
     .replace(/`([^`\n]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
     .replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+  let result = '', cursor = 0;
+  const link = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()]+)/g;
+  for (const match of source.matchAll(link)) {
+    result += format(source.slice(cursor, match.index));
+    const raw = match[2] || match[3];
+    const suffix = match[3] ? (raw.match(/[.,;:!?]+$/)?.[0] || '') : '';
+    const url = suffix ? raw.slice(0, -suffix.length) : raw;
+    let safe = false;
+    try { safe = ['http:', 'https:'].includes(new URL(url).protocol); } catch {}
+    result += safe
+      ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${format(match[1] || url)}</a>${format(suffix)}`
+      : format(match[0]);
+    cursor = match.index + match[0].length;
+  }
+  return result + format(source.slice(cursor));
 }
 
 function safeMarkdown(markdown) {
@@ -498,7 +514,7 @@ function solverGuidanceMarkup(job, active) {
 
 function solverSessionMarkup(job, events, active) {
   const jobId = solverJobId(job);
-  return `<details class="solver-event-log solver-session-log${solverLogExpanded ? ' expanded' : ''}" ${active || solverLogExpanded ? 'open' : ''}>
+  return `<details class="solver-event-log solver-session-log" ${active ? 'open' : ''}>
     <summary><span>세션 로그 <b>${events.length}</b></span><span class="solver-live-state${active ? ' live' : ''}">${active ? 'LIVE' : 'END'}</span></summary>
     <div class="solver-session-toolbar">${jobId ? `<div class="solver-session-id"><span>SESSION</span><code>${esc(jobId)}</code></div>` : '<span></span>'}<button type="button" class="small ghost icon-action solver-log-size-toggle" data-action="toggle-solver-log-size" aria-label="${solverLogExpanded ? '세션 로그 축소' : '세션 로그 확대'}" title="${solverLogExpanded ? '세션 로그 축소' : '세션 로그 확대'}" aria-pressed="${solverLogExpanded}">${solverLogExpanded ? '↙' : '⛶'}</button></div>
     <div class="solver-live-console" role="log" aria-live="polite" aria-relevant="additions text">${solverEventMarkup(events)}</div>
@@ -506,17 +522,55 @@ function solverSessionMarkup(job, events, active) {
 }
 
 function toggleSolverLogSize(button) {
-  const log = button.closest('.solver-session-log');
-  if (!log) return;
-  solverLogExpanded = !log.classList.contains('expanded');
-  try { localStorage.setItem('ctf-solver-log-expanded',String(solverLogExpanded)); } catch {}
-  log.classList.toggle('expanded',solverLogExpanded);
-  log.open = true;
-  const label = solverLogExpanded ? '세션 로그 축소' : '세션 로그 확대';
-  button.textContent = solverLogExpanded ? '↙' : '⛶';
-  button.setAttribute('aria-label',label);
-  button.setAttribute('title',label);
-  button.setAttribute('aria-pressed',String(solverLogExpanded));
+  if (solverConsoleDialog?.open) { solverConsoleDialog.close(); return; }
+  if (!currentSolverJob) return;
+  if (!solverConsoleDialog) {
+    solverConsoleDialog = document.createElement('dialog');
+    solverConsoleDialog.className = 'solver-console-dialog';
+    solverConsoleDialog.setAttribute('aria-label','세션 로그');
+    document.body.append(solverConsoleDialog);
+    solverConsoleDialog.addEventListener('close', () => {
+      solverLogExpanded = false;
+      const toggle = detail.querySelector('.solver-log-size-toggle');
+      if (toggle) {
+        toggle.textContent = '⛶';
+        toggle.setAttribute('aria-label','세션 로그 확대');
+        toggle.setAttribute('title','세션 로그 확대');
+        toggle.setAttribute('aria-pressed','false');
+      }
+    });
+  }
+  const provider = (currentSolverJob.model || currentSolverJob.configuration || {}).provider;
+  const active = solverIsActive(currentSolverJob) && currentSolverJob.guidance_allowed !== false;
+  solverConsoleDialog.innerHTML = `<header class="solver-console-head"><div><strong>${esc(currentChallenge?.name || '세션 로그')}</strong><small>${esc(solverJobId(currentSolverJob))}</small></div><button type="button" class="small ghost" data-action="close-solver-console" aria-label="세션 로그 닫기">닫기</button></header>
+    <div class="solver-console-stream" role="log" aria-live="polite">${solverEventMarkup(currentSolverEvents)}</div>
+    <div class="solver-console-controls"><form id="solver-console-guidance-form" class="solver-console-guidance${active ? '' : ' hidden'}">
+      <label for="solver-console-message">추가 명령</label><textarea id="solver-console-message" name="message" maxlength="16384" rows="3" placeholder="풀이 방향이나 확인할 내용을 입력" required>${esc(solverGuidanceDraft)}</textarea>
+      <div class="solver-console-send"><select name="requested_delivery" aria-label="명령 전달 방식" ${provider === 'claude' ? 'disabled' : ''}><option value="same_turn">현재 턴에 개입</option><option value="next_turn" ${provider === 'claude' ? 'selected' : ''}>다음 턴에 전달</option></select><button type="submit" class="primary">전송</button></div>
+    </form><label class="solver-console-upload">문제 파일 추가<input id="solver-console-files" type="file" multiple></label><small>업로드가 끝난 파일은 진행 중인 풀이의 attachments/에 추가됩니다.</small></div>`;
+  solverConsoleDialog.showModal();
+  solverLogExpanded = true;
+  const toggle = detail.querySelector('.solver-log-size-toggle');
+  if (toggle) {
+    toggle.textContent = '↙';
+    toggle.setAttribute('aria-label','세션 로그 축소');
+    toggle.setAttribute('title','세션 로그 축소');
+    toggle.setAttribute('aria-pressed','true');
+  }
+  const stream = solverConsoleDialog.querySelector('.solver-console-stream');
+  if (stream) stream.scrollTop = stream.scrollHeight;
+}
+
+function paintSolverConsole() {
+  if (!solverConsoleDialog?.open) return;
+  const stream = solverConsoleDialog.querySelector('.solver-console-stream');
+  if (!stream) return;
+  const followLatest = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 32;
+  const scrollTop = stream.scrollTop;
+  stream.innerHTML = solverEventMarkup(currentSolverEvents);
+  stream.scrollTop = followLatest ? stream.scrollHeight : scrollTop;
+  const form = solverConsoleDialog.querySelector('#solver-console-guidance-form');
+  if (form) form.classList.toggle('hidden', !solverIsActive(currentSolverJob) || currentSolverJob.guidance_allowed === false);
 }
 
 function solverWriteup(job = currentSolverJob) {
@@ -586,7 +640,7 @@ function solverProviderSelector() {
   const modelOptions = solverModels.map(item => { const value = item.model || item.id; return value ? `<option value="${esc(value)}" ${value === solverModel ? 'selected' : ''}>${esc(item.displayName || value)}</option>` : ''; }).join('');
   const chosen = solverSelectedModel();
   const efforts = Array.isArray(chosen?.supportedReasoningEfforts) ? chosen.supportedReasoningEfforts.map(item => item?.reasoningEffort).filter(Boolean) : [];
-  const effortOptions = efforts.map(value => `<option value="${esc(value)}" ${value === solverReasoning ? 'selected' : ''}>${esc(value)}</option>`).join('');
+  const effortOptions = efforts.map(value => `<option value="${esc(value)}" ${value === solverReasoning ? 'selected' : ''}>${value === 'ultracode' ? 'Ultracode · xhigh' : esc(value)}</option>`).join('');
   const supportsFast = solverProvider === 'codex' && Array.isArray(chosen?.serviceTiers) && chosen.serviceTiers.some(item => item?.id === 'fast');
   return `<div class="solver-configuration">${provider}
     <label>실행 계정<select id="solver-account-select" aria-label="문제 풀이 계정">${accountOptions}</select></label>
@@ -794,6 +848,7 @@ async function runForm(task, form, button) {
 }
 
 function showLogin(expired = false, configured = true, setupAvailable = false) {
+  if (solverConsoleDialog?.open) solverConsoleDialog.close();
   clearAccountsReturnTarget();
   ++modalRendering; ++ctfdSubmitRendering; challengeFlags.clear();
   stopSolverPolling();
@@ -1256,10 +1311,7 @@ async function changeRelation(removeId = null) {
 async function openChallenge(id, focusSolverSession = false, expandSolverSession = false) {
   rememberNotes();
   stopSolverPolling();
-  if (expandSolverSession) {
-    solverLogExpanded = true;
-    try { localStorage.setItem('ctf-solver-log-expanded','true'); } catch {}
-  }
+  if (solverConsoleDialog?.open) solverConsoleDialog.close();
   const ticket = ++challengeRendering, workspaceId = currentWorkspace.id;
   const c = await api(path(id,workspaceId));
   if (ticket !== challengeRendering || currentWorkspace?.id !== workspaceId) return;
@@ -1299,6 +1351,7 @@ async function openChallenge(id, focusSolverSession = false, expandSolverSession
     if (ticket !== challengeRendering || currentWorkspace?.id !== workspaceId || currentChallenge?.id !== c.id || !detail.open) return;
     const session = detail.querySelector('.solver-session-log');
     if (session) session.open = true;
+    if (expandSolverSession && session) toggleSolverLogSize();
     const panel = detail.querySelector('#solver-panel');
     panel?.focus?.({preventScroll:true});
     panel?.scrollIntoView?.({behavior:'smooth',block:'start'});
@@ -1394,6 +1447,8 @@ function paintSolver(job, events, workspaceId, challengeId, generation, guidance
   currentSolverGuidance = mergeSolverGuidance(currentSolverGuidance,guidance);
   solverEventCursor = Math.max(solverEventCursor,...currentSolverEvents.map(solverEventSequence));
   const previousConsole = panel.querySelector('.solver-live-console');
+  const previousLog = panel.querySelector('.solver-session-log');
+  const previousLogOpen = previousLog?.open;
   const previousScroll = Number(previousConsole?.scrollTop || 0);
   const followLatest = !previousConsole || Number(previousConsole.scrollHeight || 0) - previousScroll - Number(previousConsole.clientHeight || 0) < 32;
   const guidanceFocused = document.activeElement?.id === 'solver-guidance-message' && solverIsActive(job);
@@ -1407,7 +1462,10 @@ function paintSolver(job, events, workspaceId, challengeId, generation, guidance
     if (guidanceHistory) guidanceHistory.innerHTML = solverGuidanceHistoryMarkup();
   }
   const nextConsole = panel.querySelector('.solver-live-console');
+  const nextLog = panel.querySelector('.solver-session-log');
+  if (nextLog && previousLog && previousJobId === nextJobId) nextLog.open = previousLogOpen;
   if (nextConsole) nextConsole.scrollTop = followLatest ? nextConsole.scrollHeight : previousScroll;
+  paintSolverConsole();
   if (!job) return;
 
   if (typeof job.flag === 'string' && job.flag && !job.flag_rejected) {
@@ -1775,7 +1833,7 @@ async function cancelSolver() {
   toast('풀이 중단을 요청했습니다.');
 }
 
-async function sendSolverGuidance(value) {
+async function sendSolverGuidance(value, requestedDelivery = 'same_turn') {
   const job = currentSolverJob, jobId = solverJobId(job);
   if (!jobId || !solverIsActive(job)) throw new Error('진행 중인 풀이 세션이 없습니다.');
   if (job.guidance_allowed === false) throw new Error('현재 풀이 단계에는 추가 명령을 보낼 수 없습니다.');
@@ -1785,9 +1843,11 @@ async function sendSolverGuidance(value) {
   const workspaceId = currentWorkspace?.id, challengeId = currentChallenge?.id, generation = solverRendering;
   if (!workspaceId || !challengeId || !solverContext(workspaceId,challengeId,generation)) throw new Error('풀이 화면을 다시 열어 주세요.');
   solverGuidanceDraft = message;
-  const payload = await api(`/api/solver/jobs/${encodeURIComponent(jobId)}/guidance`,{method:'POST',body:{message}});
+  const payload = await api(`/api/solver/jobs/${encodeURIComponent(jobId)}/guidance`,{method:'POST',body:{message,requested_delivery:requestedDelivery}});
   if (!solverContext(workspaceId,challengeId,generation) || solverJobId(currentSolverJob) !== jobId) return;
   solverGuidanceDraft = '';
+  const consoleInput = solverConsoleDialog?.querySelector('#solver-console-message');
+  if (consoleInput) consoleInput.value = '';
   const normalized = normalizeSolverPayload(payload);
   if (normalized.job) paintSolver(normalized.job,normalized.events,workspaceId,challengeId,generation,normalized.guidance);
   else {
@@ -1877,6 +1937,16 @@ async function refreshUploads(workspaceId, challengeId) {
   const result = await api(`${path(challengeId,workspaceId)}/uploads`);
   paintUploads(result.uploads,workspaceId,challengeId,true);
   return result.uploads;
+}
+
+async function refreshChallengeAttachmentsInPlace(workspaceId, challengeId) {
+  const latest = await api(path(challengeId,workspaceId));
+  if (currentChallenge?.workspace_id !== workspaceId || currentChallenge?.id !== challengeId) return;
+  currentChallenge.attachments = latest.attachments || [];
+  const list = detail.querySelector('.file-list');
+  if (list) list.innerHTML = currentChallenge.attachments.map(file => `<div class="file-item"><div><a href="${path(challengeId,workspaceId)}/attachments/${file.id}" target="_blank" rel="noopener" download>${esc(file.original_name)}</a><small>${size(file.size)}</small></div><button class="small danger icon-action" data-action="delete-attachment" data-id="${esc(file.id)}" aria-label="${esc(file.original_name)} 삭제" title="${esc(file.original_name)} 삭제">×</button></div>`).join('');
+  const heading = list?.closest('section')?.querySelector('h3 .muted');
+  if (heading) heading.textContent = String(currentChallenge.attachments.length);
 }
 
 async function uploadFile(file, workspaceId, challengeId, resumeId) {
@@ -1989,7 +2059,7 @@ async function refreshReleaseUpdatePanel() {
     const active = ['queued','downloading','verifying','installing','health_check','rolling_back'].includes(phase);
     const labels = {idle:'대기',queued:'대기 중',downloading:'다운로드 중',verifying:'검증 중',installing:'설치 중',health_check:'상태 확인 중',rolling_back:'이전 버전 복구 중',completed:'완료',failed:'실패'};
     area.innerHTML = `<h2>서비스 업데이트</h2><p>${i18n.locale === 'en' ? 'Current' : '현재'} ${esc(info.current)} · ${i18n.locale === 'en' ? 'Latest' : '최신'} ${esc(info.latest?.tag || i18n.t('조회 불가'))}</p>
-      ${info.latest?.notes ? `<details><summary>업데이트 내역</summary><pre class="release-notes">${esc(info.latest.notes)}</pre></details>` : ''}
+      ${info.latest?.notes ? `<details><summary>업데이트 내역</summary><div class="release-notes markdown-preview" data-i18n-ignore>${safeMarkdown(info.latest.notes)}</div></details>` : ''}
       ${info.error ? `<p class="form-hint" role="status">${esc(info.error)}</p>` : ''}
       ${!info.helper_ready ? '<p class="form-hint">이 설치 방식에는 웹 업데이트 실행기가 연결되어 있지 않습니다.</p>' : ''}
       ${phase !== 'idle' ? `<p class="form-hint" role="status">${esc(i18n.t(labels[phase] || phase))}${info.status?.message ? ` · ${esc(info.status.message)}` : ''}</p>` : ''}
@@ -2541,6 +2611,7 @@ document.addEventListener('click', event => {
     'toggle-sidebar': () => toggleSidebar(button),
     'toggle-resource-meter': () => toggleResourceMeter(button),
     'toggle-solver-log-size': () => toggleSolverLogSize(button),
+    'close-solver-console': () => solverConsoleDialog?.close(),
     'open-solver-accounts': () => openSolverAccounts(),
     'new-workspace': () => workspaceForm(), 'edit-workspace': () => workspaceForm(true),
     'new-challenge': () => challengeForm(), 'edit-challenge': async () => { const c = currentChallenge; await saveNotes(true); if (currentChallenge === c && currentWorkspace?.id === c.workspace_id) challengeForm(true); },
@@ -2560,6 +2631,7 @@ document.addEventListener('click', event => {
       if (detailBusy) return;
       if (notesDirty() && !confirm('저장하지 않은 노트가 있습니다. 닫을까요?')) return;
       rememberNotes(); stopSolverPolling(); ++challengeRendering;
+      if (solverConsoleDialog?.open) solverConsoleDialog.close();
       detail.close();
     },
     'open-challenge': () => openChallenge(button.dataset.id),
@@ -2625,7 +2697,7 @@ document.addEventListener('submit', event => {
     return;
   }
   if (!form.id) return;
-  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-guidance-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-auth-form','ctfd-submit-connection-form'];
+  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-guidance-form','solver-console-guidance-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-auth-form','ctfd-submit-connection-form'];
   if (!known.includes(form.id)) return;
   event.preventDefault();
   const challengeFiles = form.id === 'new-challenge-form' ? [...selectedChallengeFiles(form)] : [];
@@ -2669,6 +2741,7 @@ document.addEventListener('submit', event => {
     else if (form.id === 'reset-user-form') { await api(`/api/admin/users/${form.dataset.userId}/password`,{method:'POST',body}); form.reset(); modal.close(); toast('비밀번호를 변경했습니다.'); }
     else if (form.id === 'solver-capacity-form') { const maximum = String(body.maximum || '').trim(); await api('/api/admin/solver-capacity',{method:'PUT',body:{maximum:maximum ? Number(maximum) : null}}); await renderAdmin(); toast('솔버 최대 수를 저장했습니다.'); }
     else if (form.id === 'solver-guidance-form') { await sendSolverGuidance(body.message); }
+    else if (form.id === 'solver-console-guidance-form') { await sendSolverGuidance(body.message,body.requested_delivery || 'next_turn'); }
     else if (form.id === 'ctfd-preview-form') {
       if (!body.token) delete body.token;
       body.url = body.url.trim(); if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(body.url)) body.url = `https://${body.url}`;
@@ -2775,6 +2848,27 @@ document.addEventListener('change', event => {
     if (currentChallenge?.id === c.id) await openChallenge(c.id); input.value = '';
     if (failures.length) throw new Error(failures.join(' / ')); if (completed) toast(`첨부파일 ${completed}개를 저장했습니다.`);
   },input);
+  if (input.id === 'solver-console-files') run(async () => {
+    const challenge = currentChallenge, files = [...input.files], failures = [];
+    if (!challenge) return;
+    let completed = 0;
+    try {
+      for (const file of files) {
+        try { if (await uploadFile(file,challenge.workspace_id,challenge.id)) completed++; }
+        catch (error) { failures.push(`${file.name}: ${error.message}`); }
+      }
+      await refreshChallengeAttachmentsInPlace(challenge.workspace_id,challenge.id);
+      if (completed && currentChallenge?.id === challenge.id && solverIsActive(currentSolverJob) && currentSolverJob.guidance_allowed !== false) {
+        const names = files.filter(file => file?.name).map(file => file.name).slice(0, 20);
+        try {
+          await sendSolverGuidance(`새 문제 파일 ${completed}개를 업로드했습니다. attachments/에서 새로 추가된 파일을 확인하고 풀이를 이어가세요.${names.length ? ` 파일: ${names.join(', ')}` : ''}`.slice(0, 4000),
+            (currentSolverJob.model || currentSolverJob.configuration || {}).provider === 'claude' ? 'next_turn' : 'same_turn');
+        } catch (error) { toast(`파일은 저장됐습니다. 추가 명령 전달: ${error.message}`, true); }
+      }
+      if (completed) toast(`첨부파일 ${completed}개를 저장했습니다.`);
+      if (failures.length) throw new Error(failures.join(' / '));
+    } finally { input.value = ''; }
+  },input);
   if (input.id === 'notes-file' && input.files.length) detailAction(async () => {
     const c = currentChallenge, editor = document.querySelector('#notes-editor'), previous = editor.value;
     try {
@@ -2794,6 +2888,7 @@ document.addEventListener('input', event => {
   if (event.target.id === 'notes-editor') { rememberNotes(); const state = document.querySelector('#notes-save-state'); if (state) { state.classList?.remove('hidden'); state.textContent = '저장하지 않은 변경 사항'; } }
   if (event.target.id === 'writeup-refine-instruction') writeupRefineInstruction = event.target.value;
   if (event.target.id === 'solver-guidance-message') solverGuidanceDraft = event.target.value;
+  if (event.target.id === 'solver-console-message') solverGuidanceDraft = event.target.value;
 });
 
 document.addEventListener('dragenter', event => {
@@ -2834,7 +2929,7 @@ window.addEventListener('hashchange', event => {
   accountsReturnPending = false;
   const returnRoute = accountsReturnRoute();
   if (returnRoute && location.hash === `#${returnRoute}`) clearAccountsReturnTarget();
-  rememberNotes(); stopSolverPolling(); stopResourcePolling(); stopChallengeListPolling(); ++challengeRendering; ++listRendering; ++modalRendering; challengeFlags.clear(); selectedStatus=''; selectedCategory=''; selectedSort='added_desc'; search=''; detail.close(); modal.close(); if (csrf) run(render);
+  rememberNotes(); stopSolverPolling(); stopResourcePolling(); stopChallengeListPolling(); ++challengeRendering; ++listRendering; ++modalRendering; challengeFlags.clear(); selectedStatus=''; selectedCategory=''; selectedSort='added_desc'; search=''; if (solverConsoleDialog?.open) solverConsoleDialog.close(); detail.close(); modal.close(); if (csrf) run(render);
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') { stopResourcePolling(); stopChallengeListPolling(); }
