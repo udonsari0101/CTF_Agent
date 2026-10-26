@@ -1,8 +1,7 @@
-"""Per-user Telegram linking and reliable CTF notifications.
+"""Per-user Telegram bots, linking, and reliable CTF notifications.
 
-The bot token is read only from the process environment or its private secret
-file. Link secrets are single-use values and only their SHA-256 digests are
-stored in SQLite.
+Bot tokens are entered by their owners and encrypted with a local key. Link
+secrets are single-use values; only their SHA-256 digests are stored in SQLite.
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel
 
@@ -32,6 +32,7 @@ from .process_lock import ProcessFileLock
 LINK_TTL_SECONDS = 10 * 60
 START_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
 BOT_USERNAME = re.compile(r"^[A-Za-z0-9_]{5,32}$")
+BOT_TOKEN = re.compile(r"^[0-9]{5,20}:[A-Za-z0-9_-]{30,}$")
 _SAFE_JOB_SETTING = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}$")
 _COPY_TEXT_MAX_CHARACTERS = 256
 _SOLVER_ALERT_STATUSES = frozenset({"failed", "refused", "needs_input"})
@@ -141,6 +142,10 @@ class TelegramToggle(BaseModel):
     enabled: bool
 
 
+class TelegramBotInput(BaseModel):
+    token: str
+
+
 class TelegramAPIError(RuntimeError):
     """A token-safe error raised for a failed Bot API request."""
 
@@ -172,7 +177,11 @@ class TelegramService:
         if identity_verified:
             self._accept_bot_identity(self.expected_bot_username)
         self.client: httpx.AsyncClient | None = None
+        self.start_count = 0
         self.poll_task: asyncio.Task | None = None
+        self.bot_reconcile_task: asyncio.Task | None = None
+        self.bot_poll_tasks: dict[str, asyncio.Task] = {}
+        self.bot_poll_hashes: dict[str, str] = {}
         self.outbox_task: asyncio.Task | None = None
         self.wakeup: asyncio.Event | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -182,13 +191,57 @@ class TelegramService:
         self.delivery_locks: dict[str, asyncio.Lock] = {}
         lock_base = Path(getattr(settings, "config_dir", getattr(settings, "data_dir", Path("."))))
         self.delivery_lock_root = lock_base / ".locks" / "telegram-delivery"
+        self.poll_lock_root = lock_base / ".locks" / "telegram-poll"
+        self.key_path = lock_base / "telegram-bots.key"
+        self._cipher: Fernet | None = None
+
+    def _fernet(self) -> Fernet:
+        if self._cipher is not None:
+            return self._cipher
+        self.key_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(self.key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(descriptor, "wb") as key_file:
+                key_file.write(Fernet.generate_key())
+                key_file.flush()
+                os.fsync(key_file.fileno())
+        try:
+            for attempt in range(5):
+                key = self.key_path.read_bytes()
+                if key:
+                    break
+                time.sleep(.02)
+            self._cipher = Fernet(key)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Telegram token key is unavailable or invalid") from exc
+        return self._cipher
+
+    def _bot_row(self, user_id: str) -> sqlite3.Row | None:
+        with self.database() as db:
+            return db.execute(
+                "SELECT token_ciphertext,token_hash,bot_username FROM telegram_bots WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+
+    def _token_for(self, user_id: str) -> str | None:
+        row = self._bot_row(user_id)
+        if row is None:
+            return self.token if self.configured else None
+        try:
+            return self._fernet().decrypt(row["token_ciphertext"].encode("ascii")).decode("utf-8")
+        except (InvalidToken, UnicodeError, ValueError, RuntimeError):
+            return None
 
     @property
     def configured(self) -> bool:
         return bool(self.token and self.identity_verified and self.bot_username)
 
     async def start(self) -> None:
-        if not self.token or self.poll_task:
+        self.start_count += 1
+        if self.client:
             return
         self.bot_username = ""
         self.identity_verified = False
@@ -196,26 +249,37 @@ class TelegramService:
         self.loop = asyncio.get_running_loop()
         self.wakeup = asyncio.Event()
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10))
-        try:
-            await self._discover_bot_identity()
-        except TelegramAPIError as error:
-            # Keep startup and the rest of the site available when Telegram is
-            # unreachable or misconfigured, but never mint an unverified link.
-            self.configuration_error = error.code
-            await self.client.aclose()
-            self.client = None
-            self.loop = None
-            return
-        self.poll_task = asyncio.create_task(self._poll_loop(), name="telegram-update-poll")
+        if self.token:
+            try:
+                await self._discover_bot_identity()
+            except TelegramAPIError as error:
+                self.configuration_error = error.code
+                await self.client.aclose()
+                self.client = None
+                self.loop = None
+                return
+            self.poll_task = asyncio.create_task(self._poll_loop(), name="telegram-update-poll")
+        else:
+            self.bot_reconcile_task = asyncio.create_task(
+                self._reconcile_bots_loop(), name="telegram-bot-reconcile"
+            )
         self.outbox_task = asyncio.create_task(self._outbox_loop(), name="telegram-notification-outbox")
 
     async def stop(self) -> None:
-        tasks = [task for task in (self.poll_task, self.outbox_task) if task]
+        if self.start_count == 0:
+            return
+        self.start_count -= 1
+        if self.start_count:
+            return
+        tasks = [task for task in (self.poll_task, self.outbox_task, self.bot_reconcile_task) if task]
+        tasks.extend(self.bot_poll_tasks.values())
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self.poll_task = self.outbox_task = None
+        self.poll_task = self.outbox_task = self.bot_reconcile_task = None
+        self.bot_poll_tasks.clear()
+        self.bot_poll_hashes.clear()
         if self.client:
             await self.client.aclose()
         self.client = None
@@ -248,12 +312,15 @@ class TelegramService:
                 raise TelegramAPIError("bot_username_mismatch")
         self._accept_bot_identity(username)
 
-    async def _api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _api(self, method: str, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
         if not self.client:
             raise TelegramAPIError("client_unavailable")
+        bot_token = token if token is not None else self.token
+        if not bot_token:
+            raise TelegramAPIError("bot_not_configured")
         try:
             response = await self.client.post(
-                f"https://api.telegram.org/bot{self.token}/{method}", json=payload
+                f"https://api.telegram.org/bot{bot_token}/{method}", json=payload
             )
             body = response.json()
         except (httpx.HTTPError, ValueError):
@@ -262,6 +329,73 @@ class TelegramService:
             error_code = body.get("error_code") if isinstance(body, dict) else response.status_code
             raise TelegramAPIError(f"api_{error_code or 'error'}")
         return body
+
+    async def save_bot(self, user_id: str, token: str) -> dict[str, Any]:
+        token = token.strip()
+        if not BOT_TOKEN.fullmatch(token):
+            raise HTTPException(422, "Enter a valid Telegram bot token from BotFather.")
+        try:
+            identity = (await self._api("getMe", {}, token=token)).get("result")
+        except TelegramAPIError:
+            raise HTTPException(422, "Telegram could not verify this bot token.") from None
+        if (not isinstance(identity, dict) or identity.get("is_bot") is not True
+                or type(identity.get("id")) is not int or identity["id"] <= 0
+                or not isinstance(identity.get("username"), str)
+                or not BOT_USERNAME.fullmatch(identity["username"])):
+            raise HTTPException(422, "Telegram returned an invalid bot identity.")
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        ciphertext = self._fernet().encrypt(token.encode("utf-8")).decode("ascii")
+        try:
+            async with self.delivery_boundary(user_id):
+                with self.database() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    existing = db.execute(
+                        "SELECT token_hash FROM telegram_bots WHERE user_id=?", (user_id,)
+                    ).fetchone()
+                    changed = existing is None or existing["token_hash"] != digest
+                    db.execute(
+                        """INSERT INTO telegram_bots(user_id,token_ciphertext,token_hash,bot_id,bot_username,updated_at)
+                           VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+                           token_ciphertext=excluded.token_ciphertext,token_hash=excluded.token_hash,
+                           bot_id=excluded.bot_id,bot_username=excluded.bot_username,updated_at=excluded.updated_at""",
+                        (user_id, ciphertext, digest, identity["id"], identity["username"], utc_stamp()),
+                    )
+                    if changed:
+                        db.execute("DELETE FROM telegram_link_tokens WHERE user_id=?", (user_id,))
+                        db.execute(
+                            "UPDATE telegram_settings SET chat_id=NULL,enabled=0,linked_at=NULL WHERE user_id=?",
+                            (user_id,),
+                        )
+                        db.execute(
+                            "UPDATE notification_outbox SET status='cancelled',claimed_at=NULL "
+                            "WHERE user_id=? AND status IN ('pending','processing','failed')",
+                            (user_id,),
+                        )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "This bot is already connected to another user.") from None
+        except TimeoutError:
+            raise HTTPException(503, "Telegram delivery is still finishing. Try again shortly.") from None
+        return self.settings_for(user_id)
+
+    async def delete_bot(self, user_id: str) -> dict[str, Any]:
+        try:
+            async with self.delivery_boundary(user_id):
+                with self.database() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("DELETE FROM telegram_bots WHERE user_id=?", (user_id,))
+                    db.execute("DELETE FROM telegram_link_tokens WHERE user_id=?", (user_id,))
+                    db.execute(
+                        "UPDATE telegram_settings SET chat_id=NULL,enabled=0,linked_at=NULL WHERE user_id=?",
+                        (user_id,),
+                    )
+                    db.execute(
+                        "UPDATE notification_outbox SET status='cancelled',claimed_at=NULL "
+                        "WHERE user_id=? AND status IN ('pending','processing','failed')",
+                        (user_id,),
+                    )
+        except TimeoutError:
+            raise HTTPException(503, "Telegram delivery is still finishing. Try again shortly.") from None
+        return self.settings_for(user_id)
 
     @asynccontextmanager
     async def delivery_boundary(self, user_id: str, wait_seconds: float = 40.0):
@@ -283,7 +417,8 @@ class TelegramService:
                 lease.release()
 
     def issue_link(self, user_id: str) -> dict[str, Any]:
-        if not self.configured:
+        state = self.settings_for(user_id)
+        if not state["configured"]:
             raise HTTPException(503, "Telegram 봇이 아직 설정되지 않았습니다.")
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode()).hexdigest()
@@ -297,19 +432,24 @@ class TelegramService:
                 (digest, user_id, expires, utc_stamp(timestamp)),
             )
         return {
-            "deep_link": f"https://t.me/{self.bot_username}?start={token}",
+            "deep_link": f"https://t.me/{state['bot_username']}?start={token}",
             "expires_at": utc_stamp(expires),
         }
 
     def settings_for(self, user_id: str) -> dict[str, Any]:
         with self.database() as db:
             row = db.execute("SELECT * FROM telegram_settings WHERE user_id=?", (user_id,)).fetchone()
+            bot = db.execute(
+                "SELECT bot_username FROM telegram_bots WHERE user_id=?", (user_id,)
+            ).fetchone()
+        configured = bool(bot) or self.configured
+        linked = bool(configured and row and row["chat_id"] is not None)
         return {
-            "configured": self.configured,
-            "bot_username": self.bot_username if self.configured else None,
-            "configuration_error": self.configuration_error,
-            "linked": bool(row and row["chat_id"] is not None),
-            "enabled": bool(row and row["chat_id"] is not None and row["enabled"]),
+            "configured": configured,
+            "bot_username": bot["bot_username"] if bot else (self.bot_username if self.configured else None),
+            "configuration_error": self.configuration_error if not bot else None,
+            "linked": linked,
+            "enabled": bool(linked and row["enabled"]),
             "linked_at": row["linked_at"] if row else None,
             "last_success_at": row["last_success_at"] if row else None,
             "last_failure_at": row["last_failure_at"] if row else None,
@@ -585,16 +725,27 @@ class TelegramService:
             self.loop.call_soon_threadsafe(self.wakeup.set)
         return bool(inserted)
 
-    def _offset(self) -> int:
+    def _offset(self, user_id: str | None = None) -> int:
         with self.database() as db:
-            row = db.execute("SELECT value FROM meta WHERE key='telegram_update_offset'").fetchone()
+            row = (
+                db.execute("SELECT update_offset AS value FROM telegram_bots WHERE user_id=?", (user_id,)).fetchone()
+                if user_id is not None else
+                db.execute("SELECT value FROM meta WHERE key='telegram_update_offset'").fetchone()
+            )
         try:
             return int(row["value"]) if row else 0
         except (TypeError, ValueError):
             return 0
 
-    def _save_offset(self, update_id: int) -> None:
+    def _save_offset(self, update_id: int, user_id: str | None = None, token_hash: str | None = None) -> None:
         with self.database() as db:
+            if user_id is not None:
+                db.execute(
+                    "UPDATE telegram_bots SET update_offset=MAX(update_offset,?) "
+                    "WHERE user_id=? AND token_hash=?",
+                    (update_id + 1, user_id, token_hash),
+                )
+                return
             db.execute(
                 "INSERT INTO meta(key,value) VALUES('telegram_update_offset',?) "
                 # Overlapping pollers can finish out of order during a rolling
@@ -626,9 +777,79 @@ class TelegramService:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
 
-    async def handle_update(self, update: dict[str, Any]) -> None:
+    async def _reconcile_bots_loop(self) -> None:
+        while True:
+            try:
+                with self.database() as db:
+                    bots = db.execute(
+                        "SELECT b.user_id,b.token_hash FROM telegram_bots b "
+                        "JOIN users u ON u.id=b.user_id AND u.active=1"
+                    ).fetchall()
+                active = {row["user_id"]: row["token_hash"] for row in bots}
+                for user_id, task in list(self.bot_poll_tasks.items()):
+                    if task.done() or active.get(user_id) != self.bot_poll_hashes.get(user_id):
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        self.bot_poll_tasks.pop(user_id, None)
+                        self.bot_poll_hashes.pop(user_id, None)
+                for user_id, digest in active.items():
+                    if user_id in self.bot_poll_tasks:
+                        continue
+                    token = self._token_for(user_id)
+                    if token is None:
+                        continue
+                    self.bot_poll_hashes[user_id] = digest
+                    self.bot_poll_tasks[user_id] = asyncio.create_task(
+                        self._poll_bot(user_id, token, digest), name=f"telegram-poll-{user_id[:8]}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except (sqlite3.Error, OSError, RuntimeError):
+                pass
+            await asyncio.sleep(2)
+
+    async def _poll_bot(self, user_id: str, token: str, digest: str) -> None:
+        lock_name = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+        lease = ProcessFileLock(self.poll_lock_root / f"user-{lock_name}.lock")
+        delay = 1
+        while not lease.try_acquire():
+            await asyncio.sleep(2)
+        try:
+            webhook_cleared = False
+            while True:
+                try:
+                    if not webhook_cleared:
+                        await self._api("deleteWebhook", {"drop_pending_updates": False}, token=token)
+                        webhook_cleared = True
+                    body = await self._api(
+                        "getUpdates",
+                        {"offset": self._offset(user_id), "timeout": 20, "allowed_updates": ["message"]},
+                        token=token,
+                    )
+                    for update in body.get("result", []):
+                        if isinstance(update, dict):
+                            await self.handle_update(
+                                update, bot_user_id=user_id, bot_token=token, token_hash=digest
+                            )
+                    delay = 1
+                except asyncio.CancelledError:
+                    raise
+                except (TelegramAPIError, sqlite3.Error, OSError, TimeoutError, KeyError, TypeError):
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 30)
+        finally:
+            lease.release()
+
+    async def handle_update(
+        self, update: dict[str, Any], *, bot_user_id: str | None = None,
+        bot_token: str | None = None, token_hash: str | None = None,
+    ) -> None:
         update_id = update.get("update_id")
         try:
+            if bot_user_id is not None:
+                row = self._bot_row(bot_user_id)
+                if row is None or row["token_hash"] != token_hash:
+                    return
             message = update.get("message") or {}
             chat = message.get("chat") or {}
             text = message.get("text")
@@ -639,30 +860,35 @@ class TelegramService:
             command = pieces[0].split("@", 1)[0].lower() if pieces else ""
             if command != "/start":
                 return
+            async def respond(value: str) -> None:
+                if bot_token is None:
+                    await self._safe_message(chat_id, value)
+                else:
+                    await self._safe_message(chat_id, value, bot_token)
             if len(pieces) != 2 or not START_TOKEN.fullmatch(pieces[1]):
-                await self._safe_message(chat_id, "웹사이트 설정에서 Telegram 연결 링크를 새로 발급해 주세요.")
+                await respond("웹사이트 설정에서 Telegram 연결 링크를 새로 발급해 주세요.")
                 return
             try:
-                link_owner = self._link_owner(pieces[1])
+                link_owner = self._link_owner(pieces[1], bot_user_id)
                 if link_owner is None:
                     result = "expired"
                 else:
                     async with self.delivery_boundary(link_owner):
-                        result = self._consume_link(pieces[1], chat_id)
+                        result = self._consume_link(pieces[1], chat_id, bot_user_id)
             except (OSError, TimeoutError):
-                await self._safe_message(chat_id, "연결 처리가 지연되고 있습니다. 잠시 후 같은 링크로 다시 시도해 주세요.")
+                await respond("연결 처리가 지연되고 있습니다. 잠시 후 같은 링크로 다시 시도해 주세요.")
                 return
             messages = {
                 "linked": "Telegram 연결을 확인했습니다. 웹사이트 설정에서 알림을 켜 주세요.",
                 "expired": "연결 링크가 만료되었거나 이미 사용되었습니다. 웹사이트에서 새 링크를 발급해 주세요.",
                 "chat_in_use": "이 Telegram 대화는 이미 다른 사용자에게 연결되어 있습니다.",
             }
-            await self._safe_message(chat_id, messages[result])
+            await respond(messages[result])
         finally:
             if isinstance(update_id, int) and update_id >= 0:
-                self._save_offset(update_id)
+                self._save_offset(update_id, bot_user_id, token_hash)
 
-    def _consume_link(self, token: str, chat_id: int) -> str:
+    def _consume_link(self, token: str, chat_id: int, bot_user_id: str | None = None) -> str:
         digest, timestamp = hashlib.sha256(token.encode()).hexdigest(), int(time.time())
         try:
             with self.database() as db:
@@ -675,10 +901,12 @@ class TelegramService:
                     ).fetchone()
                 if not link:
                     return "expired"
+                if bot_user_id is not None and link["user_id"] != bot_user_id:
+                    return "expired"
                 used = db.execute(
                         "SELECT user_id FROM telegram_settings WHERE chat_id=? AND user_id!=?",
                         (chat_id, link["user_id"]),
-                    ).fetchone()
+                    ).fetchone() if bot_user_id is None else None
                 if used:
                     return "chat_in_use"
                 db.execute(
@@ -702,7 +930,7 @@ class TelegramService:
         except sqlite3.IntegrityError:
             return "expired"
 
-    def _link_owner(self, token: str) -> str | None:
+    def _link_owner(self, token: str, bot_user_id: str | None = None) -> str | None:
         digest, timestamp = hashlib.sha256(token.encode()).hexdigest(), int(time.time())
         with self.database() as db:
             row = db.execute(
@@ -711,11 +939,14 @@ class TelegramService:
                    WHERE t.token_hash=? AND t.used_at IS NULL AND t.expires_at>=? AND u.active=1""",
                 (digest, timestamp),
             ).fetchone()
-        return row["user_id"] if row else None
+        return row["user_id"] if row and (bot_user_id is None or row["user_id"] == bot_user_id) else None
 
-    async def _safe_message(self, chat_id: int, text: str) -> None:
+    async def _safe_message(self, chat_id: int, text: str, token: str | None = None) -> None:
         try:
-            await self._api("sendMessage", {"chat_id": chat_id, "text": text})
+            if token is None:
+                await self._api("sendMessage", {"chat_id": chat_id, "text": text})
+            else:
+                await self._api("sendMessage", {"chat_id": chat_id, "text": text}, token=token)
         except TelegramAPIError:
             pass
 
@@ -1108,7 +1339,13 @@ class TelegramService:
                             continue
                         method, payload = self._notification(current)
                         try:
-                            await self._api(method, payload)
+                            if self.token:
+                                await self._api(method, payload)
+                            else:
+                                token = self._token_for(row["user_id"])
+                                if token is None:
+                                    raise TelegramAPIError("bot_not_configured")
+                                await self._api(method, payload, token=token)
                         except TelegramAPIError as exc:
                             self._failed(current, exc.code)
                         else:
@@ -1136,15 +1373,38 @@ def register_telegram(app, require_auth, settings, database):
                 ON telegram_link_tokens(user_id,expires_at);
             CREATE TABLE IF NOT EXISTS telegram_settings (
                 user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                chat_id INTEGER UNIQUE,
+                chat_id INTEGER,
                 enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
                 linked_at TEXT,
                 last_success_at TEXT,
                 last_failure_at TEXT,
                 last_failure_code TEXT
             );
+            CREATE TABLE IF NOT EXISTS telegram_bots (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                token_ciphertext TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                bot_id INTEGER NOT NULL UNIQUE,
+                bot_username TEXT NOT NULL,
+                update_offset INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
             """
         )
+        definition = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='telegram_settings'"
+        ).fetchone()[0]
+        if "chat_id INTEGER UNIQUE" in definition:
+            db.executescript(
+                """ALTER TABLE telegram_settings RENAME TO telegram_settings_legacy;
+                   CREATE TABLE telegram_settings (
+                       user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                       chat_id INTEGER,enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+                       linked_at TEXT,last_success_at TEXT,last_failure_at TEXT,last_failure_code TEXT
+                   );
+                   INSERT INTO telegram_settings SELECT * FROM telegram_settings_legacy;
+                   DROP TABLE telegram_settings_legacy;"""
+            )
         _ensure_notification_outbox(db)
         # This deployment boundary prevents the newly introduced scanner from
         # replaying historical failures.  A job that terminates after the
@@ -1160,16 +1420,19 @@ def register_telegram(app, require_auth, settings, database):
             "WHERE status='failed'",
             (int(time.time()),),
         )
+        # The old installation-wide bot is not assigned to any user. Existing
+        # chats must be reverified against each owner's newly registered bot.
+        db.execute(
+            "UPDATE telegram_settings SET chat_id=NULL,enabled=0,linked_at=NULL "
+            "WHERE user_id NOT IN (SELECT user_id FROM telegram_bots)"
+        )
+        db.execute(
+            "UPDATE notification_outbox SET status='cancelled',claimed_at=NULL "
+            "WHERE user_id NOT IN (SELECT user_id FROM telegram_bots) "
+            "AND status IN ('pending','processing','failed')"
+        )
 
-    token = os.environ.get("CTF_TELEGRAM_BOT_TOKEN", "").strip()
-    token_file = os.environ.get("CTF_TELEGRAM_BOT_TOKEN_FILE", "").strip()
-    if not token and token_file:
-        try:
-            token = Path(token_file).read_text(encoding="utf-8").strip()
-        except OSError:
-            token = ""
-    username = os.environ.get("CTF_TELEGRAM_BOT_USERNAME", "").strip()
-    service = TelegramService(database, settings, token, username)
+    service = TelegramService(database, settings, "")
     app.state.telegram = service
     app.state.telegram_user_summary = service.admin_summary
 
@@ -1206,6 +1469,14 @@ def register_telegram(app, require_auth, settings, database):
     @app.get("/api/telegram", dependencies=[Depends(require_auth)])
     def telegram_settings(request: Request):
         return service.settings_for(request.state.user["id"])
+
+    @app.put("/api/telegram/bot", dependencies=[Depends(require_auth)])
+    async def save_telegram_bot(payload: TelegramBotInput, request: Request):
+        return await service.save_bot(request.state.user["id"], payload.token)
+
+    @app.delete("/api/telegram/bot", dependencies=[Depends(require_auth)])
+    async def delete_telegram_bot(request: Request):
+        return await service.delete_bot(request.state.user["id"])
 
     @app.post("/api/telegram/link", dependencies=[Depends(require_auth)])
     def create_telegram_link(request: Request):

@@ -16,7 +16,7 @@ The screenshots use synthetic challenges and account data.
 - Connect Codex and Claude Code accounts. Choose an account, model, and reasoning level for each challenge, then watch the session log and send follow-up instructions while it runs.
 - Upload multiple files, including large binaries with resumable transfers. Challenge files and the database use separate data directories.
 - See flags as soon as they are found. Review, copy, and download Korean Markdown write-ups; request a revised write-up when needed.
-- Optionally connect Telegram for flag, write-up, error, and input-request notifications. CTFd flag submission is off by default.
+- Each user can register a Telegram bot token in **Personal settings**, connect a chat through a one-time link, and receive flag, write-up, error, and input-request notifications. No bot token is bundled or required during installation. CTFd flag submission is off by default.
 - Use the first-run administrator setup for a multi-user installation. A separate no-login mode is available for explicitly configured single-user instances.
 - Switch the web interface between English and Korean. Interface translations live in [language packs](docs/localization.md) so more languages can be added.
 

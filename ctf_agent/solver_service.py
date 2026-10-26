@@ -334,6 +334,7 @@ class SolverService:
         self.stop_event: asyncio.Event | None = None
         self.wakeup: asyncio.Event | None = None
         self.task: asyncio.Task | None = None
+        self.start_count = 0
         self.runtime_ready = False
         self.runtime_error: dict[str, Any] | None = None
         self.logger = logging.getLogger("ctf_workspace.solver")
@@ -631,6 +632,9 @@ class SolverService:
         claude_runtime.rollback = rollback_claude
 
     async def start(self) -> None:
+        self.start_count += 1
+        if self.start_count > 1:
+            return
         self.coordinator.reset_stop()
         self.stop_event = asyncio.Event()
         self.wakeup = asyncio.Event()
@@ -648,6 +652,11 @@ class SolverService:
         self.task = asyncio.create_task(self._loop(), name="solver-coordinator")
 
     async def stop(self) -> None:
+        if self.start_count == 0:
+            return
+        self.start_count -= 1
+        if self.start_count:
+            return
         self.coordinator.request_stop()
         if self.stop_event:
             self.stop_event.set()

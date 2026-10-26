@@ -333,7 +333,8 @@ vm.createContext(context);vm.runInContext(source,context);
 def test_telegram_identity_failure_is_distinct_from_missing_configuration():
     source = (ROOT / "ctf_agent" / "web" / "telegram.js").read_text(encoding="utf-8")
     assert "state.configuration_error" in source
-    assert "Telegram 봇 신원을 확인하지 못했습니다" in source
+    assert "Telegram 봇 상태를 확인하지 못했습니다" in source
+    assert "data-telegram-bot-form" in source
 
 
 def test_authenticated_render_opens_workspace_challenge_deep_link():

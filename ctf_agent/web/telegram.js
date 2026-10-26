@@ -84,8 +84,8 @@ export async function renderTelegram(container, api) {
     const configured = state.configured;
     const linked = state.linked;
     const unavailable = state.configuration_error
-      ? '서버에서 Telegram 봇 신원을 확인하지 못했습니다. 관리자에게 봇 토큰 설정을 확인해 달라고 요청하세요.'
-      : '서버에 Telegram 봇이 설정되지 않았습니다.';
+      ? 'Telegram 봇 상태를 확인하지 못했습니다. 토큰을 확인해 주세요.'
+      : 'BotFather에서 발급한 봇 토큰을 등록하세요.';
     const linkPanel = link ? `
       <div class="telegram-link-box">
         <p>일회용 링크에서 <code>/start</code>를 누르세요.</p>
@@ -98,7 +98,16 @@ export async function renderTelegram(container, api) {
       </div>` : '';
     container.innerHTML = `
       <div class="section-head"><div><h2>Telegram 알림</h2></div><span class="connection-state ${linked ? 'connected' : ''}">${linked ? '연결됨' : '연결 안 됨'}</span></div>
-      ${configured ? '' : `<p class="notice error-notice">${unavailable}</p>`}
+      <form class="telegram-bot-form" data-telegram-bot-form autocomplete="off">
+        <label for="telegram-bot-token">봇 토큰</label>
+        <div class="line-actions">
+          <input id="telegram-bot-token" name="token" type="password" required autocomplete="new-password" spellcheck="false" placeholder="BotFather token" aria-label="Telegram 봇 토큰">
+          <button type="submit" class="small primary" data-telegram-save>${configured ? '토큰 교체' : '토큰 등록'}</button>
+          ${configured ? '<button type="button" class="small danger" data-telegram-action="delete-bot">토큰 삭제</button>' : ''}
+        </div>
+        ${configured ? `<small>@${escapeHtml(state.bot_username)} · 토큰은 다시 표시되지 않습니다.</small>` : '<small><a href="https://t.me/BotFather" target="_blank" rel="noopener noreferrer">BotFather</a>에서 봇 토큰을 발급받으세요.</small>'}
+      </form>
+      ${state.configuration_error ? `<p class="notice error-notice">${unavailable}</p>` : ''}
       ${configured && !linked ? '<p>Chat ID는 일회용 링크로 연결합니다.</p>' : ''}
       ${configured && !linked ? '<button type="button" class="primary" data-telegram-action="link">일회용 연결 링크 발급</button>' : ''}
       ${linkPanel}
@@ -127,6 +136,13 @@ export async function renderTelegram(container, api) {
       } else if (action === 'refresh') {
         const state = await load();
         if (state && !state.linked) message('아직 봇 인증을 기다리고 있습니다.');
+      } else if (action === 'delete-bot') {
+        if (!window.confirm('이 봇과 Telegram 연결, 대기 중인 알림을 삭제할까요?')) return;
+        stopPolling();
+        link = null;
+        const state = await api('/api/telegram/bot', {method:'DELETE'});
+        paint(state);
+        message('봇 토큰을 삭제했습니다.');
       } else if (action === 'unlink') {
         if (!window.confirm('이 Telegram 연결과 대기 중인 알림을 해제할까요?')) return;
         stopPolling();
@@ -139,6 +155,30 @@ export async function renderTelegram(container, api) {
       message(error.message || '요청을 처리하지 못했습니다.', true);
     } finally {
       if (control.isConnected) control.disabled = false;
+    }
+  });
+
+  container.addEventListener('submit', async event => {
+    const form = event.target.closest('[data-telegram-bot-form]');
+    if (!form) return;
+    event.preventDefault();
+    const input = form.querySelector('[name="token"]');
+    const button = form.querySelector('[data-telegram-save]');
+    const token = input.value.trim();
+    if (!token) return;
+    button.disabled = true;
+    message();
+    try {
+      const state = await api('/api/telegram/bot', {method:'PUT', body:{token}});
+      input.value = '';
+      stopPolling();
+      link = null;
+      paint(state);
+      message('봇 토큰을 확인하고 저장했습니다. 연결 링크를 발급해 주세요.');
+    } catch (error) {
+      message(error.message || '봇 토큰을 저장하지 못했습니다.', true);
+    } finally {
+      if (button.isConnected) button.disabled = false;
     }
   });
 

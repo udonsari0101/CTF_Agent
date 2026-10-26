@@ -344,6 +344,11 @@ input:focus, textarea:focus, select:focus {
   border-radius: var(--radius);
   background: linear-gradient(145deg, rgba(10, 17, 23, .98), rgba(4, 9, 13, .98));
 }
+.telegram-bot-form { display: grid; gap: 9px; margin: 18px 0; }
+.telegram-bot-form .line-actions { align-items: stretch; }
+.telegram-bot-form input { min-width: 0; flex: 1 1 260px; }
+.telegram-bot-form button { flex: 0 0 auto; }
+.telegram-bot-form small { color: var(--muted); }
 .connection-state {
   display: inline-flex;
   align-items: center;

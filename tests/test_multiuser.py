@@ -26,6 +26,40 @@ def add_user(client, username, role='user'):
     return response.json()
 
 
+def test_telegram_bot_tokens_are_managed_in_each_user_settings(web, monkeypatch):
+    admin, app, _ = web
+    add_user(admin, "telegram-member")
+    tokens = {
+        "123456:" + "A" * 35: (111, "AdminBot"),
+        "234567:" + "B" * 35: (222, "MemberBot"),
+    }
+
+    async def verify(method, _payload, *, token=None):
+        assert method == "getMe"
+        bot_id, username = tokens[token]
+        return {"result": {"id": bot_id, "is_bot": True, "username": username}}
+
+    monkeypatch.setattr(app.state.telegram, "_api", verify)
+    assert admin.get("/api/telegram").json()["configured"] is False
+    saved = admin.put("/api/telegram/bot", json={"token": next(iter(tokens))})
+    assert saved.status_code == 200
+    assert saved.json()["bot_username"] == "AdminBot"
+    assert "token" not in saved.text.lower()
+
+    with TestClient(app) as member:
+        sign_in(member, "telegram-member")
+        assert member.get("/api/telegram").json()["configured"] is False
+        duplicate = member.put("/api/telegram/bot", json={"token": next(iter(tokens))})
+        assert duplicate.status_code == 409
+        second_token = list(tokens)[1]
+        assert member.put("/api/telegram/bot", json={"token": second_token}).status_code == 200
+        assert member.get("/api/telegram").json()["bot_username"] == "MemberBot"
+        assert admin.get("/api/telegram").json()["bot_username"] == "AdminBot"
+        assert member.delete("/api/telegram/bot").status_code == 200
+        assert member.get("/api/telegram").json()["configured"] is False
+        assert admin.get("/api/telegram").json()["configured"] is True
+
+
 def test_relaxed_password_policy_is_consistent_across_user_flows(tmp_path, monkeypatch):
     short_passwords = {
         "bootstrap": "aaaa",

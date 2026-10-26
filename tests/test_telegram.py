@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from ctf_agent.db import Settings, connect, initialize
+from ctf_agent.main import create_app
 from ctf_agent.telegram import (
     TelegramAPIError,
     TelegramService,
@@ -44,8 +45,13 @@ def service_fixture(tmp_path):
                 used_at INTEGER,created_at TEXT NOT NULL
             );
             CREATE TABLE telegram_settings (
-                user_id TEXT PRIMARY KEY,chat_id INTEGER UNIQUE,enabled INTEGER NOT NULL DEFAULT 0,
+                user_id TEXT PRIMARY KEY,chat_id INTEGER,enabled INTEGER NOT NULL DEFAULT 0,
                 linked_at TEXT,last_success_at TEXT,last_failure_at TEXT,last_failure_code TEXT
+            );
+            CREATE TABLE telegram_bots (
+                user_id TEXT PRIMARY KEY,token_ciphertext TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,
+                bot_id INTEGER NOT NULL UNIQUE,bot_username TEXT NOT NULL,
+                update_offset INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL
             );
             CREATE TABLE notification_outbox (
                 id TEXT PRIMARY KEY,event_key TEXT NOT NULL UNIQUE,user_id TEXT NOT NULL,
@@ -94,6 +100,181 @@ def service_fixture(tmp_path):
     return TelegramService(
         database, settings, "fake-token", "ExampleBot", identity_verified=True
     ), database, owner
+
+
+def test_personal_bots_encrypt_tokens_and_isolate_links(tmp_path):
+    service, database, owner = service_fixture(tmp_path)
+    service.token = ""
+    service.bot_username = ""
+    service.identity_verified = False
+    second = "second-user"
+    with database() as db:
+        db.execute(
+            "INSERT INTO users(id,username,password_hash,role,active,created_at) "
+            "VALUES(?,?,'','user',1,'now')",
+            (second, "second-user"),
+        )
+    tokens = {
+        owner: "123456:" + "A" * 35,
+        second: "234567:" + "B" * 35,
+    }
+    identities = {
+        tokens[owner]: {"id": 111, "is_bot": True, "username": "OwnerBot"},
+        tokens[second]: {"id": 222, "is_bot": True, "username": "SecondBot"},
+    }
+    sent = []
+
+    async def fake_api(method, payload, *, token=None):
+        if method == "getMe":
+            return {"result": identities[token]}
+        sent.append((method, token, payload))
+        return {"ok": True}
+
+    service._api = fake_api
+    for user_id in (owner, second):
+        state = asyncio.run(service.save_bot(user_id, tokens[user_id]))
+        assert state["configured"]
+        assert not state["linked"]
+        assert "token" not in state
+        assert service._token_for(user_id) == tokens[user_id]
+        with database() as db:
+            row = db.execute(
+                "SELECT token_ciphertext FROM telegram_bots WHERE user_id=?", (user_id,)
+            ).fetchone()
+            assert tokens[user_id] not in row["token_ciphertext"]
+
+    first_link, first_secret = link_token(service, owner)
+    second_link, second_secret = link_token(service, second)
+    assert "OwnerBot" in first_link["deep_link"]
+    assert "SecondBot" in second_link["deep_link"]
+
+    def update(secret, chat_id, update_id):
+        return {"update_id": update_id, "message": {
+            "chat": {"id": chat_id, "type": "private"}, "text": f"/start {secret}"
+        }}
+
+    asyncio.run(service.handle_update(
+        update(first_secret, 1001, 1), bot_user_id=second,
+        bot_token=tokens[second], token_hash=hashlib.sha256(tokens[second].encode()).hexdigest(),
+    ))
+    assert not service.settings_for(owner)["linked"]
+    asyncio.run(service.handle_update(
+        update(first_secret, 1001, 2), bot_user_id=owner,
+        bot_token=tokens[owner], token_hash=hashlib.sha256(tokens[owner].encode()).hexdigest(),
+    ))
+    asyncio.run(service.handle_update(
+        update(second_secret, 1001, 3), bot_user_id=second,
+        bot_token=tokens[second], token_hash=hashlib.sha256(tokens[second].encode()).hexdigest(),
+    ))
+    assert service.settings_for(owner)["linked"]
+    assert service.settings_for(second)["linked"]
+    assert [item[1] for item in sent] == [tokens[second], tokens[owner], tokens[second]]
+
+    new_token = "345678:" + "C" * 35
+    identities[new_token] = {"id": 333, "is_bot": True, "username": "NewOwnerBot"}
+    state = asyncio.run(service.save_bot(owner, new_token))
+    assert state["configured"] and not state["linked"]
+    assert service.settings_for(second)["linked"]
+    state = asyncio.run(service.delete_bot(owner))
+    assert not state["configured"] and not state["linked"]
+    assert service._token_for(owner) is None
+    assert service._token_for(second) == tokens[second]
+
+
+def test_personal_bot_outbox_uses_each_owners_token(tmp_path):
+    service, database, owner = service_fixture(tmp_path)
+    service.token = ""
+    service.bot_username = ""
+    service.identity_verified = False
+    second = "second-user"
+    tokens = {
+        owner: "123456:" + "A" * 35,
+        second: "234567:" + "B" * 35,
+    }
+    sent = []
+
+    async def fake_api(method, payload, *, token=None):
+        if method == "getMe":
+            is_owner = token == tokens[owner]
+            return {"result": {
+                "id": 111 if is_owner else 222, "is_bot": True,
+                "username": "OwnerBot" if is_owner else "SecondBot",
+            }}
+        sent.append((token, payload["chat_id"]))
+        return {"ok": True}
+
+    service._api = fake_api
+    with database() as db:
+        db.execute(
+            "INSERT INTO users(id,username,password_hash,role,active,created_at) "
+            "VALUES(?,?,'','user',1,'now')", (second, "second-user"),
+        )
+        db.execute(
+            "INSERT INTO workspaces(id,name,description,created_at,updated_at,owner_user_id) "
+            "VALUES('second-space','Second','', 'now','now',?)", (second,),
+        )
+        db.execute(
+            "INSERT INTO challenges(id,workspace_id,name,description,flag,notes,created_at,updated_at) "
+            "VALUES('second-challenge','second-space','Other','','FLAG{two}','','now','now')"
+        )
+    for user_id in (owner, second):
+        asyncio.run(service.save_bot(user_id, tokens[user_id]))
+    with database() as db:
+        db.execute(
+            "INSERT INTO telegram_settings(user_id,chat_id,enabled) VALUES(?,?,1)",
+            (owner, 1001),
+        )
+        db.execute(
+            "INSERT INTO telegram_settings(user_id,chat_id,enabled) VALUES(?,?,1)",
+            (second, 1002),
+        )
+    assert service.enqueue_flag(owner, "a", "b", "FLAG{one}")
+    assert service.enqueue_flag(second, "second-space", "second-challenge", "FLAG{two}")
+
+    async def deliver():
+        service.loop = asyncio.get_running_loop()
+        service.wakeup = asyncio.Event()
+        task = asyncio.create_task(service._outbox_loop())
+        try:
+            for _ in range(50):
+                if len(sent) == 2:
+                    break
+                await asyncio.sleep(.05)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(deliver())
+    assert set(sent) == {(tokens[owner], 1001), (tokens[second], 1002)}
+
+
+def test_legacy_server_bot_is_not_assigned_to_users(tmp_path, monkeypatch):
+    settings = Settings(
+        tmp_path / "data", tmp_path / "db", tmp_path / "config", tmp_path / "logs"
+    )
+    initialize(settings)
+    with connect(settings) as db:
+        owner = db.execute("SELECT value FROM meta WHERE key='legacy_owner_id'").fetchone()[0]
+        db.execute(
+            """CREATE TABLE telegram_settings (
+                user_id TEXT PRIMARY KEY,chat_id INTEGER UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 0,linked_at TEXT,
+                last_success_at TEXT,last_failure_at TEXT,last_failure_code TEXT
+            )"""
+        )
+        db.execute(
+            "INSERT INTO telegram_settings(user_id,chat_id,enabled) VALUES(?,?,1)",
+            (owner, 1234),
+        )
+    monkeypatch.setenv("CTF_TELEGRAM_BOT_TOKEN", "123456:" + "A" * 35)
+    app = create_app(settings)
+    state = app.state.telegram.settings_for(owner)
+    assert not state["configured"] and not state["linked"] and not state["enabled"]
+    with connect(settings) as db:
+        definition = db.execute(
+            "SELECT sql FROM sqlite_master WHERE name='telegram_settings'"
+        ).fetchone()[0]
+        assert "chat_id INTEGER UNIQUE" not in definition
 
 
 def insert_solver_job(
