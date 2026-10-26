@@ -81,6 +81,8 @@ CREATE TABLE IF NOT EXISTS challenges (
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_challenges_workspace ON challenges(workspace_id, status);
+-- Legacy column names are retained for existing databases; each row is an
+-- undirected link between two challenges in the same workspace.
 CREATE TABLE IF NOT EXISTS challenge_relations (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     prerequisite_id TEXT NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,

@@ -2573,11 +2573,15 @@ class SolverExchangeCoordinator:
                 related_rows = db.execute(
                     """SELECT c.id,c.name,c.category,c.description,c.completion_source,c.flag,c.notes,w.markdown
                          FROM challenge_relations r
-                         JOIN challenges c ON c.id=r.prerequisite_id AND c.workspace_id=r.workspace_id
+                         JOIN challenges c ON c.id=CASE WHEN r.prerequisite_id=?
+                             THEN r.dependent_id ELSE r.prerequisite_id END
+                             AND c.workspace_id=r.workspace_id
                          LEFT JOIN challenge_writeups w ON w.challenge_id=c.id
-                        WHERE r.workspace_id=? AND r.dependent_id=? AND c.status='solved'
+                        WHERE r.workspace_id=? AND (r.prerequisite_id=? OR r.dependent_id=?)
+                          AND c.status='solved'
                         ORDER BY r.created_at,c.id LIMIT 6""",
-                    (job["workspace_id"], job["challenge_id"]),
+                    (job["challenge_id"], job["workspace_id"],
+                     job["challenge_id"], job["challenge_id"]),
                 ).fetchall()
                 if related_rows:
                     related_data = [

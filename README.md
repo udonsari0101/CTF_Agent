@@ -12,7 +12,7 @@ The screenshots use synthetic challenges and account data.
 
 ## Features
 
-- Keep each CTF in a separate workspace. Add challenges manually or import selected challenges from CTFd; sync new or changed challenges later. Link prerequisite challenges by ID, including challenges with duplicate names.
+- Keep each CTF in a separate workspace. Add challenges manually or import selected challenges from CTFd; sync new or changed challenges later. Link related challenges by ID, including challenges with duplicate names.
 - Connect Codex and Claude Code accounts. Choose an account, model, and reasoning level for each challenge, then watch the session log and send follow-up instructions while it runs.
 - Upload multiple files, including large binaries with resumable transfers. Challenge files and the database use separate data directories.
 - See flags as soon as they are found. Review, copy, and download Markdown write-ups in the selected interface language; request a revised write-up when needed.

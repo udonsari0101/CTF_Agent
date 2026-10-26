@@ -29,7 +29,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Resp
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from .ctfd import connection_info
 from .db import Settings, connect, initialize
@@ -397,7 +397,10 @@ class ChallengePatch(BaseModel):
 
 
 class ChallengeRelationInput(BaseModel):
-    prerequisite_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    related_id: str = Field(
+        validation_alias=AliasChoices("related_id", "prerequisite_id"),
+        pattern=r"^[0-9a-f]{32}$",
+    )
 
 
 def normalize_remote_pair(mode: str | None, remote: str) -> tuple[str, str]:
@@ -543,10 +546,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [dict(row) for row in db.execute(
             """SELECT c.id,c.name,c.category,c.status,c.ctfd_id,c.ctfd_url
                  FROM challenge_relations r
-                 JOIN challenges c ON c.id=r.prerequisite_id AND c.workspace_id=r.workspace_id
-                WHERE r.workspace_id=? AND r.dependent_id=?
+                 JOIN challenges c ON c.id=CASE WHEN r.prerequisite_id=?
+                     THEN r.dependent_id ELSE r.prerequisite_id END
+                     AND c.workspace_id=r.workspace_id
+                WHERE r.workspace_id=? AND (r.prerequisite_id=? OR r.dependent_id=?)
                 ORDER BY r.created_at,c.id""",
-            (workspace_id, challenge_id),
+            (challenge_id, workspace_id, challenge_id, challenge_id),
         )]
 
     def latest_solver_summary(db, workspace_id: str, challenge_id: str) -> dict | None:
@@ -1288,11 +1293,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sync_challenge_storage(db, workspace_id, challenge_id)
             result = challenge_response(db, challenge_row(db, workspace_id, challenge_id))
             result["attachments"] = [dict(row) for row in db.execute("SELECT id,original_name,size,created_at FROM attachments WHERE workspace_id=? AND challenge_id=? ORDER BY created_at,id", (workspace_id, challenge_id))]
-            result["prerequisites"] = challenge_relations(db, workspace_id, challenge_id)
+            related = challenge_relations(db, workspace_id, challenge_id)
+            result["related_challenges"] = related
+            result["prerequisites"] = related  # Compatibility with existing clients.
         return result
 
+    @app.get("/api/workspaces/{workspace_id}/challenges/{challenge_id}/relations/candidates", dependencies=[Depends(require_auth)])
     @app.get("/api/workspaces/{workspace_id}/challenges/{challenge_id}/prerequisites/candidates", dependencies=[Depends(require_auth)])
-    def prerequisite_candidates(workspace_id: str, challenge_id: str):
+    def relation_candidates(workspace_id: str, challenge_id: str):
         with database() as db:
             challenge_row(db, workspace_id, challenge_id)
             return {"challenges": [dict(row) for row in db.execute(
@@ -1301,49 +1309,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                      ORDER BY name COLLATE NOCASE,id""", (workspace_id, challenge_id),
             )]}
 
+    @app.post("/api/workspaces/{workspace_id}/challenges/{challenge_id}/relations", status_code=201, dependencies=[Depends(require_auth)])
     @app.post("/api/workspaces/{workspace_id}/challenges/{challenge_id}/prerequisites", status_code=201, dependencies=[Depends(require_auth)])
-    def add_prerequisite(workspace_id: str, challenge_id: str, payload: ChallengeRelationInput):
+    def add_relation(workspace_id: str, challenge_id: str, payload: ChallengeRelationInput):
         with database() as db:
             db.execute("BEGIN IMMEDIATE")
             challenge_row(db, workspace_id, challenge_id)
-            challenge_row(db, workspace_id, payload.prerequisite_id)
-            if challenge_id == payload.prerequisite_id:
+            challenge_row(db, workspace_id, payload.related_id)
+            if challenge_id == payload.related_id:
                 raise HTTPException(400, "문제를 자기 자신과 연결할 수 없습니다.")
-            cycle = db.execute(
-                """WITH RECURSIVE descendants(id) AS (
-                       SELECT dependent_id FROM challenge_relations
-                        WHERE workspace_id=? AND prerequisite_id=?
-                       UNION
-                       SELECT r.dependent_id FROM challenge_relations r
-                       JOIN descendants d ON d.id=r.prerequisite_id
-                        WHERE r.workspace_id=?
-                   ) SELECT 1 FROM descendants WHERE id=? LIMIT 1""",
-                (workspace_id, challenge_id, workspace_id, payload.prerequisite_id),
+            first_id, second_id = sorted((challenge_id, payload.related_id))
+            existing = db.execute(
+                """SELECT 1 FROM challenge_relations WHERE workspace_id=? AND
+                   ((prerequisite_id=? AND dependent_id=?) OR
+                    (prerequisite_id=? AND dependent_id=?)) LIMIT 1""",
+                (workspace_id, first_id, second_id, second_id, first_id),
             ).fetchone()
-            if cycle:
-                raise HTTPException(409, "연관 문제에 순환 관계를 만들 수 없습니다.")
+            if existing:
+                raise HTTPException(409, "이미 연결된 문제입니다.")
             try:
                 db.execute(
                     """INSERT INTO challenge_relations(workspace_id,prerequisite_id,dependent_id,created_at)
                        VALUES(?,?,?,?)""",
-                    (workspace_id, payload.prerequisite_id, challenge_id, now()),
+                    (workspace_id, first_id, second_id, now()),
                 )
             except sqlite3.IntegrityError:
                 raise HTTPException(409, "이미 연결된 문제입니다.") from None
-            return {"prerequisites": challenge_relations(db, workspace_id, challenge_id)}
+            related = challenge_relations(db, workspace_id, challenge_id)
+            return {"related_challenges": related, "prerequisites": related}
 
+    @app.delete("/api/workspaces/{workspace_id}/challenges/{challenge_id}/relations/{prerequisite_id}", dependencies=[Depends(require_auth)])
     @app.delete("/api/workspaces/{workspace_id}/challenges/{challenge_id}/prerequisites/{prerequisite_id}", dependencies=[Depends(require_auth)])
-    def remove_prerequisite(workspace_id: str, challenge_id: str, prerequisite_id: str):
+    def remove_relation(workspace_id: str, challenge_id: str, prerequisite_id: str):
         with database() as db:
             db.execute("BEGIN IMMEDIATE")
             challenge_row(db, workspace_id, challenge_id)
             result = db.execute(
-                """DELETE FROM challenge_relations WHERE workspace_id=? AND dependent_id=? AND prerequisite_id=?""",
-                (workspace_id, challenge_id, prerequisite_id),
+                """DELETE FROM challenge_relations WHERE workspace_id=? AND
+                   ((prerequisite_id=? AND dependent_id=?) OR
+                    (prerequisite_id=? AND dependent_id=?))""",
+                (workspace_id, challenge_id, prerequisite_id, prerequisite_id, challenge_id),
             )
-            if result.rowcount != 1:
+            if result.rowcount == 0:
                 raise HTTPException(404, "연관 문제를 찾을 수 없습니다.")
-            return {"prerequisites": challenge_relations(db, workspace_id, challenge_id)}
+            related = challenge_relations(db, workspace_id, challenge_id)
+            return {"related_challenges": related, "prerequisites": related}
 
     @app.patch("/api/workspaces/{workspace_id}/challenges/{challenge_id}", dependencies=[Depends(require_auth)])
     def edit_challenge(workspace_id: str, challenge_id: str, payload: ChallengePatch, if_match: str | None = Header(default=None)):

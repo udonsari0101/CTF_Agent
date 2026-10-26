@@ -1170,7 +1170,7 @@ function workspaceForm(edit = false) {
   openModal(edit ? '작업공간 설정' : '새 작업공간 만들기', '', `
     <label>작업공간 이름<input name="name" value="${esc(w.name)}" placeholder="예: 2026 가을 CTF" maxlength="160" required autofocus></label>
     <label>설명 <span class="optional">선택</span><textarea name="description" rows="3" placeholder="대회 일정이나 기억할 내용을 적어 주세요.">${esc(w.description)}</textarea></label>
-    <label>Flag 형식 <span class="optional">선택</span><input name="flag_format" value="${esc(w.flag_format)}" placeholder="예: HeXA 또는 CTF{...}" maxlength="500"><span class="form-hint">접두어만 입력하면 {…} 형식을 적용합니다.</span></label>
+    <label>Flag 형식 <span class="optional">선택</span><input name="flag_format" value="${esc(w.flag_format)}" maxlength="500"><span class="form-hint">접두어만 입력하면 {…} 형식을 적용합니다.</span></label>
     <label class="workspace-option"><input type="checkbox" name="open_challenge_after_create" ${w.open_challenge_after_create ? 'checked' : ''}><span>문제 등록 후 상세창 열기</span></label>
     ${edit ? '<div class="danger-zone"><button class="danger small icon-action" type="button" data-action="delete-workspace" aria-label="작업공간 삭제" title="작업공간 삭제">⌫</button></div>' : ''}`, `<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">${edit ? '변경 저장' : '작업공간 만들기'}</button>`, edit ? 'edit-workspace-form' : 'new-workspace-form');
   if (edit) modal.querySelector('form').dataset.editToken = w.edit_token || '';
@@ -1221,34 +1221,34 @@ function relatedChallengeLabel(challenge) {
 }
 
 function relatedChallengeMarkup(challenge) {
-  const linked = challenge.prerequisites || [];
+  const linked = challenge.related_challenges || challenge.prerequisites || [];
   const linkedIds = new Set(linked.map(item => item.id));
   const available = relatedCandidates.filter(item => item.id !== challenge.id && !linkedIds.has(item.id));
-  return `<h3>선행 문제</h3><div class="related-challenge-list">${linked.length ? linked.map(item =>
-    `<div class="file-item"><div><button type="button" class="small ghost" data-action="open-related-challenge" data-id="${esc(item.id)}">${esc(relatedChallengeLabel(item))}</button><small>${esc(statuses[item.status] || item.status)}</small></div><button type="button" class="small danger icon-action" data-action="remove-prerequisite" data-id="${esc(item.id)}" aria-label="선행 문제 연결 해제" title="선행 연결 해제">×</button></div>`).join('') : '<p class="muted">없음</p>'}</div>
-    ${available.length ? `<div class="related-add"><label class="sr-only" for="related-challenge-select">선행 문제 선택</label><select id="related-challenge-select"><option value="">문제 선택</option>${available.map(item => `<option value="${esc(item.id)}">${esc(relatedChallengeLabel(item))}</option>`).join('')}</select><button type="button" class="small ghost" data-action="add-prerequisite">연결</button></div>` : ''}`;
+  return `<h3>연결된 문제</h3><div class="related-challenge-list">${linked.length ? linked.map(item =>
+    `<div class="file-item"><div><button type="button" class="small ghost" data-action="open-related-challenge" data-id="${esc(item.id)}">${esc(relatedChallengeLabel(item))}</button><small>${esc(statuses[item.status] || item.status)}</small></div><button type="button" class="small danger icon-action" data-action="remove-relation" data-id="${esc(item.id)}" aria-label="문제 연결 해제" title="문제 연결 해제">×</button></div>`).join('') : '<p class="muted">없음</p>'}</div>
+    ${available.length ? `<div class="related-add"><label class="sr-only" for="related-challenge-select">연결할 문제 선택</label><select id="related-challenge-select"><option value="">문제 선택</option>${available.map(item => `<option value="${esc(item.id)}">${esc(relatedChallengeLabel(item))}</option>`).join('')}</select><button type="button" class="small ghost" data-action="add-relation">연결</button></div>` : ''}`;
 }
 
 async function loadRelatedChallenges(challenge) {
   relatedCandidates = [];
   const area = detail.querySelector('#challenge-relations');
   if (area) area.innerHTML = relatedChallengeMarkup(challenge);
-  const result = await api(`${path(challenge.id,challenge.workspace_id)}/prerequisites/candidates`);
+  const result = await api(`${path(challenge.id,challenge.workspace_id)}/relations/candidates`);
   if (currentChallenge !== challenge || !detail.open) return;
   relatedCandidates = result.challenges || [];
   const current = detail.querySelector('#challenge-relations');
   if (current) current.innerHTML = relatedChallengeMarkup(challenge);
 }
 
-async function changePrerequisite(removeId = null) {
+async function changeRelation(removeId = null) {
   const challenge = currentChallenge;
-  const prerequisiteId = removeId || detail.querySelector('#related-challenge-select')?.value;
-  if (!challenge || !prerequisiteId) return;
-  const endpoint = `${path(challenge.id,challenge.workspace_id)}/prerequisites`;
-  const result = await api(removeId ? `${endpoint}/${encodeURIComponent(prerequisiteId)}` : endpoint,
-    removeId ? {method:'DELETE'} : {method:'POST',body:{prerequisite_id:prerequisiteId}});
+  const relatedId = removeId || detail.querySelector('#related-challenge-select')?.value;
+  if (!challenge || !relatedId) return;
+  const endpoint = `${path(challenge.id,challenge.workspace_id)}/relations`;
+  const result = await api(removeId ? `${endpoint}/${encodeURIComponent(relatedId)}` : endpoint,
+    removeId ? {method:'DELETE'} : {method:'POST',body:{related_id:relatedId}});
   if (currentChallenge !== challenge) return;
-  challenge.prerequisites = result.prerequisites || [];
+  challenge.related_challenges = result.related_challenges || [];
   const area = detail.querySelector('#challenge-relations');
   if (area) area.innerHTML = relatedChallengeMarkup(challenge);
 }
@@ -2545,10 +2545,10 @@ document.addEventListener('click', event => {
     'new-workspace': () => workspaceForm(), 'edit-workspace': () => workspaceForm(true),
     'new-challenge': () => challengeForm(), 'edit-challenge': async () => { const c = currentChallenge; await saveNotes(true); if (currentChallenge === c && currentWorkspace?.id === c.workspace_id) challengeForm(true); },
     'clone-challenge': () => cloneChallenge(),
-    'add-prerequisite': () => changePrerequisite(),
+    'add-relation': () => changeRelation(),
     'install-release-update': () => installReleaseUpdate(button),
     'refresh-release-update': () => refreshReleaseUpdatePanel(),
-    'remove-prerequisite': () => changePrerequisite(button.dataset.id),
+    'remove-relation': () => changeRelation(button.dataset.id),
     'open-related-challenge': () => openChallenge(button.dataset.id),
     'remove-challenge-file': () => {
       const form = activeChallengeUploadForm(), index = Number(button.dataset.index);
