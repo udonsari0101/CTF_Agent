@@ -4811,7 +4811,10 @@ class ClaudePrintDriver(CodexAppServer):
             for key in ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR")
             if key in os.environ
         }
-        temporary = self.claude_home / "tmp"
+        # Claude's Bash tool executes in the command AppArmor domain. Its
+        # subprocess temporary files must be job-scoped but outside the
+        # credential home, which that domain intentionally cannot read.
+        temporary = self.claude_home.parent / "command-tmp"
         safe.update(
             {
                 "HOME": str(self.claude_home),
@@ -4953,6 +4956,7 @@ class ClaudePrintDriver(CodexAppServer):
             self.claude_home.mkdir(parents=True, mode=0o700, exist_ok=False)
         for child in ("tmp", "config", "cache"):
             (self.claude_home / child).mkdir(mode=0o700)
+        (self.claude_home.parent / "command-tmp").mkdir(mode=0o700, exist_ok=False)
         output = (await self._bounded_command(["--version"], maximum=512)).decode("utf-8", errors="replace")
         match = re.search(r"(?<![0-9])(\d+\.\d+\.\d+)(?![0-9])", output)
         if not match or match.group(1) != self.expected_version:
@@ -5087,7 +5091,14 @@ class ClaudePrintDriver(CodexAppServer):
         resolved = re.fullmatch(r"claude-(fable|opus|sonnet|haiku)(?:-[a-z0-9]+)*", lowered)
         if selected in {"default", "best"}:
             return lowered in {"default", "best"} or resolved is not None
-        return selected == lowered or (resolved is not None and resolved.group(1) == selected)
+        if selected == lowered or (resolved is not None and resolved.group(1) == selected):
+            return True
+        # Claude Code may resolve a selected alias to its dated API model ID
+        # when a session is resumed. Keep the family and release fixed.
+        return bool(
+            selected.startswith("claude-")
+            and re.fullmatch(re.escape(selected) + r"-20[0-9]{6}", lowered)
+        )
 
     @staticmethod
     def _policy_refusal(event: Mapping[str, Any]) -> bool:
@@ -5311,15 +5322,37 @@ class ClaudePrintDriver(CodexAppServer):
                                 agent_id=child_agent_id,
                             )
                 continue
+            if subagent_event and event_type == "system" and event.get("subtype") == "init":
+                # Forwarded child sessions may use a different model/effort.
+                # Only the root init establishes the selected solve contract.
+                if not initialized:
+                    raise AppServerFailure({"code": "invalid_response"})
+                child_tools = event.get("tools")
+                if child_tools is not None:
+                    allowed_child_tools = {
+                        *self.ALLOWED_TOOLS,
+                        "Task",
+                        "StructuredOutput",
+                        *(("Workflow",) if manifest.configuration.ultracode else ()),
+                    }
+                    if (
+                        not isinstance(child_tools, list)
+                        or any(not isinstance(tool, str) for tool in child_tools)
+                        or set(child_tools) - allowed_child_tools
+                    ):
+                        raise WorkerRefusal("tool_policy_mismatch", "Claude 하위 에이전트의 도구 제한을 확인하지 못했습니다.")
+                if event.get("mcp_servers", []) not in ([], None):
+                    raise WorkerRefusal("unexpected_remote_tool", "Claude 하위 에이전트의 MCP 도구가 활성화되었습니다.")
+                if event.get("permissionMode", "dontAsk") != "dontAsk":
+                    raise WorkerRefusal("tool_policy_mismatch", "Claude 하위 에이전트의 실행 권한을 확인하지 못했습니다.")
+                continue
             if event_type == "system" and event.get("subtype") == "init":
-                if (
-                    initialized
-                    or event_session != session
-                    or not self._model_matches(manifest.configuration.model, event.get("model"))
-                    or event.get("effort", manifest.configuration.reasoning_effort)
-                    != manifest.configuration.reasoning_effort
-                ):
+                if initialized or event_session != session:
+                    raise AppServerFailure({"code": "invalid_response"})
+                if not self._model_matches(manifest.configuration.model, event.get("model")):
                     raise WorkerRefusal("model_mismatch", "Claude가 선택한 모델과 다른 모델을 반환했습니다.", category="model")
+                if event.get("effort", manifest.configuration.reasoning_effort) != manifest.configuration.reasoning_effort:
+                    raise WorkerRefusal("reasoning_mismatch", "Claude가 선택한 추론 수준과 다른 값을 반환했습니다.", category="model")
                 if event.get("claude_code_version") != self.expected_version:
                     raise WorkerRefusal("claude_version_mismatch", "검증된 Claude worker 버전과 실행 버전이 일치하지 않습니다.")
                 if event.get("permissionMode") != "dontAsk" or event.get("slash_commands") != []:

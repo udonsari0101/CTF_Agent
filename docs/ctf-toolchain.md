@@ -64,9 +64,8 @@ same `ctf-browser` launcher available to a solve. Pwndbg's `vmmap` command
 and Websocat's CLI are checked in the image.
 The worker readiness canary
 repeats a compact set and the browser render through Codex's real AppArmor
-command profile. Claude jobs also check the provider-to-command inspection
-boundary before sending a model request, so a broken shell boundary reports an
-environment error instead of consuming a solve attempt. The readiness canary also attempts a
+command profile. Claude jobs check the provider-to-command inspection
+boundary before sending a model request. The readiness canary also attempts a
 child-process strace and publishes `toolchain_trace_functional` as a capability
 diagnostic. That check does not gate readiness because Docker's default seccomp
 on some older kernels denies ptrace even though the AppArmor command boundary
