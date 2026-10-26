@@ -48,6 +48,7 @@ let solverUltraEscalationMode = 'ask';
 let solverOptionsGeneration = 0;
 let sidebarCollapsed = (() => { try { return localStorage.getItem('ctf-sidebar-collapsed') === 'true'; } catch { return false; } })();
 let solverLogExpanded = false, solverConsoleDialog = null;
+let solverConfirmDialog = null;
 let solverConsoleAgentId = 'root', solverConsoleFollowLatest = true;
 const solverCollapsedAgentIds = new Set();
 const noteDrafts = new Map();
@@ -886,7 +887,10 @@ function solverPanelMarkup(job, events = [], loading = false) {
       : job.phase === 'completed'
       ? '<p class="form-hint">다시 실행하려면 먼저 위의 완료 취소를 눌러 미완료 상태로 되돌리세요.</p>'
       : `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>다시 풀기</button>`;
-  return `<div class="solver-panel-head"><h3>문제 풀이</h3><span class="solver-phase solver-phase-${esc(job.phase)}">${esc(active && job.cancel_requested ? '중단 요청 중' : (solverPhases[job.phase] || job.phase))}</span></div>
+  const runningEvent = events.find(event => event.kind === 'status' && event.status === 'running');
+  const startedAt = runningEvent?.created_at ?? job.started_at ?? job.created_at;
+  const elapsed = active ? solverElapsedMarkup(startedAt,Boolean(runningEvent || job.started_at)) : '';
+  return `<div class="solver-panel-head"><h3>문제 풀이</h3><div class="solver-panel-state"><span class="solver-phase solver-phase-${esc(job.phase)}">${esc(active && job.cancel_requested ? '중단 요청 중' : (solverPhases[job.phase] || job.phase))}</span>${elapsed}</div></div>
     ${modelText ? `<p class="solver-model">${esc(modelText)}</p>` : ''}
     ${job.network_policy === 'general_internet' ? '<p class="form-hint solver-limit">인터넷 사용 가능</p>' : ''}
     ${solverContinuationMarkup(job)}
@@ -1040,6 +1044,41 @@ function toast(message, error = false, duration = error ? 8000 : 4000) {
   target.append(node);
   setTimeout(() => node.remove(), duration);
   return node;
+}
+
+function siteConfirm(message, heading = '확인', actionLabel = '확인') {
+  if (solverConfirmDialog?.open) return Promise.resolve(false);
+  const restoreFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  solverConfirmDialog = dialog;
+  dialog.className = 'solver-confirm-dialog';
+  dialog.setAttribute('aria-labelledby','solver-confirm-title');
+  dialog.innerHTML = '<div class="solver-confirm-content"><h2 id="solver-confirm-title"></h2><p class="solver-confirm-message"></p><div class="solver-confirm-actions"><button type="button" data-confirm-cancel>취소</button><button type="button" class="danger" data-confirm-accept></button></div></div>';
+  dialog.querySelector('#solver-confirm-title').textContent = i18n.t(heading);
+  dialog.querySelector('.solver-confirm-message').textContent = i18n.t(message);
+  const cancel = dialog.querySelector('[data-confirm-cancel]');
+  const accept = dialog.querySelector('[data-confirm-accept]');
+  cancel.textContent = i18n.t('취소');
+  accept.textContent = i18n.t(actionLabel);
+  document.body.append(dialog);
+  return new Promise((resolve,reject) => {
+    let settled = false;
+    const finish = confirmed => {
+      if (settled) return;
+      settled = true;
+      if (dialog.open) dialog.close();
+      dialog.remove();
+      if (solverConfirmDialog === dialog) solverConfirmDialog = null;
+      if (restoreFocus?.isConnected) restoreFocus.focus();
+      resolve(confirmed);
+    };
+    cancel.addEventListener('click',() => finish(false));
+    accept.addEventListener('click',() => finish(true));
+    dialog.addEventListener('cancel',event => { event.preventDefault(); finish(false); });
+    dialog.addEventListener('close',() => finish(false));
+    try { dialog.showModal(); cancel.focus(); }
+    catch (error) { dialog.remove(); solverConfirmDialog = null; reject(error); }
+  });
 }
 
 function showManualCopy(value) {
@@ -1250,6 +1289,23 @@ function challengeElapsedText(run) {
   return minuteRemainder ? `${hours}시간 ${minuteRemainder}분` : `${hours}시간`;
 }
 
+function solverElapsedMarkup(startedAt, solveStarted = true) {
+  if (typeof startedAt !== 'number' || !Number.isFinite(startedAt) || startedAt <= 0) return '';
+  const label = i18n.t(solveStarted ? '풀이 경과 시간' : '대기 포함 경과 시간');
+  const elapsed = challengeElapsedText({elapsed_seconds:Math.max(0,Date.now() / 1000 - startedAt)});
+  return `<small class="solver-elapsed" data-started-at="${startedAt}" title="${label}" aria-label="${label} ${esc(elapsed)}">· ${esc(elapsed)}</small>`;
+}
+
+function updateSolverElapsedLabels() {
+  for (const label of document.querySelectorAll('.solver-elapsed[data-started-at]')) {
+    const startedAt = Number(label.dataset.startedAt);
+    if (!Number.isFinite(startedAt) || startedAt <= 0) continue;
+    const elapsed = challengeElapsedText({elapsed_seconds:Math.max(0,Date.now() / 1000 - startedAt)});
+    label.textContent = `· ${elapsed}`;
+    label.setAttribute('aria-label',`${label.title} ${elapsed}`);
+  }
+}
+
 function challengeInputMarkup(challenge, workspaceId) {
   const mode = challenge.remote_mode === 'none' ? 'none' : 'endpoint';
   return `<form class="challenge-inline-input" data-workspace-id="${esc(workspaceId)}" data-challenge-id="${esc(challenge.id)}" data-edit-token="${esc(challenge.edit_token || '')}" data-name="${esc(challenge.name)}">
@@ -1270,13 +1326,15 @@ function challengeCardMarkup(challenge, workspaceId) {
   const runSummary = challengeRunSummary(challenge);
   const runPhase = latestRun?.phase || latestRun?.status;
   const liveSession = latestRun && !solverTerminalPhases.has(runPhase);
+  const liveElapsed = liveSession && challenge.status === 'running'
+    ? solverElapsedMarkup(latestRun.started_at ?? latestRun.created_at,Boolean(latestRun.started_at)) : '';
   const needsInput = runPhase === 'needs_input';
   const canStart = !needsInput && ['pending','stopped','failed'].includes(challenge.status);
   const startKey = `${workspaceId}:${challenge.id}`;
   const starting = canStart && startingListSolvers.has(startKey);
   const openLabel = challenge.status === 'solved' ? '결과 보기' : challenge.status === 'running' ? '진행 보기' : challenge.status === 'flag_found' ? 'Flag 확인' : '풀이 설정';
   return `<article class="challenge-card challenge-card-${esc(challenge.status)}" data-challenge-id="${esc(challenge.id)}" role="listitem">
-    <div class="challenge-card-top"><span class="challenge-category">${esc(category)}</span><span class="challenge-card-status"><span class="status-dot" aria-hidden="true"></span>${esc(statusLabel)}${elapsed ? `<small title="${latestRun.elapsed_includes_queue ? '대기 포함 소요 시간' : '풀이 시간'}">· ${esc(elapsed)}</small>` : ''}</span></div>
+    <div class="challenge-card-top"><span class="challenge-category">${esc(category)}</span><span class="challenge-card-status"><span class="status-dot" aria-hidden="true"></span>${esc(statusLabel)}${liveElapsed || (elapsed ? `<small title="${latestRun.elapsed_includes_queue ? '대기 포함 소요 시간' : '풀이 시간'}">· ${esc(elapsed)}</small>` : '')}</span></div>
     <button type="button" class="challenge-card-title" data-action="open-challenge" data-id="${esc(challenge.id)}" aria-label="${esc(challenge.name)} 문제 열기">${esc(challenge.name)}</button>
     ${challenge.description ? `<p class="challenge-card-description">${esc(challenge.description)}</p>` : ''}
     ${runSummary ? `<div class="challenge-run-summary" aria-label="최근 실행 설정">${runSummary}</div>` : ''}
@@ -1606,7 +1664,7 @@ async function pollChallengeList(workspaceId, generation) {
     if (generation !== challengeListPollGeneration || ticket !== listRendering || currentWorkspace?.id !== workspaceId) return;
     if (!paintChallengeListing(result,workspaceId,true)) await refreshChallenges();
   } catch { /* Keep the last visible state and retry. */ }
-  scheduleChallengeListPoll(workspaceId,generation);
+  finally { scheduleChallengeListPoll(workspaceId,generation); }
 }
 
 function startChallengeListPolling(workspaceId) {
@@ -1845,6 +1903,7 @@ function solverFilename() {
 
 function paintSolver(job, events, workspaceId, challengeId, generation, guidance = []) {
   if (!solverContext(workspaceId,challengeId,generation)) return;
+  let refreshDashboard = false;
   const panel = document.querySelector('#solver-panel');
   const previousJobId = solverJobId(currentSolverJob);
   const nextJobId = solverJobId(job);
@@ -1891,7 +1950,7 @@ function paintSolver(job, events, workspaceId, challengeId, generation, guidance
     const listed = `${solverJobId(job)}:${job.flag}`;
     if (solverListedFlag !== listed) {
       solverListedFlag = listed;
-      refreshChallenges().catch(() => {});
+      refreshDashboard = true;
     }
   }
 
@@ -1903,6 +1962,7 @@ function paintSolver(job, events, workspaceId, challengeId, generation, guidance
   if (status) {
     const changed = currentChallenge.status !== status;
     currentChallenge.status = status;
+    if (changed) refreshDashboard = true;
     const controls = document.querySelector('#challenge-status-controls');
     if (changed && controls) controls.innerHTML = challengeStatusMarkup(currentChallenge);
     else {
@@ -1910,6 +1970,8 @@ function paintSolver(job, events, workspaceId, challengeId, generation, guidance
       if (holder) holder.innerHTML = badge(status);
     }
   }
+
+  if (refreshDashboard) refreshChallenges().catch(() => {});
 
   if (!job.flag_rejected && job.writeup_markdown && solverSyncedWriteup !== solverJobId(job)) {
     solverSyncedWriteup = solverJobId(job);
@@ -2266,7 +2328,8 @@ async function startWriteupRefinement() {
 async function cancelWriteupRefinement() {
   const job = writeupRefineJob, jobId = solverJobId(job);
   if (!jobId || !solverIsActive(job)) return;
-  if (!confirm('write-up 보완을 중단할까요?')) return;
+  if (!await siteConfirm('write-up 보완을 중단할까요?', 'write-up 보완 중단', '중단')) return;
+  if (solverJobId(writeupRefineJob) !== jobId || !solverIsActive(writeupRefineJob)) return;
   const workspaceId = currentWorkspace.id, challengeId = currentChallenge.id, generation = solverRendering;
   const payload = await api(`/api/solver/jobs/${encodeURIComponent(jobId)}/cancel`,{method:'POST'});
   if (!solverContext(workspaceId,challengeId,generation)) return;
@@ -2277,7 +2340,8 @@ async function cancelWriteupRefinement() {
 async function cancelSolver() {
   const job = currentSolverJob, jobId = solverJobId(job);
   if (!jobId || !solverIsActive(job)) return;
-  if (!confirm('현재 풀이를 중단할까요? 발견한 Flag와 저장된 결과는 유지됩니다.')) return;
+  if (!await siteConfirm('현재 풀이를 중단할까요? 발견한 Flag와 저장된 결과는 유지됩니다.', '풀이 중단', '중단')) return;
+  if (solverJobId(currentSolverJob) !== jobId || !solverIsActive(currentSolverJob)) return;
   const workspaceId = currentWorkspace.id, challengeId = currentChallenge.id, generation = solverRendering;
   const payload = await api(`/api/solver/jobs/${encodeURIComponent(jobId)}/cancel`,{method:'POST'});
   if (!solverContext(workspaceId,challengeId,generation)) return;
@@ -3417,4 +3481,4 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 window.addEventListener('beforeunload', event => { if (notesDirty() || formDirty() || [...activeUploads.values()].some(upload => upload.running)) { event.preventDefault(); event.returnValue = ''; } });
-run(async () => { const state = await api('/api/auth/state'); await i18n.init(); authMode = state.auth_mode || 'password'; if (state.authenticated) { csrf = state.csrf_token; sessionUser = state.user; await render(); } else if (authMode === 'password') showLogin(false,state.configured,state.setup_available); else app.innerHTML = '<main class="login-shell"><div class="login-card"><h1>서비스 연결 오류</h1></div></main>'; });
+run(async () => { const state = await api('/api/auth/state'); if (typeof window.setInterval === 'function') window.setInterval(updateSolverElapsedLabels,1000); await i18n.init(); authMode = state.auth_mode || 'password'; if (state.authenticated) { csrf = state.csrf_token; sessionUser = state.user; await render(); } else if (authMode === 'password') showLogin(false,state.configured,state.setup_available); else app.innerHTML = '<main class="login-shell"><div class="login-card"><h1>서비스 연결 오류</h1></div></main>'; });

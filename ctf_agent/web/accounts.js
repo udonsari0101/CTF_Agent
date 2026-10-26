@@ -427,18 +427,25 @@ export async function renderAccounts(container, api, options = {}) {
       card.append(el('small', `${i18n.t('마지막 조회')}: ${date(account.checked_at)}${account.stale ? ` · ${i18n.t('새로고침 필요')}` : ''}`));
       const quota = snapshot.quota;
       if (quota) {
+        const exhaustedClaudeWindow = account.provider === 'claude' && ['available', 'quota_exceeded'].includes(quota.status)
+          && Array.isArray(quota.buckets) && quota.buckets.some(bucket => Array.isArray(bucket.windows) && bucket.windows.some(window =>
+            typeof window.used_percent === 'number' && Number.isFinite(window.used_percent) && window.used_percent >= 100));
         if (quota.stale) card.append(el('p', '최근 조회 실패: 아래 사용량은 이전 조회 값입니다.'));
         if (quota.message) card.append(el('p', quota.message));
         if (quota.error) card.append(el('p', errorText({...quota.error,message:quota.error.message || '사용량을 조회하지 못했습니다.'}), 'error-text'));
-        if (quota.limited) {
+        if (quota.limited || exhaustedClaudeWindow) {
           card.className += ' quota-limited';
           card.append(el('p', '현재 계정의 사용량 제한에 도달했습니다. 초기화 뒤 새로고침하거나 다른 등록 계정을 선택해 주세요.', 'quota-alert'));
         }
         for (const bucket of orderedQuotaBuckets(quota,identity)) {
-          const list = el('div', undefined, 'quota-bucket');
+          const exhaustedWindows = account.provider === 'claude' && ['available', 'quota_exceeded'].includes(quota.status)
+            && Array.isArray(bucket.windows) && bucket.windows.some(window =>
+              typeof window.used_percent === 'number' && Number.isFinite(window.used_percent) && window.used_percent >= 100);
+          const bucketLimited = bucket.limited || exhaustedWindows;
+          const list = el('div', undefined, `quota-bucket${bucketLimited ? ' quota-limited' : ''}`);
           list.setAttribute('aria-label', `${bucket.name || bucket.id || 'Codex'} 사용량`);
           list.append(el('strong', bucket.name || bucket.id));
-          if (bucket.limited) {
+          if (bucketLimited) {
             const reason = quotaLimitLabels[bucket.reached_type] || (bucket.spend_control_reached ? '설정된 지출 한도에 도달했습니다.' : quotaLimitLabels.rate_limit_reached);
             list.append(el('p', reason, 'quota-reason'));
           }
@@ -446,9 +453,11 @@ export async function renderAccounts(container, api, options = {}) {
           for (const window of bucket.windows) {
             const used = window.used_percent;
             const remaining = typeof used === 'number' && Number.isFinite(used) ? Math.max(0, Math.min(100, 100 - used)) : null;
-            list.append(el('p', `${i18n.t(window.label)}: ${remaining == null ? i18n.t('남은 사용량 미제공') : `${remaining}% ${i18n.t('남음')}`} · ${i18n.t('초기화')} ${date(window.resets_at)}`));
+            const windowExhausted = exhaustedWindows && remaining === 0;
+            list.append(el('p', `${i18n.t(window.label)}: ${remaining == null ? i18n.t('남은 사용량 미제공') : `${remaining}% ${i18n.t('남음')}`} · ${i18n.t('초기화')} ${date(window.resets_at)}`, windowExhausted ? 'quota-window-exhausted' : undefined));
             if (remaining != null) {
               const meter = el('progress'); meter.max = 100; meter.value = remaining;
+              if (windowExhausted) meter.className = 'quota-window-exhausted';
               meter.setAttribute('aria-label', `${window.label} 남은 사용량`);
               meter.setAttribute('aria-valuetext', `${remaining}% ${i18n.t('남음')}`); list.append(meter);
             }

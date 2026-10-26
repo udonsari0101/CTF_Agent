@@ -566,6 +566,7 @@ class JobManifest:
     network_enabled: bool = False
     network_policy: str = "offline"
     retry_checkpoint: RetryCheckpoint | None = field(default=None, repr=False)
+    resume_flag: str | None = field(default=None, repr=False)
     refinement_instruction: str = field(default="", repr=False)
     verified_flag: str | None = field(default=None, repr=False)
     source_writeup: str = field(default="", repr=False)
@@ -610,6 +611,7 @@ class JobManifest:
             "network_enabled",
             "network_policy",
             "retry_checkpoint",
+            "resume_flag",
             "refinement_context",
             "challenge_input_sha256",
         }
@@ -780,6 +782,17 @@ class JobManifest:
             retry_checkpoint = None if raw_checkpoint is None else parse_checkpoint(raw_checkpoint)
         except (TypeError, ValueError) as exc:
             raise WorkerRefusal("invalid_manifest", "이전 오답 풀이 기록을 확인할 수 없습니다.") from exc
+        resume_flag = payload.get("resume_flag")
+        if resume_flag is not None and (
+            job_mode != "solve"
+            or retry_checkpoint is None
+            or retry_checkpoint.reason not in {"cancelled", "timeout", "provider_failure", "turn_limit"}
+            or not isinstance(resume_flag, str)
+            or not 0 < len(resume_flag) <= 4000
+            or "\r" in resume_flag or "\n" in resume_flag
+            or _CONTROL.search(resume_flag)
+        ):
+            raise WorkerRefusal("invalid_manifest", "Invalid resumed Flag.")
         raw_refinement = payload.get("refinement_context")
         refinement_instruction = ""
         verified_flag = None
@@ -876,6 +889,7 @@ class JobManifest:
             network_enabled=network_enabled,
             network_policy=network_policy,
             retry_checkpoint=retry_checkpoint,
+            resume_flag=resume_flag,
             refinement_instruction=refinement_instruction,
             verified_flag=verified_flag,
             source_writeup=source_writeup,
@@ -1486,6 +1500,11 @@ def _restore_solver_artifact(workdir: Path, artifact: SolverArtifact) -> Path:
         ) from exc
     destination = workdir / "solver.py"
     if destination.exists() or destination.is_symlink():
+        # A workspace handoff may already contain this exact file. Accept an
+        # identical immutable checkpoint without overwriting newer work.
+        existing = _capture_solver_artifact(destination)
+        if existing is not None and secrets.compare_digest(existing.sha256, artifact.sha256):
+            return destination
         raise WorkerRefusal(
             "invalid_retry_checkpoint",
             "이전 solver.py를 안전하게 복원할 수 없습니다.",
@@ -5759,7 +5778,7 @@ print(json.dumps(checks,separators=(",",":")))
                 requirements=("external_sandbox",),
             )
         outer = r"""
-import json,os,subprocess,sys
+import json,os,select,subprocess,sys
 worker,exchange,scratch,source,home,skills=sys.argv[1:]
 def profile():
     try: return open("/proc/self/attr/current",encoding="ascii").read().strip()
@@ -5821,6 +5840,33 @@ try:
     child=json.loads(completed.stdout) if completed.returncode==0 and len(completed.stdout)<=8192 else {}
 except Exception: child={}
 result.update(child)
+# The Claude Bash tool's native launcher observes its restricted child before
+# returning a tool result. A missing AppArmor readby grant can make even
+# `echo` fail with a bare exit code while file tools keep working. Exercise
+# that direction without exposing the provider home to the child.
+probe=None
+try:
+    probe=subprocess.Popen(
+        ["/usr/local/libexec/ctf-command/python","-I","-c",
+         "import sys;sys.stdout.write('R');sys.stdout.flush();sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
+    )
+    ready=bool(probe.stdout and select.select([probe.stdout],[],[],2)[0]
+               and probe.stdout.read(1)==b"R")
+    result["provider_observes_command"]=(
+        ready and os.readlink(f"/proc/{probe.pid}/cwd")==os.getcwd()
+    )
+except (OSError,subprocess.SubprocessError):
+    result["provider_observes_command"]=False
+finally:
+    if probe is not None:
+        try:
+            if probe.stdin is not None:
+                probe.stdin.close()
+            probe.wait(timeout=2)
+        except (OSError,subprocess.SubprocessError):
+            if probe.poll() is None:
+                probe.kill();probe.wait()
 print(json.dumps(result,separators=(",",":")))
 """
         process = await self._spawn_exact(
@@ -5856,6 +5902,7 @@ print(json.dumps(result,separators=(",",":")))
             "exchange_read_denied",
             "worker_proc_denied",
             "provider_proc_denied",
+            "provider_observes_command",
             "credential_home_denied",
             "scratch_writable",
             "challenge_write_denied",
@@ -6599,6 +6646,8 @@ class SolverWorker:
             self._publish_worker()
             prior = _load_optional_state(active, manifest.job_id)
             notes = prior.get("private_notes") if isinstance(prior.get("private_notes"), str) else ""
+            if manifest.resume_flag and not notes and manifest.retry_checkpoint:
+                notes = manifest.retry_checkpoint.private_notes
             solver_artifact_payload = _canonical_solver_artifact_payload(
                 prior.get("solver_artifact")
             )
@@ -6871,7 +6920,7 @@ class SolverWorker:
             driver.activity_reporter = activity
             driver.agent_reporter = agent
 
-            flag = prior.get("flag") if isinstance(prior.get("flag"), str) else None
+            flag = prior.get("flag") if isinstance(prior.get("flag"), str) else manifest.resume_flag
             if manifest.job_mode == "writeup_refine":
                 if flag is not None and flag != manifest.verified_flag:
                     raise WorkerRefusal(

@@ -9,6 +9,10 @@
 .account-list .model-help p { margin: .35rem 0; }
 .account-list .quota-limited { border-color: #6f3038; box-shadow: inset 2px 0 #ff7382; }
 .account-list .quota-alert, .account-list .quota-reason { color: #ff9da7; }
+.account-list .quota-bucket.quota-limited { border-color: #71343d; background: #100609; }
+.account-list .quota-window-exhausted { color: #ff9da7; }
+.account-list progress.quota-window-exhausted { accent-color: #ff7382; }
+.account-list progress.quota-window-exhausted::-webkit-progress-value { background: #ff7382; }
 .account-list .quota-reset-credits { color: #f3c38e; margin: 2rem 0 .4rem; padding: 1rem 0 0; border-top: 1px solid var(--border); }
 .account-list .model-fields { display: grid; grid-template-columns: minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr); gap: .65rem; margin-top: 1rem; }
 .account-list .model-fields label { min-width: 0; color: #c6d5da; }

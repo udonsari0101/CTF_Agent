@@ -449,8 +449,12 @@ input:focus, textarea:focus, select:focus {
   animation: solver-config-loading 1.4s ease-in-out infinite;
 }
 @keyframes solver-config-loading { to { background-position-x: -140%; } }
-.solver-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.solver-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
 .solver-panel-head h3 { margin: 0; }
+.solver-panel-state { display: flex; align-items: center; justify-content: flex-end; gap: 7px; min-width: 0; flex-wrap: wrap; }
+.solver-elapsed { color: #80b9c9; font: 10px ui-monospace,"Cascadia Code",Consolas,monospace; white-space: nowrap; }
+.challenge-card-status { min-width: 0; max-width: 58%; flex-wrap: wrap; justify-content: flex-end; text-align: right; white-space: normal; }
+.challenge-card-status .solver-elapsed { white-space: nowrap; }
 .solver-phase {
   display: inline-flex;
   flex: 0 0 auto;
@@ -530,11 +534,21 @@ input:focus, textarea:focus, select:focus {
 .solver-guidance label { min-width: 0; color: #d4bcff; font: 600 10px ui-monospace,"Cascadia Code",Consolas,monospace; }
 .solver-guidance textarea { width: 100%; min-height: 64px; max-height: 160px; margin-top: 5px; border-color: #352955; background: #030107; font-size: 11px; }
 .solver-guidance button { min-height: 36px; border-color: #4c3973; color: #d7c0ff; }
-.solver-guidance-history-slot { grid-column: 1/-1; }
-.solver-guidance-history { display: grid; gap: 4px; margin: 2px 0 0; padding: 7px 0 0; border-top: 1px solid #272039; list-style: none; }
-.solver-guidance-history li { display: flex; justify-content: space-between; gap: 9px; color: #9b8caf; font-size: 9px; }
-.solver-guidance-history span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.solver-guidance-history small { flex: 0 0 auto; color: #c8a7ef; }
+.solver-guidance-history-slot { grid-column: 1/-1; min-width: 0; max-width: 100%; overflow: hidden; }
+.solver-guidance-history { display: grid; min-width: 0; gap: 4px; margin: 2px 0 0; padding: 7px 0 0; border-top: 1px solid #272039; list-style: none; }
+.solver-guidance-history li { display: grid; grid-template-columns: minmax(0,1fr) auto; min-width: 0; max-width: 100%; gap: 9px; color: #9b8caf; font-size: 9px; }
+.solver-guidance-history span { min-width: 0; max-height: 5em; overflow: auto; overflow-wrap: anywhere; white-space: normal; }
+.solver-guidance-history small { align-self: start; color: #c8a7ef; white-space: nowrap; }
+@media(max-width:500px) { .solver-guidance-history li { grid-template-columns: minmax(0,1fr); gap: 2px; } }
+
+.solver-confirm-dialog { width: min(420px,calc(100vw - 24px)); max-width: none; padding: 0; border: 1px solid #295063; border-radius: 11px; background: #03080d; color: var(--text); box-shadow: 0 22px 76px #000e; }
+.solver-confirm-dialog::backdrop { background: #000c; backdrop-filter: blur(3px); }
+.solver-confirm-content { display: grid; gap: 14px; padding: 22px; }
+.solver-confirm-content h2 { margin: 0; font-size: 16px; }
+.solver-confirm-message { margin: 0; color: #9db6c0; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.solver-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.solver-confirm-actions button { min-width: 74px; }
+.solver-confirm-actions .danger { border-color: #72343f; background: #220c12; color: #ffadba; }
 .challenge-card-actions .session-action { min-width: 34px; border-color: #234553; color: #8bc8d8; font: 700 9px ui-monospace,"Cascadia Code",Consolas,monospace; letter-spacing: .04em; }
 .challenge-card-actions .session-action.live { border-color: #197755; color: #52f5bd; background: #031a12; box-shadow: inset 0 0 12px rgba(82,245,189,.08); }
 .session-live-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }

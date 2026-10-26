@@ -13,9 +13,10 @@ The screenshots use synthetic challenges and account data.
 ## Features
 
 - Keep each CTF in a separate workspace. Add challenges manually or import selected challenges from CTFd; sync new or changed challenges later. Link related challenges by ID, including challenges with duplicate names.
-- Connect Codex and Claude Code accounts. Choose an account, model, and reasoning level for each challenge, then watch the session log and send follow-up instructions while it runs.
+- Connect Codex and Claude Code through account sign-in or an API key. Choose the account, model, and reasoning level per challenge; see remaining account quota, live solve time, session activity, and child agents.
+- Send instructions during a solve. On retry, a compatible provider session can resume directly; switching between Codex and Claude Code carries bounded analysis notes and work files into the new provider session.
 - Upload multiple files, including large binaries with resumable transfers. Challenge files and the database use separate data directories.
-- See flags as soon as they are found. Review, copy, and download Markdown write-ups in the selected interface language; request a revised write-up when needed.
+- See status and flags update while a solve runs, without refreshing the page. Review, copy, and download Markdown write-ups in the selected interface language; request a revised write-up when needed.
 - Each user can register a Telegram bot token in **Personal settings**, connect a chat through a one-time link, and receive flag, write-up, error, and input-request notifications. No bot token is bundled or required during installation. CTFd flag submission is off by default.
 - Use the first-run administrator setup for a multi-user installation. A separate no-login mode is available for explicitly configured single-user instances.
 - Switch the web interface between English and Korean. Interface translations live in [language packs](docs/localization.md) so more languages can be added.
@@ -36,7 +37,7 @@ The screenshots use synthetic challenges and account data.
 2. Run `Install.cmd`. The installer checks WSL 2, suggests a suitable Linux distribution, checks Docker Desktop and available disk space, then asks where to keep your data inside WSL.
 3. Open <http://127.0.0.1:5050> and create the first administrator account. Connect a Codex or Claude Code account in **Agents**.
 
-Open **Administration → Service updates** to check public releases, read release notes, and install an update. Release v0.3.0 predates the web updater; run `Install.cmd` once from a newer release to enable it. Later updates can also use `Install.cmd`. Both paths preserve the selected data directory. The release installer pulls the same commit-pinned public GHCR image used on servers, including its CTF toolchain; it does not build the application locally. See the [installation guide](docs/docker-desktop.md) for requirements, troubleshooting, and Windows Explorer access to challenge files.
+Open **Administration → Service updates** to check public releases, read release notes, and install an update. `Install.cmd` can also update an existing installation. Both paths preserve the selected data directory. The release installer pulls the same commit-pinned public GHCR image used on servers, including its CTF toolchain; it does not build the application locally. See the [installation guide](docs/docker-desktop.md) for requirements, troubleshooting, and Windows Explorer access to challenge files.
 
 The installer asks whether to start CTF Agent when you sign in to Windows. You can always use Start.cmd to start it manually and Uninstall.cmd to remove its containers, local image tags, and installed release files. Both launchers are placed in your Windows user profile under CTF Agent. A shared public image cache may remain. Uninstall keeps the selected data and database folders, WSL distribution, and Docker Desktop.
 
@@ -63,4 +64,4 @@ Each solver runs in a separate container with its own scratch space. The challen
 | Forensics | `binwalk`, `foremost`, `exiftool`, Sleuth Kit, `testdisk`, Volatility 3, `tshark`, YARA, `ffmpeg`, `steghide`, `stegseek`: file, disk, memory, traffic, media, and steganography analysis. |
 | Network and misc | `dig`, `whois`, `nmap`, Scapy, `socat`, `tesseract`, `zbarimg`, Python: protocol inspection, automation, and OCR. |
 
-See the [toolchain inventory](docs/ctf-toolchain.md) for version and availability details. Optional host features such as GPU and KVM depend on the local Docker setup.
+REA is not bundled. Its Ghidra and JADX backends are available directly in the image, without requiring an additional agent integration. See the [toolchain inventory](docs/ctf-toolchain.md) for version and availability details. Optional host features such as GPU and KVM depend on the local Docker setup.

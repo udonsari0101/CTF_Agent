@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 from .remote_relay import RemoteAccessError, parse_connection_info
+from .solver_continuation import ContinuationInvalid, stage_workspace_only
 from .solver import ModelConfiguration, SelectedAccount, normalize_rate_limit_context
 from .solver_worker import (
     EXCHANGE_PROTOCOL,
@@ -1230,6 +1231,31 @@ class SolverExchangeCoordinator:
                 continuation_source_job_id = (
                     checkpoint_row["source_job_id"] if retry_checkpoint_json and checkpoint_row else None
                 )
+                if (
+                    job_mode == "solve"
+                    and retry_checkpoint_json
+                    and checkpoint is not None
+                    and checkpoint.reason in {"cancelled", "timeout", "provider_failure", "turn_limit"}
+                    and continuation_source_job_id
+                    and challenge["status"] == "flag_found"
+                    and isinstance(challenge["flag"], str)
+                ):
+                    flagged_source = db.execute(
+                        """SELECT flag,flag_rejected_at,challenge_input_sha256
+                           FROM solver_jobs WHERE id=? AND owner_user_id=?
+                             AND workspace_id=? AND challenge_id=?
+                             AND released_ingested=1 AND job_mode='solve'""",
+                        (continuation_source_job_id, owner_user_id, workspace_id, challenge_id),
+                    ).fetchone()
+                    if (
+                        flagged_source
+                        and flagged_source["flag_rejected_at"] is None
+                        and flagged_source["flag"] == challenge["flag"]
+                        and flagged_source["challenge_input_sha256"] == challenge_input_sha256
+                        and 0 < len(challenge["flag"]) <= 4000
+                        and not _CONTROL.search(challenge["flag"])
+                    ):
+                        verified_flag = challenge["flag"]
                 if job_mode == "solve" and retry_checkpoint_json:
                     saved = db.execute(
                         """SELECT * FROM solver_continuations
@@ -1366,7 +1392,7 @@ class SolverExchangeCoordinator:
                         "flag": verified_flag,
                         "private_notes": source_private_notes,
                         "solver_artifact_json": source_solver_artifact_json,
-                        "flag_hooked": 1 if job_mode == "writeup_refine" else 0,
+                        "flag_hooked": 1 if verified_flag is not None else 0,
                         "created_at": timestamp,
                         "updated_at": timestamp,
                     },
@@ -2721,12 +2747,14 @@ class SolverExchangeCoordinator:
             release_event.get("flag") if release_event is not None else job.get("flag")
         )
         reason = None
-        if not flag:
-            if status == "needs_input":
+        if status != "completed":
+            if status == "needs_input" and not flag:
                 code = error.get("code") if isinstance(error, Mapping) else None
                 reason = "ultra_escalation" if code == "ultra_escalation_requested" else "needs_remote"
             elif status == "cancelled":
                 reason = "cancelled"
+            elif status == "flag_found" and flag:
+                reason = "provider_failure"
             elif status in {"failed", "refused"}:
                 code = error.get("code") if isinstance(error, Mapping) else None
                 resumable_refusals = {
@@ -2740,7 +2768,7 @@ class SolverExchangeCoordinator:
                     "timeout" if code == "timeout"
                     else "turn_limit" if code == "flag_not_submitted"
                     else "provider_failure" if status == "failed"
-                    else "provider_failure" if code in resumable_refusals
+                    else "provider_failure" if flag or code in resumable_refusals
                     else None
                 )
         if reason is not None:
@@ -3092,7 +3120,18 @@ class SolverExchangeCoordinator:
                         "UPDATE solver_jobs SET continuation_mode='workspace',continuation_confirmed=0,updated_at=? WHERE id=?",
                         (self.clock(), job["id"]),
                     )
-            continuation_bytes = continuation[2] + _MAX_CONTINUATION_META_BYTES if continuation else 0
+            if continuation:
+                # Workspace mode never needs the previous provider's session.
+                # Allow a small compression/header margin when repacking only
+                # the workdir, while preserving the hard archive size limit.
+                continuation_archive_budget = (
+                    min(_MAX_CONTINUATION_BYTES, continuation[2] + 64 * 1024)
+                    if continuation[3] == "workspace" else continuation[2]
+                )
+                continuation_bytes = continuation_archive_budget + _MAX_CONTINUATION_META_BYTES
+            else:
+                continuation_archive_budget = 0
+                continuation_bytes = 0
             total = _checked_total(
                 attachment_bytes,
                 auth_size,
@@ -3151,17 +3190,34 @@ class SolverExchangeCoordinator:
                 transfer = staging / "continuation-input"
                 try:
                     transfer.mkdir(mode=0o700)
-                    copied_digest = _copy_regular_file(
-                        source_dir / "snapshot.tar.gz", transfer / "snapshot.tar.gz",
-                        expected_size=archive_size, cancelled=lambda: self._is_cancelled(job["id"]),
-                        maximum_size=_MAX_CONTINUATION_BYTES, space_reserved=True,
-                        return_digest=True, source_root=source_dir,
-                    )
-                    if not secrets.compare_digest(copied_digest, metadata["archive_sha256"]):
-                        raise ExchangeError("invalid_continuation_snapshot", "The saved solver session changed during staging.", category="safety")
+                    if restore_mode == "workspace":
+                        copied_digest, copied_size = stage_workspace_only(
+                            source_dir / "snapshot.tar.gz",
+                            transfer / "snapshot.tar.gz",
+                            expected_size=archive_size,
+                            expected_sha256=metadata["archive_sha256"],
+                            maximum_size=continuation_archive_budget,
+                            provider=metadata["provider"],
+                            cancelled=lambda: self._is_cancelled(job["id"]),
+                        )
+                        metadata = {
+                            **metadata,
+                            "archive_sha256": copied_digest,
+                            "archive_size": copied_size,
+                            "session_id": "",
+                        }
+                    else:
+                        copied_digest = _copy_regular_file(
+                            source_dir / "snapshot.tar.gz", transfer / "snapshot.tar.gz",
+                            expected_size=archive_size, cancelled=lambda: self._is_cancelled(job["id"]),
+                            maximum_size=_MAX_CONTINUATION_BYTES, space_reserved=True,
+                            return_digest=True, source_root=source_dir,
+                        )
+                        if not secrets.compare_digest(copied_digest, metadata["archive_sha256"]):
+                            raise ExchangeError("invalid_continuation_snapshot", "The saved solver session changed during staging.", category="safety")
                     _write_json_file(transfer / "meta.json", metadata)
                     _write_json_file(transfer / "mode.json", {"version": 1, "mode": restore_mode})
-                except (OSError, ExchangeError, StorageBudgetError):
+                except (OSError, ExchangeError, StorageBudgetError, ContinuationInvalid):
                     _safe_remove_tree(transfer, staging)
                     continuation = None
                     self._downgrade_continuation(job)
@@ -3221,6 +3277,14 @@ class SolverExchangeCoordinator:
                     "retry_checkpoint": retry_checkpoint.payload() if retry_checkpoint else None,
                     "challenge_input_sha256": job["challenge_input_sha256"],
                 }
+            if not is_refinement and job.get("flag") is not None:
+                if record.get("flag") != job["flag"] or not job.get("retry_checkpoint_json"):
+                    raise ExchangeError(
+                        "resume_flag_changed",
+                        "The previously found Flag changed before write-up resumed.",
+                        category="safety",
+                    )
+                manifest["resume_flag"] = job["flag"]
             if is_refinement:
                 manifest["refinement_context"] = {
                     "instruction": job["writeup_instruction"],
@@ -5812,7 +5876,7 @@ def _continuation_bundle(directory: Path, *, provider: str | None = None) -> tup
         ):
             raise ValueError("continuation metadata values are invalid")
         archive = directory / "snapshot.tar.gz"
-        descriptor = os.open(archive, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(archive, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
         try:
             details = os.fstat(descriptor)
             if (
@@ -6084,7 +6148,11 @@ def _copy_regular_file(
                     category="storage",
                     retryable=True,
                 )
-        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
         while True:
             if cancelled():
                 raise _StageCancelled

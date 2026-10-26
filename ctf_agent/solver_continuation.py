@@ -16,6 +16,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Callable
 
 
 SNAPSHOT_LIMIT = 512 * 1024 * 1024
@@ -114,7 +115,9 @@ def read_input(active: Path, provider: str) -> ContinuationInput | None:
 
 def _private_path(relative: PurePosixPath) -> bool:
     return any(
-        part in _PRIVATE_NAMES or part.startswith(".env.") or part in _SKIP_DIRS
+        part.casefold() in _PRIVATE_NAMES
+        or part.casefold().startswith(".env.")
+        or part.casefold() in _SKIP_DIRS
         for part in relative.parts
     )
 
@@ -315,6 +318,147 @@ def _archive_target(job_root: Path, name: str, mode: str, provider: str) -> Path
     if pure.parts[1] == "sessions" and len(pure.parts) >= 3:
         return job_root / "home" / Path(*pure.parts[1:])
     raise ContinuationInvalid("unexpected Codex history path")
+
+
+class _BoundedArchiveWriter:
+    """Keep a repacked workspace snapshot within the reserved stage budget."""
+
+    def __init__(self, stream, maximum: int):
+        self.stream = stream
+        self.maximum = maximum
+        self.count = 0
+        self.digest = hashlib.sha256()
+
+    def write(self, data: bytes) -> int:
+        if self.count + len(data) > self.maximum:
+            raise ContinuationInvalid("workspace handoff exceeds reserved size")
+        written = self.stream.write(data)
+        if written != len(data):
+            raise ContinuationInvalid("short workspace handoff write")
+        self.count += written
+        self.digest.update(data)
+        return written
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    def tell(self) -> int:
+        return self.count
+
+
+def stage_workspace_only(
+    source: Path,
+    destination: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    maximum_size: int,
+    provider: str,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> tuple[str, int]:
+    """Transfer work files without exposing the old provider's transcript.
+
+    A changed account, model, or provider cannot resume the old CLI session.
+    Its worker receives only the changed workdir, never ``provider/`` history.
+    The original private archive remains untouched for a compatible retry.
+    """
+
+    if (
+        provider not in {"codex", "claude"}
+        or type(expected_size) is not int
+        or not 0 < expected_size <= SNAPSHOT_LIMIT
+        or type(maximum_size) is not int
+        or not 0 < maximum_size <= SNAPSHOT_LIMIT
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or destination.exists()
+    ):
+        raise ContinuationInvalid("invalid workspace handoff")
+    try:
+        info = source.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size != expected_size
+        ):
+            raise ContinuationInvalid("invalid source handoff")
+        source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        with os.fdopen(source_fd, "rb") as source_stream:
+            opened = os.fstat(source_stream.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size != expected_size
+            ):
+                raise ContinuationInvalid("source handoff changed")
+            digest = hashlib.sha256()
+            while chunk := source_stream.read(1024 * 1024):
+                if cancelled():
+                    raise ContinuationInvalid("workspace handoff cancelled")
+                digest.update(chunk)
+            if digest.hexdigest() != expected_sha256:
+                raise ContinuationInvalid("source handoff digest changed")
+            source_stream.seek(0)
+
+            target_fd = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+            with os.fdopen(target_fd, "wb") as target_stream:
+                writer = _BoundedArchiveWriter(target_stream, maximum_size)
+                count = 0
+                total = 0
+                source_count = 0
+                source_total = 0
+                seen: set[str] = set()
+                with tarfile.open(fileobj=source_stream, mode="r|gz") as incoming:
+                    with tarfile.open(fileobj=writer, mode="w|gz", compresslevel=1) as outgoing:
+                        for entry in incoming:
+                            if cancelled():
+                                raise ContinuationInvalid("workspace handoff cancelled")
+                            if not entry.isfile() or entry.size < 0:
+                                raise ContinuationInvalid("unsafe source handoff entry")
+                            source_count += 1
+                            source_total += entry.size
+                            if source_count > SNAPSHOT_FILE_LIMIT or source_total > SNAPSHOT_LIMIT:
+                                raise ContinuationInvalid("source handoff exceeds limits")
+                            target = _archive_target(
+                                Path("ctf-job-validation"), entry.name, "workspace", provider
+                            )
+                            if target is None:
+                                continue
+                            if entry.name in seen:
+                                raise ContinuationInvalid("duplicate workspace handoff entry")
+                            seen.add(entry.name)
+                            count += 1
+                            total += entry.size
+                            if count > SNAPSHOT_FILE_LIMIT or total > SNAPSHOT_LIMIT:
+                                raise ContinuationInvalid("workspace handoff exceeds limits")
+                            content = incoming.extractfile(entry)
+                            if content is None:
+                                raise ContinuationInvalid("missing workspace handoff entry")
+                            clean = tarfile.TarInfo(entry.name)
+                            clean.size = entry.size
+                            clean.mode = 0o600
+                            with content:
+                                outgoing.addfile(clean, content)
+                if not count or not writer.count:
+                    raise ContinuationInvalid("empty workspace handoff")
+                writer.flush()
+                os.fsync(target_stream.fileno())
+            final = os.fstat(source_stream.fileno())
+            if (
+                final.st_size != opened.st_size
+                or final.st_mtime_ns != opened.st_mtime_ns
+                or final.st_ctime_ns != opened.st_ctime_ns
+            ):
+                raise ContinuationInvalid("source handoff changed")
+            return writer.digest.hexdigest(), writer.count
+    except (OSError, ValueError, tarfile.TarError, EOFError) as exc:
+        destination.unlink(missing_ok=True)
+        if isinstance(exc, ContinuationInvalid):
+            raise
+        raise ContinuationInvalid("invalid workspace handoff") from exc
 
 
 def restore_snapshot(active: Path, job_root: Path, staged: ContinuationInput) -> bool:

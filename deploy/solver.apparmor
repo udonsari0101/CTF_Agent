@@ -78,6 +78,9 @@ profile "ctf-agent-solver" flags=(attach_disconnected,mediate_deleted) {
   ptrace (readby,tracedby) peer="ctf-agent-solver//&ctf-agent-app-server//&ctf-agent-command",
   ptrace (readby,tracedby) peer="ctf-agent-app-server//&ctf-agent-command//&ctf-agent-solver",
   ptrace (readby,tracedby) peer="ctf-agent-command//&ctf-agent-app-server//&ctf-agent-solver",
+  # The credential-holding provider may inspect its restricted child while
+  # collecting tool exit status. The reverse read remains denied.
+  ptrace (readby) peer="ctf-agent-app-server//&ctf-agent-solver",
 
   deny @{PROC}/* w,
   deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/][^0-9y/][^0-9s/],[^1-9/][^0-9/][^0-9/][^0-9/]*}/** w,
@@ -190,6 +193,7 @@ profile "ctf-agent-app-server" flags=(attach_disconnected,mediate_deleted) {
   ptrace (readby,tracedby) peer="ctf-agent-solver//&ctf-agent-app-server//&ctf-agent-command",
   ptrace (readby,tracedby) peer="ctf-agent-app-server//&ctf-agent-command//&ctf-agent-solver",
   ptrace (readby,tracedby) peer="ctf-agent-command//&ctf-agent-app-server//&ctf-agent-solver",
+  ptrace (readby) peer="ctf-agent-app-server//&ctf-agent-solver",
 
   deny mount,
   deny umount,
@@ -285,6 +289,7 @@ profile "ctf-agent-command" flags=(attach_disconnected,mediate_deleted) {
   ptrace (readby,tracedby) peer="ctf-agent-solver//&ctf-agent-app-server//&ctf-agent-command",
   ptrace (readby,tracedby) peer="ctf-agent-app-server//&ctf-agent-command//&ctf-agent-solver",
   ptrace (readby,tracedby) peer="ctf-agent-command//&ctf-agent-app-server//&ctf-agent-solver",
+  ptrace (readby) peer="ctf-agent-app-server//&ctf-agent-solver",
   deny ptrace (trace,read) peer="ctf-agent-solver",
   deny ptrace (trace,read) peer="ctf-agent-app-server",
   deny ptrace (trace,read) peer="ctf-agent-solver//&ctf-agent-app-server",

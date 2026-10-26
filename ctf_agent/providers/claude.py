@@ -99,8 +99,12 @@ def normalize_claude_usage(payload: object) -> dict:
                 window = None
             if window:
                 windows.append(window)
-    return {"status": "available" if windows else "unavailable", "source": "claude_oauth_usage",
-            "buckets": [{"id": "claude", "name": "Claude Code", "windows": windows}] if windows else [],
+    exhausted = any(window["used_percent"] >= 100 for window in windows)
+    return {"status": "quota_exceeded" if exhausted else "available" if windows else "unavailable",
+            "source": "claude_oauth_usage", "limited": exhausted,
+            "buckets": [{"id": "claude", "name": "Claude Code", "windows": windows,
+                         "limited": exhausted,
+                         "reached_type": "rate_limit_reached" if exhausted else None}] if windows else [],
             "checked_at": time.time()}
 
 

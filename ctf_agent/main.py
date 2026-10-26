@@ -571,6 +571,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         result = {
             "account_label": row["account_label"],
             "status": row["status"],
+            "created_at": row["created_at"],
             "configuration": {
                 "provider": row["provider"],
                 "model": row["model"],
@@ -578,9 +579,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "service_tier": row["service_tier"],
             },
         }
-        if row["status"] == "completed" and isinstance(
-            row["released_at"], (int, float)
-        ):
+        if row["status"] in {"queued", "staging", "awaiting_credential", "validating",
+                             "running", "writing", "cleanup_blocked", "completed"}:
             running_at = None
             flag_at = None
             for event in db.execute(
@@ -601,6 +601,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
                 if isinstance(payload, dict) and payload.get("status") == "running":
                     running_at = event["created_at"]
+            if isinstance(running_at, (int, float)):
+                result["started_at"] = running_at
+        if row["status"] == "completed" and isinstance(
+            row["released_at"], (int, float)
+        ):
             started_at = running_at if running_at is not None else row["created_at"]
             finished_at = flag_at if flag_at is not None else row["released_at"]
             if isinstance(started_at, (int, float)) and isinstance(

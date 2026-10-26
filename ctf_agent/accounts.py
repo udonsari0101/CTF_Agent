@@ -392,7 +392,7 @@ class AccountManager:
                 quota = snapshot.get("quota", {})
                 old_quota = previous.get("quota", {})
                 if (snapshot.get("status") == "authenticated" and previous.get("identity") == snapshot.get("identity")
-                        and quota.get("status") != "available" and old_quota.get("buckets")):
+                        and quota.get("status") not in ("available", "quota_exceeded") and old_quota.get("buckets")):
                     snapshot["quota"] = {**old_quota, "status": quota.get("status"),
                                          "message": quota.get("message"), "error": quota.get("error"), "stale": True}
             except ProviderError as exc:
