@@ -1,0 +1,76 @@
+name: Publish container image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/image.yml
+      - Dockerfile
+      - Dockerfile.toolchain
+      - toolchain.lock
+      - requirements.txt
+      - requirements-ctf.txt
+      - ctf_agent/**
+      - deploy/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ctf-agent-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build, smoke test, and publish immutable images
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          app="ghcr.io/$owner/ctf-agent"
+          toolchain="ghcr.io/$owner/ctf-agent-toolchain"
+          fingerprint="$(sha256sum Dockerfile.toolchain toolchain.lock requirements.txt requirements-ctf.txt deploy/DecompileAll.java deploy/DecompileFn.java | sha256sum | cut -d' ' -f1)"
+          toolchain_tag="$toolchain:toolchain-1-$fingerprint"
+          app_tag="$app:$GITHUB_SHA"
+
+          retry_once() {
+            if "$@"; then return 0; fi
+            echo 'Build failed; retrying once after 20 seconds.' >&2
+            sleep 20
+            "$@"
+          }
+
+          if ! docker manifest inspect "$toolchain_tag" >/dev/null 2>&1; then
+            retry_once docker build --file Dockerfile.toolchain --tag "$toolchain_tag" .
+            docker push "$toolchain_tag"
+          fi
+          docker pull "$toolchain_tag" >/dev/null
+          toolchain_ref="$(docker image inspect --format '{{index .RepoDigests 0}}' "$toolchain_tag")"
+          case "$toolchain_ref" in "$toolchain"@sha256:*) ;; *) echo 'Toolchain digest unavailable' >&2; exit 1 ;; esac
+
+          if docker manifest inspect "$app_tag" >/dev/null 2>&1; then
+            docker pull "$app_tag" >/dev/null
+          else
+            retry_once docker build --file Dockerfile --build-arg "TOOLCHAIN_IMAGE=$toolchain_ref" --build-arg "RELEASE_SHA=$GITHUB_SHA" --tag "$app_tag" .
+          fi
+          revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$app_tag")"
+          test "$revision" = "$GITHUB_SHA"
+          docker run --rm --network none --entrypoint python "$app_tag" - < deploy/image-smoke.py
+          if ! docker manifest inspect "$app_tag" >/dev/null 2>&1; then
+            docker push "$app_tag"
+          fi
+          docker tag "$app_tag" "$app:production"
+          docker push "$app:production"
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$app_tag")"
+          printf 'Published %s\nToolchain %s\n' "$digest" "$toolchain_ref" >> "$GITHUB_STEP_SUMMARY"
