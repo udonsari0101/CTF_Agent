@@ -34,6 +34,57 @@ def _local_path(value: str) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def verify_external_database(environment: dict[str, str]) -> None:
+    """Refuse to start containers against an unmounted or wrong database VHD."""
+
+    home_value = environment.get("CTF_LOCAL_HOME", "")
+    config_path = Path(home_value) / ".local-config.json" if home_value else None
+    config = {}
+    if config_path and config_path.exists():
+        if config_path.is_symlink() or not config_path.is_file():
+            raise RuntimeError("Local installation settings are invalid")
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise RuntimeError("Local installation settings are invalid")
+    mount_value = environment.get("CTF_LOCAL_DB_MOUNT", "")
+    configured_mount = config.get("database_mount", "")
+    if not isinstance(configured_mount, str) or (configured_mount and configured_mount != mount_value):
+        raise RuntimeError("The configured external database VHD is unavailable")
+    if mount_value and home_value and (Path(home_value) / ".current-release").is_file() and not config:
+        raise RuntimeError("External database installation settings are missing")
+    if not mount_value:
+        return
+    if not re.fullmatch(r"/mnt/wsl/[A-Za-z0-9_-]+", mount_value):
+        raise RuntimeError("External database mount path is invalid")
+    mount = Path(mount_value)
+    database = environment.get("CTF_LOCAL_FS_DATABASE", environment.get("CTF_LOCAL_DATABASE", ""))
+    if database != str(mount / "Database" / "CTF_Agent"):
+        raise RuntimeError("External database path does not match its mount")
+    marker = mount / ".ctf-agent-db-volume"
+    with Path("/proc/self/mountinfo").open(encoding="utf-8") as stream:
+        filesystems = [
+            line.split(" - ", 1)[1].split()[0]
+            for line in stream if " - " in line
+            if line.split(" - ", 1)[0].split()[4] == mount_value
+        ]
+    updating = environment.get("CTF_UPDATE_IN_PROGRESS") == "true"
+    if (not filesystems or (not updating and "ext4" not in filesystems)
+            or mount.is_symlink() or not mount.is_dir()
+            or marker.is_symlink() or not marker.is_file()
+            or marker.stat().st_size > 64):
+        raise RuntimeError("The external database VHD is unavailable")
+    volume_id = marker.read_text(encoding="ascii").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", volume_id):
+        raise RuntimeError("The external database volume marker is invalid")
+    if config and config.get("database_volume_id") != volume_id:
+        raise RuntimeError("The mounted database VHD does not match this installation")
+    if updating and not (mount / "Database" / "CTF_Agent" / "sqlite" / "ctf_agent.sqlite3").is_file():
+        raise RuntimeError("The existing external database is unavailable")
+    for path in (mount / "Database", mount / "Database" / "CTF_Agent"):
+        if path.is_symlink():
+            raise RuntimeError("External database path contains a symlink")
+
+
 def prepare_readable_storage(environment: dict[str, str]) -> Path:
     """Create the bind-mounted readable root as the invoking WSL user."""
 
@@ -320,6 +371,7 @@ def main() -> int:
     effective_count = requested_count
     arguments = normalize_arguments(sys.argv[1:] or ["up", "-d", "--build"])
     environment = os.environ.copy()
+    verify_external_database(environment)
     prepare_readable_storage(environment)
     actions = {"up", "down", "stop", "rm", "kill", "restart", "start", "ps", "logs", "config", "pull", "build"}
     action = next((item for item in arguments if item in actions), "up")

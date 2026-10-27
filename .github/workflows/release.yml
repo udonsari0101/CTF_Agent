@@ -41,7 +41,7 @@ jobs:
           prefix = f'CTF_Agent-{tag}/'
           with ZipFile(archive) as bundle:
               names = set(bundle.namelist())
-              required = {'Install.cmd', 'Install.ps1', 'Start.cmd', 'Start.ps1',
+              required = {'Install.cmd', 'Install.ps1', 'DatabaseDisk.ps1', 'Start.cmd', 'Start.ps1',
                           'Uninstall.cmd', 'Uninstall.ps1', 'installer/install.sh',
                           'installer/start.sh', 'installer/uninstall.py',
                           'app/Dockerfile.updater', 'app/ctf_agent/release_updates.py',

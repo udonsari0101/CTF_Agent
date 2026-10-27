@@ -43,6 +43,8 @@ The installer asks whether to start CTF Agent when you sign in to Windows. You c
 
 To open your challenge files from Windows, use Explorer at `\\wsl.localhost\<distribution>\<Linux data path>\ctf_agent_data\workspace_files`.
 
+The installer can optionally keep WSL and challenge data on C: while storing only the database in an ext4 VHDX on D: or another fixed local drive. The database remains accessible in Explorer through `\\wsl.localhost`; see the [Windows installation guide](docs/docker-desktop.md). Existing databases are not moved automatically.
+
 ### Install from source
 
 Run this line inside a WSL 2 distribution with Docker Desktop integration enabled:

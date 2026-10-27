@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import uuid
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 REPOSITORY = "udonsari0101/CTF_Agent"
@@ -335,6 +335,55 @@ def _healthy(root: Path, request: dict, *, expected_sha: str | None = None) -> b
     return False
 
 
+def _verified_local_database(home: Path) -> tuple[Path, str]:
+    """Resolve the local database without falling back from a missing VHD."""
+
+    default = home / "Database" / "CTF_Agent"
+    config_file = home / ".local-config.json"
+    if not config_file.exists():
+        if os.environ.get("CTF_LOCAL_DB_MOUNT"):
+            raise RuntimeError("External database settings are missing")
+        return default, ""
+    if config_file.is_symlink() or not config_file.is_file():
+        raise RuntimeError("Local installation settings are invalid")
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("Invalid settings")
+        database_value = config.get("database_path", str(default))
+        mount_value = config.get("database_mount", "")
+        volume_id = config.get("database_volume_id", "")
+        if not all(isinstance(value, str) for value in (database_value, mount_value, volume_id)):
+            raise ValueError("Invalid database settings")
+        database = Path(database_value)
+        if not mount_value:
+            if database != default or volume_id or os.environ.get("CTF_LOCAL_DB_MOUNT"):
+                raise ValueError("Invalid local database settings")
+            return default, ""
+        mount = Path(mount_value)
+        if (not re.fullmatch(r"/mnt/wsl/[A-Za-z0-9_-]+", mount_value)
+                or database != mount / "Database" / "CTF_Agent"
+                or not re.fullmatch(r"[0-9a-f]{32}", volume_id)):
+            raise ValueError("Invalid external database settings")
+        if os.environ.get("CTF_LOCAL_DB_MOUNT", "") != mount_value:
+            raise ValueError("External database mount does not match installation")
+        with Path("/proc/self/mountinfo").open(encoding="utf-8") as stream:
+            mounted = any(
+                line.split(" - ", 1)[0].split()[4] == mount_value
+                for line in stream if " - " in line
+            )
+        marker = mount / ".ctf-agent-db-volume"
+        if (not mounted or mount.is_symlink() or not mount.is_dir()
+                or marker.is_symlink() or not marker.is_file()
+                or marker.stat().st_size > 64
+                or marker.read_text(encoding="ascii").strip() != volume_id
+                or (mount / "Database").is_symlink() or database.is_symlink()):
+            raise ValueError("External database VHD is unavailable or does not match")
+        return database, mount_value
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise RuntimeError("External database VHD is unavailable or invalid") from exc
+
+
 def _compose_mount_environment(home: Path) -> dict[str, str]:
     """Keep Docker's bind sources distinct from paths visible inside the updater."""
     result = subprocess.run(
@@ -363,19 +412,62 @@ def _compose_mount_environment(home: Path) -> dict[str, str]:
             raise ValueError("Unsupported restart policy")
     except (ValueError, KeyError, TypeError) as exc:
         raise RuntimeError("Installed container mounts are invalid") from exc
+    database_fs_path, database_mount = _verified_local_database(home)
+    if database_mount:
+        if not (database_fs_path / "sqlite" / "ctf_agent.sqlite3").is_file():
+            raise RuntimeError("The existing external database is unavailable")
+        if shutil.disk_usage(database_fs_path).free < 1024**3:
+            raise RuntimeError("The external database needs at least 1 GB free before updating")
+        updater = subprocess.run(
+            ["docker", "inspect", "ctf_agent_local_updater"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if updater.returncode:
+            raise RuntimeError("External database updater mount is unavailable")
+        try:
+            updater_container, = json.loads(updater.stdout)
+            updater_mounts = [
+                item["Source"] for item in updater_container["Mounts"]
+                if item.get("Type") == "bind" and item.get("Destination") == database_mount
+            ]
+            if (updater_container.get("Name") != "/ctf_agent_local_updater"
+                    or len(updater_mounts) != 1
+                    or not isinstance(updater_mounts[0], str)
+                    or not updater_mounts[0].startswith("/")
+                    or PurePosixPath(mounts["/database"]) !=
+                    PurePosixPath(updater_mounts[0]) / "Database" / "CTF_Agent"):
+                raise ValueError("External database bind sources differ")
+        except (TypeError, ValueError, KeyError) as exc:
+            raise RuntimeError("External database bind sources could not be verified") from exc
+        # Windows starts the application only after mounting its VHD. Docker
+        # itself must never auto-restart this stack against an empty path.
+        if restart_policy != "no":
+            raise RuntimeError("External database containers must not auto-restart")
+        settings = json.loads((home / ".local-config.json").read_text(encoding="utf-8"))
+        auto_start = settings.get("auto_start")
+        if type(auto_start) is not bool:
+            raise RuntimeError("Local startup setting is invalid")
+    else:
+        auto_start = restart_policy == "unless-stopped"
     return {
         "CTF_LOCAL_DATA": mounts["/data"],
         "CTF_LOCAL_DATABASE": mounts["/database"],
         "CTF_LOCAL_FS_DATA": str(home / "ctf_agent_data"),
-        "CTF_LOCAL_FS_DATABASE": str(home / "Database" / "CTF_Agent"),
+        "CTF_LOCAL_FS_DATABASE": str(database_fs_path),
+        "CTF_LOCAL_DB_MOUNT": database_mount,
         "CTF_LOCAL_AUTH_MODE": auth_mode,
         "CTF_AUTH_MODE": auth_mode,
-        "CTF_LOCAL_AUTOSTART": "true" if restart_policy == "unless-stopped" else "false",
+        "CTF_LOCAL_AUTOSTART": "true" if auto_start else "false",
         "CTF_LOCAL_RESTART_POLICY": restart_policy,
     }
 
 
 def _rollback(home: Path, previous: str, root: Path, request: dict, mount_environment: dict[str, str]) -> bool:
+    if mount_environment.get("CTF_LOCAL_DB_MOUNT"):
+        try:
+            _verified_local_database(home)
+        except RuntimeError:
+            return False
     target = home / "releases" / previous
     revision_file = target / ".release-revision"
     if not revision_file.is_file():
@@ -386,6 +478,7 @@ def _rollback(home: Path, previous: str, root: Path, request: dict, mount_enviro
         "CTF_LOCAL_UID": os.environ["CTF_LOCAL_UID"], "CTF_LOCAL_GID": os.environ["CTF_LOCAL_GID"],
         "CTF_RELEASE_SHA": revision_file.read_text(encoding="ascii").strip(),
         "CTF_RELEASE_VERSION": previous, "CTF_ALLOW_WEB_BOOTSTRAP": "true",
+        "CTF_UPDATE_IN_PROGRESS": "true",
     })
     env.update(mount_environment)
     _status(root, "rolling_back", request_id=request["id"], tag=request["tag"])
@@ -418,6 +511,12 @@ def _apply(home: Path, root: Path, request: dict) -> None:
         raise ValueError("Release is not newer than the installed version")
     if shutil.disk_usage(home).free < 15 * 1024**3:
         raise ValueError("At least 15 GB free space is required for an update")
+    database_fs_path, database_mount = _verified_local_database(home)
+    if database_mount:
+        if not (database_fs_path / "sqlite" / "ctf_agent.sqlite3").is_file():
+            raise ValueError("The existing external database is unavailable")
+        if shutil.disk_usage(database_fs_path).free < 1024**3:
+            raise ValueError("The external database needs at least 1 GB free before updating")
     latest = latest_release()
     if latest["tag"] != tag:
         raise ValueError("Requested release is no longer latest")
@@ -464,6 +563,7 @@ def _apply(home: Path, root: Path, request: dict) -> None:
 def worker_loop() -> None:
     import fcntl
     home = Path(os.environ["CTF_LOCAL_HOME"]).resolve(strict=True)
+    _verified_local_database(home)
     root = control_root(home / "ctf_agent_data")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = root / "worker.lock"

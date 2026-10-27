@@ -3,6 +3,9 @@ $installer = Join-Path $PSScriptRoot 'installer\install.sh'
 $stateFile = Join-Path $env:LOCALAPPDATA 'CTF Agent\install.json'
 $minimumFreeBytes = 15GB
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw 'Release archive is incomplete.' }
+$databaseDiskHelper = Join-Path $PSScriptRoot 'DatabaseDisk.ps1'
+if (-not (Test-Path -LiteralPath $databaseDiskHelper -PathType Leaf)) { throw 'Release archive is incomplete.' }
+. $databaseDiskHelper
 
 function Ask-YesNo([string]$question, [bool]$default = $true) {
     $hint = if ($default) { 'Y/n' } else { 'y/N' }
@@ -50,6 +53,209 @@ function Invoke-WslPython([string]$name, [string]$source, [string[]]$arguments =
         $ErrorActionPreference = $previousPreference
     }
     return [pscustomobject]@{ Output = ($output -join "`n"); ExitCode = $exitCode }
+}
+
+function Get-WslBlockDevices([string]$name) {
+    $probe = @'
+import json,subprocess
+result=subprocess.run(['lsblk','-b','-J','-o','NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT'],
+                      check=True,capture_output=True,text=True)
+print(json.dumps(json.loads(result.stdout).get('blockdevices',[])))
+'@
+    $result = Invoke-WslPython $name $probe
+    if ($result.ExitCode -ne 0) { throw 'Could not inspect WSL block devices; no disk was formatted.' }
+    return @($result.Output | ConvertFrom-Json)
+}
+
+function Assert-FreshDatabaseHome([string]$name, [string]$home) {
+    $probe = @'
+import json,os,sys
+home=sys.argv[1]
+db=os.path.join(home,'Database','CTF_Agent')
+existing=os.path.lexists(os.path.join(home,'.current-release'))
+occupied=os.path.lexists(db) and (os.path.islink(db) or
+         not os.path.isdir(db) or bool(os.listdir(db)))
+print(json.dumps({'installed':existing,'database_occupied':occupied}))
+'@
+    $result = Invoke-WslPython $name $probe @($home)
+    if ($result.ExitCode -ne 0) { throw 'Could not check existing database data.' }
+    $check = $result.Output | ConvertFrom-Json
+    if ($check.installed -or $check.database_occupied) {
+        throw 'An existing installation or database was found. Database relocation is not automatic; keep the original location.'
+    }
+}
+
+function Assert-WslVhdSupport {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $helpText = (@(& wsl.exe --help 2>$null) -replace "`0", '') -join "`n"
+    } finally { $ErrorActionPreference = $previousPreference }
+    if ($helpText -notmatch '--mount' -or $helpText -notmatch '--vhd' -or
+        $helpText -notmatch '--name') {
+        throw 'This WSL version cannot mount a named VHDX. Update WSL and rerun Install.cmd.'
+    }
+}
+
+function Assert-DatabaseTaskSupport {
+    foreach ($name in @('Get-ScheduledTask','Get-ScheduledTaskInfo','Start-ScheduledTask',
+            'New-ScheduledTaskAction','New-ScheduledTaskTrigger',
+            'New-ScheduledTaskPrincipal','New-ScheduledTaskSettingsSet','Register-ScheduledTask')) {
+        if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+            throw 'Automatic database mounting needs Windows Task Scheduler cmdlets.'
+        }
+    }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    New-ScheduledTaskTrigger -AtLogOn -User $sid | Out-Null
+    New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Highest | Out-Null
+}
+
+function Select-DatabaseVhd([string]$savedPath) {
+    if ($savedPath) {
+        Write-Host "Database VHDX: $savedPath"
+        return (Assert-DatabaseVhdPath $savedPath)
+    }
+    $default = if (Test-Path -LiteralPath 'D:\' -PathType Container) {
+        'D:\CTF_Agent\Database\ctf-agent-db.vhdx'
+    } else { '' }
+    if ($default) { Write-Host "Recommended database disk: $default" }
+    $answer = (Read-Host 'New database VHDX path on a local drive [Enter for recommendation]').Trim()
+    if (-not $answer) { $answer = $default }
+    if (-not $answer) { throw 'Enter a local drive path for the database VHDX.' }
+    $full = Assert-DatabaseVhdPath $answer
+    if ((Test-Path -LiteralPath $full) -and
+        -not (Ask-YesNo 'Reuse this existing database VHDX after verifying its CTF Agent marker?' $false)) {
+        throw 'Existing VHDX was left untouched. Choose a new file to create a new database.'
+    }
+    if ((Get-HostVolumeFree $full) -lt $minimumFreeBytes) {
+        throw 'The database drive needs at least 15 GB free before installation.'
+    }
+    return $full
+}
+
+function Read-DatabaseVolumeMarker([string]$name) {
+    $probe = @'
+import json,os,pathlib
+p=pathlib.Path('/mnt/wsl/ctf-agent-db/.ctf-agent-db-volume')
+if not p.is_file() or p.is_symlink() or p.stat().st_size > 128:
+    print(json.dumps({'uuid':''}))
+else:
+    print(json.dumps({'uuid':p.read_text(encoding='ascii').strip()}))
+'@
+    $result = Invoke-WslPython $name $probe
+    if ($result.ExitCode -ne 0) { throw 'Could not verify the database volume marker.' }
+    return [string](($result.Output | ConvertFrom-Json).uuid)
+}
+
+function Write-DatabaseVolumeMarker([string]$name, [string]$uuid) {
+    $probe = @'
+import os,pathlib,sys
+p=pathlib.Path('/mnt/wsl/ctf-agent-db/.ctf-agent-db-volume')
+fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+with os.fdopen(fd,'w',encoding='ascii') as stream:
+    stream.write(sys.argv[1].replace('-','').lower()+'\n')
+    stream.flush()
+    os.fsync(stream.fileno())
+'@
+    $result = Invoke-WslPython $name $probe @($uuid)
+    if ($result.ExitCode -ne 0) { throw 'Could not write the new database volume marker.' }
+}
+
+function Initialize-DatabaseVhd([string]$name, [string]$vhd, [string]$savedUuid) {
+    Assert-WslVhdSupport
+    if ($savedUuid) {
+        if (-not (Test-DatabaseMount $name $savedUuid)) {
+            Assert-DatabaseVhdHeader $vhd | Out-Null
+            Invoke-ElevatedDatabaseAction 'mount' $vhd
+            if (-not (Test-DatabaseMount $name $savedUuid)) {
+                throw 'The existing database VHDX did not mount with its recorded filesystem identity.'
+            }
+        }
+        if ((Read-DatabaseVolumeMarker $name) -ne $savedUuid.Replace('-', '').ToLowerInvariant()) {
+            throw 'The mounted database VHDX does not have its recorded CTF Agent marker.'
+        }
+        return $savedUuid.ToLowerInvariant()
+    }
+    $mountProbe = @'
+import json,os,pathlib
+p=pathlib.Path('/mnt/wsl/ctf-agent-db')
+print(json.dumps({'unsafe':p.is_symlink() or (p.exists() and
+                  (not p.is_dir() or bool(os.listdir(p))))}))
+'@
+    $mountResult = Invoke-WslPython $name $mountProbe
+    if ($mountResult.ExitCode -ne 0 -or ($mountResult.Output | ConvertFrom-Json).unsafe) {
+        throw 'The database mount directory already contains data; it was not overmounted.'
+    }
+    if (Test-Path -LiteralPath $vhd) {
+        if (Get-DatabaseMountInfo $name) {
+            throw 'A database filesystem is already mounted. Unmount it before adopting an existing VHDX without installation settings.'
+        }
+        Assert-DatabaseVhdHeader $vhd | Out-Null
+        Invoke-ElevatedDatabaseAction 'mount' $vhd
+        $existing = Get-DatabaseMountInfo $name
+        if (-not $existing -or (Read-DatabaseVolumeMarker $name) -ne $existing.Uuid.Replace('-', '')) {
+            throw 'The existing VHDX is not a verified CTF Agent database volume; it was not formatted or changed.'
+        }
+        return $existing.Uuid
+    }
+    if (Get-DatabaseMountInfo $name) {
+        throw 'The CTF Agent database mount point is already in use.'
+    }
+    $before = @(Get-WslBlockDevices $name)
+    Invoke-ElevatedDatabaseAction 'create-bare' $vhd
+    $newDisk = @()
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        $after = @(Get-WslBlockDevices $name)
+        $names = @($before | ForEach-Object { [string]$_.name })
+        $newDisk = @($after | Where-Object { [string]$_.name -notin $names })
+        if ($newDisk.Count) { break }
+        Start-Sleep -Seconds 1
+    }
+    if ($newDisk.Count -ne 1) {
+        throw 'New VHDX block-device identity is ambiguous; no disk was formatted.'
+    }
+    foreach ($old in $before) {
+        $same = @($after | Where-Object { $_.name -eq $old.name -and
+            $_.size -eq $old.size -and $_.type -eq $old.type })
+        if ($same.Count -ne 1) {
+            throw 'An existing WSL block device changed during attach; no disk was formatted.'
+        }
+    }
+    $disk = $newDisk[0]
+    $device = '/dev/' + [string]$disk.name
+    if ($disk.type -ne 'disk' -or $device -notmatch '^/dev/sd[a-z]+$' -or
+        [math]::Abs(([int64]$disk.size) - [int64]64GB) -gt 1MB -or
+        $disk.fstype -or $disk.mountpoint -or $disk.children) {
+        throw 'The new block device is not an empty 64 GB VHDX; no disk was formatted.'
+    }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $signatures = @(& wsl.exe --distribution $name --user root --exec wipefs -n $device 2>$null)
+        $signatureExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    if ($signatureExit -ne 0 -or $signatures.Count) {
+        throw 'The new VHDX has an unexpected filesystem signature; no disk was formatted.'
+    }
+    & wsl.exe --distribution $name --user root --exec mkfs.ext4 -F -q -L ctf-agent-db $device
+    if ($LASTEXITCODE -ne 0) { throw 'Could not format the verified new VHDX.' }
+    & wsl.exe --distribution $name --user root --exec mkdir -p (Get-DatabaseMountPath)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create the WSL database mount point.' }
+    & wsl.exe --distribution $name --user root --exec mount -t ext4 $device (Get-DatabaseMountPath)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not mount the new database filesystem.' }
+    $info = Get-DatabaseMountInfo $name
+    if (-not $info -or $info.Source -ne $device) {
+        throw 'The formatted VHDX did not appear at the dedicated database mount point.'
+    }
+    $uid = @(& wsl.exe --distribution $name --exec id -u)[0].Trim()
+    $gid = @(& wsl.exe --distribution $name --exec id -g)[0].Trim()
+    if ($uid -notmatch '^\d+$' -or $gid -notmatch '^\d+$') { throw 'Could not determine the WSL user.' }
+    & wsl.exe --distribution $name --user root --exec chown "$($uid):$gid" (Get-DatabaseMountPath)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not set database mount ownership.' }
+    & wsl.exe --distribution $name --user root --exec chmod 0750 (Get-DatabaseMountPath)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not set database mount permissions.' }
+    Write-DatabaseVolumeMarker $name $info.Uuid
+    return $info.Uuid
 }
 
 function Get-WslInfo([string]$name, [hashtable]$versions) {
@@ -159,10 +365,28 @@ function Select-WslDistribution([object[]]$infos, [string]$savedName) {
 
 function Get-HostVolumeFree([string]$path) {
     $expanded = [Environment]::ExpandEnvironmentVariables($path)
+    if ($expanded -match '^\\\\\?\\[A-Za-z]:\\') { $expanded = $expanded.Substring(4) }
     if ($expanded -match '^[A-Za-z]:$') { $expanded += '\' }
     $root = [IO.Path]::GetPathRoot($expanded)
     if (-not $root -or $root.StartsWith('\\')) { throw "Cannot check the Windows volume for $path" }
     return [int64](Get-PSDrive -Name $root.Substring(0, 1) -ErrorAction Stop).Free
+}
+
+function Get-WslBackingDrive([string]$distro) {
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    $registered = @(Get-ChildItem -Path $key -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ItemProperty -Path $_.PSPath } |
+        Where-Object { $_.DistributionName -eq $distro } | Select-Object -First 1)
+    if (-not $registered.Count -or -not $registered[0].BasePath) {
+        throw 'Could not locate the selected WSL disk on Windows.'
+    }
+    $backing = [Environment]::ExpandEnvironmentVariables([string]$registered[0].BasePath)
+    if ($backing -match '^\\\\\?\\[A-Za-z]:\\') { $backing = $backing.Substring(4) }
+    $root = [IO.Path]::GetPathRoot($backing)
+    if (-not $root -or $root -notmatch '^[A-Za-z]:\\$') {
+        throw 'Could not identify the selected WSL backing drive.'
+    }
+    return $root
 }
 
 function Assert-StorageCapacity([string]$distro, [string]$linuxHome) {
@@ -276,26 +500,99 @@ if ($saved -and ($saved.distro -ne $distro -or $saved.home -ne $linuxHome) -and
     -not (Ask-YesNo 'This changes the data location. Existing data will not move automatically. Continue?' $false)) {
     throw 'Installation cancelled; existing data was not changed.'
 }
+if ($saved.db_vhd -and ($saved.distro -ne $distro -or $saved.home -ne $linuxHome)) {
+    throw 'A separate database VHDX is bound to the original WSL distribution and installation path.'
+}
 Assert-StorageCapacity $distro $linuxHome
-$autoStartDefault = if ($saved -and $null -ne $saved.autoStart) { [bool]$saved.autoStart } else { $true }
+$separateDatabase = Ask-YesNo 'Store only the database on a separate ext4 VHDX on a Windows drive?' ([bool]$saved.db_vhd)
+if (-not $separateDatabase -and $saved.db_vhd) {
+    throw 'The existing separate database cannot be moved automatically. Keep its VHDX setting.'
+}
+$dbVhd = ''
+$databaseMount = ''
+$databasePath = ''
+$dbUuid = ''
+$validatedPreexistingTask = $false
+if ($separateDatabase) {
+    if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        throw 'Windows Task Scheduler inspection is required for a separate database disk.'
+    }
+    if (-not $saved.db_task_managed -and
+        (Get-ScheduledTask -TaskName (Get-DatabaseTaskName) -ErrorAction SilentlyContinue)) {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        if (-not $saved.db_vhd -or -not (Test-DatabaseMountTask ([string]$saved.db_vhd) $sid)) {
+            throw 'A scheduled task already uses the CTF Agent database name; it was not changed.'
+        }
+        $validatedPreexistingTask = $true
+    }
+    if ($linuxHome -match '^/mnt/wsl(/|$)') {
+        throw 'For a separate database disk, keep the application data inside the selected WSL distribution.'
+    }
+    if (-not $saved.db_vhd) { Assert-FreshDatabaseHome $distro $linuxHome }
+    $dbVhd = Select-DatabaseVhd ([string]$saved.db_vhd)
+    if ((Get-HostVolumeFree $dbVhd) -lt $minimumFreeBytes) {
+        throw 'The database drive needs at least 15 GB free before installation.'
+    }
+    if ([IO.Path]::GetPathRoot($dbVhd) -ieq (Get-WslBackingDrive $distro)) {
+        throw 'Choose a different Windows drive letter from the selected WSL distribution for the database VHDX.'
+    }
+    $databaseMount = Get-DatabaseMountPath
+    $databasePath = "$databaseMount/Database/CTF_Agent"
+    if ($saved.db_vhd) {
+        if ([string]$saved.db_uuid -notmatch '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') {
+            throw 'The existing database disk identity is missing from installation settings.'
+        }
+        $dbUuid = [string]$saved.db_uuid
+    }
+}
+$autoStartDefault = if ($saved -and $null -ne $saved.autoStart) { [bool]$saved.autoStart }
+    elseif ($separateDatabase) { $false } else { $true }
 $autoStart = Ask-YesNo 'Start CTF Agent automatically when you sign in to Windows?' $autoStartDefault
+if ($separateDatabase -and $autoStart) { Assert-DatabaseTaskSupport }
 $loginDefault = -not ($saved -and $saved.authMode -eq 'nologin')
 $requireLogin = Ask-YesNo 'Require account login on this computer?' $loginDefault
 $authMode = if ($requireLogin) { 'password' } else { 'nologin' }
 Ensure-DockerDesktop $distro
+if ($separateDatabase) {
+    $dbUuid = Initialize-DatabaseVhd $distro $dbVhd $dbUuid
+    Write-Host "Database filesystem: $dbVhd -> $databasePath"
+    # A verified filesystem can be reused after an interrupted installation.
+    # Save its identity before release download or Docker startup can fail.
+    $pendingDir = Split-Path -Parent $stateFile
+    New-Item -ItemType Directory -Path $pendingDir -Force | Out-Null
+    $dbTaskManaged = ([bool]$saved.db_task_managed -or $validatedPreexistingTask)
+    @{distro=$distro;home=$linuxHome;autoStart=$dbTaskManaged;authMode=$authMode;
+        db_vhd=$dbVhd;database_mount=$databaseMount;database_path=$databasePath;
+        db_uuid=$dbUuid;db_task_managed=$dbTaskManaged;pending_install=$true} |
+        ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($autoStart) {
+        Invoke-ElevatedDatabaseAction 'register-task' $dbVhd $sid
+        $dbTaskManaged = $true
+    } elseif ($dbTaskManaged) {
+        Invoke-ElevatedDatabaseAction 'unregister-task' $dbVhd $sid
+        $dbTaskManaged = $false
+    }
+    @{distro=$distro;home=$linuxHome;autoStart=$autoStart;authMode=$authMode;
+        db_vhd=$dbVhd;database_mount=$databaseMount;database_path=$databasePath;
+        db_uuid=$dbUuid;db_task_managed=$dbTaskManaged;pending_install=$true} |
+        ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
+}
 $linuxPath = @(& wsl.exe --distribution $distro --exec wslpath -a -u $installer 2>$null)
 if ($LASTEXITCODE -ne 0 -or -not $linuxPath.Count -or -not $linuxPath[0].StartsWith('/')) {
     throw 'The selected WSL distribution cannot access the extracted release folder.'
 }
-& wsl.exe --distribution $distro --exec env "CTF_LOCAL_HOME=$linuxHome" "CTF_LOCAL_AUTOSTART=$($autoStart.ToString().ToLowerInvariant())" "CTF_LOCAL_AUTH_MODE=$authMode" bash $linuxPath[0]
+& wsl.exe --distribution $distro --exec env "CTF_LOCAL_HOME=$linuxHome" "CTF_LOCAL_AUTOSTART=$($autoStart.ToString().ToLowerInvariant())" "CTF_LOCAL_AUTH_MODE=$authMode" "CTF_LOCAL_DATABASE=$databasePath" "CTF_LOCAL_FS_DATABASE=$databasePath" "CTF_LOCAL_DB_MOUNT=$databaseMount" bash $linuxPath[0]
 if ($LASTEXITCODE -ne 0) { throw "Local installation failed (exit code $LASTEXITCODE)." }
 $stateDir = Split-Path -Parent $stateFile
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
-foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1')) {
+foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1', 'DatabaseDisk.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $stateDir $name) -Force
 }
-@{distro=$distro;home=$linuxHome;autoStart=$autoStart;authMode=$authMode} | ConvertTo-Json |
-    Set-Content -LiteralPath $stateFile -Encoding UTF8
+$state = @{distro=$distro;home=$linuxHome;autoStart=$autoStart;
+    authMode=$authMode;db_vhd=$dbVhd;database_mount=$databaseMount;database_path=$databasePath;
+    db_uuid=$dbUuid;db_task_managed=if ($dbVhd) { $dbTaskManaged } else { $false };pending_install=$false}
+$state | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'CTF Agent Local.lnk'
 $targetPath = Join-Path $stateDir 'Start.cmd'
 $shell = New-Object -ComObject WScript.Shell
@@ -316,3 +613,7 @@ Write-Host "Uninstall: $(Join-Path $stateDir 'Uninstall.cmd')"
 if ($requireLogin) { Write-Host 'Open http://127.0.0.1:5050 to create the first administrator account.' }
 else { Write-Host 'Open http://127.0.0.1:5050.' }
 Write-Host "Files in Explorer: \\wsl.localhost\$distro\$($linuxHome.TrimStart('/') -replace '/', '\')\ctf_agent_data\workspace_files"
+if ($dbVhd) {
+    Write-Host "Database VHDX on Windows: $dbVhd"
+    Write-Host "Database in Explorer: \\wsl.localhost\$distro\mnt\wsl\ctf-agent-db\Database\CTF_Agent"
+}

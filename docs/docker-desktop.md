@@ -8,9 +8,17 @@ During installation choose whether CTF Agent starts when you sign in to Windows 
 
 The installer checks WSL 2, recommends an installed Linux distribution or offers to install Ubuntu, checks Docker Desktop and its WSL integration, and verifies at least 15 GB of free space in WSL and on the backing Windows volume. Choose an absolute path inside the WSL Linux filesystem for your data. The suggested path is `~/.local/share/ctf-agent` in the selected distribution. The installer stores your choice for upgrades.
 
+### Keep WSL on C: and place only the database on D:
+
+After choosing the WSL data folder, select the separate database VHDX option and accept `D:\CTF_Agent\Database\ctf-agent-db.vhdx`, or enter another path on a fixed local drive. The existing WSL distribution, challenge files, and application releases stay at their original location. The installer creates a dynamically expanding ext4 VHDX with a 64 GB virtual limit and requires at least 15 GB free on its Windows drive. Your signed-in Windows account must have administrator rights to attach the disk; approving UAC with a different account is not supported. It formats only a newly created, uniquely verified blank VHDX. An existing VHDX can be reused only when it contains the matching CTF Agent volume marker; it is never reformatted.
+
+The database is visible in Explorer at `\\wsl.localhost\<distribution>\mnt\wsl\ctf-agent-db\Database\CTF_Agent`. The D: folder contains the VHDX file rather than individual SQLite files. Docker starts only after that ext4 filesystem is mounted and verified. In this mode, container restart is disabled so it cannot start before the database mount. If Windows sign-in startup is enabled, the installer registers a narrowly scoped elevated task to mount the VHDX before the startup launcher runs. With startup disabled, launching Start.cmd after a reboot may show a Windows administrator prompt to attach the disk.
+
+This is a fresh-install choice. The installer does not move an existing database from C: to D:. Uninstall.cmd removes the managed mount task and detaches the VHDX after stopping the application, while keeping the VHDX file and the challenge data. If installation is interrupted after the new filesystem is verified, rerunning Install.cmd resumes using its recorded filesystem identity.
+
 Open <http://127.0.0.1:5050> after installation. Create the first administrator account there. That setup page is available only before an administrator exists. Later visits use the login page.
 
-To upgrade, use **Administration → Service updates** in the web interface. Release v0.3.0 has no web update worker, so run the newer release's `Install.cmd` once to enable this feature. It checks the public GitHub release, shows its notes, downloads the installer ZIP, verifies its SHA-256 checksum, and updates the local Docker stack. If the new container does not become healthy, the update worker attempts to restore the previous installed release. You can also extract a newer release and run its `Install.cmd`. Data and the database stay in the selected directory; application releases are stored separately. The release installer resolves the public GHCR image tagged with the ZIP's commit SHA, pulls its immutable digest, verifies the image revision, and starts it without a local application or toolchain build. The separate small update controller is built locally. Docker may retain a shared public image cache after uninstall.
+To upgrade, use **Administration → Service updates** in the web interface. Release v0.3.0 has no web update worker, so run the newer release's `Install.cmd` once to enable this feature. It checks the public GitHub release, shows its notes, downloads the installer ZIP, verifies its SHA-256 checksum, and updates the local Docker stack. If the new container does not become healthy, the update worker attempts to restore the previous installed release. You can also extract a newer release and run its `Install.cmd`. Data and the database each stay in their configured location; application releases are stored separately. The release installer resolves the public GHCR image tagged with the ZIP's commit SHA, pulls its immutable digest, verifies the image revision, and starts it without a local application or toolchain build. The separate small update controller is built locally. Docker may retain a shared public image cache after uninstall.
 
 If the installer asks you to enable WSL integration, open **Docker Desktop → Settings → Resources → WSL Integration**, enable the selected distribution, and retry. Follow any Windows restart prompt before rerunning the installer.
 
@@ -22,7 +30,7 @@ Keep the data directory in WSL's Linux filesystem. Open it in Explorer with `exp
 \\wsl.localhost\<distribution>\home\<user>\.local\share\ctf-agent\ctf_agent_data\workspace_files
 ```
 
-The database and logs are stored separately under `Database/CTF_Agent`. Docker's [WSL guidance](https://docs.docker.com/desktop/features/wsl/best-practices/) explains why Linux filesystem bind mounts perform better than files under `/mnt/c`.
+By default, the database and logs are stored separately under `Database/CTF_Agent` in the same WSL distribution. Docker's [WSL guidance](https://docs.docker.com/desktop/features/wsl/best-practices/) explains why Linux filesystem bind mounts perform better than files under `/mnt/c`.
 
 ## Install from source
 

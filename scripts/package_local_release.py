@@ -35,6 +35,7 @@ FIXED_APP_FILES = {
 INSTALLER_FILES = {
     "installer/Install.cmd": "Install.cmd",
     "installer/Install.ps1": "Install.ps1",
+    "installer/DatabaseDisk.ps1": "DatabaseDisk.ps1",
     "installer/Start.cmd": "Start.cmd",
     "installer/Start.ps1": "Start.ps1",
     "installer/Uninstall.cmd": "Uninstall.cmd",

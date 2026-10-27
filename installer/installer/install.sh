@@ -21,9 +21,86 @@ if [[ "$home_dir" != /* ]] || [[ -L "$home_dir" ]]; then
     echo 'CTF_LOCAL_HOME must be an absolute, non-symlink Linux path.' >&2
     exit 2
 fi
+default_database="$home_dir/Database/CTF_Agent"
+database_path="${CTF_LOCAL_DATABASE:-$default_database}"
+database_fs_path="${CTF_LOCAL_FS_DATABASE:-$database_path}"
+database_mount="${CTF_LOCAL_DB_MOUNT:-}"
+if [[ "$database_path" != /* || "$database_fs_path" != /* ]]; then
+    echo 'Local database paths must be absolute.' >&2
+    exit 2
+fi
+database_volume_id=""
+if [[ -n "$database_mount" ]]; then
+    # This runs before creating a database directory. If the D: VHD is not
+    # mounted, Docker must never create a fresh database on the WSL root disk.
+    database_volume_id="$(python3 - "$database_fs_path" "$database_mount" "$home_dir/.local-config.json" "$default_database" "${CTF_UPDATE_IN_PROGRESS:-false}" <<'PY'
+import json, os, pathlib, re, sys
+
+database, mount, config, default_database = map(pathlib.Path, sys.argv[1:5])
+updating = sys.argv[5] == "true"
+if (not mount.is_absolute() or str(mount) != os.path.normpath(str(mount))
+        or not re.fullmatch(r"/mnt/wsl/[A-Za-z0-9_-]+", str(mount))
+        or database != mount / "Database" / "CTF_Agent"):
+    raise SystemExit("Invalid external database mount or path")
+if not mount.is_dir() or mount.is_symlink():
+    raise SystemExit("The external database VHD is not mounted")
+with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+    filesystems = [
+        line.split(" - ", 1)[1].split()[0]
+        for line in stream if " - " in line
+        if line.split(" - ", 1)[0].split()[4] == str(mount)
+    ]
+if not filesystems or (not updating and "ext4" not in filesystems):
+    raise SystemExit("The external database VHD is not mounted as ext4")
+if updating and not (database / "sqlite" / "ctf_agent.sqlite3").is_file():
+    raise SystemExit("The external database is unavailable during update")
+for path in (mount / "Database", database):
+    if path.is_symlink():
+        raise SystemExit("The external database path must not contain symlinks")
+prior = {}
+if config.exists():
+    if config.is_symlink():
+        raise SystemExit("Local installation settings are invalid")
+    prior = json.loads(config.read_text(encoding="utf-8"))
+    previous_database = prior.get("database_path", str(default_database))
+    previous_mount = prior.get("database_mount", "")
+    if previous_database != str(database) or previous_mount != str(mount):
+        previous_file = pathlib.Path(previous_database) / "sqlite" / "ctf_agent.sqlite3"
+        if previous_file.exists():
+            raise SystemExit("Existing database must be migrated before changing its location")
+        raise SystemExit("Existing installation uses a different database location")
+elif (default_database / "sqlite" / "ctf_agent.sqlite3").exists():
+    raise SystemExit("Existing database must be migrated before changing its location")
+marker = mount / ".ctf-agent-db-volume"
+if marker.is_symlink():
+    raise SystemExit("The external database volume marker is invalid")
+if not marker.is_file() or marker.stat().st_size > 64:
+    raise SystemExit("The external database volume marker is missing or invalid")
+volume_id = marker.read_text(encoding="ascii").strip()
+if not re.fullmatch(r"[0-9a-f]{32}", volume_id):
+    raise SystemExit("The external database volume marker is invalid")
+if prior and prior.get("database_volume_id") != volume_id:
+    raise SystemExit("The mounted database VHD does not match this installation")
+print(volume_id)
+PY
+)"
+elif [[ "$database_fs_path" != "$default_database" ]]; then
+    echo 'An external database path requires CTF_LOCAL_DB_MOUNT.' >&2
+    exit 2
+elif [[ -f "$home_dir/.local-config.json" ]]; then
+    if ! python3 - "$home_dir/.local-config.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if value.get("database_mount"):
+    raise SystemExit("External database VHD is required for this installation")
+PY
+    then
+        exit 2
+    fi
+fi
 releases="$home_dir/releases"
 target="$releases/$version"
-mkdir -p -- "$releases" "$home_dir/ctf_agent_data" "$home_dir/Database/CTF_Agent"
+mkdir -p -- "$releases" "$home_dir/ctf_agent_data" "$database_fs_path"
 if [[ -L "$releases" || -L "$target" ]]; then
     echo 'Release path must not be a symlink.' >&2
     exit 2
@@ -55,10 +132,16 @@ case "${CTF_LOCAL_AUTOSTART:-true}" in
     false) export CTF_LOCAL_RESTART_POLICY=no ;;
     *) echo 'CTF_LOCAL_AUTOSTART must be true or false.' >&2; exit 2 ;;
 esac
+if [[ -n "$database_mount" ]]; then
+    # Docker Desktop can restart containers before a Windows login task
+    # reattaches the VHD. Only the verified launcher may start this stack.
+    export CTF_LOCAL_RESTART_POLICY=no
+fi
 export CTF_LOCAL_DATA="${CTF_LOCAL_DATA:-$home_dir/ctf_agent_data}"
-export CTF_LOCAL_DATABASE="${CTF_LOCAL_DATABASE:-$home_dir/Database/CTF_Agent}"
+export CTF_LOCAL_DATABASE="$database_path"
 export CTF_LOCAL_FS_DATA="${CTF_LOCAL_FS_DATA:-$home_dir/ctf_agent_data}"
-export CTF_LOCAL_FS_DATABASE="${CTF_LOCAL_FS_DATABASE:-$home_dir/Database/CTF_Agent}"
+export CTF_LOCAL_FS_DATABASE="$database_fs_path"
+export CTF_LOCAL_DB_MOUNT="$database_mount"
 export CTF_RELEASE_SHA="$revision"
 export CTF_RELEASE_VERSION="$version"
 cd -- "$target"
@@ -146,7 +229,17 @@ for name in start.sh uninstall.py; do
     chmod 0644 "$home_dir/.launcher/$name"
 done
 local_config_temp="$(mktemp "$home_dir/.local-config.XXXXXXXX")"
-printf '{"auth_mode":"%s","auto_start":%s}\n' "$CTF_AUTH_MODE" "${CTF_LOCAL_AUTOSTART:-true}" > "$local_config_temp"
+python3 - "$local_config_temp" "$CTF_AUTH_MODE" "${CTF_LOCAL_AUTOSTART:-true}" \
+    "$database_fs_path" "$database_mount" "$database_volume_id" <<'PY'
+import json, sys
+target, auth_mode, auto_start, database_path, database_mount, volume_id = sys.argv[1:]
+value = {"auth_mode": auth_mode, "auto_start": auto_start == "true",
+         "database_path": database_path, "database_mount": database_mount,
+         "database_volume_id": volume_id}
+with open(target, "w", encoding="utf-8") as output:
+    json.dump(value, output, separators=(",", ":"))
+    output.write("\n")
+PY
 chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$local_config_temp"
 mv -f -- "$local_config_temp" "$home_dir/.local-config.json"
 if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
@@ -165,11 +258,55 @@ if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
         printf '%s\n' "$updater_fingerprint" > "$updater_stamp"
     fi
     docker rm -f ctf_agent_local_updater >/dev/null 2>&1 || true
+    status_file="$home_dir/ctf_agent_data/update-control/status.json"
+    status_before_ns="$(python3 - "$status_file" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+print(path.stat().st_mtime_ns if path.exists() else 0)
+PY
+)"
+    updater_mount=()
+    if [[ -n "$database_mount" ]]; then
+        updater_mount=(-v "$database_mount:$database_mount")
+    fi
     docker run -d --name ctf_agent_local_updater --restart "$CTF_LOCAL_RESTART_POLICY" \
         --memory 1g --cpus 1 --security-opt no-new-privileges \
         -e "CTF_LOCAL_HOME=$home_dir" -e "CTF_LOCAL_UID=$CTF_LOCAL_UID" -e "CTF_LOCAL_GID=$CTF_LOCAL_GID" \
-        -v "$home_dir:$home_dir" -v /var/run/docker.sock:/var/run/docker.sock \
+        -e "CTF_LOCAL_DB_MOUNT=$database_mount" \
+        -v "$home_dir:$home_dir" "${updater_mount[@]}" -v /var/run/docker.sock:/var/run/docker.sock \
         ctf-agent-updater:local >/dev/null
+    if [[ -n "$database_mount" ]]; then
+        updater_ready=false
+        for attempt in {1..10}; do
+            running="$(docker inspect --format '{{.State.Running}}' ctf_agent_local_updater 2>/dev/null || true)"
+            if [[ "$running" != true ]]; then
+                echo 'The updater could not access the external database VHD.' >&2
+                exit 1
+            fi
+            if python3 - "$status_file" "$status_before_ns" <<'PY'
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    fresh = path.stat().st_mtime_ns > int(sys.argv[2])
+    value = json.loads(path.read_text(encoding="utf-8")) if fresh else {}
+    healthy = time.time() - float(value.get("updated_at", 0)) < 10
+except (OSError, ValueError, TypeError):
+    healthy = False
+raise SystemExit(0 if healthy else 1)
+PY
+            then
+                updater_ready=true
+                break
+            fi
+            sleep 2
+        done
+        if [[ "$updater_ready" != true ]]; then
+            echo 'The updater did not confirm access to the external database VHD.' >&2
+            exit 1
+        fi
+    fi
 fi
 printf '\nCTF Agent %s installed. Open http://127.0.0.1:5050\n' "$version"
 printf 'Data: %s\n' "$CTF_LOCAL_DATA"

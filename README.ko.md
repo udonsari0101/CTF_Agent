@@ -43,6 +43,8 @@
 
 Windows 파일 탐색기에서는 `\\wsl.localhost\<배포판>\<Linux 데이터 경로>\ctf_agent_data\workspace_files`로 문제 파일에 접근할 수 있습니다.
 
+설치 중 별도 ext4 VHDX 옵션을 선택하면 기존 WSL과 문제 데이터는 C:에 두고 DB만 D: 등 다른 로컬 드라이브에 저장할 수 있습니다. DB 파일은 `\\wsl.localhost`를 통해 파일 탐색기에서 열 수 있습니다. 기존 DB는 자동으로 이동하지 않습니다. 자세한 내용은 [Windows 설치 안내](docs/docker-desktop.md)를 참고하세요.
+
 ### 소스에서 설치
 
 Docker Desktop의 WSL 2 통합이 활성화된 Linux 배포판 안에서 다음 명령을 실행합니다.

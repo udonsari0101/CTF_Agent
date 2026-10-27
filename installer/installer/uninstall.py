@@ -140,9 +140,48 @@ def remove_release_files(home: Path) -> None:
             launcher.rmdir()
 
 
+def verify_external_database(mount: Path, database: Path, volume_id: str) -> None:
+    """Keep uninstall from targeting an unmounted or substituted DB path."""
+
+    if (not re.fullmatch(r"/mnt/wsl/[A-Za-z0-9_-]+", str(mount))
+            or database != mount / "Database" / "CTF_Agent"
+            or not re.fullmatch(r"[0-9a-f]{32}", volume_id)):
+        raise RuntimeError("External database settings are invalid")
+    with Path("/proc/self/mountinfo").open(encoding="utf-8") as stream:
+        mounted = any(
+            line.split(" - ", 1)[0].split()[4] == str(mount)
+            and line.split(" - ", 1)[1].split()[0] == "ext4"
+            for line in stream if " - " in line
+        )
+    marker = mount / ".ctf-agent-db-volume"
+    if (not mounted or mount.is_symlink() or not mount.is_dir()
+            or marker.is_symlink() or not marker.is_file()
+            or marker.stat().st_size > 64
+            or marker.read_text(encoding="ascii").strip() != volume_id
+            or (mount / "Database").is_symlink() or database.is_symlink()):
+        raise RuntimeError("The configured external database VHD is unavailable")
+
+
 def uninstall(home: Path) -> None:
     _version, release = release_root(home)
     home = home.resolve(strict=True)
+    config_file = home / ".local-config.json"
+    if config_file.is_symlink() or not config_file.is_file():
+        raise RuntimeError("Local installation settings are missing")
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise RuntimeError("Local installation settings are invalid")
+    default_database = home / "Database" / "CTF_Agent"
+    database_value = config.get("database_path", str(default_database))
+    mount_value = config.get("database_mount", "")
+    volume_id = config.get("database_volume_id", "")
+    if not all(isinstance(value, str) for value in (database_value, mount_value, volume_id)):
+        raise RuntimeError("Local database settings are invalid")
+    database = Path(database_value)
+    if mount_value:
+        verify_external_database(Path(mount_value), database, volume_id)
+    elif database != default_database or volume_id:
+        raise RuntimeError("Local database settings are invalid")
     control = home / "ctf_agent_data" / "update-control"
     if (control / "running.json").exists() or (control / "request.json").exists():
         raise RuntimeError("An update is queued or running; wait for it to finish")
@@ -156,7 +195,7 @@ def uninstall(home: Path) -> None:
         command += ["--profile", f"solver-{number}"]
     environment = dict(os.environ)
     environment["CTF_LOCAL_DATA"] = str(home / "ctf_agent_data")
-    environment["CTF_LOCAL_DATABASE"] = str(home / "Database" / "CTF_Agent")
+    environment["CTF_LOCAL_DATABASE"] = str(database)
     result = subprocess.run(
         ["docker", *command, "down", "--remove-orphans"],
         cwd=release, env=environment, capture_output=True, text=True, timeout=240, check=False,
@@ -191,7 +230,7 @@ def uninstall(home: Path) -> None:
     remove_release_files(home)
     print("CTF Agent runtime removed.")
     print(f"Preserved data: {home / 'ctf_agent_data'}")
-    print(f"Preserved database: {home / 'Database' / 'CTF_Agent'}")
+    print(f"Preserved database: {database}")
     print("WSL and Docker Desktop were not removed.")
 
 
