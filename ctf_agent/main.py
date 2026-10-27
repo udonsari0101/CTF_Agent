@@ -35,6 +35,7 @@ from .ctfd import connection_info
 from .db import Settings, connect, initialize
 from .flag_formats import normalize_flag_format
 from .password_policy import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH
+from .solver_time import continuation_flag_time, continuation_start
 from .writeups import merge_generated_writeup, remove_generated_writeup
 
 CURRENT_USER = ContextVar("ctf_current_user", default=None)
@@ -558,8 +559,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Return the current owner's newest safe run metadata for list cards."""
 
         row = db.execute(
-            """SELECT id,account_label,provider,model,reasoning_effort,service_tier,
-                      status,created_at,released_at
+            """SELECT id,job_mode,owner_user_id,workspace_id,challenge_id,
+                       continuation_source_job_id,account_label,provider,model,
+                       reasoning_effort,service_tier,status,flag,created_at,released_at
                FROM solver_jobs
                WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?
                  AND job_mode='solve'
@@ -579,8 +581,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "service_tier": row["service_tier"],
             },
         }
+        elapsed_origin = continuation_start(db, row)
+        if elapsed_origin is not None:
+            result["continuation_started_at"] = elapsed_origin[0]
+            result["continuation_started_running"] = elapsed_origin[1]
         if row["status"] in {"queued", "staging", "awaiting_credential", "validating",
-                             "running", "writing", "cleanup_blocked", "completed"}:
+                             "running", "flag_found", "writing", "cleanup_blocked", "completed"}:
             running_at = None
             flag_at = None
             for event in db.execute(
@@ -606,15 +612,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if row["status"] == "completed" and isinstance(
             row["released_at"], (int, float)
         ):
-            started_at = running_at if running_at is not None else row["created_at"]
-            finished_at = flag_at if flag_at is not None else row["released_at"]
+            started_at = (elapsed_origin[0] if elapsed_origin is not None
+                          else running_at if running_at is not None else row["created_at"])
+            inherited_flag_at = continuation_flag_time(db, row)
+            finished_at = (inherited_flag_at if inherited_flag_at is not None
+                           else flag_at if flag_at is not None else row["released_at"])
             if isinstance(started_at, (int, float)) and isinstance(
                 finished_at, (int, float)
             ):
                 result["elapsed_seconds"] = max(
                     0, min(int(finished_at - started_at), 31_536_000)
                 )
-                result["elapsed_includes_queue"] = running_at is None
+                result["elapsed_includes_queue"] = (
+                    not elapsed_origin[1] if elapsed_origin is not None
+                    else running_at is None
+                )
         return result
 
     @app.exception_handler(RequestValidationError)

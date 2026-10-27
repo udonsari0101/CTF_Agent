@@ -352,7 +352,7 @@ input:focus, textarea:focus, select:focus {
 .telegram-bot-form .line-actions { align-items: stretch; }
 .telegram-bot-form input { min-width: 0; flex: 1 1 260px; }
 .telegram-bot-form button { flex: 0 0 auto; }
-.telegram-bot-form small { color: var(--muted); }
+.telegram-bot-form > small { color: var(--muted); margin-top: 8px; }
 .connection-state {
   display: inline-flex;
   align-items: center;

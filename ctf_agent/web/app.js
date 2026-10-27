@@ -888,8 +888,10 @@ function solverPanelMarkup(job, events = [], loading = false) {
       ? '<p class="form-hint">다시 실행하려면 먼저 위의 완료 취소를 눌러 미완료 상태로 되돌리세요.</p>'
       : `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>다시 풀기</button>`;
   const runningEvent = events.find(event => event.kind === 'status' && event.status === 'running');
-  const startedAt = runningEvent?.created_at ?? job.started_at ?? job.created_at;
-  const elapsed = active ? solverElapsedMarkup(startedAt,Boolean(runningEvent || job.started_at)) : '';
+  const startedAt = job.continuation_started_at ?? runningEvent?.created_at ?? job.started_at ?? job.created_at;
+  const solveStarted = job.continuation_started_at != null
+    ? job.continuation_started_running : Boolean(runningEvent || job.started_at);
+  const elapsed = active ? solverElapsedMarkup(startedAt,solveStarted) : '';
   return `<div class="solver-panel-head"><h3>문제 풀이</h3><div class="solver-panel-state"><span class="solver-phase solver-phase-${esc(job.phase)}">${esc(active && job.cancel_requested ? '중단 요청 중' : (solverPhases[job.phase] || job.phase))}</span>${elapsed}</div></div>
     ${modelText ? `<p class="solver-model">${esc(modelText)}</p>` : ''}
     ${job.network_policy === 'general_internet' ? '<p class="form-hint solver-limit">인터넷 사용 가능</p>' : ''}
@@ -1327,7 +1329,11 @@ function challengeCardMarkup(challenge, workspaceId) {
   const runPhase = latestRun?.phase || latestRun?.status;
   const liveSession = latestRun && !solverTerminalPhases.has(runPhase);
   const liveElapsed = liveSession && challenge.status === 'running'
-    ? solverElapsedMarkup(latestRun.started_at ?? latestRun.created_at,Boolean(latestRun.started_at)) : '';
+    ? solverElapsedMarkup(
+      latestRun.continuation_started_at ?? latestRun.started_at ?? latestRun.created_at,
+      latestRun.continuation_started_at != null
+        ? latestRun.continuation_started_running : Boolean(latestRun.started_at),
+    ) : '';
   const needsInput = runPhase === 'needs_input';
   const canStart = !needsInput && ['pending','stopped','failed'].includes(challenge.status);
   const startKey = `${workspaceId}:${challenge.id}`;

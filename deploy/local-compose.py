@@ -99,14 +99,14 @@ def prepare_readable_storage(environment: dict[str, str]) -> Path:
     return target
 
 
-def protected_solver_ceiling(environment: dict[str, str] | None = None) -> int:
-    """Keep every slot that may still contain an in-flight credential copy."""
+def protected_solver_slots(environment: dict[str, str] | None = None) -> set[int]:
+    """Keep exact slots that may still contain an in-flight credential copy."""
 
     env = environment or os.environ
     data_root = _local_path(env.get("CTF_LOCAL_FS_DATA", env.get("CTF_LOCAL_DATA", "./.local/ctf_agent_data")))
     database_root = _local_path(env.get("CTF_LOCAL_FS_DATABASE", env.get("CTF_LOCAL_DATABASE", "./.local/Database/CTF_Agent")))
     database = database_root / "sqlite" / "ctf_agent.sqlite3"
-    protected = 1
+    protected = {1}
     if database.is_file():
         try:
             with sqlite3.connect(database, timeout=15) as connection:
@@ -123,7 +123,7 @@ def protected_solver_ceiling(environment: dict[str, str] | None = None) -> int:
                             index = int(slot_id[7:])
                         else:
                             raise RuntimeError("지원하지 않는 solver 슬롯 정보가 있습니다.")
-                        protected = max(protected, index)
+                        protected.add(index)
         except sqlite3.Error as exc:
             raise RuntimeError("solver 슬롯 상태를 확인할 수 없습니다.") from exc
     indices = set()
@@ -160,25 +160,42 @@ def protected_solver_ceiling(environment: dict[str, str] | None = None) -> int:
         except OSError as exc:
             raise RuntimeError("solver 작업 경로를 확인할 수 없습니다.") from exc
         if exchange_busy or scratch_busy:
-            protected = max(protected, index)
+            protected.add(index)
     return protected
 
 
-def compose_commands(count: int, arguments: list[str]) -> list[list[str]]:
+def protected_solver_ceiling(environment: dict[str, str] | None = None) -> int:
+    """Legacy high-water helper; not a worker count."""
+
+    return max(protected_solver_slots(environment))
+
+
+def _selected_slots(count: int, protected: set[int]) -> set[int]:
+    selected = set(protected) | {1}
+    candidate = 1
+    while len(selected) < count:
+        selected.add(candidate)
+        candidate += 1
+    return selected
+
+
+def compose_commands(count: int, arguments: list[str], *, slots: set[int] | None = None) -> list[list[str]]:
     base = _compose_base()
     actions = {"up", "down", "stop", "rm", "kill", "restart", "start", "ps", "logs", "config", "pull", "build"}
     action = next((item for item in arguments if item in actions), "up")
     if action not in {"up", "start"}:
         return [base + ALL_PROFILES + arguments]
+    selected_slots = slots if slots is not None else set(range(1, count + 1))
     selected = [
         item
-        for index in range(2, min(count, STATIC_SOLVER_COUNT) + 1)
+        for index in sorted(selected_slots)
+        if 2 <= index <= STATIC_SOLVER_COUNT
         for item in ("--profile", f"solver-{index}")
     ]
     commands = []
     inactive = [
-        f"solver-{index}"
-        for index in range(max(2, count + 1), STATIC_SOLVER_COUNT + 1)
+        f"solver-{index}" for index in range(2, STATIC_SOLVER_COUNT + 1)
+        if index not in selected_slots
     ]
     if inactive:
         commands.append(base + ALL_PROFILES + ["rm", "--stop", "--force", *inactive])
@@ -201,7 +218,10 @@ def normalize_arguments(arguments: list[str]) -> list[str]:
     return normalized[:index] + ["up", "-d"] + normalized[index + 1 :]
 
 
-def remove_autoscaled_containers(environment: dict[str, str]) -> int:
+def remove_autoscaled_containers(
+    environment: dict[str, str], *, protected_slots: set[int] | None = None,
+    retained_slots: set[int] | None = None,
+) -> int:
     """Remove only controller-owned local replicas before Compose handoff."""
 
     listed = subprocess.run(
@@ -236,7 +256,18 @@ def remove_autoscaled_containers(environment: dict[str, str]) -> int:
         if slot < 2 or parts[1] != f"ctf_agent_local_autosolver_{slot}":
             raise RuntimeError("자동 확장 solver 컨테이너 소유권을 확인할 수 없습니다.")
         rows.append((parts[0], slot))
-    identifiers = validate_local_autoscaled_containers(rows, environment)
+    validated = validate_local_autoscaled_containers(rows, environment)
+    protected = protected_slots if protected_slots is not None else protected_solver_slots(environment)
+    identifiers = [
+        identifier for (identifier, slot), verified in zip(rows, validated)
+        if identifier == verified and slot not in protected
+    ]
+    if len(validated) != len(rows) or any(
+        identifier != verified for (identifier, _slot), verified in zip(rows, validated)
+    ):
+        raise RuntimeError("solver container identity list changed during validation")
+    if retained_slots is not None:
+        retained_slots.update(slot for _identifier, slot in rows if slot in protected)
     if not identifiers:
         return 0
     stopped = subprocess.run(
@@ -437,7 +468,8 @@ def validate_local_autoscaled_containers(
 
 def main() -> int:
     requested_count = recommended_solver_concurrency()
-    effective_count = requested_count
+    effective_slots = _selected_slots(requested_count, {1})
+    retained_dynamic: set[int] = set()
     arguments = normalize_arguments(sys.argv[1:] or ["up", "-d", "--build"])
     environment = os.environ.copy()
     verify_external_database(environment)
@@ -458,18 +490,26 @@ def main() -> int:
         )
         if quiesce.returncode:
             return quiesce.returncode
+        protected = protected_solver_slots(environment)
         if action in {"up", "start"}:
-            effective_count = max(requested_count, protected_solver_ceiling(environment))
-        handoff = remove_autoscaled_containers(environment)
+            effective_slots = _selected_slots(requested_count, protected)
+        handoff = remove_autoscaled_containers(
+            environment, protected_slots=protected, retained_slots=retained_dynamic
+        )
         if handoff:
             return handoff
     # The web coordinator must retain the desired capacity separately from the
     # number of worker profiles kept alive to drain protected higher slots.
     environment["CTF_SOLVER_MAX_CONCURRENT"] = str(requested_count)
     environment["CTF_SOLVER_RECOMMENDED_CONCURRENT"] = str(requested_count)
-    environment["CTF_SOLVER_STATIC_COUNT"] = str(min(effective_count, STATIC_SOLVER_COUNT))
-    print(f"solver workers: {effective_count} (requested: {requested_count})", flush=True)
-    for command in compose_commands(effective_count, arguments):
+    static_slots = {
+        slot for slot in effective_slots
+        if slot <= STATIC_SOLVER_COUNT and slot not in retained_dynamic
+    }
+    environment["CTF_SOLVER_STATIC_COUNT"] = str(STATIC_SOLVER_COUNT)
+    environment["CTF_SOLVER_STATIC_SLOTS"] = ",".join(map(str, sorted(static_slots)))
+    print(f"solver workers: {len(effective_slots)} (requested: {requested_count})", flush=True)
+    for command in compose_commands(len(effective_slots), arguments, slots=static_slots):
         result = subprocess.run(command, cwd=ROOT, env=environment, check=False)
         if result.returncode:
             return result.returncode

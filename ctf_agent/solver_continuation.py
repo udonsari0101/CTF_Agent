@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
+from .request_remote import REQUEST_NAME
+
 
 SNAPSHOT_LIMIT = 512 * 1024 * 1024
 SNAPSHOT_FREE_RESERVE = 1024 * 1024 * 1024
@@ -122,6 +124,24 @@ def _private_path(relative: PurePosixPath) -> bool:
     )
 
 
+def _ephemeral_workdir_signal(relative: PurePosixPath) -> bool:
+    """Do not carry a one-shot remote handoff into the next solve attempt.
+
+    The helper stages the marker as ``.remote-request.<random>.tmp`` before an
+    atomic rename. Match only files at the workdir root so similarly named
+    analysis files elsewhere remain part of the workspace.
+    """
+    if len(relative.parts) != 1:
+        return False
+    name = relative.name
+    prefix = REQUEST_NAME + "."
+    return name == REQUEST_NAME or (
+        name.startswith(prefix)
+        and name.endswith(".tmp")
+        and len(name) > len(prefix) + len(".tmp")
+    )
+
+
 def _provider_paths(root: Path, provider: str) -> list[tuple[Path, str]]:
     if provider == "claude":
         return [(root / "home" / "claude" / "projects", "provider/projects")]
@@ -181,6 +201,8 @@ def _source_files(root: Path, provider: str, baseline: dict[str, tuple[int, int,
                 if _private_path(relative):
                     continue
                 if prefix == "workdir":
+                    if _ephemeral_workdir_signal(relative):
+                        continue
                     if relative.as_posix() in {"AGENTS.md", "CLAUDE.md", "notes/RELATED.json"}:
                         continue
                     try:
@@ -302,6 +324,10 @@ def _archive_target(job_root: Path, name: str, mode: str, provider: str) -> Path
     if _private_path(pure):
         raise ContinuationInvalid("private continuation path")
     if pure.parts[0] == "workdir" and len(pure.parts) >= 2:
+        if _ephemeral_workdir_signal(PurePosixPath(*pure.parts[1:])):
+            # The archive still passes the digest, entry type, path and size
+            # checks. Only this obsolete one-shot file is skipped on restore.
+            return None
         if pure.parts[1:] in {
             ("AGENTS.md",), ("CLAUDE.md",), ("notes", "RELATED.json"),
         }:

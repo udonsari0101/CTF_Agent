@@ -55,6 +55,7 @@ from .solver_retry import (
     parse_solver_artifact,
 )
 from .storage_budget import MAX_SQLITE_INTEGER, StorageBudget, StorageBudgetError
+from .solver_time import continuation_start
 from .writeups import merge_generated_writeup, remove_generated_writeup
 
 
@@ -1577,7 +1578,11 @@ class SolverExchangeCoordinator:
                        WHERE status='queued' AND (created_at<? OR (created_at=? AND id<=?))""",
                     (row["created_at"], row["created_at"], row["id"]),
                 ).fetchone()[0]
+            elapsed_origin = continuation_start(db, row)
         result = _public_job(row, events, position, guidance=guidance)
+        if elapsed_origin is not None:
+            result["continuation_started_at"] = elapsed_origin[0]
+            result["continuation_started_running"] = elapsed_origin[1]
         if row["status"] == "queued" and self._service_updating():
             result["queue_block_reason"] = "service_update"
         return result
@@ -4599,19 +4604,21 @@ class SolverCoordinatorPool:
         self.hard_max_concurrent = hard_max_concurrent
         self.demand_concurrent = max_concurrent
         self.requested_concurrent = max_concurrent
-        protected_ceiling = self._protected_slot_ceiling(
+        protected_slots = self._protected_slot_indices(
             self.database_path, self.data_dir, slots_root
         )
-        # Defer a capacity reduction while a higher slot owns a claim or
-        # retains active/scratch data. All production worker containers remain
-        # available, so that coordinator can finish and clean the job.
-        self.host_desired_concurrent = max(max_concurrent, protected_ceiling)
+        # Slot identity and worker count are independent. A claim in slot 17
+        # must survive without forcing idle slots 2..16 to stay running.
+        self.host_desired_slots = self._select_slots(max_concurrent, protected_slots)
+        self.host_desired_concurrent = len(self.host_desired_slots)
         self.max_concurrent = self.host_desired_concurrent
-        self.required_concurrent = max(max_concurrent, protected_ceiling)
+        self.required_concurrent = max(max_concurrent, len(protected_slots))
+        self._claimable_slots = {slot for slot in self.host_desired_slots if slot <= max_concurrent}
         self.slots_root = slots_root
         self.coordinators: list[SolverExchangeCoordinator] = []
+        self._slot_numbers: list[int] = []
         self._slot_executors: list[concurrent.futures.ThreadPoolExecutor] = []
-        self._ensure_coordinators(self.max_concurrent)
+        self._ensure_coordinators(self.host_desired_slots)
         if not self.coordinators:
             raise ExchangeError(
                 "solver_slot_unavailable",
@@ -4634,13 +4641,25 @@ class SolverCoordinatorPool:
         self._continuation_prune_at = 0.0
         self._write_capacity_control(open_jobs=0)
 
-    def _ensure_coordinators(self, count: int) -> None:
-        """Create trusted coordinators and one execution thread per new slot."""
+    @staticmethod
+    def _select_slots(target: int, protected: set[int]) -> set[int]:
+        """Retain protected identities, then fill the lowest reusable slots."""
 
-        while len(self.coordinators) < count:
-            index = len(self.coordinators) + 1
+        selected = set(protected) | {1}
+        candidate = 1
+        while len(selected) < target:
+            selected.add(candidate)
+            candidate += 1
+        return selected
+
+    def _ensure_coordinators(self, slots: set[int]) -> None:
+        """Create trusted coordinators only for selected slot identities."""
+
+        for index in sorted(slots - set(self._slot_numbers)):
             if self.host_managed_slots and not self._host_slot_ready(index):
-                break
+                if index == 1:
+                    break
+                continue
             coordinator = SolverExchangeCoordinator(
                 self.database_path,
                 self.data_dir,
@@ -4649,16 +4668,22 @@ class SolverCoordinatorPool:
                 slot_id="default" if index == 1 else f"solver-{index}",
                 deliver_global_hooks=index == 1,
                 defer_global_hooks=index == 1,
-                accept_new_jobs=index <= self.requested_concurrent,
+                accept_new_jobs=index in self._claimable_slots,
                 host_managed_exchange=self.host_managed_slots,
                 enforce_host_ownership=self.enforce_host_ownership,
                 **self._coordinator_options,
             )
-            self.coordinators.append(coordinator)
-            self._slot_executors.append(
+            position = next(
+                (position for position, slot in enumerate(self._slot_numbers) if slot > index),
+                len(self._slot_numbers),
+            )
+            self._slot_numbers.insert(position, index)
+            self.coordinators.insert(position, coordinator)
+            self._slot_executors.insert(
+                position,
                 concurrent.futures.ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix=f"solver-slot-{index}"
-                )
+                ),
             )
 
     def _host_slot_ready(self, index: int) -> bool:
@@ -4693,17 +4718,20 @@ class SolverCoordinatorPool:
             and stat.S_IMODE(scratch_state.st_mode) == 0o700
         )
 
-    def _trim_coordinators(self, count: int) -> None:
-        """Release idle high-slot coordinators and their persistent threads."""
+    def _trim_coordinators(self, slots: set[int]) -> None:
+        """Release only unselected coordinators with no in-flight tick."""
 
-        while len(self.coordinators) > count:
-            index = len(self.coordinators) - 1
-            if index in self._slot_futures:
+        for position in reversed(range(len(self._slot_numbers))):
+            slot = self._slot_numbers[position]
+            if slot in slots:
+                continue
+            if slot in self._slot_futures:
                 raise RuntimeError("cannot trim a solver slot with an in-flight tick")
-            self.coordinators.pop().request_stop()
-            executor = self._slot_executors.pop()
+            self.coordinators.pop(position).request_stop()
+            self._slot_numbers.pop(position)
+            executor = self._slot_executors.pop(position)
             executor.shutdown(wait=True, cancel_futures=False)
-            self._slot_future_blocks.pop(index, None)
+            self._slot_future_blocks.pop(slot, None)
 
     def _open_job_count(self) -> int:
         with sqlite3.connect(self.database_path, timeout=15) as db:
@@ -4721,6 +4749,7 @@ class SolverCoordinatorPool:
         payload = {
             "protocol": 1,
             "desired": self.host_desired_concurrent,
+            "slots": sorted(self.host_desired_slots),
             "target": self.requested_concurrent,
             "demand": self.demand_concurrent,
             "baseline": self.minimum_concurrent,
@@ -4764,33 +4793,37 @@ class SolverCoordinatorPool:
             else demand
         )
 
-        # Stop high slots from claiming before examining whether they can be
-        # removed. A running future remains configured through cleanup.
-        for index, item in enumerate(self.coordinators, 1):
-            item.accept_new_jobs = index <= target
-        protected = self._protected_slot_ceiling(
+        # Stop protected high slots from claiming again after their current
+        # job; the lowest free slot IDs are used for fresh demand.
+        protected = self._protected_slot_indices(
             self.database_path, self.data_dir, self.slots_root
         )
         # A done future is harvested later in this tick. Retain its slot for
         # one extra DB/filesystem scan so its final claim/cleanup commit cannot
         # race a host-side container removal.
-        in_flight = max((index + 1 for index in self._slot_futures), default=1)
-        host_desired = max(target, protected, in_flight)
+        protected.update(self._slot_futures)
+        host_slots = self._select_slots(target, protected)
+        claimable_slots = {slot for slot in host_slots if slot <= target}
+        for slot, item in zip(self._slot_numbers, self.coordinators):
+            item.accept_new_jobs = slot in claimable_slots
+        previous_host_slots = self.host_desired_slots
         self.demand_concurrent = demand
         self.requested_concurrent = target
-        self.required_concurrent = max(self.minimum_concurrent, protected)
-        if host_desired < len(self.coordinators):
-            self._trim_coordinators(host_desired)
-        self._ensure_coordinators(host_desired)
+        self.required_concurrent = max(self.minimum_concurrent, len(protected))
+        self.host_desired_slots = host_slots
+        self._claimable_slots = claimable_slots
+        self._trim_coordinators(host_slots)
+        self._ensure_coordinators(host_slots)
         configured = len(self.coordinators)
-        for index, item in enumerate(self.coordinators, 1):
-            item.accept_new_jobs = index <= target
+        for slot, item in zip(self._slot_numbers, self.coordinators):
+            item.accept_new_jobs = slot in claimable_slots
         changed = (
             configured != self.max_concurrent
-            or host_desired != self.host_desired_concurrent
+            or host_slots != previous_host_slots
+            or len(host_slots) != self.host_desired_concurrent
         )
         self.max_concurrent = configured
-        self.host_desired_concurrent = host_desired
+        self.host_desired_concurrent = len(host_slots)
         control = self.exchange_root / "pool-control.json"
         try:
             heartbeat_due = time.time() - control.stat().st_mtime >= 10.0
@@ -4808,6 +4841,7 @@ class SolverCoordinatorPool:
                 or previous.get("target") != target
                 or previous.get("demand") != demand
                 or previous.get("required") != self.required_concurrent
+                or previous.get("slots") != sorted(host_slots)
             ):
                 self._write_capacity_control(open_jobs=open_jobs)
         return {
@@ -4820,12 +4854,12 @@ class SolverCoordinatorPool:
         }
 
     @staticmethod
-    def _protected_slot_ceiling(
+    def _protected_slot_indices(
         database_path: Path, data_dir: Path, slots_root: Path
-    ) -> int:
-        """Return the highest slot that must survive a capacity reduction."""
+    ) -> set[int]:
+        """Return exact slot identities that must survive capacity reduction."""
 
-        protected = 1
+        protected = {1}
         if database_path.is_file():
             with sqlite3.connect(database_path, timeout=15) as db:
                 db.execute("PRAGMA busy_timeout=15000")
@@ -4841,7 +4875,7 @@ class SolverCoordinatorPool:
                                 "solver 슬롯 식별자를 확인할 수 없습니다.",
                                 category="safety",
                             )
-                        protected = max(protected, index)
+                        protected.add(index)
         scratch_root = data_dir / "solver-scratch"
         indices: set[int] = set()
         for root in (slots_root, scratch_root):
@@ -4903,7 +4937,7 @@ class SolverCoordinatorPool:
                         continue
                     protected_entry = True
                 if protected_entry:
-                    protected = max(protected, index)
+                    protected.add(index)
             if scratch.exists():
                 if scratch.is_symlink() or not scratch.is_dir():
                     raise ExchangeError(
@@ -4920,8 +4954,16 @@ class SolverCoordinatorPool:
                         category="safety",
                     ) from exc
                 if scratch_nonempty:
-                    protected = max(protected, index)
+                    protected.add(index)
         return protected
+
+    @staticmethod
+    def _protected_slot_ceiling(
+        database_path: Path, data_dir: Path, slots_root: Path
+    ) -> int:
+        """Compatibility helper for callers that still need a high-water mark."""
+
+        return max(SolverCoordinatorPool._protected_slot_indices(database_path, data_dir, slots_root))
 
     def _migrate_legacy_exchange(self, first_slot: Path) -> None:
         """Move generation-1 active/runtime trees into slot one once."""
@@ -5067,16 +5109,16 @@ class SolverCoordinatorPool:
                 self._reconcile_capacity_locked()
                 changed = before != (self.max_concurrent, self.requested_concurrent)
             if not self._stopping:
-                for index, item in enumerate(self.coordinators[: self.max_concurrent]):
-                    if index not in self._slot_futures:
+                for position, (slot, item) in enumerate(zip(self._slot_numbers, self.coordinators)):
+                    if slot not in self._slot_futures:
                         try:
-                            self._slot_futures[index] = self._slot_executors[index].submit(
+                            self._slot_futures[slot] = self._slot_executors[position].submit(
                                 item.tick
                             )
                         except RuntimeError:
                             # A concurrent shutdown must fail closed without
                             # terminating the long-running service loop.
-                            self._slot_future_blocks[index] = ExchangeError(
+                            self._slot_future_blocks[slot] = ExchangeError(
                                 "coordinator_thread_unavailable",
                                 "solver 작업 스레드를 준비하지 못했습니다.",
                                 retryable=True,
@@ -5127,15 +5169,11 @@ class SolverCoordinatorPool:
                 # A later tick retries stale bundle cleanup. Never interrupt
                 # an active solve because an old snapshot could not be pruned.
                 pass
-        blocks = [
-            item.last_block
-            for item in self.coordinators[: self.max_concurrent]
-            if item.last_block
-        ]
+        blocks = [item.last_block for item in self.coordinators if item.last_block]
         blocks.extend(
             value
-            for index, value in self._slot_future_blocks.items()
-            if index < self.max_concurrent
+            for slot, value in self._slot_future_blocks.items()
+            if slot in self._slot_numbers
         )
         if self._hook_block:
             blocks.append(self._hook_block)
@@ -5180,51 +5218,53 @@ class SolverCoordinatorPool:
         return all(outcomes)
 
     def health(self) -> dict[str, Any]:
-        snapshots = [item.health() for item in self.coordinators[: self.max_concurrent]]
+        snapshots = {slot: item.health() for slot, item in zip(self._slot_numbers, self.coordinators)}
         try:
-            protected = self._protected_slot_ceiling(
+            protected = self._protected_slot_indices(
                 self.database_path, self.data_dir, self.slots_root
             )
         except ExchangeError as exc:
-            protected = self.max_concurrent
+            protected = set(self._slot_numbers)
             protected_error = exc.public(stage="coordinator")
         else:
             protected_error = None
-        required = max(self.minimum_concurrent, protected)
-        required_snapshots = snapshots[: min(self.max_concurrent, required)]
+        required_slots = self._select_slots(self.minimum_concurrent, protected)
+        required = len(required_slots)
+        required_snapshots = [snapshots[slot] for slot in sorted(required_slots) if slot in snapshots]
         blocks = [item.get("blocked") for item in required_snapshots if item.get("blocked")]
         blocks.extend(
             value
-            for index, value in self._slot_future_blocks.items()
-            if index < required
+            for slot, value in self._slot_future_blocks.items()
+            if slot in required_slots
         )
         if self._hook_block:
             blocks.append(self._hook_block)
         if protected_error:
             blocks.append(protected_error)
         pool_block = blocks[0] if blocks else None
-        ready_workers = sum(bool(item.get("ready")) for item in snapshots)
+        ready_workers = sum(bool(item.get("ready")) for item in snapshots.values())
         required_ready = sum(bool(item.get("ready")) for item in required_snapshots)
-        active_workers = sum(bool(item.get("active")) for item in snapshots)
+        active_workers = sum(bool(item.get("active")) for item in snapshots.values())
         workers = []
-        for index, item in enumerate(snapshots, 1):
+        for slot, item in snapshots.items():
             worker = dict(item.get("worker") or {})
-            worker["slot"] = index
-            worker["draining"] = index > self.requested_concurrent
+            worker["slot"] = slot
+            worker["draining"] = slot not in self._claimable_slots
             workers.append(worker)
-        ready_states = [worker for worker in workers if worker.get("ready") is True]
         all_ready = (
-            self.max_concurrent >= required
+            required_slots.issubset(snapshots)
             and required_ready == required
             and pool_block is None
         )
         aggregate_clean = all_ready and all(
-            worker.get("clean") is True for worker in workers[:required]
+            snapshots[slot].get("worker", {}).get("clean") is True
+            for slot in required_slots
         )
         cleanup_blocked = any(
             worker.get("cleanup_blocked") is True for worker in workers
         )
-        base = dict(snapshots[0])
+        draining = sum(slot not in self._claimable_slots for slot in self._slot_numbers)
+        base = dict(snapshots[1])
         base.update(
             ready=all_ready,
             active=active_workers,
@@ -5235,23 +5275,27 @@ class SolverCoordinatorPool:
                 "cleanup_blocked": cleanup_blocked,
                 "configured": self.max_concurrent,
                 "requested": self.requested_concurrent,
-                "draining": self.max_concurrent - self.requested_concurrent,
+                "draining": draining,
                 "warming": max(0, self.demand_concurrent - self.max_concurrent),
                 "demand": self.demand_concurrent,
                 "required": required,
                 "ready_count": ready_workers,
                 "active_count": active_workers,
+                "slots": list(self._slot_numbers),
+                "claimable": self.max_concurrent - draining,
                 "workers": workers,
             },
             capacity={
                 "configured": self.max_concurrent,
                 "requested": self.requested_concurrent,
-                "draining": self.max_concurrent - self.requested_concurrent,
+                "draining": draining,
                 "warming": max(0, self.demand_concurrent - self.max_concurrent),
                 "demand": self.demand_concurrent,
                 "required": required,
                 "ready": ready_workers,
                 "active": active_workers,
+                "slots": list(self._slot_numbers),
+                "claimable": self.max_concurrent - draining,
             },
             blocked=pool_block,
         )

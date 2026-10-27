@@ -79,6 +79,9 @@ def record_request(note: str, directory: Path | None = None) -> Path:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments in (["-h"], ["--help"]):
+        sys.stdout.write('usage: request-remote "<needed connection detail>"\n')
+        return 0
     if len(arguments) != 1:
         sys.stderr.write('usage: request-remote "<needed connection detail>"\n')
         return 64

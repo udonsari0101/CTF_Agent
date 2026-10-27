@@ -1,6 +1,6 @@
 """Docker host controller for demand-sized isolated solver containers.
 
-The web process publishes only a numeric desired count.  This controller is
+The web process publishes a desired count and optionally exact slot IDs. This controller is
 the sole component with access to the Docker socket.  It clones the already
 attested first worker, substitutes only the per-slot exchange and scratch
 binds, and removes only containers carrying its private ownership labels.
@@ -139,7 +139,7 @@ class DockerEngine:
         return result if isinstance(result, list) else []
 
 
-def read_control(path: Path, *, now: float | None = None, max_age: float = 30.0) -> dict[str, int]:
+def read_control(path: Path, *, now: float | None = None, max_age: float = 30.0) -> dict[str, Any]:
     try:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         if os.name == "posix":
@@ -174,6 +174,21 @@ def read_control(path: Path, *, now: float | None = None, max_age: float = 30.0)
         raise AutoscalerError("solver capacity control requires a positive worker count")
     if fields["target"] > fields["desired"]:
         raise AutoscalerError("solver capacity control target exceeds retained workers")
+    slots = value.get("slots")
+    if slots is not None:
+        if (
+            not isinstance(slots, list)
+            or len(slots) != fields["desired"]
+            or not slots
+            or slots[0] != 1
+            or any(
+                not isinstance(slot, int) or isinstance(slot, bool) or slot < 1
+                for slot in slots
+            )
+            or slots != sorted(set(slots))
+        ):
+            raise AutoscalerError("solver capacity control has invalid slot identities")
+        fields["slots"] = slots
     updated = value.get("updated_at")
     if not isinstance(updated, (int, float)) or isinstance(updated, bool):
         raise AutoscalerError("solver capacity control timestamp is invalid")
@@ -743,6 +758,7 @@ class SolverAutoscaler:
         control_path: Path,
         static_prefix: str | None = None,
         static_count: int = 1,
+        static_slots: set[int] | None = None,
         storage_root: Path = Path("/data"),
         step: int = 8,
         require_protected_parents: bool = True,
@@ -753,6 +769,12 @@ class SolverAutoscaler:
             raise AutoscalerError("static solver container naming policy is invalid")
         if static_count < 1:
             raise AutoscalerError("static solver count must be positive")
+        if static_slots is not None and (
+            1 not in static_slots
+            or any(not isinstance(slot, int) or isinstance(slot, bool) or slot < 1
+                   or slot > static_count for slot in static_slots)
+        ):
+            raise AutoscalerError("static solver slot identities are invalid")
         if step < 1:
             raise AutoscalerError("autoscale step must be positive")
         self.engine = engine
@@ -760,6 +782,9 @@ class SolverAutoscaler:
         self.container_prefix = container_prefix
         self.static_prefix = static_prefix or container_prefix
         self.static_count = static_count
+        self.static_slots = (
+            set(static_slots) if static_slots is not None else set(range(1, static_count + 1))
+        )
         self.control_path = control_path
         self.storage_root = storage_root
         self.step = step
@@ -768,7 +793,7 @@ class SolverAutoscaler:
     def name(self, slot: int) -> str:
         if slot == 1:
             return self.template_name
-        prefix = self.static_prefix if slot <= self.static_count else self.container_prefix
+        prefix = self.static_prefix if slot in self.static_slots else self.container_prefix
         return f"{prefix}{slot}"
 
     def _slot_of(self, container: Mapping[str, Any]) -> int | None:
@@ -782,18 +807,35 @@ class SolverAutoscaler:
             return None
         return slot if slot >= 2 else None
 
-    def reconcile(self, control: Mapping[str, int]) -> dict[str, Any]:
+    def reconcile(self, control: Mapping[str, Any]) -> dict[str, Any]:
         desired = int(control["desired"])
+        slots = control.get("slots")
+        if slots is None:
+            # Protocol-one controls from older web releases remain dense.
+            selected = list(range(1, desired + 1))
+        elif (
+            not isinstance(slots, list)
+            or not slots
+            or len(slots) != desired
+            or slots[0] != 1
+            or any(not isinstance(slot, int) or isinstance(slot, bool) or slot < 1 for slot in slots)
+            or slots != sorted(set(slots))
+        ):
+            raise AutoscalerError("solver capacity control has invalid slot identities")
+        else:
+            selected = slots
+        selected_set = set(selected)
         template = self.engine.inspect(self.template_name)
         if not template or not (template.get("State") or {}).get("Running"):
             raise AutoscalerError("the first solver container is not running")
         created = 0
         available = 1
-        for slot in range(2, desired + 1):
+        available_slots = [1]
+        for slot in selected[1:]:
             name = self.name(slot)
             current = self.engine.inspect(name)
             if current is not None:
-                managed_required = slot > self.static_count
+                managed_required = slot not in self.static_slots
                 try:
                     validate_slot_container(
                         current,
@@ -823,6 +865,15 @@ class SolverAutoscaler:
                     # Release transitions may leave a controller-owned worker
                     # on an old image. Keep its exchange data and recreate the
                     # container so restart recovery can resume that slot.
+                    if not _slot_is_idle(self.storage_root, slot):
+                        # Keep a claimed old-release worker alive until its
+                        # job and private cleanup finish. The new template
+                        # can replace it on a later idle reconciliation.
+                        if not (current.get("State") or {}).get("Running"):
+                            self.engine.start(name)
+                        available += 1
+                        available_slots.append(slot)
+                        continue
                     if (current.get("State") or {}).get("Running"):
                         self.engine.stop(name)
                     self.engine.remove(name)
@@ -831,15 +882,16 @@ class SolverAutoscaler:
                 state = current.get("State") or {}
                 if not state.get("Running"):
                     self.engine.start(name)
-                available = slot
+                available += 1
+                available_slots.append(slot)
                 continue
             # Compose owns warm/static workers. During parallel startup they
             # can appear after this controller; wait instead of creating an
             # identically named container without Compose ownership metadata.
-            if slot <= self.static_count:
-                break
+            if slot in self.static_slots:
+                continue
             if created >= self.step:
-                break
+                continue
             _prepare_slot(
                 template,
                 slot,
@@ -849,17 +901,18 @@ class SolverAutoscaler:
             self.engine.create(name, clone_payload(template, slot))
             self.engine.start(name)
             created += 1
-            available = slot
+            available += 1
+            available_slots.append(slot)
         removed = 0
         retained = 0
         for container in self.engine.managed():
             slot = self._slot_of(container)
-            if slot is None or slot <= desired:
+            if slot is None or slot in selected_set:
                 continue
             names = container.get("Names") or []
             expected = "/" + self.name(slot)
             if expected not in names:
-                continue
+                raise AutoscalerError("managed solver slot conflicts with the static profile policy")
             name = self.name(slot)
             current = self.engine.inspect(name)
             if current is None:
@@ -871,9 +924,14 @@ class SolverAutoscaler:
                 managed_required=True,
                 allow_release_mismatch=True,
             )
+            if not _slot_is_idle(self.storage_root, slot):
+                retained += 1
+                continue
             was_running = bool((current.get("State") or {}).get("Running"))
             if was_running:
                 self.engine.stop(name)
+            # The worker may have begun writing between the first check and
+            # Docker stop. Never remove a container while its slot is active.
             if not _slot_is_idle(self.storage_root, slot):
                 if was_running:
                     self.engine.start(name)
@@ -885,6 +943,8 @@ class SolverAutoscaler:
         return {
             "desired": desired,
             "available": available,
+            "slots": selected,
+            "available_slots": available_slots,
             "created": created,
             "removed": removed,
             "retained": retained,
@@ -906,6 +966,16 @@ def main() -> int:
     prefix = os.environ.get("CTF_SOLVER_CONTAINER_PREFIX", "ctf_agent_solver_")
     static_prefix = os.environ.get("CTF_SOLVER_STATIC_PREFIX", prefix)
     static_count = max(1, int(os.environ.get("CTF_SOLVER_STATIC_COUNT", "6")))
+    raw_static_slots = os.environ.get("CTF_SOLVER_STATIC_SLOTS")
+    if raw_static_slots is None:
+        static_slots = None
+    else:
+        parts = raw_static_slots.split(",")
+        if not parts or any(not re.fullmatch(r"[1-9][0-9]*", part) for part in parts):
+            raise AutoscalerError("static solver slot identities are invalid")
+        static_slots = {int(part) for part in parts}
+        if len(static_slots) != len(parts):
+            raise AutoscalerError("static solver slot identities are duplicated")
     interval = max(0.2, float(os.environ.get("CTF_SOLVER_AUTOSCALE_INTERVAL", "1")))
     step = max(1, int(os.environ.get("CTF_SOLVER_AUTOSCALE_STEP", "8")))
     once = os.environ.get("CTF_SOLVER_AUTOSCALE_ONCE", "").lower() in {"1", "true", "yes"}
@@ -915,6 +985,7 @@ def main() -> int:
         container_prefix=prefix,
         static_prefix=static_prefix,
         static_count=static_count,
+        static_slots=static_slots,
         control_path=control,
         storage_root=Path(os.environ.get("CTF_SOLVER_STORAGE_ROOT", "/data")),
         step=step,

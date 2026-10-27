@@ -6455,17 +6455,20 @@ class SolverWorker:
         scratch: Path,
         challenge_source: Path,
     ) -> None:
-        """Retry one transient command exit without weakening the canary."""
+        """Repeat a transient canary failure; the full isolation check must pass."""
 
         try:
             await driver.sandbox_canary(
                 os.getpid(), self.exchange, scratch, challenge_source
             )
         except WorkerRefusal as exc:
-            if (
-                exc.error.code != "sandbox_canary_failed"
-                or tuple(exc.error.requirements) != ("command_exit",)
-            ):
+            if exc.error.code != "sandbox_canary_failed" or tuple(exc.error.requirements) not in {
+                ("command_exit",),
+                # worker.json is atomically replaced through a short-lived
+                # top-level temporary file. A concurrent status publication
+                # can intersect the command sandbox's directory listing.
+                ("exchange_inventory_safe",),
+            }:
                 raise
             await asyncio.sleep(0.2)
             await driver.sandbox_canary(

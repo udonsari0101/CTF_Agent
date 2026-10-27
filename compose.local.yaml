@@ -282,6 +282,7 @@ services:
       CTF_SOLVER_CONTAINER_PREFIX: ctf_agent_local_autosolver_
       CTF_SOLVER_STATIC_PREFIX: ctf_agent_local_solver_
       CTF_SOLVER_STATIC_COUNT: ${CTF_SOLVER_STATIC_COUNT:-1}
+      CTF_SOLVER_STATIC_SLOTS: ${CTF_SOLVER_STATIC_SLOTS:-1}
     volumes:
       - type: bind
         source: ${CTF_LOCAL_DATA:-./.local/ctf_agent_data}/solver-exchange
