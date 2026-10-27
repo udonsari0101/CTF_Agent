@@ -57,7 +57,12 @@ jobs:
           fi
           revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$app_tag")"
           test "$revision" = "$GITHUB_SHA"
-          docker run --rm --network none --entrypoint python "$app_tag" - < deploy/image-smoke.py
+          # Keep stdin attached so Python executes the smoke script. Provide
+          # the same writable home/scratch paths the solver has in Compose.
+          docker run --rm -i --network none \
+            --tmpfs /data:uid=10001,gid=10001,mode=0700 \
+            --tmpfs /solver-scratch:uid=10001,gid=10001,mode=0700 \
+            --entrypoint python "$app_tag" - < deploy/image-smoke.py
           if ! docker manifest inspect "$app_tag" >/dev/null 2>&1; then
             docker push "$app_tag"
           fi

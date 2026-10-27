@@ -23,6 +23,9 @@ from ctf_agent.solver_exchange import _continuation_bundle
 
 with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     root = Path(temporary)
+    # The CI container uses disposable tmpfs mounts for the solver's writable
+    # paths. Ghidra resolves the image user's home from passwd, not $HOME.
+    Path("/data/config/home").mkdir(parents=True, mode=0o700, exist_ok=True)
     password = secrets.token_urlsafe(24)
     os.environ.update({
         "CTF_DATA_DIR": str(root / "data"),
