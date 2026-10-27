@@ -33,6 +33,25 @@ function Get-WslVersions {
     return $versions
 }
 
+function Invoke-WslPython([string]$name, [string]$source, [string[]]$arguments = @()) {
+    # Windows PowerShell 5.1 changes quotes inside a multiline native argument.
+    # Pass a single-line wrapper without quoted literals; Python decodes the
+    # original source from a separate argument before forwarding its argv.
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($source))
+    $program = 'import base64,sys;exec(base64.b64decode(sys.argv.pop(1)))'
+    $previousPreference = $ErrorActionPreference
+    try {
+        # A probe failure is reported through its exit code, not a native stderr
+        # ErrorRecord that terminates the installer before it can offer recovery.
+        $ErrorActionPreference = 'Continue'
+        $output = @(& wsl.exe --distribution $name --exec python3 -c $program $encoded @arguments 2>$null)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return [pscustomobject]@{ Output = ($output -join "`n"); ExitCode = $exitCode }
+}
+
 function Get-WslInfo([string]$name, [hashtable]$versions) {
     $probe = @'
 import json,os,shutil,sys
@@ -48,10 +67,10 @@ print(json.dumps({'id':data.get('ID',''),'version':data.get('VERSION_ID',''),
                   'home':os.path.expanduser('~'),'python':list(sys.version_info[:2]),
                   'bash':bool(shutil.which('bash'))}))
 '@
-    $output = @(& wsl.exe --distribution $name --exec python3 -c $probe 2>$null)
+    $probeResult = Invoke-WslPython $name $probe
     $result = $null
-    if ($LASTEXITCODE -eq 0) {
-        try { $result = ($output -join "`n" | ConvertFrom-Json) } catch { $result = $null }
+    if ($probeResult.ExitCode -eq 0) {
+        try { $result = ($probeResult.Output | ConvertFrom-Json) } catch { $result = $null }
     }
     $version = if ($versions.ContainsKey($name)) { [int]$versions[$name] } else { 0 }
     $score = 0
@@ -156,9 +175,9 @@ while not os.path.exists(p):
     p=parent
 print(json.dumps({'free':shutil.disk_usage(p).free,'existing':p}))
 '@
-    $output = @(& wsl.exe --distribution $distro --exec python3 -c $diskProbe $linuxHome 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw 'Could not check free space inside the selected WSL distribution.' }
-    $wslFree = [int64](($output -join "`n" | ConvertFrom-Json).free)
+    $probeResult = Invoke-WslPython $distro $diskProbe @($linuxHome)
+    if ($probeResult.ExitCode -ne 0) { throw 'Could not check free space inside the selected WSL distribution.' }
+    $wslFree = [int64](($probeResult.Output | ConvertFrom-Json).free)
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
     $registered = @(Get-ChildItem -Path $key -ErrorAction SilentlyContinue |
         ForEach-Object { Get-ItemProperty -Path $_.PSPath } |
