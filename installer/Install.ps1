@@ -160,7 +160,7 @@ print(json.dumps(json.loads(result.stdout).get('blockdevices',[])))
     return @($result.Output | ConvertFrom-Json)
 }
 
-function Assert-FreshDatabaseHome([string]$name, [string]$home) {
+function Assert-FreshDatabaseHome([string]$name, [string]$linuxDataHome) {
     $probe = @'
 import json,os,sys
 home=sys.argv[1]
@@ -170,7 +170,7 @@ occupied=os.path.lexists(db) and (os.path.islink(db) or
          not os.path.isdir(db) or bool(os.listdir(db)))
 print(json.dumps({'installed':existing,'database_occupied':occupied}))
 '@
-    $result = Invoke-WslPython $name $probe @($home)
+    $result = Invoke-WslPython $name $probe @($linuxDataHome)
     if ($result.ExitCode -ne 0) { throw 'Could not check existing database data.' }
     $check = $result.Output | ConvertFrom-Json
     if ($check.installed -or $check.database_occupied) {
