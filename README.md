@@ -43,7 +43,7 @@ The installer asks whether to start CTF Agent when you sign in to Windows. You c
 
 To open your challenge files from Windows, use Explorer at `\\wsl.localhost\<distribution>\<Linux data path>\ctf_agent_data\workspace_files`.
 
-To place only the database on another drive, paste a Windows folder path such as `D:\Develop\ctf_agent\data` at the data path prompt. The installer creates `D:\Develop\ctf_agent\data\ctf-agent-db.vhdx` for the ext4 database; the application and challenge files keep the usual WSL path. Pressing Enter instead keeps all data at the usual WSL location. The database remains accessible in Explorer through `\\wsl.localhost`; see the [Windows installation guide](docs/docker-desktop.md). Existing databases are not moved automatically.
+To place only the database at a Windows location, paste a folder path such as `D:\Develop\ctf_agent\data` at the data path prompt. The installer creates `D:\Develop\ctf_agent\data\ctf-agent-db.vhdx` for the ext4 database; the application and challenge files keep the usual WSL path. Any fixed local drive, including C:, D:, or E:, is accepted even when it also holds the selected WSL distribution. D: is only an example, not a default. Pressing Enter keeps all data at the usual WSL location. The database remains accessible in Explorer through `\\wsl.localhost`; see the [Windows installation guide](docs/docker-desktop.md). Existing databases are not moved automatically.
 
 ### Install from source
 

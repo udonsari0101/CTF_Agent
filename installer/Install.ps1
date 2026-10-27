@@ -376,23 +376,6 @@ function Get-HostVolumeFree([string]$path) {
     return [int64](Get-PSDrive -Name $root.Substring(0, 1) -ErrorAction Stop).Free
 }
 
-function Get-WslBackingDrive([string]$distro) {
-    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
-    $registered = @(Get-ChildItem -Path $key -ErrorAction SilentlyContinue |
-        ForEach-Object { Get-ItemProperty -Path $_.PSPath } |
-        Where-Object { $_.DistributionName -eq $distro } | Select-Object -First 1)
-    if (-not $registered.Count -or -not $registered[0].BasePath) {
-        throw 'Could not locate the selected WSL disk on Windows.'
-    }
-    $backing = [Environment]::ExpandEnvironmentVariables([string]$registered[0].BasePath)
-    if ($backing -match '^\\\\\?\\[A-Za-z]:\\') { $backing = $backing.Substring(4) }
-    $root = [IO.Path]::GetPathRoot($backing)
-    if (-not $root -or $root -notmatch '^[A-Za-z]:\\$') {
-        throw 'Could not identify the selected WSL backing drive.'
-    }
-    return $root
-}
-
 function Assert-StorageCapacity([string]$distro, [string]$linuxHome) {
     $diskProbe = @'
 import json,os,shutil,sys
@@ -546,9 +529,6 @@ if ($separateDatabase) {
     $dbVhd = Select-DatabaseVhd ([string]$saved.db_vhd) $requestedDatabaseVhd
     if ((Get-HostVolumeFree $dbVhd) -lt $minimumFreeBytes) {
         throw 'The database drive needs at least 15 GB free before installation.'
-    }
-    if ([IO.Path]::GetPathRoot($dbVhd) -ieq (Get-WslBackingDrive $distro)) {
-        throw 'Choose a different Windows drive letter from the selected WSL distribution for the database VHDX.'
     }
     $databaseMount = Get-DatabaseMountPath
     $databasePath = "$databaseMount/Database/CTF_Agent"

@@ -43,7 +43,7 @@
 
 Windows 파일 탐색기에서는 `\\wsl.localhost\<배포판>\<Linux 데이터 경로>\ctf_agent_data\workspace_files`로 문제 파일에 접근할 수 있습니다.
 
-데이터 경로 입력창에 `D:\Develop\ctf_agent\data` 같은 Windows 폴더 경로를 붙여 넣으면 `D:\Develop\ctf_agent\data\ctf-agent-db.vhdx`를 만들어 DB만 별도 ext4 저장소에 둡니다. 프로그램과 문제 파일은 기존 WSL 경로를 사용합니다. Enter만 누르면 모든 데이터가 기존 WSL 경로에 남습니다. DB 파일은 `\\wsl.localhost`를 통해 파일 탐색기에서 열 수 있습니다. 기존 DB는 자동으로 이동하지 않습니다. 자세한 내용은 [Windows 설치 안내](docs/docker-desktop.md)를 참고하세요.
+데이터 경로 입력창에 `D:\Develop\ctf_agent\data` 같은 Windows 폴더 경로를 붙여 넣으면 `D:\Develop\ctf_agent\data\ctf-agent-db.vhdx`를 만들어 DB만 별도 ext4 저장소에 둡니다. C:, D:, E: 등 로컬 고정 드라이브라면 선택한 WSL 배포판과 같은 드라이브도 사용할 수 있습니다. D:는 예시이며 기본값이 아닙니다. 프로그램과 문제 파일은 기존 WSL 경로를 사용합니다. Enter만 누르면 모든 데이터가 기존 WSL 경로에 남습니다. DB 파일은 `\\wsl.localhost`를 통해 파일 탐색기에서 열 수 있습니다. 기존 DB는 자동으로 이동하지 않습니다. 자세한 내용은 [Windows 설치 안내](docs/docker-desktop.md)를 참고하세요.
 
 ### 소스에서 설치
 
