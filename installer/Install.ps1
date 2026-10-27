@@ -148,6 +148,34 @@ function Invoke-WslPythonStdin([string]$name, [string]$source, [string[]]$argume
     return [pscustomobject]@{ Output = ($output -join "`n"); ExitCode = $exitCode }
 }
 
+function Invoke-WslNative([string[]]$command, [switch]$Quiet, [switch]$Visible) {
+    # Windows PowerShell 5.1 turns redirected native stderr into an ErrorRecord.
+    # The caller must inspect the exit code, including when the WSL command is
+    # missing while Docker Desktop is still starting.
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        if ($Quiet) {
+            & wsl.exe @command *> $null
+            $output = @()
+        } elseif ($Visible) {
+            & wsl.exe @command | Out-Host
+            $output = @()
+        } else {
+            $output = @(& wsl.exe @command 2>$null)
+        }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return [pscustomobject]@{ Output=$output; ExitCode=$exitCode }
+}
+
+function Test-WslDockerReady([string]$distro) {
+    $result = Invoke-WslNative @('--distribution', $distro, '--exec', 'docker', 'info') -Quiet
+    return ($result.ExitCode -eq 0)
+}
+
 function Get-WslBlockDevices([string]$name) {
     $probe = @'
 import json,subprocess
@@ -334,23 +362,34 @@ print(json.dumps({'unsafe':p.is_symlink() or (p.exists() and
     if ($signatureExit -ne 0 -or $signatures.Count) {
         throw 'The new VHDX has an unexpected filesystem signature; no disk was formatted.'
     }
-    & wsl.exe --distribution $name --user root --exec mkfs.ext4 -F -q -L ctf-agent-db $device
-    if ($LASTEXITCODE -ne 0) { throw 'Could not format the verified new VHDX.' }
-    & wsl.exe --distribution $name --user root --exec mkdir -p (Get-DatabaseMountPath)
-    if ($LASTEXITCODE -ne 0) { throw 'Could not create the WSL database mount point.' }
-    & wsl.exe --distribution $name --user root --exec mount -t ext4 $device (Get-DatabaseMountPath)
-    if ($LASTEXITCODE -ne 0) { throw 'Could not mount the new database filesystem.' }
+    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
+        'mkfs.ext4', '-F', '-q', '-L', 'ctf-agent-db', $device) -Visible
+    if ($step.ExitCode -ne 0) { throw 'Could not format the verified new VHDX.' }
+    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
+        'mkdir', '-p', (Get-DatabaseMountPath)) -Visible
+    if ($step.ExitCode -ne 0) { throw 'Could not create the WSL database mount point.' }
+    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
+        'mount', '-t', 'ext4', $device, (Get-DatabaseMountPath)) -Visible
+    if ($step.ExitCode -ne 0) { throw 'Could not mount the new database filesystem.' }
     $info = Get-DatabaseMountInfo $name
     if (-not $info -or $info.Source -ne $device) {
         throw 'The formatted VHDX did not appear at the dedicated database mount point.'
     }
-    $uid = @(& wsl.exe --distribution $name --exec id -u)[0].Trim()
-    $gid = @(& wsl.exe --distribution $name --exec id -g)[0].Trim()
+    $uidResult = Invoke-WslNative @('--distribution', $name, '--exec', 'id', '-u')
+    $gidResult = Invoke-WslNative @('--distribution', $name, '--exec', 'id', '-g')
+    if ($uidResult.ExitCode -ne 0 -or $gidResult.ExitCode -ne 0 -or
+        @($uidResult.Output).Count -ne 1 -or @($gidResult.Output).Count -ne 1) {
+        throw 'Could not determine the WSL user.'
+    }
+    $uid = [string]$uidResult.Output[0].Trim()
+    $gid = [string]$gidResult.Output[0].Trim()
     if ($uid -notmatch '^\d+$' -or $gid -notmatch '^\d+$') { throw 'Could not determine the WSL user.' }
-    & wsl.exe --distribution $name --user root --exec chown "$($uid):$gid" (Get-DatabaseMountPath)
-    if ($LASTEXITCODE -ne 0) { throw 'Could not set database mount ownership.' }
-    & wsl.exe --distribution $name --user root --exec chmod 0750 (Get-DatabaseMountPath)
-    if ($LASTEXITCODE -ne 0) { throw 'Could not set database mount permissions.' }
+    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
+        'chown', "$($uid):$gid", (Get-DatabaseMountPath)) -Visible
+    if ($step.ExitCode -ne 0) { throw 'Could not set database mount ownership.' }
+    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
+        'chmod', '0750', (Get-DatabaseMountPath)) -Visible
+    if ($step.ExitCode -ne 0) { throw 'Could not set database mount permissions.' }
     Write-DatabaseVolumeMarker $name $info.Uuid
     return $info.Uuid
 }
@@ -406,7 +445,9 @@ print(json.dumps({'id':data.get('ID',''),'version':data.get('VERSION_ID',''),
 }
 
 function Get-OnlineUbuntu {
-    $lines = @(& wsl.exe --list --online 2>$null) | ForEach-Object { $_ -replace "`0", '' }
+    $listing = Invoke-WslNative @('--list', '--online')
+    if ($listing.ExitCode -ne 0) { return 'Ubuntu' }
+    $lines = @($listing.Output) | ForEach-Object { $_ -replace "`0", '' }
     if (($lines -join "`n") -match '(?m)^\s*Ubuntu-24\.04\s') { return 'Ubuntu-24.04' }
     return 'Ubuntu'
 }
@@ -535,19 +576,25 @@ function Ensure-DockerDesktop([string]$distro) {
             Start-Process 'https://docs.docker.com/desktop/setup/install/windows-install/'
             throw 'winget is unavailable. Install Docker Desktop from the opened official page and rerun Install.cmd.'
         }
-        & winget.exe install --id Docker.DockerDesktop --exact --source winget `
-            --accept-source-agreements --accept-package-agreements
-        if ($LASTEXITCODE -ne 0) { throw "Docker Desktop installation failed (exit code $LASTEXITCODE)." }
+        $previousPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & winget.exe install --id Docker.DockerDesktop --exact --source winget `
+                --accept-source-agreements --accept-package-agreements
+            $wingetExit = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $previousPreference }
+        if ($wingetExit -ne 0) { throw "Docker Desktop installation failed (exit code $wingetExit)." }
         $desktop = Get-DockerDesktopExecutable
         if (-not $desktop) { throw 'Finish Docker Desktop installation and rerun Install.cmd.' }
     }
     if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue)) {
         Start-Process -FilePath $desktop
     }
+    Write-Host "Checking Docker Desktop in WSL distribution $distro..."
     for ($round = 1; $round -le 3; $round++) {
-        for ($attempt = 1; $attempt -le 12; $attempt++) {
-            & wsl.exe --distribution $distro --exec docker info *> $null
-            if ($LASTEXITCODE -eq 0) { return }
+        $attemptLimit = if ($round -eq 1) { 4 } else { 12 }
+        for ($attempt = 1; $attempt -le $attemptLimit; $attempt++) {
+            if (Test-WslDockerReady $distro) { return }
             Start-Sleep -Seconds 5
         }
         if ($round -lt 3) {
@@ -687,12 +734,17 @@ if ($separateDatabase) {
         db_uuid=$dbUuid;db_task_managed=$dbTaskManaged;pending_install=$true} |
         ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
 }
-$linuxPath = @(& wsl.exe --distribution $distro --exec wslpath -a -u $installer 2>$null)
-if ($LASTEXITCODE -ne 0 -or -not $linuxPath.Count -or -not $linuxPath[0].StartsWith('/')) {
+$pathResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'wslpath', '-a', '-u', $installer)
+$linuxPath = @($pathResult.Output)
+if ($pathResult.ExitCode -ne 0 -or -not $linuxPath.Count -or -not $linuxPath[0].StartsWith('/')) {
     throw 'The selected WSL distribution cannot access the extracted release folder.'
 }
-& wsl.exe --distribution $distro --exec env "CTF_LOCAL_HOME=$linuxHome" "CTF_LOCAL_AUTOSTART=$($autoStart.ToString().ToLowerInvariant())" "CTF_LOCAL_AUTH_MODE=$authMode" "CTF_LOCAL_DATABASE=$databasePath" "CTF_LOCAL_FS_DATABASE=$databasePath" "CTF_LOCAL_DB_MOUNT=$databaseMount" bash $linuxPath[0]
-if ($LASTEXITCODE -ne 0) { throw "Local installation failed (exit code $LASTEXITCODE)." }
+$installResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
+    "CTF_LOCAL_HOME=$linuxHome", "CTF_LOCAL_AUTOSTART=$($autoStart.ToString().ToLowerInvariant())",
+    "CTF_LOCAL_AUTH_MODE=$authMode", "CTF_LOCAL_DATABASE=$databasePath",
+    "CTF_LOCAL_FS_DATABASE=$databasePath", "CTF_LOCAL_DB_MOUNT=$databaseMount",
+    'bash', $linuxPath[0]) -Visible
+if ($installResult.ExitCode -ne 0) { throw "Local installation failed (exit code $($installResult.ExitCode))." }
 $stateDir = Split-Path -Parent $stateFile
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1', 'DatabaseDisk.ps1')) {

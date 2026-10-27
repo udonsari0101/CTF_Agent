@@ -7,6 +7,17 @@ function Get-DatabaseDiskHelperPath {
     return (Join-Path $PSScriptRoot 'DatabaseDisk.ps1')
 }
 
+function Invoke-DatabaseNative([string]$file, [string[]]$arguments, [switch]$Quiet) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        if ($Quiet) { & $file @arguments *> $null }
+        else { & $file @arguments | Out-Host }
+        $exitCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    return [int]$exitCode
+}
+
 function Assert-DatabaseVhdPath([string]$path, [bool]$allowExisting = $true) {
     if (-not $path -or $path -notmatch '^[A-Za-z]:[\\/]' -or
         $path -match '[\x00-\x1f"<>|?*]' -or $path -match '(^|[\\/])\.\.([\\/]|$)') {
@@ -241,23 +252,24 @@ function Invoke-DatabaseElevatedPayload([string]$payload) {
         try {
             @('create vdisk file="' + $vhd + '" maximum=65536 type=expandable', 'exit') |
                 Set-Content -LiteralPath $scriptPath -Encoding ASCII
-            & diskpart.exe /s $scriptPath | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'DiskPart could not create the VHDX.' }
+            $exitCode = Invoke-DatabaseNative 'diskpart.exe' @('/s', $scriptPath) -Quiet
+            if ($exitCode -ne 0) { throw 'DiskPart could not create the VHDX.' }
         } finally { Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue }
         Assert-DatabaseVhdHeader $vhd | Out-Null
-        & wsl.exe --mount --vhd $vhd --bare
-        if ($LASTEXITCODE -ne 0) { throw 'WSL could not attach the new VHDX.' }
+        $exitCode = Invoke-DatabaseNative 'wsl.exe' @('--mount', '--vhd', $vhd, '--bare')
+        if ($exitCode -ne 0) { throw 'WSL could not attach the new VHDX.' }
         return
     }
     if ($action -eq 'mount') {
         Assert-DatabaseVhdHeader $vhd | Out-Null
-        & wsl.exe --mount --vhd $vhd --name ctf-agent-db
-        if ($LASTEXITCODE -ne 0) { throw 'WSL could not mount the database VHDX.' }
+        $exitCode = Invoke-DatabaseNative 'wsl.exe' @('--mount', '--vhd', $vhd,
+            '--name', 'ctf-agent-db')
+        if ($exitCode -ne 0) { throw 'WSL could not mount the database VHDX.' }
         return
     }
     if ($action -eq 'unmount') {
-        & wsl.exe --unmount $vhd
-        if ($LASTEXITCODE -ne 0) { throw 'WSL could not detach the database VHDX.' }
+        $exitCode = Invoke-DatabaseNative 'wsl.exe' @('--unmount', $vhd)
+        if ($exitCode -ne 0) { throw 'WSL could not detach the database VHDX.' }
         return
     }
     if ($action -notin @('register-task', 'unregister-task')) { throw 'Unsupported database disk action.' }

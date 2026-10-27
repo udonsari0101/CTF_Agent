@@ -1,4 +1,20 @@
 $ErrorActionPreference = 'Stop'
+function Invoke-WslNative([string[]]$command, [switch]$Quiet, [switch]$Visible) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        if ($Quiet) { & wsl.exe @command *> $null; $output = @() }
+        elseif ($Visible) { & wsl.exe @command | Out-Host; $output = @() }
+        else { $output = @(& wsl.exe @command 2>$null) }
+        $exitCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    return [pscustomobject]@{ Output=$output; ExitCode=$exitCode }
+}
+
+function Test-WslDockerReady([string]$distro) {
+    $result = Invoke-WslNative @('--distribution', $distro, '--exec', 'docker', 'info') -Quiet
+    return ($result.ExitCode -eq 0)
+}
 $stateFile = Join-Path $env:LOCALAPPDATA 'CTF Agent\install.json'
 if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
     throw 'CTF Agent installation settings are missing. Run Install.cmd first.'
@@ -32,12 +48,13 @@ if ($dbVhd) {
     Ensure-DatabaseMount $distro $dbVhd $dbUuid ([bool]$saved.db_task_managed)
 }
 $linuxPath = "$linuxHome/.launcher/start.sh"
-& wsl.exe --distribution $distro --exec test -f $linuxPath *> $null
-if ($LASTEXITCODE -ne 0) {
+$exists = Invoke-WslNative @('--distribution', $distro, '--exec', 'test', '-f', $linuxPath) -Quiet
+if ($exists.ExitCode -ne 0) {
     $launcher = Join-Path $PSScriptRoot 'installer\start.sh'
     if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw 'CTF Agent start script is missing.' }
-    $converted = @(& wsl.exe --distribution $distro --exec wslpath -a -u $launcher 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $converted.Count) { throw 'The start script is unavailable in WSL.' }
+    $pathResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'wslpath', '-a', '-u', $launcher)
+    $converted = @($pathResult.Output)
+    if ($pathResult.ExitCode -ne 0 -or -not $converted.Count) { throw 'The start script is unavailable in WSL.' }
     $linuxPath = $converted[0]
 }
 $desktop = @(
@@ -49,10 +66,12 @@ if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue) -and
 }
 $ready = $false
 for ($attempt = 0; $attempt -lt 30; $attempt++) {
-    & wsl.exe --distribution $distro --exec docker info *> $null
-    if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+    if (Test-WslDockerReady $distro) { $ready = $true; break }
     Start-Sleep -Seconds 4
 }
 if (-not $ready) { throw "Docker Desktop is unavailable inside $distro." }
-& wsl.exe --distribution $distro --exec env "CTF_LOCAL_HOME=$linuxHome" "CTF_LOCAL_DATABASE=$databasePath" "CTF_LOCAL_FS_DATABASE=$databasePath" "CTF_LOCAL_DB_MOUNT=$databaseMount" bash $linuxPath
-if ($LASTEXITCODE -ne 0) { throw "CTF Agent start failed (exit code $LASTEXITCODE)." }
+$launch = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
+    "CTF_LOCAL_HOME=$linuxHome", "CTF_LOCAL_DATABASE=$databasePath",
+    "CTF_LOCAL_FS_DATABASE=$databasePath", "CTF_LOCAL_DB_MOUNT=$databaseMount",
+    'bash', $linuxPath) -Visible
+if ($launch.ExitCode -ne 0) { throw "CTF Agent start failed (exit code $($launch.ExitCode))." }

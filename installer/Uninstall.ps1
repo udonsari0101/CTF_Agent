@@ -1,4 +1,20 @@
 $ErrorActionPreference = 'Stop'
+function Invoke-WslNative([string[]]$command, [switch]$Quiet, [switch]$Visible) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        if ($Quiet) { & wsl.exe @command *> $null; $output = @() }
+        elseif ($Visible) { & wsl.exe @command | Out-Host; $output = @() }
+        else { $output = @(& wsl.exe @command 2>$null) }
+        $exitCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    return [pscustomobject]@{ Output=$output; ExitCode=$exitCode }
+}
+
+function Test-WslDockerReady([string]$distro) {
+    $result = Invoke-WslNative @('--distribution', $distro, '--exec', 'docker', 'info') -Quiet
+    return ($result.ExitCode -eq 0)
+}
 $stateDir = Join-Path $env:LOCALAPPDATA 'CTF Agent'
 $stateFile = Join-Path $stateDir 'install.json'
 if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
@@ -31,12 +47,13 @@ if ($dbVhd) {
     }
 }
 $linuxPath = "$linuxHome/.launcher/uninstall.py"
-& wsl.exe --distribution $distro --exec test -f $linuxPath *> $null
-if ($LASTEXITCODE -ne 0) {
+$exists = Invoke-WslNative @('--distribution', $distro, '--exec', 'test', '-f', $linuxPath) -Quiet
+if ($exists.ExitCode -ne 0) {
     $uninstaller = Join-Path $PSScriptRoot 'installer\uninstall.py'
     if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw 'CTF Agent removal script is missing.' }
-    $converted = @(& wsl.exe --distribution $distro --exec wslpath -a -u $uninstaller 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $converted.Count) { throw 'The removal script is unavailable in WSL.' }
+    $pathResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'wslpath', '-a', '-u', $uninstaller)
+    $converted = @($pathResult.Output)
+    if ($pathResult.ExitCode -ne 0 -or -not $converted.Count) { throw 'The removal script is unavailable in WSL.' }
     $linuxPath = $converted[0]
 }
 Write-Host "CTF Agent containers, images and release files will be removed from $distro."
@@ -60,13 +77,15 @@ if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue) -and
 }
 $ready = $false
 for ($attempt = 0; $attempt -lt 30; $attempt++) {
-    & wsl.exe --distribution $distro --exec docker info *> $null
-    if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+    if (Test-WslDockerReady $distro) { $ready = $true; break }
     Start-Sleep -Seconds 4
 }
 if (-not $ready) { throw "Docker Desktop is unavailable inside $distro. Nothing was deleted." }
-& wsl.exe --distribution $distro --exec env "CTF_LOCAL_HOME=$linuxHome" "CTF_LOCAL_DATABASE=$databasePath" "CTF_LOCAL_FS_DATABASE=$databasePath" "CTF_LOCAL_DB_MOUNT=$databaseMount" python3 $linuxPath
-if ($LASTEXITCODE -ne 0) { throw "CTF Agent removal failed (exit code $LASTEXITCODE). Data was preserved." }
+$removal = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
+    "CTF_LOCAL_HOME=$linuxHome", "CTF_LOCAL_DATABASE=$databasePath",
+    "CTF_LOCAL_FS_DATABASE=$databasePath", "CTF_LOCAL_DB_MOUNT=$databaseMount",
+    'python3', $linuxPath) -Visible
+if ($removal.ExitCode -ne 0) { throw "CTF Agent removal failed (exit code $($removal.ExitCode)). Data was preserved." }
 if ($dbVhd) {
     if ($saved.db_task_managed) {
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
