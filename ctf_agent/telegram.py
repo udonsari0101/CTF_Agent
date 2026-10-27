@@ -27,6 +27,7 @@ from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from .process_lock import ProcessFileLock
+from .solver_time import continuation_elapsed
 
 
 LINK_TTL_SECONDS = 10 * 60
@@ -960,7 +961,8 @@ class TelegramService:
         if not isinstance(job_id, str):
             return None
         return db.execute(
-            """SELECT j.id,j.owner_user_id,j.workspace_id,j.challenge_id,j.provider,j.model,
+            """SELECT j.id,j.job_mode,j.owner_user_id,j.workspace_id,j.challenge_id,
+                      j.continuation_source_job_id,j.flag_rejected_at,j.provider,j.model,
                       j.reasoning_effort,j.service_tier,j.ultra_escalation_mode,j.status,j.error_json,j.cancel_requested,
                       j.released_ingested,j.flag,j.writeup_markdown,j.created_at,j.updated_at,
                       j.released_at,c.status AS challenge_status,
@@ -978,19 +980,6 @@ class TelegramService:
         job: sqlite3.Row,
         target_kind: str | None,
     ) -> dict[str, Any]:
-        running_at = None
-        for event in db.execute(
-            "SELECT event_json,created_at FROM solver_job_events "
-            "WHERE job_id=? AND kind='status' ORDER BY sequence",
-            (job["id"],),
-        ).fetchall():
-            try:
-                value = json.loads(event["event_json"]) if len(event["event_json"]) <= 4096 else None
-            except (ValueError, TypeError):
-                value = None
-            if isinstance(value, dict) and value.get("status") == "running":
-                running_at = event["created_at"]
-                break
         target_at = None
         if target_kind is not None:
             target = db.execute(
@@ -1001,10 +990,14 @@ class TelegramService:
             target_at = target["created_at"] if target else None
         if target_at is None:
             target_at = job["released_at"] if job["released_at"] is not None else job["updated_at"]
-        start_at = running_at if running_at is not None else job["created_at"]
-        elapsed = None
-        if isinstance(start_at, (int, float)) and isinstance(target_at, (int, float)):
-            elapsed = max(0, min(int(target_at - start_at), 31_536_000))
+        timing = continuation_elapsed(
+            db, job, now=target_at, stop_at_flag=target_kind != "writeup",
+        )
+        elapsed = timing["seconds"]
+        running_since = timing["running_since"]
+        if running_since is not None and isinstance(target_at, (int, float)):
+            elapsed += max(0, target_at - running_since)
+        elapsed = max(0, min(int(elapsed), 31_536_000))
         provider = {"codex": "Codex", "claude": "Claude Code"}.get(job["provider"])
         model = job["model"] if isinstance(job["model"], str) and _SAFE_JOB_SETTING.fullmatch(job["model"]) else None
         effort = (
@@ -1020,7 +1013,7 @@ class TelegramService:
             "solver_effort": effort,
             "solver_fast": tier == "fast",
             "solver_elapsed": elapsed,
-            "solver_elapsed_includes_queue": running_at is None,
+            "solver_elapsed_includes_queue": timing["includes_queue"],
         }
 
     def _current_delivery(

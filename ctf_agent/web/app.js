@@ -887,11 +887,7 @@ function solverPanelMarkup(job, events = [], loading = false) {
       : job.phase === 'completed'
       ? '<p class="form-hint">다시 실행하려면 먼저 위의 완료 취소를 눌러 미완료 상태로 되돌리세요.</p>'
       : `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>다시 풀기</button>`;
-  const runningEvent = events.find(event => event.kind === 'status' && event.status === 'running');
-  const startedAt = job.continuation_started_at ?? runningEvent?.created_at ?? job.started_at ?? job.created_at;
-  const solveStarted = job.continuation_started_at != null
-    ? job.continuation_started_running : Boolean(runningEvent || job.started_at);
-  const elapsed = active ? solverElapsedMarkup(startedAt,solveStarted) : '';
+  const elapsed = active ? solverElapsedMarkup(job) : '';
   return `<div class="solver-panel-head"><h3>문제 풀이</h3><div class="solver-panel-state"><span class="solver-phase solver-phase-${esc(job.phase)}">${esc(active && job.cancel_requested ? '중단 요청 중' : (solverPhases[job.phase] || job.phase))}</span>${elapsed}</div></div>
     ${modelText ? `<p class="solver-model">${esc(modelText)}</p>` : ''}
     ${job.network_policy === 'general_internet' ? '<p class="form-hint solver-limit">인터넷 사용 가능</p>' : ''}
@@ -1291,18 +1287,23 @@ function challengeElapsedText(run) {
   return minuteRemainder ? `${hours}시간 ${minuteRemainder}분` : `${hours}시간`;
 }
 
-function solverElapsedMarkup(startedAt, solveStarted = true) {
-  if (typeof startedAt !== 'number' || !Number.isFinite(startedAt) || startedAt <= 0) return '';
-  const label = i18n.t(solveStarted ? '풀이 경과 시간' : '대기 포함 경과 시간');
-  const elapsed = challengeElapsedText({elapsed_seconds:Math.max(0,Date.now() / 1000 - startedAt)});
-  return `<small class="solver-elapsed" data-started-at="${startedAt}" title="${label}" aria-label="${label} ${esc(elapsed)}">· ${esc(elapsed)}</small>`;
+function solverElapsedMarkup(run) {
+  const base = run?.solve_elapsed_seconds;
+  if (typeof base !== 'number' || !Number.isFinite(base) || base < 0) return '';
+  const runningSince = run.solve_elapsed_running_since;
+  const ticking = typeof runningSince === 'number' && Number.isFinite(runningSince) && runningSince > 0;
+  const label = i18n.t(run.solve_elapsed_includes_queue ? '대기 포함 경과 시간' : '풀이 경과 시간');
+  const elapsed = challengeElapsedText({elapsed_seconds:base + (ticking ? Math.max(0,Date.now() / 1000 - runningSince) : 0)});
+  return `<small class="solver-elapsed" data-elapsed-base="${base}" ${ticking ? `data-running-since="${runningSince}" ` : ''}title="${label}" aria-label="${label} ${esc(elapsed)}">· ${esc(elapsed)}</small>`;
 }
 
 function updateSolverElapsedLabels() {
-  for (const label of document.querySelectorAll('.solver-elapsed[data-started-at]')) {
-    const startedAt = Number(label.dataset.startedAt);
-    if (!Number.isFinite(startedAt) || startedAt <= 0) continue;
-    const elapsed = challengeElapsedText({elapsed_seconds:Math.max(0,Date.now() / 1000 - startedAt)});
+  for (const label of document.querySelectorAll('.solver-elapsed[data-elapsed-base]')) {
+    const base = Number(label.dataset.elapsedBase);
+    if (!Number.isFinite(base) || base < 0) continue;
+    const runningSince = Number(label.dataset.runningSince);
+    const ticking = Number.isFinite(runningSince) && runningSince > 0;
+    const elapsed = challengeElapsedText({elapsed_seconds:base + (ticking ? Math.max(0,Date.now() / 1000 - runningSince) : 0)});
     label.textContent = `· ${elapsed}`;
     label.setAttribute('aria-label',`${label.title} ${elapsed}`);
   }
@@ -1329,11 +1330,7 @@ function challengeCardMarkup(challenge, workspaceId) {
   const runPhase = latestRun?.phase || latestRun?.status;
   const liveSession = latestRun && !solverTerminalPhases.has(runPhase);
   const liveElapsed = liveSession && challenge.status === 'running'
-    ? solverElapsedMarkup(
-      latestRun.continuation_started_at ?? latestRun.started_at ?? latestRun.created_at,
-      latestRun.continuation_started_at != null
-        ? latestRun.continuation_started_running : Boolean(latestRun.started_at),
-    ) : '';
+    ? solverElapsedMarkup(latestRun) : '';
   const needsInput = runPhase === 'needs_input';
   const canStart = !needsInput && ['pending','stopped','failed'].includes(challenge.status);
   const startKey = `${workspaceId}:${challenge.id}`;

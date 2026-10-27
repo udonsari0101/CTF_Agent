@@ -35,7 +35,7 @@ from .ctfd import connection_info
 from .db import Settings, connect, initialize
 from .flag_formats import normalize_flag_format
 from .password_policy import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH
-from .solver_time import continuation_flag_time, continuation_start
+from .solver_time import continuation_elapsed, continuation_start
 from .writeups import merge_generated_writeup, remove_generated_writeup
 
 CURRENT_USER = ContextVar("ctf_current_user", default=None)
@@ -561,7 +561,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         row = db.execute(
             """SELECT id,job_mode,owner_user_id,workspace_id,challenge_id,
                        continuation_source_job_id,account_label,provider,model,
-                       reasoning_effort,service_tier,status,flag,created_at,released_at
+                       reasoning_effort,service_tier,status,flag,flag_rejected_at,
+                       created_at,updated_at,released_at
                FROM solver_jobs
                WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?
                  AND job_mode='solve'
@@ -585,20 +586,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if elapsed_origin is not None:
             result["continuation_started_at"] = elapsed_origin[0]
             result["continuation_started_running"] = elapsed_origin[1]
+        solve_clock = continuation_elapsed(db, row)
+        result["solve_elapsed_seconds"] = solve_clock["seconds"]
+        result["solve_elapsed_running_since"] = solve_clock["running_since"]
+        result["solve_elapsed_includes_queue"] = solve_clock["includes_queue"]
         if row["status"] in {"queued", "staging", "awaiting_credential", "validating",
                              "running", "flag_found", "writing", "cleanup_blocked", "completed"}:
             running_at = None
-            flag_at = None
             for event in db.execute(
                 """SELECT kind,event_json,created_at
                      FROM solver_job_events
-                     WHERE job_id=? AND kind IN ('status','flag')
+                     WHERE job_id=? AND kind='status'
                      ORDER BY sequence""",
                 (row["id"],),
             ):
-                if event["kind"] == "flag":
-                    flag_at = event["created_at"]
-                    continue
                 if running_at is not None:
                     continue
                 try:
@@ -609,24 +610,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     running_at = event["created_at"]
             if isinstance(running_at, (int, float)):
                 result["started_at"] = running_at
-        if row["status"] == "completed" and isinstance(
-            row["released_at"], (int, float)
-        ):
-            started_at = (elapsed_origin[0] if elapsed_origin is not None
-                          else running_at if running_at is not None else row["created_at"])
-            inherited_flag_at = continuation_flag_time(db, row)
-            finished_at = (inherited_flag_at if inherited_flag_at is not None
-                           else flag_at if flag_at is not None else row["released_at"])
-            if isinstance(started_at, (int, float)) and isinstance(
-                finished_at, (int, float)
-            ):
-                result["elapsed_seconds"] = max(
-                    0, min(int(finished_at - started_at), 31_536_000)
-                )
-                result["elapsed_includes_queue"] = (
-                    not elapsed_origin[1] if elapsed_origin is not None
-                    else running_at is None
-                )
+        if row["status"] == "completed" and row["released_at"] is not None:
+            result["elapsed_seconds"] = int(solve_clock["seconds"])
+            result["elapsed_includes_queue"] = solve_clock["includes_queue"]
         return result
 
     @app.exception_handler(RequestValidationError)

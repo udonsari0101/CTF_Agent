@@ -55,7 +55,7 @@ from .solver_retry import (
     parse_solver_artifact,
 )
 from .storage_budget import MAX_SQLITE_INTEGER, StorageBudget, StorageBudgetError
-from .solver_time import continuation_start
+from .solver_time import continuation_elapsed, continuation_start
 from .writeups import merge_generated_writeup, remove_generated_writeup
 
 
@@ -1579,10 +1579,14 @@ class SolverExchangeCoordinator:
                     (row["created_at"], row["created_at"], row["id"]),
                 ).fetchone()[0]
             elapsed_origin = continuation_start(db, row)
+            solve_clock = continuation_elapsed(db, row)
         result = _public_job(row, events, position, guidance=guidance)
         if elapsed_origin is not None:
             result["continuation_started_at"] = elapsed_origin[0]
             result["continuation_started_running"] = elapsed_origin[1]
+        result["solve_elapsed_seconds"] = solve_clock["seconds"]
+        result["solve_elapsed_running_since"] = solve_clock["running_since"]
+        result["solve_elapsed_includes_queue"] = solve_clock["includes_queue"]
         if row["status"] == "queued" and self._service_updating():
             result["queue_block_reason"] = "service_update"
         return result
