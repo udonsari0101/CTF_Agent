@@ -18,6 +18,11 @@ Requirements: x64 Windows, WSL 2, Docker Desktop with its WSL 2 engine and
 integration enabled for the selected distribution, internet access, and at
 least 15 GB of available space in WSL and on its backing Windows volume.
 
+If installed WSL distributions are listed but readiness checks fail, read the
+reason shown for each one. Retry Install.cmd as administrator under the same
+Windows account that owns those distributions. WSL registrations are per-user;
+do not install another Ubuntu just because a readiness check failed.
+
 To upgrade, extract a newer release and run its Install.cmd. The selected
 data directory and database are preserved. The installer remembers the WSL
 distribution and data path under your Windows user profile.

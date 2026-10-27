@@ -18,20 +18,96 @@ function Ask-YesNo([string]$question, [bool]$default = $true) {
     }
 }
 
+function Convert-WslListBytes([byte[]]$bytes) {
+    if (-not $bytes -or -not $bytes.Length) { return @() }
+    $encoding = [Text.Encoding]::UTF8
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xff -and $bytes[1] -eq 0xfe) {
+        $encoding = [Text.Encoding]::Unicode
+    } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xfe -and $bytes[1] -eq 0xff) {
+        $encoding = [Text.Encoding]::BigEndianUnicode
+    } elseif ($bytes.Length -ge 4) {
+        $evenNull = 0
+        $oddNull = 0
+        for ($index = 0; $index -lt [Math]::Min(80, $bytes.Length); $index++) {
+            if ($bytes[$index] -eq 0) {
+                if ($index % 2) { $oddNull++ } else { $evenNull++ }
+            }
+        }
+        if ($oddNull -ge 2 -and $oddNull -gt ($evenNull * 2)) {
+            $encoding = [Text.Encoding]::Unicode
+        } elseif ($evenNull -ge 2 -and $evenNull -gt ($oddNull * 2)) {
+            $encoding = [Text.Encoding]::BigEndianUnicode
+        }
+    }
+    $decoded = $encoding.GetString($bytes).TrimStart([char]0xfeff)
+    return @($decoded -split '\r?\n' | ForEach-Object {
+        ($_ -replace "`0", '').TrimStart([char]0xfeff).TrimEnd("`r")
+    } | Where-Object { $_.Trim() })
+}
+
+function Invoke-WslList([string]$mode) {
+    if ($mode -notin @('quiet', 'verbose')) { throw 'Unsupported WSL list mode.' }
+    $wslPath = Join-Path $env:WINDIR 'System32\wsl.exe'
+    if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+        $wslPath = Join-Path $env:WINDIR 'Sysnative\wsl.exe'
+    }
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $wslPath
+    $start.Arguments = "--list --$mode"
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::Start($start)
+    $buffer = New-Object IO.MemoryStream
+    try {
+        $process.StandardOutput.BaseStream.CopyTo($buffer)
+        $errorText = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+        $lines = @(Convert-WslListBytes $buffer.ToArray())
+    } finally {
+        $buffer.Dispose()
+        $process.Dispose()
+    }
+    return [pscustomobject]@{ Lines=$lines; ExitCode=$exitCode; Error=$errorText }
+}
+
 function Get-WslNames {
-    $lines = @(& wsl.exe --list --quiet 2>$null)
-    if ($LASTEXITCODE -ne 0) { return @() }
-    return @($lines | ForEach-Object { ($_ -replace "`0", '').Trim() } |
+    $listing = Invoke-WslList 'quiet'
+    if ($listing.ExitCode -ne 0) {
+        throw "WSL distribution listing failed (exit $($listing.ExitCode)). Retry Install.cmd as administrator under this same Windows account, then check wsl.exe --list --verbose."
+    }
+    return @($listing.Lines | ForEach-Object { $_.Trim().TrimStart([char]0xfeff) } |
         Where-Object { $_ -and $_ -notlike 'docker-desktop*' } | Select-Object -Unique)
 }
 
 function Get-WslVersions {
     $versions = @{}
-    $lines = @(& wsl.exe --list --verbose 2>$null)
-    if ($LASTEXITCODE -ne 0) { return $versions }
-    foreach ($line in $lines) {
-        $clean = ($line -replace "`0", '').Trim().TrimStart('*').Trim()
-        if ($clean -match '^(.+?)\s+.+\s+([12])\s*$') { $versions[$Matches[1].Trim()] = [int]$Matches[2] }
+    $listing = Invoke-WslList 'verbose'
+    if ($listing.ExitCode -eq 0) {
+        foreach ($line in $listing.Lines) {
+            $clean = $line.Trim().TrimStart('*').Trim()
+            if ($clean -match '^(.+?)\s{2,}.+?\s+([12])\s*$') {
+                $versions[$Matches[1].Trim()] = [int]$Matches[2]
+            }
+        }
+    } else {
+        Write-Warning "WSL version listing failed (exit $($listing.ExitCode)); checking this Windows account's registered distributions."
+    }
+    # The per-user WSL registration resolves versions when localized list
+    # formatting differs from the table above. It does not add hidden distros.
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    foreach ($entry in @(Get-ChildItem -Path $key -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ItemProperty -Path $_.PSPath })) {
+        $name = [string]$entry.DistributionName
+        if ($name -and -not $versions.ContainsKey($name) -and
+            $entry.Version -in @(1, 2)) {
+            $versions[$name] = [int]$entry.Version
+        }
+    }
+    if ($listing.ExitCode -ne 0 -and -not $versions.Count) {
+        throw 'WSL version listing failed and no registered distributions were found. Retry Install.cmd as administrator under this same Windows account, then check wsl.exe --list --verbose.'
     }
     return $versions
 }
@@ -50,6 +126,23 @@ function Invoke-WslPython([string]$name, [string]$source, [string[]]$arguments =
         $output = @(& wsl.exe --distribution $name --exec python3 -c $program $encoded @arguments 2>$null)
         $exitCode = $LASTEXITCODE
     } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return [pscustomobject]@{ Output = ($output -join "`n"); ExitCode = $exitCode }
+}
+
+function Invoke-WslPythonStdin([string]$name, [string]$source, [string[]]$arguments = @()) {
+    # The WSL eligibility probe can use stdin if a particular Windows build
+    # mishandles the Python -c argument through PowerShell 5.1.
+    $previousPreference = $ErrorActionPreference
+    $previousEncoding = $OutputEncoding
+    try {
+        $ErrorActionPreference = 'Continue'
+        $OutputEncoding = New-Object Text.UTF8Encoding($false)
+        $output = @($source | & wsl.exe --distribution $name --exec python3 - @arguments 2>$null)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $OutputEncoding = $previousEncoding
         $ErrorActionPreference = $previousPreference
     }
     return [pscustomobject]@{ Output = ($output -join "`n"); ExitCode = $exitCode }
@@ -282,6 +375,13 @@ print(json.dumps({'id':data.get('ID',''),'version':data.get('VERSION_ID',''),
     if ($probeResult.ExitCode -eq 0) {
         try { $result = ($probeResult.Output | ConvertFrom-Json) } catch { $result = $null }
     }
+    if (-not $result) {
+        $probeResult = Invoke-WslPythonStdin $name $probe
+        if ($probeResult.ExitCode -eq 0) {
+            try { $result = ($probeResult.Output | ConvertFrom-Json) } catch { $result = $null }
+        }
+    }
+    if ($result -and (-not $result.python -or $result.python.Count -lt 2)) { $result = $null }
     $version = if ($versions.ContainsKey($name)) { [int]$versions[$name] } else { 0 }
     $score = 0
     if ($version -eq 2 -and $result -and $result.bash -and
@@ -294,8 +394,9 @@ print(json.dumps({'id':data.get('ID',''),'version':data.get('VERSION_ID',''),
         }
         elseif ($result.id -eq 'debian') { $score = 80 }
     }
-    $reason = if ($version -ne 2) { 'WSL 2 required' }
-        elseif (-not $result) { 'Python 3 unavailable or distribution not initialized' }
+    $reason = if ($version -eq 0) { 'WSL version could not be verified' }
+        elseif ($version -ne 2) { 'WSL 2 required' }
+        elseif (-not $result) { "Python probe failed (exit $($probeResult.ExitCode)); try Install.cmd as administrator under this same Windows account" }
         elseif (-not $result.bash) { 'bash unavailable' }
         elseif ($score -eq 0) { 'Python 3.10+ required' }
         else { 'recommended' }
@@ -325,21 +426,29 @@ function Install-WslDistribution([string]$name) {
 }
 
 function Select-WslDistribution([object[]]$infos, [string]$savedName) {
-    $ready = @($infos | Where-Object { $_.Score -gt 0 } | Sort-Object Score -Descending)
+    $ordered = @($infos | Sort-Object Score -Descending)
+    if ($ordered.Count) {
+        Write-Host 'Available WSL distributions:'
+        for ($index = 0; $index -lt $ordered.Count; $index++) {
+            $info = $ordered[$index]
+            $label = if ($info.Score -gt 0) { 'usable' } else { $info.Reason }
+            Write-Host "  $($index + 1). $($info.Name) ($($info.Linux), WSL $($info.Version)) - $label"
+        }
+    }
+    $ready = @($ordered | Where-Object { $_.Score -gt 0 })
     if (-not $ready.Count) {
+        $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        if ($ordered.Count) {
+            throw "Installed WSL distributions are visible for $account, but none passed the checks above. Retry Install.cmd as administrator under this same Windows account; do not install another Ubuntu yet."
+        }
+        Write-Host "No WSL distributions are visible for Windows account: $account"
+        Write-Host 'If they belong to a different Windows account, run Install.cmd while signed in as that account.'
         $candidate = Get-OnlineUbuntu
-        if (-not (Ask-YesNo "No suitable WSL 2 distribution was found. Install $candidate now?")) {
+        if (-not (Ask-YesNo "Install $candidate for this Windows account now?" $false)) {
             throw 'A WSL 2 distribution with bash and Python 3.10+ is required.'
         }
         Install-WslDistribution $candidate
         return $candidate
-    }
-    Write-Host 'Available WSL distributions:'
-    $ordered = @($infos | Sort-Object Score -Descending)
-    for ($index = 0; $index -lt $ordered.Count; $index++) {
-        $info = $ordered[$index]
-        $label = if ($info.Score -gt 0) { 'usable' } else { $info.Reason }
-        Write-Host "  $($index + 1). $($info.Name) ($($info.Linux), WSL $($info.Version)) - $label"
     }
     $default = 1
     if ($savedName) {
@@ -457,10 +566,16 @@ $saved = $null
 if (Test-Path -LiteralPath $stateFile -PathType Leaf) {
     try { $saved = Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $saved = $null }
 }
+$versions = Get-WslVersions
 $names = @(Get-WslNames)
-$infos = @($names | ForEach-Object { Get-WslInfo $_ (Get-WslVersions) })
+if (-not $names.Count) {
+    $names = @($versions.Keys | Where-Object { $_ -notlike 'docker-desktop*' })
+    if ($names.Count) { Write-Warning 'WSL quiet listing was empty; checking the registered distribution names.' }
+}
+$infos = @($names | ForEach-Object { Get-WslInfo $_ $versions })
 $distro = Select-WslDistribution $infos ([string]$saved.distro)
-$selectedInfo = Get-WslInfo $distro (Get-WslVersions)
+if (-not $versions.ContainsKey($distro)) { $versions = Get-WslVersions }
+$selectedInfo = Get-WslInfo $distro $versions
 if ($selectedInfo.Score -le 0) {
     Write-Host 'Finish WSL setup or restart Windows, then rerun Install.cmd.'
     exit 20
