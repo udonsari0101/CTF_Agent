@@ -110,19 +110,23 @@ function Assert-DatabaseTaskSupport {
     New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Highest | Out-Null
 }
 
-function Select-DatabaseVhd([string]$savedPath) {
+function Select-DatabaseVhd([string]$savedPath, [string]$requestedPath = '') {
     if ($savedPath) {
+        $savedPath = Assert-DatabaseVhdPath $savedPath
+        if ($requestedPath -and
+            (Assert-DatabaseVhdPath $requestedPath) -ine $savedPath) {
+            throw 'The existing database VHDX cannot be relocated automatically. Keep its original path.'
+        }
         Write-Host "Database VHDX: $savedPath"
-        return (Assert-DatabaseVhdPath $savedPath)
+        return $savedPath
     }
-    $default = if (Test-Path -LiteralPath 'D:\' -PathType Container) {
-        'D:\CTF_Agent\Database\ctf-agent-db.vhdx'
-    } else { '' }
-    if ($default) { Write-Host "Recommended database disk: $default" }
-    $answer = (Read-Host 'New database VHDX path on a local drive [Enter for recommendation]').Trim()
-    if (-not $answer) { $answer = $default }
-    if (-not $answer) { throw 'Enter a local drive path for the database VHDX.' }
-    $full = Assert-DatabaseVhdPath $answer
+    if ($requestedPath) {
+        $full = Assert-DatabaseVhdPath $requestedPath
+    } else {
+        $answer = (Read-Host 'Database folder or .vhdx path on a local Windows drive').Trim()
+        if (-not $answer) { throw 'Enter a local drive path for the database VHDX.' }
+        $full = Resolve-DatabaseVhdInputPath $answer
+    }
     if ((Test-Path -LiteralPath $full) -and
         -not (Ask-YesNo 'Reuse this existing database VHDX after verifying its CTF Agent marker?' $false)) {
         throw 'Existing VHDX was left untouched. Choose a new file to create a new database.'
@@ -482,11 +486,19 @@ $defaultHome = "$($selectedInfo.Home.TrimEnd('/'))/.local/share/ctf-agent"
 if ($saved -and $saved.distro -eq $distro -and $saved.home) { $defaultHome = [string]$saved.home }
 Write-Host "Recommended data folder: $defaultHome"
 Write-Host "Windows Explorer: \\wsl.localhost\$distro\$($defaultHome.TrimStart('/') -replace '/', '\')"
+$requestedDatabaseVhd = ''
 while ($true) {
-    $answer = (Read-Host 'Data folder inside WSL [Enter for the recommendation]').Trim()
+    $answer = (Read-Host 'WSL data folder, or Windows folder for DB only [Enter for WSL default]').Trim()
+    if ($answer -match '^"[A-Za-z]:[\\/].*"$' -or $answer -match '^[A-Za-z]:[\\/]') {
+        $requestedDatabaseVhd = Resolve-DatabaseVhdInputPath $answer
+        $linuxHome = $defaultHome
+        Write-Host "Application files stay in WSL: $linuxHome"
+        Write-Host "Database disk on Windows: $requestedDatabaseVhd"
+        break
+    }
     $linuxHome = if ($answer) { $answer } else { $defaultHome }
-    if ($linuxHome -match '^[A-Za-z]:[\\/]' -or $linuxHome.StartsWith('\\')) {
-        Write-Host 'Choose a WSL Linux path. Explorer can open it through \\wsl.localhost without a slow Windows bind mount.'
+    if ($linuxHome.StartsWith('\\')) {
+        Write-Host 'Enter a WSL Linux path or a local Windows drive path.'
         continue
     }
     if (-not $linuxHome.StartsWith('/') -or $linuxHome -match '[\x00-\x1f]' -or
@@ -504,7 +516,9 @@ if ($saved.db_vhd -and ($saved.distro -ne $distro -or $saved.home -ne $linuxHome
     throw 'A separate database VHDX is bound to the original WSL distribution and installation path.'
 }
 Assert-StorageCapacity $distro $linuxHome
-$separateDatabase = Ask-YesNo 'Store only the database on a separate ext4 VHDX on a Windows drive?' ([bool]$saved.db_vhd)
+$separateDatabase = if ($requestedDatabaseVhd) { $true } else {
+    Ask-YesNo 'Store only the database on a separate ext4 VHDX on a Windows drive?' ([bool]$saved.db_vhd)
+}
 if (-not $separateDatabase -and $saved.db_vhd) {
     throw 'The existing separate database cannot be moved automatically. Keep its VHDX setting.'
 }
@@ -529,7 +543,7 @@ if ($separateDatabase) {
         throw 'For a separate database disk, keep the application data inside the selected WSL distribution.'
     }
     if (-not $saved.db_vhd) { Assert-FreshDatabaseHome $distro $linuxHome }
-    $dbVhd = Select-DatabaseVhd ([string]$saved.db_vhd)
+    $dbVhd = Select-DatabaseVhd ([string]$saved.db_vhd) $requestedDatabaseVhd
     if ((Get-HostVolumeFree $dbVhd) -lt $minimumFreeBytes) {
         throw 'The database drive needs at least 15 GB free before installation.'
     }

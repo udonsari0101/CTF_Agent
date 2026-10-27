@@ -56,6 +56,21 @@ function Assert-DatabaseVhdPath([string]$path, [bool]$allowExisting = $true) {
     return $full
 }
 
+function Resolve-DatabaseVhdInputPath([string]$path) {
+    $candidate = $path.Trim()
+    if ($candidate.Length -ge 2 -and $candidate.StartsWith('"') -and
+        $candidate.EndsWith('"')) {
+        $candidate = $candidate.Substring(1, $candidate.Length - 2)
+    }
+    if ($candidate -notmatch '^[A-Za-z]:[\\/]') {
+        throw 'Enter a full folder or .vhdx path on a local Windows drive.'
+    }
+    if ([IO.Path]::GetExtension($candidate) -ine '.vhdx') {
+        $candidate = [IO.Path]::Combine($candidate, 'ctf-agent-db.vhdx')
+    }
+    return (Assert-DatabaseVhdPath $candidate)
+}
+
 function Assert-DatabaseVhdHeader([string]$path) {
     $full = Assert-DatabaseVhdPath $path
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw 'The database VHDX is missing.' }

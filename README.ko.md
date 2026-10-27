@@ -34,7 +34,7 @@
 ## Windows에 설치
 
 1. 최신 릴리즈의 `CTF_Agent-*-local-windows.zip` 파일을 내려받아 로컬 폴더에 압축을 풉니다.
-2. `Install.cmd`를 실행합니다. 설치 프로그램이 WSL 2, 적합한 Linux 배포판, Docker Desktop, 남은 디스크 공간을 확인하고 WSL 내부의 데이터 저장 경로를 묻습니다.
+2. `Install.cmd`를 실행합니다. 설치 프로그램이 WSL 2, 적합한 Linux 배포판, Docker Desktop, 남은 디스크 공간을 확인하고 기존 방식의 WSL 데이터 경로를 제안합니다. Enter를 누르면 해당 경로를 사용합니다.
 3. <http://127.0.0.1:5050>에서 첫 관리자 계정을 만들고 **에이전트** 화면에서 Codex 또는 Claude Code 계정을 연결합니다.
 
 **관리자 설정 → 서비스 업데이트**에서 공개 릴리스와 변경 내역을 확인하고 업데이트할 수 있습니다. 기존 설치에도 `Install.cmd`를 다시 실행해 업데이트할 수 있습니다. 두 방법 모두 선택한 데이터 폴더를 유지합니다. 릴리스 설치기는 서버와 동일한 커밋 고정 공개 GHCR 이미지를 내려받으며, CTF 도구를 포함한 앱 이미지를 로컬에서 빌드하지 않습니다. 자세한 요구 사항과 문제 해결 방법은 [설치 안내](docs/docker-desktop.md)를 참고하세요.
@@ -43,7 +43,7 @@
 
 Windows 파일 탐색기에서는 `\\wsl.localhost\<배포판>\<Linux 데이터 경로>\ctf_agent_data\workspace_files`로 문제 파일에 접근할 수 있습니다.
 
-설치 중 별도 ext4 VHDX 옵션을 선택하면 기존 WSL과 문제 데이터는 C:에 두고 DB만 D: 등 다른 로컬 드라이브에 저장할 수 있습니다. DB 파일은 `\\wsl.localhost`를 통해 파일 탐색기에서 열 수 있습니다. 기존 DB는 자동으로 이동하지 않습니다. 자세한 내용은 [Windows 설치 안내](docs/docker-desktop.md)를 참고하세요.
+데이터 경로 입력창에 `D:\Develop\ctf_agent\data` 같은 Windows 폴더 경로를 붙여 넣으면 `D:\Develop\ctf_agent\data\ctf-agent-db.vhdx`를 만들어 DB만 별도 ext4 저장소에 둡니다. 프로그램과 문제 파일은 기존 WSL 경로를 사용합니다. Enter만 누르면 모든 데이터가 기존 WSL 경로에 남습니다. DB 파일은 `\\wsl.localhost`를 통해 파일 탐색기에서 열 수 있습니다. 기존 DB는 자동으로 이동하지 않습니다. 자세한 내용은 [Windows 설치 안내](docs/docker-desktop.md)를 참고하세요.
 
 ### 소스에서 설치
 

@@ -1,10 +1,14 @@
 CTF Agent - Windows local installation
 
 1. Extract the entire release ZIP to a local folder.
-2. Run Install.cmd. Choose a WSL 2 distribution and a Linux data folder.
+2. Run Install.cmd. Choose a WSL 2 distribution and press Enter at the data
+   path prompt for the usual Linux folder.
    The installer can offer to install WSL or Docker Desktop if needed.
-   Optionally place only the database on another fixed local drive using a
-   dedicated ext4 VHDX. Existing databases are not migrated automatically.
+   To put only the database on another fixed local drive, paste a Windows
+   folder such as D:\Develop\ctf_agent\data at the data path prompt. The
+   installer stores its ext4 VHDX at
+   D:\Develop\ctf_agent\data\ctf-agent-db.vhdx and leaves challenge files
+   at the usual WSL path. Existing databases are not migrated automatically.
    Choose whether to start the service at Windows sign-in and require login.
 3. Open http://127.0.0.1:5050 and create the first administrator account.
 4. Connect a Codex or Claude Code account in Agents.
