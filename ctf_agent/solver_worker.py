@@ -2822,6 +2822,17 @@ class CodexAppServer:
             "-c", "analytics.enabled=false",
             "-c", f"agents.enabled={'true' if multi_agent else 'false'}",
         ]
+        if self._uses_local_permissions():
+            # Codex 0.164's legacy workspaceWrite policy creates an inner
+            # writable /dev/shm even when Docker mounted it read-only. Named
+            # profiles enforce an explicit deny while retaining cwd-only writes.
+            filesystem = '{":root"="read", ":workspace_roots"={"."="write"}, "/dev/shm"="deny"}'
+            command.extend((
+                "-c", 'default_permissions="ctf-local"',
+                "-c", 'permissions={'
+                'ctf-local={filesystem=' + filesystem + ',network={enabled=true}},'
+                'ctf-local-offline={filesystem=' + filesystem + ',network={enabled=false}}}',
+            ))
         if multi_agent:
             command.extend((
                 "-c", "agents.max_concurrent_threads_per_session=4",
@@ -2835,6 +2846,24 @@ class CodexAppServer:
             command.extend(("--disable", feature))
         command.extend(("app-server", "--stdio"))
         return command
+
+    @staticmethod
+    def _uses_local_permissions() -> bool:
+        return (os.environ.get("CTF_SOLVER_LOCAL_DESKTOP") == "true"
+                and os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") != "true")
+
+    def _sandbox_parameters(
+        self, method: str, challenge: Path, *, network_access: bool = True
+    ) -> dict[str, Any]:
+        """Use one effective policy for startup, threads, resumes and turns."""
+        if self._uses_local_permissions():
+            key = "permissionProfile" if method == "command/exec" else "permissions"
+            return {key: "ctf-local" if network_access else "ctf-local-offline"}
+        if method in {"thread/start", "thread/resume"}:
+            return {"sandbox": "danger-full-access" if
+                    os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
+                    else "workspace-write"}
+        return {"sandboxPolicy": self._sandbox_policy(challenge, network_access=network_access)}
 
     async def start(self) -> None:
         if not self.executable:
@@ -3425,7 +3454,7 @@ print(json.dumps(result,separators=(",",":")))
                         "AWS_ACCESS_KEY_ID": None,
                         "AWS_SECRET_ACCESS_KEY": None,
                     },
-                    "sandboxPolicy": self._sandbox_policy(scratch, network_access=True),
+                    **self._sandbox_parameters("command/exec", scratch, network_access=True),
                 },
                 timeout=25,
             )
@@ -3580,7 +3609,9 @@ print(json.dumps(result,separators=(",",":")))
             original_id = self.resume_thread_id
             try:
                 restored = await self.request(
-                    "thread/resume", {"threadId": original_id, "excludeTurns": True}
+                    "thread/resume", {"threadId": original_id, "excludeTurns": True,
+                        **self._sandbox_parameters("thread/resume", self.challenge,
+                            network_access=getattr(manifest, "network_enabled", True))}
                 )
                 thread = restored.get("thread")
                 if (
@@ -3610,7 +3641,8 @@ print(json.dumps(result,separators=(",",":")))
             "runtimeWorkspaceRoots": [str(self.challenge)],
             "model": provider_model,
             "approvalPolicy": "never",
-            "sandbox": "danger-full-access" if os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true" else "workspace-write",
+            **self._sandbox_parameters("thread/start", self.challenge,
+                network_access=getattr(manifest, "network_enabled", True)),
             "ephemeral": False,
             "allowProviderModelFallback": False,
             "dynamicTools": [],
@@ -3814,8 +3846,8 @@ print(json.dumps(result,separators=(",",":")))
             "model": self._provider_model(manifest.configuration.model),
             "effort": manifest.configuration.reasoning_effort,
             "approvalPolicy": "never",
-            "sandboxPolicy": self._sandbox_policy(
-                self.challenge,
+            **self._sandbox_parameters(
+                "turn/start", self.challenge,
                 network_access=getattr(manifest, "network_enabled", True),
             ),
         }

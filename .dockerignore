@@ -3,6 +3,7 @@
 !Dockerfile
 !Dockerfile.toolchain
 !Dockerfile.updater
+!Dockerfile.local-runtime
 !toolchain.lock
 !requirements.txt
 !requirements-ctf.txt

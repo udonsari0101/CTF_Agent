@@ -54,10 +54,55 @@ jobs:
           PY
       - name: Check scripts and local stack
         run: |
-          python -m compileall -q ctf_agent deploy/local-compose.py scripts/package_local_release.py
-          python -m py_compile installer/installer/uninstall.py
+          python -m compileall -q ctf_agent deploy/local-compose.py deploy/local_runtime.py scripts/package_local_release.py
+          python -m py_compile installer/installer/uninstall.py installer/installer/storage_control.py
           for script in ctf_agent/web/*.js ctf_agent/web/i18n/*.js; do node --check "$script"; done
           bash -n installer/installer/install.sh
           bash -n installer/installer/start.sh
           sh -n deploy/submit-flag deploy/request-remote deploy/connect-remote deploy/ctf-browser
           docker compose -f compose.local.yaml config --quiet
+      - name: Check local installer bundle and protected storage controls
+        run: |
+          python scripts/package_local_release.py --version v0.0.0 --commit "$GITHUB_SHA" --output "$RUNNER_TEMP/ctf-local.zip"
+          python - "$RUNNER_TEMP/ctf-local.zip" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import tempfile
+          import zipfile
+
+          from installer.installer.storage_control import manage
+
+          uid, gid = os.getuid(), os.getgid()
+          with tempfile.TemporaryDirectory() as temp:
+              root = Path(temp)
+              token = manage(root, "reserve", uid, gid)
+              assert re.fullmatch(r"[0-9]+:[0-9]+", token)
+              assert (root / "update-control").stat().st_mode & 0o777 == 0o700
+              assert manage(root, "release", uid, gid, token) == ""
+              assert not (root / "deployment-drain").exists()
+              token = manage(root, "reserve", uid, gid)
+              (root / "deployment-drain").write_text("active", encoding="ascii")
+              try:
+                  manage(root, "release", uid, gid, token)
+              except RuntimeError:
+                  pass
+              else:
+                  raise AssertionError("An active deployment marker was removed")
+          archive = Path(__import__("sys").argv[1])
+          prefix = "CTF_Agent-v0.0.0/"
+          required = {
+              "DockerDesktop.ps1", "installer/storage_control.py",
+              "app/Dockerfile.local-runtime", "app/deploy/local_runtime.py",
+              "app/deploy/local-seccomp.json", "app/deploy/local-seccomp.README.md",
+              "app/deploy/moby-profiles-LICENSE",
+          }
+          with zipfile.ZipFile(archive) as bundle:
+              names = set(bundle.namelist())
+              assert all(prefix + name in names for name in required)
+              assert not any("/tests/" in name for name in names)
+              assert bundle.testzip() is None
+              policy = json.loads(bundle.read(prefix + "app/deploy/local-seccomp.json"))
+              assert isinstance(policy.get("syscalls"), list) and policy["syscalls"]
+          PY

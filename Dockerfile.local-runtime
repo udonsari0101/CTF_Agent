@@ -1,0 +1,7 @@
+# Apply the reviewed local worker policy to the verified public release image.
+# No toolchain rebuild or mutable registry tag is used as the base.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG LOCAL_RUNTIME_FINGERPRINT
+LABEL io.github.ctf-agent.local-runtime=$LOCAL_RUNTIME_FINGERPRINT
+COPY --chown=0:0 --chmod=0444 ctf_agent/solver_worker.py /app/ctf_agent/solver_worker.py

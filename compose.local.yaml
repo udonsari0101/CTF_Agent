@@ -1,7 +1,7 @@
 name: ctf_agent_local
 
 x-app-image: &app-image
-  image: ctf-agent-local:latest
+  image: ${CTF_LOCAL_RUNTIME_IMAGE:-ctf-agent-local:latest}
   build:
     context: .
     args:
@@ -43,9 +43,12 @@ x-solver-common: &solver-common
     CTF_SOLVER_MIN_FREE_BYTES: ${CTF_SOLVER_MIN_FREE_BYTES:-268435456}
   read_only: true
   tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
     - /dev/shm:ro,nosuid,nodev,noexec,size=64k,mode=000
   cap_drop: [ALL]
-  security_opt: [no-new-privileges:true]
+  security_opt:
+    - no-new-privileges:true
+    - seccomp=./deploy/local-seccomp.json
   stop_grace_period: 30s
   depends_on:
     init-storage:

@@ -295,7 +295,7 @@ def _validate_local_template(template: dict, environment: dict[str, str]) -> Non
         or config.get("Cmd") != ["python", "-m", "ctf_agent.solver_worker"]
         or host.get("ReadonlyRootfs") is not True
         or set(host.get("CapDrop") or []) != {"ALL"}
-        or set(host.get("SecurityOpt") or []) != {"no-new-privileges:true"}
+        or not _local_security_options_match(template, environment)
     ):
         raise RuntimeError("로컬 solver 기준 컨테이너의 실행 격리를 확인할 수 없습니다.")
     data_root = _local_path(
@@ -337,6 +337,75 @@ def _validate_local_template(template: dict, environment: dict[str, str]) -> Non
         raise RuntimeError("로컬 solver 기준 컨테이너의 mount를 확인할 수 없습니다.")
 
 
+def _local_security_options_match(template: dict, environment: dict[str, str]) -> bool:
+    """Accept the exact local policy, or the verified old public template for cleanup."""
+    options = (template.get("HostConfig") or {}).get("SecurityOpt") or []
+    if not isinstance(options, list) or not all(isinstance(item, str) for item in options):
+        return False
+    normalized = ["no-new-privileges" if item == "no-new-privileges:true" else item
+                  for item in options]
+    if normalized.count("no-new-privileges") != 1:
+        return False
+    policies = [item[len("seccomp="):] for item in normalized if item.startswith("seccomp=")]
+    if len(normalized) == 2 and len(policies) == 1:
+        try:
+            expected = json.loads((ROOT / "deploy/local-seccomp.json").read_text(encoding="utf-8"))
+            return json.loads(policies[0]) == expected
+        except (ValueError, OSError):
+            return False
+    if normalized == ["no-new-privileges"]:
+        # The previous release is still selected until the new stack is up.
+        # Its idle autoscaled workers may use the old public template. Compare
+        # the immutable image ID and OCI labels, not a mutable local tag or the
+        # new release's .image-ref (which already points to the new image).
+        previous_id = _previous_release_image_id(environment)
+        return bool(previous_id and template.get("Image") == previous_id)
+    return False
+
+
+def _previous_release_image_id(environment: dict[str, str]) -> str | None:
+    home_value = environment.get("CTF_LOCAL_HOME", "")
+    if not home_value:
+        return None
+    home = Path(home_value)
+    marker = home / ".current-release"
+    try:
+        if (not home.is_absolute() or home.is_symlink() or (home / "releases").is_symlink()
+                or marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 128):
+            return None
+        tag = marker.read_text(encoding="ascii").strip()
+        if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", tag):
+            return None
+        previous = home / "releases" / tag
+        reference_file = previous / ".image-ref"
+        revision_file = previous / ".release-revision"
+        if (previous.is_symlink() or reference_file.is_symlink() or revision_file.is_symlink()
+                or not reference_file.is_file() or not revision_file.is_file()
+                or reference_file.stat().st_size > 256 or revision_file.stat().st_size > 128):
+            return None
+        reference = reference_file.read_text(encoding="ascii").strip()
+        revision = revision_file.read_text(encoding="ascii").strip()
+        if (not re.fullmatch(r"ghcr\.io/udonsari0101/ctf-agent-public@sha256:[0-9a-f]{64}", reference)
+                or not re.fullmatch(r"[0-9a-f]{40}", revision)):
+            return None
+        result = subprocess.run(["docker", "image", "inspect", reference],
+                                check=True, capture_output=True, text=True)
+        values = json.loads(result.stdout)
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+            return None
+        image = values[0]
+        labels = (image.get("Config") or {}).get("Labels") or {}
+        image_id = image.get("Id")
+        if (not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)
+                or labels.get("org.opencontainers.image.revision") != revision
+                or labels.get("org.opencontainers.image.source") != "https://github.com/udonsari0101/CTF_Agent"):
+            return None
+        return image_id
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError,
+            subprocess.CalledProcessError):
+        return None
+
+
 def validate_local_autoscaled_containers(
     rows: list[tuple[str, int]], environment: dict[str, str]
 ) -> list[str]:
@@ -375,6 +444,9 @@ def main() -> int:
     prepare_readable_storage(environment)
     actions = {"up", "down", "stop", "rm", "kill", "restart", "start", "ps", "logs", "config", "pull", "build"}
     action = next((item for item in arguments if item in actions), "up")
+    if action in {"up", "start"} and (ROOT / ".local-runtime.json").exists():
+        from local_runtime import select_image
+        environment["CTF_LOCAL_RUNTIME_IMAGE"] = select_image(ROOT)
     if action in {"up", "start", "down", "stop", "rm", "kill"}:
         # Stop the coordinator first so it cannot claim a higher slot between
         # the host-side inspection and removal of an idle worker container.

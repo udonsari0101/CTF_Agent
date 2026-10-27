@@ -98,6 +98,7 @@ if [[ -f "$release/.image-ref" ]]; then
         exit 1
     fi
 fi
+export CTF_LOCAL_RUNTIME_IMAGE="$(python3 "$release/deploy/local_runtime.py" select)"
 export CTF_LOCAL_HOME="$home_dir"
 export CTF_LOCAL_DATA="$home_dir/ctf_agent_data"
 export CTF_LOCAL_DATABASE="${options[2]}"
@@ -121,4 +122,4 @@ python3 deploy/local-compose.py up -d --no-build
 if docker image inspect ctf-agent-updater:local >/dev/null 2>&1; then
     docker start ctf_agent_local_updater >/dev/null 2>&1 || true
 fi
-printf 'CTF Agent %s started at http://127.0.0.1:5050\n' "$version"
+printf 'CTF Agent %s services requested; solver readiness requires /readyz HTTP 200.\n' "$version"

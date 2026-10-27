@@ -2,6 +2,16 @@
 set -euo pipefail
 umask 077
 
+# These release and updater base images are public. Do not invoke a user's
+# Windows credential helper for anonymous registry access: WSL interop may be
+# unavailable even though the Linux Docker engine and its CLI work correctly.
+# Keep the user's Docker config and credentials untouched.
+public_docker() (
+    registry_config="$(mktemp -d /tmp/ctf-agent-public-registry.XXXXXXXX)"
+    trap 'rm -rf -- "$registry_config"' EXIT
+    DOCKER_CONFIG="$registry_config" docker "$@"
+)
+
 bundle_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 version="$(cat -- "$bundle_root/VERSION")"
 revision="$(cat -- "$bundle_root/COMMIT")"
@@ -105,19 +115,210 @@ if [[ -L "$releases" || -L "$target" ]]; then
     echo 'Release path must not be a symlink.' >&2
     exit 2
 fi
+staging=""
+previous_snapshot=""
+previous_version=""
+previous_release=""
+previous_revision=""
+previous_base_id=""
+previous_runtime_id=""
+settings_snapshot=""
+updater_candidate=""
+updater_old_exists=false
+updater_old_running=false
+updater_old_image=""
+updater_old_renamed=false
+updater_candidate_started=false
+updater_promoted=false
+drain_token=""
+rollout_started=false
+new_ready=false
+cleanup_install() {
+    local status=$?
+    local drain_released=true
+    local source_restored=true
+    local settings_restored=true
+    local updater_replacement_removed=true
+    trap - EXIT
+    if (( status != 0 )); then
+        # Keep the previous update controller alive if replacing it failed.
+        # The old container retains its image even after the local tag moves.
+        if [[ "$updater_promoted" == true ]]; then
+            if ! docker rm -f ctf_agent_local_updater >/dev/null; then
+                echo 'The replacement update controller could not be removed safely.' >&2
+                status=1
+                updater_replacement_removed=false
+            fi
+        elif [[ "$updater_candidate_started" == true ]]; then
+            if docker container inspect "$updater_candidate" >/dev/null 2>&1 &&
+               ! docker rm -f "$updater_candidate" >/dev/null; then
+                echo 'The candidate update controller could not be removed safely.' >&2
+                status=1
+                updater_replacement_removed=false
+            fi
+        fi
+        if [[ "$updater_old_renamed" == true && "$updater_replacement_removed" == true ]]; then
+            if ! docker rename ctf_agent_local_updater_previous ctf_agent_local_updater >/dev/null; then
+                echo 'The previous update controller could not be renamed back.' >&2
+                status=1
+                updater_replacement_removed=false
+            fi
+        fi
+        if [[ "$updater_old_exists" == true ]]; then
+            if [[ "$updater_old_image" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                docker image tag "$updater_old_image" ctf-agent-updater:local >/dev/null || status=1
+            fi
+            if [[ "$updater_old_running" == true && "$updater_replacement_removed" == true ]]; then
+                if [[ "$(docker inspect --format '{{.State.Running}}' ctf_agent_local_updater 2>/dev/null || true)" != true ]]; then
+                    docker start ctf_agent_local_updater >/dev/null || status=1
+                fi
+            fi
+        fi
+        if [[ -n "$settings_snapshot" ]]; then
+            restore_setting() {
+                local source="$settings_snapshot/$1" destination="$2"
+                if [[ -L "$destination" || ( -e "$destination" && ! -f "$destination" ) ]]; then
+                    return 1
+                fi
+                if [[ -f "$source" ]]; then
+                    cp -p -- "$source" "$destination"
+                elif [[ -f "$destination" ]]; then
+                    rm -f -- "$destination"
+                fi
+            }
+            restore_setting current-release "$home_dir/.current-release" || { status=1; settings_restored=false; }
+            restore_setting local-config.json "$home_dir/.local-config.json" || { status=1; settings_restored=false; }
+            restore_setting updater-image "$home_dir/.updater-image" || { status=1; settings_restored=false; }
+            restore_setting launcher-start.sh "$home_dir/.launcher/start.sh" || { status=1; settings_restored=false; }
+            restore_setting launcher-uninstall.py "$home_dir/.launcher/uninstall.py" || { status=1; settings_restored=false; }
+        fi
+    fi
+    if [[ -n "$previous_snapshot" && -d "$previous_snapshot" ]]; then
+        if (( status != 0 )) && [[ "$previous_version" == "$version" ]]; then
+            local failed_target
+            failed_target="$(mktemp -d "$releases/.failed-release.XXXXXXXX")"
+            rmdir -- "$failed_target"
+            if mv -- "$target" "$failed_target"; then
+                if mv -- "$previous_snapshot" "$target"; then
+                    previous_release="$target"
+                    previous_snapshot=""
+                    rm -rf -- "$failed_target"
+                else
+                    mv -- "$failed_target" "$target" || true
+                    source_restored=false
+                fi
+            else
+                source_restored=false
+            fi
+            if [[ "$source_restored" != true ]]; then
+                echo 'The previous release files could not be restored automatically.' >&2
+                status=1
+            fi
+        else
+            rm -rf -- "$previous_snapshot"
+        fi
+    fi
+    if [[ -n "$drain_token" ]]; then
+        if ! manage_storage_control release "$drain_token" >/dev/null; then
+            echo 'The deployment drain changed and was preserved; the previous service was not restarted.' >&2
+            drain_released=false
+            status=1
+        fi
+    fi
+    if (( status != 0 )) && [[ "$rollout_started" == true && "$new_ready" != true &&
+                                "${CTF_UPDATE_IN_PROGRESS:-false}" != true &&
+                                "$drain_released" == true && "$source_restored" == true &&
+                                "$settings_restored" == true ]]; then
+        if [[ -n "$previous_release" ]]; then
+            if ! restore_previous_service; then
+                echo 'The previous service could not be restored automatically; its release and data were preserved.' >&2
+            fi
+        else
+            # A failed first installation must not leave an unregistered web
+            # stack running. Compose down keeps every bind-mounted data path.
+            if ! docker compose -f "$target/compose.local.yaml" down --remove-orphans; then
+                echo 'The incomplete first service could not be stopped automatically.' >&2
+            fi
+            echo 'No previous service exists to restore; installation data was preserved.' >&2
+        fi
+    fi
+    if [[ -n "$staging" && -d "$staging" ]]; then rm -rf -- "$staging"; fi
+    if [[ -n "$settings_snapshot" && -d "$settings_snapshot" ]]; then
+        if [[ "$settings_restored" == true ]]; then
+            rm -rf -- "$settings_snapshot"
+        else
+            echo "Previous installation settings were preserved at $settings_snapshot." >&2
+        fi
+    fi
+    exit "$status"
+}
+trap cleanup_install EXIT
+if [[ -e "$home_dir/.current-release" || -L "$home_dir/.current-release" ]]; then
+    if [[ ! -f "$home_dir/.current-release" || -L "$home_dir/.current-release" ]]; then
+        echo 'Installed release marker is invalid.' >&2
+        exit 2
+    fi
+    previous_version="$(cat -- "$home_dir/.current-release")"
+    if [[ ! "$previous_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+        echo 'Installed release marker is invalid.' >&2
+        exit 2
+    fi
+    previous_release="$releases/$previous_version"
+    if [[ -L "$previous_release" || ! -d "$previous_release" ||
+          ! -f "$previous_release/.release-revision" ]]; then
+        echo 'Previous release files are unavailable.' >&2
+        exit 2
+    fi
+    if [[ "$previous_version" == "$version" ]]; then
+        previous_snapshot="$(mktemp -d "$releases/.previous-release.XXXXXXXX")"
+        cp -a -- "$previous_release/." "$previous_snapshot/"
+        previous_release="$previous_snapshot"
+    fi
+    previous_revision="$(cat -- "$previous_release/.release-revision")"
+    if [[ ! "$previous_revision" =~ ^[0-9a-f]{40}$ ]]; then
+        echo 'Previous release revision is invalid.' >&2
+        exit 2
+    fi
+    previous_base_ref=ctf-agent-local:latest
+    if [[ -f "$previous_release/.image-ref" && ! -L "$previous_release/.image-ref" ]]; then
+        previous_base_ref="$(cat -- "$previous_release/.image-ref")"
+        if [[ ! "$previous_base_ref" =~ ^ghcr\.io/udonsari0101/ctf-agent-public@sha256:[0-9a-f]{64}$ ]]; then
+            echo 'Previous public image reference is invalid.' >&2
+            exit 2
+        fi
+    fi
+    previous_base_id="$(docker image inspect --format '{{.Id}}' "$previous_base_ref")"
+    if [[ ! "$previous_base_id" =~ ^sha256:[0-9a-f]{64}$ ||
+          "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$previous_base_id")" != "$previous_revision" ||
+          "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$previous_base_id")" != 'https://github.com/udonsari0101/CTF_Agent' ]]; then
+        echo 'Previous public image identity could not be verified.' >&2
+        exit 2
+    fi
+    if [[ -f "$previous_release/deploy/local_runtime.py" ]]; then
+        previous_runtime_id="$(python3 "$previous_release/deploy/local_runtime.py" select)"
+        [[ "$previous_runtime_id" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 2
+    fi
+fi
 if [[ ! -d "$target" ]]; then
     staging="$(mktemp -d "$releases/.staging.XXXXXXXX")"
-    trap 'rm -rf -- "$staging"' EXIT
     cp -R -- "$bundle_root/app/." "$staging/"
     mkdir -p -- "$staging/installer"
     cp -- "$bundle_root/installer/start.sh" "$bundle_root/installer/uninstall.py" "$staging/installer/"
     printf '%s\n' "$revision" > "$staging/.release-revision"
     mv -- "$staging" "$target"
-    trap - EXIT
+    staging=""
 elif [[ "$(cat -- "$target/.release-revision" 2>/dev/null || true)" != "$revision" ]]; then
     echo 'An installed release with this version has different contents.' >&2
     exit 2
 fi
+
+# Refresh only the reviewed local runtime overlay when repairing the same
+# release. Application data and the verified public base image stay separate.
+for name in Dockerfile.local-runtime compose.local.yaml ctf_agent/solver_worker.py \
+    deploy/local_runtime.py deploy/local-compose.py deploy/local-seccomp.json \
+    deploy/local-seccomp.README.md deploy/moby-profiles-LICENSE; do
+    install -D -m 0644 "$bundle_root/app/$name" "$target/$name"
+done
 
 export CTF_AUTH_MODE="${CTF_LOCAL_AUTH_MODE:-password}"
 [[ "$CTF_AUTH_MODE" == password || "$CTF_AUTH_MODE" == nologin ]] || { echo 'Invalid authentication mode.' >&2; exit 2; }
@@ -149,7 +350,7 @@ image_repository=ghcr.io/udonsari0101/ctf-agent-public
 image_tag="$image_repository:$revision"
 # Resolve the immutable registry digest before pulling. This is the same
 # release image used by the server, including its CTF toolchain layers.
-image_digest="$(docker manifest inspect --verbose "$image_tag" | python3 -c '
+image_digest="$(public_docker manifest inspect --verbose "$image_tag" | python3 -c '
 import json, re, sys
 manifest = json.load(sys.stdin)
 descriptor = manifest.get("Descriptor") if isinstance(manifest, dict) else None
@@ -159,7 +360,7 @@ if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", diges
 print(digest)
 ')"
 image_ref="$image_repository@$image_digest"
-docker pull "$image_ref"
+public_docker pull "$image_ref"
 image_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_ref")"
 image_source="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$image_ref")"
 if [[ "$image_revision" != "$revision" || "$image_source" != "https://github.com/udonsari0101/CTF_Agent" ]]; then
@@ -172,6 +373,13 @@ if [[ "$(id -u)" == 0 ]]; then
     chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$image_ref_temp"
 fi
 mv -f -- "$image_ref_temp" "$target/.image-ref"
+export CTF_LOCAL_RUNTIME_IMAGE="$(python3 deploy/local_runtime.py build)"
+manage_storage_control() {
+    docker run --rm -i --network none --user 0:0 --entrypoint python \
+        -v "$CTF_LOCAL_FS_DATA:/data" "$image_ref" - \
+        "$1" "$CTF_LOCAL_UID" "$CTF_LOCAL_GID" "${2:-}" \
+        < "$bundle_root/installer/storage_control.py"
+}
 # The installed web coordinator stops claiming queued work while this file
 # exists. Wait for every claimed solve to finish before Compose recreates its
 # worker; a timed-out update leaves the current workers running.
@@ -181,20 +389,9 @@ if [[ -L "$CTF_LOCAL_FS_DATA" ]]; then
     exit 1
 fi
 mkdir -p -- "$CTF_LOCAL_FS_DATA"
-if [[ -e "$drain_file" || -L "$drain_file" ]]; then
-    if [[ -f "$drain_file" && ! -L "$drain_file" ]] &&
-       (( $(date +%s) - $(stat -c %Y -- "$drain_file") >= 7200 )); then
-        rm -f -- "$drain_file"
-    else
-        echo 'Another deployment drain is active.' >&2
-        exit 1
-    fi
-fi
-if ! (set -C; : > "$drain_file"); then
-    echo 'Could not reserve the deployment drain.' >&2
-    exit 1
-fi
-trap 'rm -f -- "$drain_file"' EXIT
+# init-storage intentionally makes /data root-owned 0750. Use a narrowly
+# scoped helper for these control files both before and after Compose runs.
+drain_token="$(manage_storage_control reserve)"
 drain_deadline=$(( $(date +%s) + 3300 ))
 while :; do
     claimed="$(python3 - "$CTF_LOCAL_FS_DATABASE/sqlite/ctf_agent.sqlite3" <<'PY'
@@ -220,11 +417,92 @@ PY
     echo "Waiting for $claimed active solver job(s) before update."
     sleep 10
 done
+wait_service_healthy() {
+    local expected_image="$1" deadline=$((SECONDS + $2)) health current_image
+    while (( SECONDS < deadline )); do
+        health="$(docker inspect --format '{{.State.Health.Status}}' ctf_agent_local 2>/dev/null || true)"
+        current_image="$(docker inspect --format '{{.Image}}' ctf_agent_local 2>/dev/null || true)"
+        if [[ "$health" == healthy && "$current_image" == "$expected_image" ]]; then return 0; fi
+        if [[ "$health" == unhealthy ]]; then return 1; fi
+        sleep 5
+    done
+    return 1
+}
+restore_previous_service() {
+    [[ -n "$previous_release" && -n "$previous_base_id" ]] || return 1
+    # The attempted install may have changed auth and auto-start. Recover
+    # these values from the restored previous configuration, never from the
+    # failed install's exported environment.
+    local prior_options prior_auth prior_restart
+    prior_options="$(python3 - "$home_dir/.local-config.json" "$database_mount" <<'PY'
+import json, sys
+from pathlib import Path
+path, expected_mount = Path(sys.argv[1]), sys.argv[2]
+if path.is_symlink() or not path.is_file():
+    raise SystemExit('Previous local settings are unavailable')
+settings = json.loads(path.read_text(encoding='utf-8'))
+mode, auto = settings.get('auth_mode'), settings.get('auto_start')
+if mode not in {'password', 'nologin'} or type(auto) is not bool:
+    raise SystemExit('Previous local settings are invalid')
+if settings.get('database_mount', '') != expected_mount:
+    raise SystemExit('Previous database mount changed')
+print(mode, 'no' if expected_mount or not auto else 'unless-stopped')
+PY
+)" || return 1
+    read -r prior_auth prior_restart <<< "$prior_options"
+    [[ "$prior_auth" == password || "$prior_auth" == nologin ]] || return 1
+    [[ "$prior_restart" == no || "$prior_restart" == unless-stopped ]] || return 1
+    docker image tag "$previous_base_id" ctf-agent-local:latest || return 1
+    (
+        cd -- "$previous_release"
+        CTF_LOCAL_RUNTIME_IMAGE="$previous_runtime_id" \
+        CTF_AUTH_MODE="$prior_auth" CTF_LOCAL_AUTH_MODE="$prior_auth" \
+        CTF_LOCAL_RESTART_POLICY="$prior_restart" \
+        CTF_RELEASE_SHA="$previous_revision" CTF_RELEASE_VERSION="$previous_version" \
+            python3 deploy/local-compose.py up -d --no-build --force-recreate
+    ) || return 1
+    local previous_image="${previous_runtime_id:-$previous_base_id}"
+    if ! wait_service_healthy "$previous_image" 180; then return 1; fi
+    echo "Previous CTF Agent release $previous_version restored and ready." >&2
+}
 docker image tag "$image_ref" ctf-agent-local:latest
+# Drain old claims first, then stop the old coordinators before removing this
+# install's marker and starting the new stack.
+rollout_started=true
+docker compose -f compose.local.yaml stop web solver-autoscaler
+manage_storage_control release "$drain_token" >/dev/null
+drain_token=""
 python3 deploy/local-compose.py up -d --no-build
+if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
+    if ! wait_service_healthy "$CTF_LOCAL_RUNTIME_IMAGE" 180; then
+        echo 'The new solver did not pass /readyz before the installation deadline.' >&2
+        exit 1
+    fi
+fi
+# Web updates perform their own readiness check and rollback. Manual installs
+# keep the previous release available through the remaining launcher and
+# updater setup, which can still fail after the web service becomes healthy.
+settings_snapshot="$(mktemp -d "$home_dir/.previous-settings.XXXXXXXX")"
+for name in .current-release .local-config.json .updater-image; do
+    path="$home_dir/$name"
+    if [[ -e "$path" || -L "$path" ]]; then
+        [[ -f "$path" && ! -L "$path" ]] || { echo 'Previous installation settings are invalid.' >&2; exit 2; }
+        cp -p -- "$path" "$settings_snapshot/${name#.}"
+    fi
+done
+if [[ -e "$home_dir/.launcher" || -L "$home_dir/.launcher" ]]; then
+    [[ -d "$home_dir/.launcher" && ! -L "$home_dir/.launcher" ]] || { echo 'Previous launcher is invalid.' >&2; exit 2; }
+    for name in start.sh uninstall.py; do
+        path="$home_dir/.launcher/$name"
+        if [[ -e "$path" || -L "$path" ]]; then
+            [[ -f "$path" && ! -L "$path" ]] || { echo 'Previous launcher file is invalid.' >&2; exit 2; }
+            cp -p -- "$path" "$settings_snapshot/launcher-$name"
+        fi
+    done
+fi
 install -d -m 0750 -o "$CTF_LOCAL_UID" -g "$CTF_LOCAL_GID" "$home_dir/.launcher"
 for name in start.sh uninstall.py; do
-    cp -- "$target/installer/$name" "$home_dir/.launcher/$name"
+    cp -- "$bundle_root/installer/$name" "$home_dir/.launcher/$name"
     chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$home_dir/.launcher/$name"
     chmod 0644 "$home_dir/.launcher/$name"
 done
@@ -248,16 +526,34 @@ if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
     chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$current_temp"
     mv -f -- "$current_temp" "$home_dir/.current-release"
 fi
-install -d -m 0700 -o "$CTF_LOCAL_UID" -g "$CTF_LOCAL_GID" "$home_dir/ctf_agent_data/update-control"
 if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
+    updater_candidate="ctf_agent_local_updater_candidate_$$"
+    if docker container inspect ctf_agent_local_updater_previous >/dev/null 2>&1 ||
+       docker container inspect "$updater_candidate" >/dev/null 2>&1; then
+        echo 'An earlier update-controller replacement needs inspection.' >&2
+        exit 1
+    fi
+    if docker container inspect ctf_agent_local_updater >/dev/null 2>&1; then
+        updater_old_exists=true
+        updater_old_running="$(docker inspect --format '{{.State.Running}}' ctf_agent_local_updater)"
+        updater_old_image="$(docker inspect --format '{{.Image}}' ctf_agent_local_updater)"
+        [[ "$updater_old_image" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+    fi
+    update_control="$home_dir/ctf_agent_data/update-control"
+    if [[ -e "$update_control/request.json" || -e "$update_control/running.json" ]]; then
+        echo 'A site update is queued or running; finish it before reinstalling.' >&2
+        exit 1
+    fi
     updater_fingerprint="$(sha256sum Dockerfile.updater ctf_agent/release_updates.py | sha256sum | cut -d ' ' -f 1)"
     updater_stamp="$home_dir/.updater-image"
     if ! docker image inspect ctf-agent-updater:local >/dev/null 2>&1 ||
        [[ "$(cat -- "$updater_stamp" 2>/dev/null || true)" != "$updater_fingerprint" ]]; then
-        docker build --file Dockerfile.updater --tag ctf-agent-updater:local .
+        public_docker build --file Dockerfile.updater --tag ctf-agent-updater:local .
         printf '%s\n' "$updater_fingerprint" > "$updater_stamp"
     fi
-    docker rm -f ctf_agent_local_updater >/dev/null 2>&1 || true
+    if [[ "$updater_old_exists" == true && "$updater_old_running" == true ]]; then
+        docker stop ctf_agent_local_updater >/dev/null
+    fi
     status_file="$home_dir/ctf_agent_data/update-control/status.json"
     status_before_ns="$(python3 - "$status_file" <<'PY'
 import sys
@@ -270,21 +566,21 @@ PY
     if [[ -n "$database_mount" ]]; then
         updater_mount=(-v "$database_mount:$database_mount")
     fi
-    docker run -d --name ctf_agent_local_updater --restart "$CTF_LOCAL_RESTART_POLICY" \
+    updater_candidate_started=true
+    docker run -d --name "$updater_candidate" --restart "$CTF_LOCAL_RESTART_POLICY" \
         --memory 1g --cpus 1 --security-opt no-new-privileges \
         -e "CTF_LOCAL_HOME=$home_dir" -e "CTF_LOCAL_UID=$CTF_LOCAL_UID" -e "CTF_LOCAL_GID=$CTF_LOCAL_GID" \
         -e "CTF_LOCAL_DB_MOUNT=$database_mount" \
         -v "$home_dir:$home_dir" "${updater_mount[@]}" -v /var/run/docker.sock:/var/run/docker.sock \
         ctf-agent-updater:local >/dev/null
-    if [[ -n "$database_mount" ]]; then
-        updater_ready=false
-        for attempt in {1..10}; do
-            running="$(docker inspect --format '{{.State.Running}}' ctf_agent_local_updater 2>/dev/null || true)"
-            if [[ "$running" != true ]]; then
-                echo 'The updater could not access the external database VHD.' >&2
-                exit 1
-            fi
-            if python3 - "$status_file" "$status_before_ns" <<'PY'
+    updater_ready=false
+    for attempt in {1..10}; do
+        running="$(docker inspect --format '{{.State.Running}}' "$updater_candidate" 2>/dev/null || true)"
+        if [[ "$running" != true ]]; then
+            echo 'The update controller stopped before becoming ready.' >&2
+            exit 1
+        fi
+        if python3 - "$status_file" "$status_before_ns" <<'PY'
 import json, sys, time
 from pathlib import Path
 path = Path(sys.argv[1])
@@ -296,17 +592,31 @@ except (OSError, ValueError, TypeError):
     healthy = False
 raise SystemExit(0 if healthy else 1)
 PY
-            then
-                updater_ready=true
-                break
-            fi
-            sleep 2
-        done
-        if [[ "$updater_ready" != true ]]; then
-            echo 'The updater did not confirm access to the external database VHD.' >&2
-            exit 1
+        then
+            updater_ready=true
+            break
         fi
+        sleep 2
+    done
+    if [[ "$updater_ready" != true ]]; then
+        echo 'The update controller did not become ready.' >&2
+        exit 1
+    fi
+    if [[ "$updater_old_exists" == true ]]; then
+        docker rename ctf_agent_local_updater ctf_agent_local_updater_previous
+        updater_old_renamed=true
+    fi
+    docker rename "$updater_candidate" ctf_agent_local_updater
+    updater_promoted=true
+    if [[ "$(docker inspect --format '{{.State.Running}}' ctf_agent_local_updater)" != true ]]; then
+        echo 'The replacement update controller is not running.' >&2
+        exit 1
+    fi
+    if [[ "$updater_old_renamed" == true ]]; then
+        docker rm ctf_agent_local_updater_previous >/dev/null
+        updater_old_renamed=false
     fi
 fi
-printf '\nCTF Agent %s installed. Open http://127.0.0.1:5050\n' "$version"
+new_ready=true
+printf '\nCTF Agent %s files and services configured; solver readiness requires /readyz HTTP 200.\n' "$version"
 printf 'Data: %s\n' "$CTF_LOCAL_DATA"

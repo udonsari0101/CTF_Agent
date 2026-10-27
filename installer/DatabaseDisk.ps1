@@ -18,6 +18,20 @@ function Invoke-DatabaseNative([string]$file, [string[]]$arguments, [switch]$Qui
     return [int]$exitCode
 }
 
+function Invoke-DatabaseRootTool([string]$distro, [string]$tool, [string[]]$arguments = @()) {
+    # WSL --exec resolves a bare program before the root user's usual shell
+    # PATH is applied. Explicit env also covers tools in /usr/sbin and /sbin.
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& wsl.exe --distribution $distro --user root --exec /usr/bin/env `
+            'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' `
+            $tool @arguments 2>&1 | ForEach-Object { $_.ToString() })
+        $exitCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    return [pscustomobject]@{ExitCode=$exitCode;Output=$output}
+}
+
 function Assert-DatabaseVhdPath([string]$path, [bool]$allowExisting = $true) {
     if (-not $path -or $path -notmatch '^[A-Za-z]:[\\/]' -or
         $path -match '[\x00-\x1f"<>|?*]' -or $path -match '(^|[\\/])\.\.([\\/]|$)') {
@@ -106,8 +120,9 @@ function Get-DatabaseMountInfo([string]$distro) {
         if ($parts.Count -ne 2 -or $parts[1] -ne 'ext4' -or $parts[0] -notmatch '^/dev/[A-Za-z0-9]+$') {
             throw 'The database mount is not a standalone ext4 disk.'
         }
-        $uuidLines = @(& wsl.exe --distribution $distro --user root --exec blkid -s UUID -o value $parts[0] 2>$null)
-        if ($LASTEXITCODE -ne 0 -or $uuidLines.Count -ne 1 -or
+        $uuidResult = Invoke-DatabaseRootTool $distro 'blkid' @('-s', 'UUID', '-o', 'value', $parts[0])
+        $uuidLines = @($uuidResult.Output)
+        if ($uuidResult.ExitCode -ne 0 -or $uuidLines.Count -ne 1 -or
             $uuidLines[0].Trim() -notmatch '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') {
             throw 'The database filesystem identity could not be verified.'
         }
@@ -250,7 +265,10 @@ function Invoke-DatabaseElevatedPayload([string]$payload) {
         $vhd = Assert-DatabaseVhdPath $vhd $false
         $scriptPath = Join-Path $env:TEMP ("ctf-agent-db-" + [Guid]::NewGuid().ToString('N') + '.txt')
         try {
-            @('create vdisk file="' + $vhd + '" maximum=65536 type=expandable', 'exit') |
+            @(
+                ('create vdisk file="' + $vhd + '" maximum=65536 type=expandable')
+                'exit'
+            ) |
                 Set-Content -LiteralPath $scriptPath -Encoding ASCII
             $exitCode = Invoke-DatabaseNative 'diskpart.exe' @('/s', $scriptPath) -Quiet
             if ($exitCode -ne 0) { throw 'DiskPart could not create the VHDX.' }

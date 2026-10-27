@@ -16,6 +16,11 @@ FIXED_APP_FILES = {
     "Dockerfile",
     "Dockerfile.toolchain",
     "Dockerfile.updater",
+    "Dockerfile.local-runtime",
+    "deploy/local_runtime.py",
+    "deploy/local-seccomp.json",
+    "deploy/local-seccomp.README.md",
+    "deploy/moby-profiles-LICENSE",
     "toolchain.lock",
     "compose.local.yaml",
     "requirements.txt",
@@ -36,6 +41,7 @@ INSTALLER_FILES = {
     "installer/Install.cmd": "Install.cmd",
     "installer/Install.ps1": "Install.ps1",
     "installer/DatabaseDisk.ps1": "DatabaseDisk.ps1",
+    "installer/DockerDesktop.ps1": "DockerDesktop.ps1",
     "installer/Start.cmd": "Start.cmd",
     "installer/Start.ps1": "Start.ps1",
     "installer/Uninstall.cmd": "Uninstall.cmd",
@@ -44,6 +50,7 @@ INSTALLER_FILES = {
     "installer/installer/install.sh": "installer/install.sh",
     "installer/installer/start.sh": "installer/start.sh",
     "installer/installer/uninstall.py": "installer/uninstall.py",
+    "installer/installer/storage_control.py": "installer/storage_control.py",
 }
 
 

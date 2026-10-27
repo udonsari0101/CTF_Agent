@@ -6,6 +6,9 @@ if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw 'Release ar
 $databaseDiskHelper = Join-Path $PSScriptRoot 'DatabaseDisk.ps1'
 if (-not (Test-Path -LiteralPath $databaseDiskHelper -PathType Leaf)) { throw 'Release archive is incomplete.' }
 . $databaseDiskHelper
+$dockerDesktopHelper = Join-Path $PSScriptRoot 'DockerDesktop.ps1'
+if (-not (Test-Path -LiteralPath $dockerDesktopHelper -PathType Leaf)) { throw 'Release archive is incomplete: DockerDesktop.ps1 is missing.' }
+. $dockerDesktopHelper
 
 function Ask-YesNo([string]$question, [bool]$default = $true) {
     $hint = if ($default) { 'Y/n' } else { 'y/N' }
@@ -112,23 +115,20 @@ function Get-WslVersions {
     return $versions
 }
 
-function Invoke-WslPython([string]$name, [string]$source, [string[]]$arguments = @()) {
+function Invoke-WslPython([string]$name, [string]$source, [string[]]$arguments = @(), [switch]$ReadOnly) {
     # Windows PowerShell 5.1 changes quotes inside a multiline native argument.
     # Pass a single-line wrapper without quoted literals; Python decodes the
     # original source from a separate argument before forwarding its argv.
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($source))
     $program = 'import base64,sys;exec(base64.b64decode(sys.argv.pop(1)))'
-    $previousPreference = $ErrorActionPreference
-    try {
-        # A probe failure is reported through its exit code, not a native stderr
-        # ErrorRecord that terminates the installer before it can offer recovery.
-        $ErrorActionPreference = 'Continue'
-        $output = @(& wsl.exe --distribution $name --exec python3 -c $program $encoded @arguments 2>$null)
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousPreference
+    $nativeArguments = @('--distribution', $name, '--exec', 'python3', '-c', $program, $encoded) + $arguments
+    $result = Invoke-DesktopNative 'wsl.exe' $nativeArguments 30
+    if ($ReadOnly -and $result.TimedOut) {
+        Write-Host 'A read-only WSL probe timed out. Retrying once...'
+        $result = Invoke-DesktopNative 'wsl.exe' $nativeArguments 30
     }
-    return [pscustomobject]@{ Output = ($output -join "`n"); ExitCode = $exitCode }
+    $detail = if ($result.ExitCode -ne 0) { $result.Output } else { $result.Stderr }
+    return [pscustomobject]@{Output=$result.Stdout;ExitCode=$result.ExitCode;Error=$detail;TimedOut=$result.TimedOut}
 }
 
 function Invoke-WslPythonStdin([string]$name, [string]$source, [string[]]$arguments = @()) {
@@ -171,11 +171,6 @@ function Invoke-WslNative([string[]]$command, [switch]$Quiet, [switch]$Visible) 
     return [pscustomobject]@{ Output=$output; ExitCode=$exitCode }
 }
 
-function Test-WslDockerReady([string]$distro) {
-    $result = Invoke-WslNative @('--distribution', $distro, '--exec', 'docker', 'info') -Quiet
-    return ($result.ExitCode -eq 0)
-}
-
 function Get-WslBlockDevices([string]$name) {
     $probe = @'
 import json,subprocess
@@ -185,7 +180,10 @@ print(json.dumps(json.loads(result.stdout).get('blockdevices',[])))
 '@
     $result = Invoke-WslPython $name $probe
     if ($result.ExitCode -ne 0) { throw 'Could not inspect WSL block devices; no disk was formatted.' }
-    return @($result.Output | ConvertFrom-Json)
+    # In Windows PowerShell 5.1, wrapping ConvertFrom-Json's pipeline directly
+    # nests the entire JSON array as one item. Return the decoded array itself.
+    $devices = $result.Output | ConvertFrom-Json
+    return $devices
 }
 
 function Assert-FreshDatabaseHome([string]$name, [string]$linuxDataHome) {
@@ -268,7 +266,7 @@ else:
     print(json.dumps({'uuid':p.read_text(encoding='ascii').strip()}))
 '@
     $result = Invoke-WslPython $name $probe
-    if ($result.ExitCode -ne 0) { throw 'Could not verify the database volume marker.' }
+    if ($result.ExitCode -ne 0) { throw "Could not verify the database volume marker (exit $($result.ExitCode)): $($result.Error)" }
     return [string](($result.Output | ConvertFrom-Json).uuid)
 }
 
@@ -288,6 +286,16 @@ with os.fdopen(fd,'w',encoding='ascii') as stream:
 
 function Initialize-DatabaseVhd([string]$name, [string]$vhd, [string]$savedUuid) {
     Assert-WslVhdSupport
+    $toolProbe = @'
+import json,shutil
+tools=['wipefs','mkfs.ext4','blkid','mount','mkdir','chown','chmod']
+path='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+print(json.dumps({'missing':[tool for tool in tools if not shutil.which(tool,path=path)]}))
+'@
+    $toolResult = Invoke-WslPython $name $toolProbe -ReadOnly
+    if ($toolResult.ExitCode -ne 0) { throw "Could not check database filesystem tools (exit $($toolResult.ExitCode)): $($toolResult.Error). No disk was created or formatted." }
+    $missingTools = @((($toolResult.Output | ConvertFrom-Json).missing))
+    if ($missingTools.Count) { throw "Missing database filesystem tools: $($missingTools -join ', '). Install util-linux and e2fsprogs in $name before retrying; no disk was created or formatted." }
     if ($savedUuid) {
         if (-not (Test-DatabaseMount $name $savedUuid)) {
             Assert-DatabaseVhdHeader $vhd | Out-Null
@@ -353,24 +361,20 @@ print(json.dumps({'unsafe':p.is_symlink() or (p.exists() and
         $disk.fstype -or $disk.mountpoint -or $disk.children) {
         throw 'The new block device is not an empty 64 GB VHDX; no disk was formatted.'
     }
-    $previousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $signatures = @(& wsl.exe --distribution $name --user root --exec wipefs -n $device 2>$null)
-        $signatureExit = $LASTEXITCODE
-    } finally { $ErrorActionPreference = $previousPreference }
-    if ($signatureExit -ne 0 -or $signatures.Count) {
+    $signatureResult = Invoke-DatabaseRootTool $name 'wipefs' @('-n', $device)
+    if ($signatureResult.ExitCode -ne 0) {
+        throw "Could not inspect the new VHDX signatures: $($signatureResult.Output -join ' '). No disk was formatted."
+    }
+    $signatures = @($signatureResult.Output | Where-Object { $_.Trim() })
+    if ($signatures.Count) {
         throw 'The new VHDX has an unexpected filesystem signature; no disk was formatted.'
     }
-    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
-        'mkfs.ext4', '-F', '-q', '-L', 'ctf-agent-db', $device) -Visible
-    if ($step.ExitCode -ne 0) { throw 'Could not format the verified new VHDX.' }
-    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
-        'mkdir', '-p', (Get-DatabaseMountPath)) -Visible
-    if ($step.ExitCode -ne 0) { throw 'Could not create the WSL database mount point.' }
-    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
-        'mount', '-t', 'ext4', $device, (Get-DatabaseMountPath)) -Visible
-    if ($step.ExitCode -ne 0) { throw 'Could not mount the new database filesystem.' }
+    $step = Invoke-DatabaseRootTool $name 'mkfs.ext4' @('-F', '-q', '-L', 'ctf-agent-db', $device)
+    if ($step.ExitCode -ne 0) { throw "Could not format the verified new VHDX: $($step.Output -join ' ')" }
+    $step = Invoke-DatabaseRootTool $name 'mkdir' @('-p', (Get-DatabaseMountPath))
+    if ($step.ExitCode -ne 0) { throw "Could not create the WSL database mount point: $($step.Output -join ' ')" }
+    $step = Invoke-DatabaseRootTool $name 'mount' @('-t', 'ext4', $device, (Get-DatabaseMountPath))
+    if ($step.ExitCode -ne 0) { throw "Could not mount the new database filesystem: $($step.Output -join ' ')" }
     $info = Get-DatabaseMountInfo $name
     if (-not $info -or $info.Source -ne $device) {
         throw 'The formatted VHDX did not appear at the dedicated database mount point.'
@@ -384,14 +388,23 @@ print(json.dumps({'unsafe':p.is_symlink() or (p.exists() and
     $uid = [string]$uidResult.Output[0].Trim()
     $gid = [string]$gidResult.Output[0].Trim()
     if ($uid -notmatch '^\d+$' -or $gid -notmatch '^\d+$') { throw 'Could not determine the WSL user.' }
-    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
-        'chown', "$($uid):$gid", (Get-DatabaseMountPath)) -Visible
+    $step = Invoke-DatabaseRootTool $name 'chown' @("$($uid):$gid", (Get-DatabaseMountPath))
     if ($step.ExitCode -ne 0) { throw 'Could not set database mount ownership.' }
-    $step = Invoke-WslNative @('--distribution', $name, '--user', 'root', '--exec',
-        'chmod', '0750', (Get-DatabaseMountPath)) -Visible
+    $step = Invoke-DatabaseRootTool $name 'chmod' @('0750', (Get-DatabaseMountPath))
     if ($step.ExitCode -ne 0) { throw 'Could not set database mount permissions.' }
     Write-DatabaseVolumeMarker $name $info.Uuid
     return $info.Uuid
+}
+
+function Get-WslCandidateInfo([string]$name, [hashtable]$versions) {
+    # Listing a menu must not start every installed distro. On affected WSL
+    # versions, an unselected systemd distro's idle shutdown removes shared
+    # mounts used by Docker and by external DB VHDs (microsoft/WSL#41084).
+    $version = if ($versions.ContainsKey($name)) { [int]$versions[$name] } else { 0 }
+    $score = if ($version -ne 2) { 0 } elseif ($name -match 'Ubuntu') { 90 }
+        elseif ($name -match 'Debian') { 80 } else { 60 }
+    return [pscustomobject]@{Name=$name;Version=$version;Score=$score;
+        Reason='WSL 2 required';Home='';Linux='not started';ProbeDeferred=$true}
 }
 
 function Get-WslInfo([string]$name, [hashtable]$versions) {
@@ -472,7 +485,8 @@ function Select-WslDistribution([object[]]$infos, [string]$savedName) {
         Write-Host 'Available WSL distributions:'
         for ($index = 0; $index -lt $ordered.Count; $index++) {
             $info = $ordered[$index]
-            $label = if ($info.Score -gt 0) { 'usable' } else { $info.Reason }
+            $label = if ($info.Score -le 0) { $info.Reason }
+                elseif ($info.ProbeDeferred) { 'checked after selection' } else { 'usable' }
             Write-Host "  $($index + 1). $($info.Name) ($($info.Linux), WSL $($info.Version)) - $label"
         }
     }
@@ -591,18 +605,7 @@ function Ensure-DockerDesktop([string]$distro) {
         Start-Process -FilePath $desktop
     }
     Write-Host "Checking Docker Desktop in WSL distribution $distro..."
-    for ($round = 1; $round -le 3; $round++) {
-        $attemptLimit = if ($round -eq 1) { 4 } else { 12 }
-        for ($attempt = 1; $attempt -le $attemptLimit; $attempt++) {
-            if (Test-WslDockerReady $distro) { return }
-            Start-Sleep -Seconds 5
-        }
-        if ($round -lt 3) {
-            Write-Host "Docker is unavailable inside $distro. Enable Settings > Resources > WSL Integration in Docker Desktop."
-            Read-Host 'Finish Docker Desktop setup and press Enter to retry' | Out-Null
-        }
-    }
-    throw "Docker Desktop WSL integration is unavailable in $distro. Enable it and rerun Install.cmd."
+    Wait-WslDockerReady $distro -AllowRepair
 }
 
 Write-Host 'CTF Agent local installer'
@@ -619,12 +622,20 @@ if (-not $names.Count) {
     $names = @($versions.Keys | Where-Object { $_ -notlike 'docker-desktop*' })
     if ($names.Count) { Write-Warning 'WSL quiet listing was empty; checking the registered distribution names.' }
 }
-$infos = @($names | ForEach-Object { Get-WslInfo $_ $versions })
-$distro = Select-WslDistribution $infos ([string]$saved.distro)
+$infos = @($names | ForEach-Object { Get-WslCandidateInfo $_ $versions })
+$preferredDistro = [string]$saved.distro
+if (-not $preferredDistro) {
+    $registrationRoot = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    $defaultId = (Get-ItemProperty -LiteralPath $registrationRoot -ErrorAction SilentlyContinue).DefaultDistribution
+    if ($defaultId) {
+        $preferredDistro = [string](Get-ItemProperty -LiteralPath (Join-Path $registrationRoot $defaultId) -ErrorAction SilentlyContinue).DistributionName
+    }
+}
+$distro = Select-WslDistribution $infos $preferredDistro
 if (-not $versions.ContainsKey($distro)) { $versions = Get-WslVersions }
 $selectedInfo = Get-WslInfo $distro $versions
 if ($selectedInfo.Score -le 0) {
-    Write-Host 'Finish WSL setup or restart Windows, then rerun Install.cmd.'
+    Write-Host "Selected distribution is not ready: $($selectedInfo.Reason)"
     exit 20
 }
 $defaultHome = "$($selectedInfo.Home.TrimEnd('/'))/.local/share/ctf-agent"
@@ -747,7 +758,7 @@ $installResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
 if ($installResult.ExitCode -ne 0) { throw "Local installation failed (exit code $($installResult.ExitCode))." }
 $stateDir = Split-Path -Parent $stateFile
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
-foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1', 'DatabaseDisk.ps1')) {
+foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1', 'DatabaseDisk.ps1', 'DockerDesktop.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $stateDir $name) -Force
 }
 $state = @{distro=$distro;home=$linuxHome;autoStart=$autoStart;
@@ -769,6 +780,7 @@ if ($autoStart) {
     $shortcut.WindowStyle = 7
     $shortcut.Save()
 }
+Wait-CtfAgentReady $distro $linuxHome
 Write-Host "Start: $(Join-Path $stateDir 'Start.cmd')"
 Write-Host "Uninstall: $(Join-Path $stateDir 'Uninstall.cmd')"
 if ($requireLogin) { Write-Host 'Open http://127.0.0.1:5050 to create the first administrator account.' }

@@ -3,20 +3,6 @@ name: Publish container image
 on:
   push:
     branches: [main]
-    paths:
-      - .github/workflows/image.yml
-      - Dockerfile
-      - Dockerfile.toolchain
-      - toolchain.lock
-      - requirements.txt
-      - requirements-ctf.txt
-      - ctf_agent/**
-      - deploy/**
-      - installer/**
-      - compose.local.yaml
-      - scripts/package_local_release.py
-      - pyproject.toml
-      - .github/workflows/release.yml
   workflow_dispatch:
 
 permissions:

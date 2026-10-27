@@ -16,6 +16,7 @@ REVISION = re.compile(r"[0-9a-f]{40}\Z")
 AUTOSOLVER = re.compile(r"ctf_agent_local_autosolver_([2-9]|[1-9][0-9]+)\Z")
 IMAGE = re.compile(
     r"(?:ctf-agent-local:(?:latest|rollback-[0-9a-f]{12})|"
+    r"ctf-agent-local-runtime:[0-9a-f]{64}|"
     r"ctf-agent-toolchain:local|ctf-agent-updater:local)\Z"
 )
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -207,7 +208,33 @@ def uninstall(home: Path) -> None:
     listed = docker("image", "ls", "--format", "{{.Repository}}:{{.Tag}}")
     tags = sorted({tag for tag in listed.stdout.splitlines() if IMAGE.fullmatch(tag)})
     for tag in tags:
+        if tag.startswith("ctf-agent-local-runtime:"):
+            details = docker("image", "inspect", tag)
+            try:
+                image, = json.loads(details.stdout)
+                labels = (image.get("Config") or {}).get("Labels") or {}
+                if labels.get("io.github.ctf-agent.local-runtime") != tag.split(":", 1)[1]:
+                    raise ValueError("Local runtime image identity mismatch")
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("A local runtime image could not be verified") from exc
         docker("image", "rm", tag)
+    local_runtime = docker(
+        "image", "ls", "--filter", "label=io.github.ctf-agent.local-runtime",
+        "--no-trunc", "--format", "{{.ID}}",
+    )
+    for image_id in sorted(set(local_runtime.stdout.splitlines())):
+        if not IMAGE_ID.fullmatch(image_id):
+            raise RuntimeError("A local runtime image ID could not be verified")
+        details = docker("image", "inspect", image_id)
+        try:
+            image, = json.loads(details.stdout)
+            labels = (image.get("Config") or {}).get("Labels") or {}
+            if (not re.fullmatch(r"[0-9a-f]{64}", labels.get("io.github.ctf-agent.local-runtime", ""))
+                    or any(not IMAGE.fullmatch(tag) for tag in image.get("RepoTags") or [])):
+                raise ValueError("Local runtime image ownership mismatch")
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("A local runtime image could not be verified") from exc
+        docker("image", "rm", image_id)
     dangling = docker(
         "image", "ls", "--filter", "label=io.github.ctf-agent.local-install=true",
         "--no-trunc", "--format", "{{.ID}}",

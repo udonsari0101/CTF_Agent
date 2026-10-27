@@ -489,6 +489,26 @@ def _rollback(home: Path, previous: str, root: Path, request: dict, mount_enviro
     )
     if restored_image.returncode:
         return False
+    # Releases with a local policy overlay must restore that exact verified
+    # image. The rollback tag above preserves the public base only.
+    runtime_marker = target / ".local-runtime.json"
+    if runtime_marker.exists() or runtime_marker.is_symlink():
+        runtime_script = target / "deploy" / "local_runtime.py"
+        if runtime_script.is_symlink() or not runtime_script.is_file():
+            return False
+        try:
+            selected = subprocess.run(
+                ["python3", str(runtime_script), "select"],
+                capture_output=True, text=True, timeout=45, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        runtime_id = selected.stdout.strip()
+        if selected.returncode or not re.fullmatch(r"sha256:[0-9a-f]{64}", runtime_id):
+            return False
+        env["CTF_LOCAL_RUNTIME_IMAGE"] = runtime_id
+    else:
+        env.pop("CTF_LOCAL_RUNTIME_IMAGE", None)
     if not _run_with_heartbeat(["python3", str(target / "deploy" / "local-compose.py"), "up", "-d", "--no-build", "--force-recreate"],
                                root, request, "rolling_back", env=env):
         return False

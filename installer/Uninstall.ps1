@@ -1,4 +1,7 @@
 $ErrorActionPreference = 'Stop'
+$dockerDesktopHelper = Join-Path $PSScriptRoot 'DockerDesktop.ps1'
+if (-not (Test-Path -LiteralPath $dockerDesktopHelper -PathType Leaf)) { throw 'DockerDesktop.ps1 is missing. Reinstall the patched release.' }
+. $dockerDesktopHelper
 function Invoke-WslNative([string[]]$command, [switch]$Quiet, [switch]$Visible) {
     $previousPreference = $ErrorActionPreference
     try {
@@ -11,10 +14,6 @@ function Invoke-WslNative([string[]]$command, [switch]$Quiet, [switch]$Visible) 
     return [pscustomobject]@{ Output=$output; ExitCode=$exitCode }
 }
 
-function Test-WslDockerReady([string]$distro) {
-    $result = Invoke-WslNative @('--distribution', $distro, '--exec', 'docker', 'info') -Quiet
-    return ($result.ExitCode -eq 0)
-}
 $stateDir = Join-Path $env:LOCALAPPDATA 'CTF Agent'
 $stateFile = Join-Path $stateDir 'install.json'
 if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
@@ -75,12 +74,7 @@ $desktop = @(
 if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue) -and $desktop) {
     Start-Process -FilePath $desktop -WindowStyle Hidden
 }
-$ready = $false
-for ($attempt = 0; $attempt -lt 30; $attempt++) {
-    if (Test-WslDockerReady $distro) { $ready = $true; break }
-    Start-Sleep -Seconds 4
-}
-if (-not $ready) { throw "Docker Desktop is unavailable inside $distro. Nothing was deleted." }
+Wait-WslDockerReady $distro -AllowRepair
 $removal = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
     "CTF_LOCAL_HOME=$linuxHome", "CTF_LOCAL_DATABASE=$databasePath",
     "CTF_LOCAL_FS_DATABASE=$databasePath", "CTF_LOCAL_DB_MOUNT=$databaseMount",
