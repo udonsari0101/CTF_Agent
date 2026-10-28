@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# CTF_AGENT_DATABASE_BIND_V1
 set -euo pipefail
 
 home_dir="${CTF_LOCAL_HOME:?CTF_LOCAL_HOME is required}"
@@ -74,6 +75,27 @@ if [[ "${#options[@]}" -ne 5 ]]; then
     echo 'Local installation settings are invalid.' >&2
     exit 2
 fi
+database_file="${options[2]}/sqlite/ctf_agent.sqlite3"
+if [[ -L "$database_file" || ! -f "$database_file" || ! -s "$database_file" ]]; then
+    echo 'The existing local database is unavailable; refusing to start with an empty database.' >&2
+    exit 2
+fi
+python3 - "$database_file" <<'PY'
+import pathlib, sqlite3, sys
+path = pathlib.Path(sys.argv[1])
+try:
+    with sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=5) as db:
+        db.execute("PRAGMA query_only=ON")
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('meta','users','workspaces')")}
+        owner = db.execute("SELECT value FROM meta WHERE key='legacy_owner_id'").fetchone() if "meta" in tables else None
+        user = db.execute("SELECT 1 FROM users LIMIT 1").fetchone() if "users" in tables else None
+        if tables != {"meta", "users", "workspaces"} or not owner or not owner[0] or not user:
+            raise ValueError("Required initialized data is missing")
+except (sqlite3.Error, ValueError) as exc:
+    raise SystemExit("The existing local database is not initialized; refusing to replace it") from exc
+PY
 docker info >/dev/null
 docker image inspect ctf-agent-local:latest >/dev/null
 image_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' ctf-agent-local:latest)"
@@ -101,9 +123,23 @@ fi
 export CTF_LOCAL_RUNTIME_IMAGE="$(python3 "$release/deploy/local_runtime.py" select)"
 export CTF_LOCAL_HOME="$home_dir"
 export CTF_LOCAL_DATA="$home_dir/ctf_agent_data"
-export CTF_LOCAL_DATABASE="${options[2]}"
 export CTF_LOCAL_FS_DATABASE="${options[2]}"
 export CTF_LOCAL_DB_MOUNT="${options[3]}"
+if [[ -n "${options[3]}" ]]; then
+    database_alias="$home_dir/.database-bind"
+    if [[ -L "$database_alias" ]]; then
+        [[ "$(readlink -- "$database_alias")" == "${options[2]}" ]] || {
+            echo 'The database bind alias targets a different disk.' >&2; exit 2;
+        }
+    elif [[ -e "$database_alias" ]]; then
+        echo 'The database bind alias is not a symlink.' >&2; exit 2
+    else
+        ln -s -- "${options[2]}" "$database_alias"
+    fi
+    export CTF_LOCAL_DATABASE="$database_alias"
+else
+    export CTF_LOCAL_DATABASE="${options[2]}"
+fi
 export CTF_LOCAL_UID="$(id -u)"
 export CTF_LOCAL_GID="$(id -g)"
 export CTF_AUTH_MODE="${options[0]}"
@@ -118,8 +154,45 @@ fi
 export CTF_RELEASE_SHA="$revision"
 export CTF_RELEASE_VERSION="$version"
 cd -- "$release"
+if [[ -n "${options[3]}" ]]; then
+    python3 "$release/ctf_agent/release_updates.py" --prepare-host-worker
+fi
 python3 deploy/local-compose.py up -d --no-build
-if docker image inspect ctf-agent-updater:local >/dev/null 2>&1; then
+if [[ -n "${options[3]}" ]]; then
+    status_file="$home_dir/ctf_agent_data/update-control/status.json"
+    status_before_ns="$(python3 - "$status_file" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+print(path.stat().st_mtime_ns if path.exists() else 0)
+PY
+)"
+    nohup python3 "$release/ctf_agent/release_updates.py" --host-worker \
+        </dev/null >/dev/null 2>&1 &
+    host_updater_ready=false
+    for attempt in {1..6}; do
+        if python3 - "$status_file" "$status_before_ns" <<'PY'
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    fresh = path.stat().st_mtime_ns > int(sys.argv[2])
+    value = json.loads(path.read_text(encoding="utf-8")) if fresh else {}
+    healthy = time.time() - float(value.get("updated_at", 0)) < 10
+except (OSError, ValueError, TypeError):
+    healthy = False
+raise SystemExit(0 if healthy else 1)
+PY
+        then
+            host_updater_ready=true
+            break
+        fi
+        sleep 2
+    done
+    [[ "$host_updater_ready" == true ]] || {
+        echo 'The host update controller did not become ready.' >&2; exit 1;
+    }
+elif docker image inspect ctf-agent-updater:local >/dev/null 2>&1; then
     docker start ctf_agent_local_updater >/dev/null 2>&1 || true
 fi
 printf 'CTF Agent %s services requested; solver readiness requires /readyz HTTP 200.\n' "$version"

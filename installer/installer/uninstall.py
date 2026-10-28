@@ -6,8 +6,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -163,6 +166,79 @@ def verify_external_database(mount: Path, database: Path, volume_id: str) -> Non
         raise RuntimeError("The configured external database VHD is unavailable")
 
 
+@contextmanager
+def stop_host_updater(control: Path, *, external: bool):
+    """Hold the uninstall and worker locks while removing a VHD-backed runtime."""
+
+    if not external:
+        yield
+        return
+    import fcntl
+
+    if control.is_symlink() or not control.is_dir() or control.stat().st_uid != os.getuid():
+        raise RuntimeError("The update control directory is not owned by this installation")
+    flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+    uninstall_fd = os.open(control / ".uninstall.lock", flags, 0o600)
+    worker_fd = None
+    stop = control / "stop-worker"
+    lock_acquired = False
+    stop_info = None
+    valid_stop = False
+    try:
+        info = os.fstat(uninstall_fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_size or info.st_uid != os.getuid()):
+            raise RuntimeError("The uninstall control lock is invalid")
+        try:
+            fcntl.flock(uninstall_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("Another uninstall is running") from exc
+        lock_acquired = True
+        if any(path.exists() or path.is_symlink() for path in
+               (control / "request.json", control / "running.json")):
+            raise RuntimeError("An update is queued or running; wait for it to finish")
+        try:
+            marker_fd = os.open(stop, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            marker_fd = None
+        else:
+            os.close(marker_fd)
+        stop_info = stop.lstat()
+        if (not stat.S_ISREG(stop_info.st_mode) or stop_info.st_nlink != 1
+                or stop_info.st_size or stop_info.st_uid != os.getuid()):
+            raise RuntimeError("The host worker stop marker is invalid")
+        valid_stop = True
+        worker_fd = os.open(control / "worker.lock", flags, 0o600)
+        info = os.fstat(worker_fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_size or info.st_uid != os.getuid()):
+            raise RuntimeError("The host worker lock is invalid")
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("The host updater did not stop")
+                time.sleep(0.2)
+        if any(path.exists() or path.is_symlink() for path in
+               (control / "request.json", control / "running.json")):
+            raise RuntimeError("An update started during uninstall handoff")
+        if stop.lstat() != stop_info:
+            raise RuntimeError("The host worker stop marker changed")
+        yield
+    finally:
+        try:
+            if lock_acquired and valid_stop and (stop.exists() or stop.is_symlink()):
+                if stop.lstat() == stop_info:
+                    stop.unlink()
+        finally:
+            if worker_fd is not None:
+                os.close(worker_fd)
+            os.close(uninstall_fd)
+
+
 def uninstall(home: Path) -> None:
     _version, release = release_root(home)
     home = home.resolve(strict=True)
@@ -181,11 +257,24 @@ def uninstall(home: Path) -> None:
     database = Path(database_value)
     if mount_value:
         verify_external_database(Path(mount_value), database, volume_id)
+        database_alias = home / ".database-bind"
+        if database_alias.is_symlink():
+            if os.readlink(database_alias) != str(database):
+                raise RuntimeError("The database bind link points to a different path")
+        elif database_alias.exists():
+            raise RuntimeError("The database bind path is occupied by another file")
     elif database != default_database or volume_id:
         raise RuntimeError("Local database settings are invalid")
     control = home / "ctf_agent_data" / "update-control"
     if (control / "running.json").exists() or (control / "request.json").exists():
         raise RuntimeError("An update is queued or running; wait for it to finish")
+    with stop_host_updater(control, external=bool(mount_value)):
+        if release_root(home)[1] != release:
+            raise RuntimeError("The installed release changed while uninstall was starting")
+        _uninstall_runtime(home, release, database, database_alias if mount_value else None)
+
+
+def _uninstall_runtime(home: Path, release: Path, database: Path, database_alias: Path | None) -> None:
     docker("info")
     dynamic = verify_containers(home)
     updater = inspect("ctf_agent_local_updater")
@@ -196,7 +285,7 @@ def uninstall(home: Path) -> None:
         command += ["--profile", f"solver-{number}"]
     environment = dict(os.environ)
     environment["CTF_LOCAL_DATA"] = str(home / "ctf_agent_data")
-    environment["CTF_LOCAL_DATABASE"] = str(database)
+    environment["CTF_LOCAL_DATABASE"] = str(database_alias or database)
     result = subprocess.run(
         ["docker", *command, "down", "--remove-orphans"],
         cwd=release, env=environment, capture_output=True, text=True, timeout=240, check=False,
@@ -255,6 +344,8 @@ def uninstall(home: Path) -> None:
             raise RuntimeError("A local image could not be verified") from exc
         docker("image", "rm", image_id)
     remove_release_files(home)
+    if database_alias is not None and database_alias.is_symlink():
+        database_alias.unlink()
     print("CTF Agent runtime removed.")
     print(f"Preserved data: {home / 'ctf_agent_data'}")
     print(f"Preserved database: {database}")

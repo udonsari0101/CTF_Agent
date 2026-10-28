@@ -681,6 +681,7 @@ if (-not $separateDatabase -and $saved.db_vhd) {
 $dbVhd = ''
 $databaseMount = ''
 $databasePath = ''
+$dockerDatabasePath = ''
 $dbUuid = ''
 $validatedPreexistingTask = $false
 if ($separateDatabase) {
@@ -749,14 +750,27 @@ if ($separateDatabase) {
 # metadata unreadable to this distribution's normal user. The Linux installer
 # verifies that previous image before it stages the replacement release.
 Repair-LocalRuntimeMetadata $distro $linuxHome
+# Installation already waited for Docker Desktop before attaching the VHD.
+# Verify its identity again after the intervening WSL probes, immediately
+# before the Linux installer can start containers.
+if ($dbVhd) {
+    Ensure-DatabaseMount $distro $dbVhd $dbUuid $dbTaskManaged
+    $dockerDatabasePath = Ensure-DatabaseBindLink $distro $linuxHome $databasePath `
+        -AllowCreateDatabaseDirectory:([bool]$saved.pending_install -or -not [bool]$saved.db_vhd)
+}
 $pathResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'wslpath', '-a', '-u', $installer)
 $linuxPath = @($pathResult.Output)
 if ($pathResult.ExitCode -ne 0 -or -not $linuxPath.Count -or -not $linuxPath[0].StartsWith('/')) {
     throw 'The selected WSL distribution cannot access the extracted release folder.'
 }
+if ($dbVhd) {
+    Ensure-DatabaseMount $distro $dbVhd $dbUuid $dbTaskManaged
+    $dockerDatabasePath = Ensure-DatabaseBindLink $distro $linuxHome $databasePath `
+        -AllowCreateDatabaseDirectory:([bool]$saved.pending_install -or -not [bool]$saved.db_vhd)
+}
 $installResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
     "CTF_LOCAL_HOME=$linuxHome", "CTF_LOCAL_AUTOSTART=$($autoStart.ToString().ToLowerInvariant())",
-    "CTF_LOCAL_AUTH_MODE=$authMode", "CTF_LOCAL_DATABASE=$databasePath",
+    "CTF_LOCAL_AUTH_MODE=$authMode", "CTF_LOCAL_DATABASE=$dockerDatabasePath",
     "CTF_LOCAL_FS_DATABASE=$databasePath", "CTF_LOCAL_DB_MOUNT=$databaseMount",
     'bash', $linuxPath[0]) -Visible
 if ($installResult.ExitCode -ne 0) { throw "Local installation failed (exit code $($installResult.ExitCode))." }

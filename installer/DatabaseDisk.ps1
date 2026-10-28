@@ -246,6 +246,49 @@ function Ensure-DatabaseMount([string]$distro, [string]$vhd,
     }
 }
 
+function Ensure-DatabaseBindLink([string]$distro, [string]$linuxHome,
+    [string]$databasePath, [switch]$AllowCreateDatabaseDirectory) {
+    # Docker Desktop can route a /mnt/wsl source through its host-file proxy,
+    # which may show an old, detached VHD. An exact symlink inside the Ubuntu
+    # home makes Docker use its WSL-distribution file proxy instead. The Linux
+    # launcher still verifies that both sides see the same live database.
+    $program = @'
+import os,pathlib,sys
+home=pathlib.Path(sys.argv[1])
+database=pathlib.Path(sys.argv[2])
+allow_create=sys.argv[3]=="true"
+if (not home.is_absolute() or str(home)=="/" or home.is_symlink()
+        or database!=pathlib.Path("/mnt/wsl/ctf-agent-db/Database/CTF_Agent")
+        or database.is_symlink() or database.parent.is_symlink()):
+    raise SystemExit("Invalid external database bind path")
+if not database.is_dir():
+    if not allow_create or database.exists():
+        raise SystemExit("The external database directory is unavailable")
+    database.mkdir(parents=True, exist_ok=False)
+link=home/".database-bind"
+if link.is_symlink():
+    if os.readlink(link)!=str(database):
+        raise SystemExit("The database bind link points elsewhere")
+elif link.exists():
+    raise SystemExit("The database bind path is occupied")
+else:
+    os.symlink(str(database),link)
+if not link.is_symlink() or os.readlink(link)!=str(database) or not link.is_dir():
+    raise SystemExit("The database bind link is unavailable")
+print(link)
+'@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($program))
+    $wrapper = 'import base64,sys;exec(base64.b64decode(sys.argv.pop(1)))'
+    $result = Invoke-DesktopNative 'wsl.exe' @('--distribution', $distro, '--exec',
+        'python3', '-c', $wrapper, $encoded, $linuxHome, $databasePath,
+        $AllowCreateDatabaseDirectory.IsPresent.ToString().ToLowerInvariant()) 15
+    $expected = "$linuxHome/.database-bind"
+    if ($result.ExitCode -ne 0 -or $result.Stdout.Trim() -ne $expected) {
+        throw "The external database bind link could not be verified: $($result.Output)"
+    }
+    return $expected
+}
+
 function Invoke-DatabaseElevatedPayload([string]$payload) {
     $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
     $action = [string]$request.action

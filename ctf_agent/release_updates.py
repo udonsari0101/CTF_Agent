@@ -8,7 +8,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -225,6 +227,9 @@ def queue_update(root: Path, tag: str) -> str:
     if version_tuple(tag) is None:
         raise ValueError("Invalid release version")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if any(path.exists() or path.is_symlink() for path in
+           (root / "stop-worker", root.parent / "deployment-drain")):
+        raise FileExistsError("The update controller is unavailable during installation")
     if (root / "running.json").exists():
         raise FileExistsError("Update already running")
     request_id = uuid.uuid4().hex
@@ -238,6 +243,9 @@ def queue_update(root: Path, tag: str) -> str:
             os.fsync(stream.fileno())
         if (root / "running.json").exists():
             raise FileExistsError("Update already running")
+        if any(path.exists() or path.is_symlink() for path in
+               (root / "stop-worker", root.parent / "deployment-drain")):
+            raise FileExistsError("The update controller is unavailable during installation")
         os.link(temporary, root / "request.json")
     finally:
         temporary.unlink(missing_ok=True)
@@ -384,7 +392,7 @@ def _verified_local_database(home: Path) -> tuple[Path, str]:
         raise RuntimeError("External database VHD is unavailable or invalid") from exc
 
 
-def _compose_mount_environment(home: Path) -> dict[str, str]:
+def _compose_mount_environment(home: Path, *, host_external: bool = False) -> dict[str, str]:
     """Keep Docker's bind sources distinct from paths visible inside the updater."""
     result = subprocess.run(
         ["docker", "inspect", "ctf_agent_local"],
@@ -418,27 +426,45 @@ def _compose_mount_environment(home: Path) -> dict[str, str]:
             raise RuntimeError("The existing external database is unavailable")
         if shutil.disk_usage(database_fs_path).free < 1024**3:
             raise RuntimeError("The external database needs at least 1 GB free before updating")
-        updater = subprocess.run(
-            ["docker", "inspect", "ctf_agent_local_updater"],
-            capture_output=True, text=True, timeout=15, check=False,
-        )
-        if updater.returncode:
-            raise RuntimeError("External database updater mount is unavailable")
-        try:
-            updater_container, = json.loads(updater.stdout)
-            updater_mounts = [
-                item["Source"] for item in updater_container["Mounts"]
-                if item.get("Type") == "bind" and item.get("Destination") == database_mount
-            ]
-            if (updater_container.get("Name") != "/ctf_agent_local_updater"
-                    or len(updater_mounts) != 1
-                    or not isinstance(updater_mounts[0], str)
-                    or not updater_mounts[0].startswith("/")
-                    or PurePosixPath(mounts["/database"]) !=
-                    PurePosixPath(updater_mounts[0]) / "Database" / "CTF_Agent"):
-                raise ValueError("External database bind sources differ")
-        except (TypeError, ValueError, KeyError) as exc:
-            raise RuntimeError("External database bind sources could not be verified") from exc
+        if host_external:
+            # Docker Desktop routes this symlink through the selected Ubuntu
+            # distro. A direct /mnt/wsl source can resolve to a detached VHD's
+            # shadow directory inside the Docker daemon instead. Docker inspect
+            # may report either the submitted symlink or its resolved target;
+            # the host-origin nonce preflight below is mandatory before use.
+            alias = home / ".database-bind"
+            if (not alias.is_symlink() or os.readlink(alias) != str(database_fs_path)
+                    or mounts["/database"] not in {str(alias), str(database_fs_path)}
+                    or mounts["/data"] != str(home / "ctf_agent_data")):
+                raise RuntimeError("The installed database bind does not use the verified WSL path")
+            old_updater = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Running}}", "ctf_agent_local_updater"],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if old_updater.returncode == 0 and old_updater.stdout.strip() != "false":
+                raise RuntimeError("The legacy Docker updater is still running")
+        else:
+            updater = subprocess.run(
+                ["docker", "inspect", "ctf_agent_local_updater"],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if updater.returncode:
+                raise RuntimeError("External database updater mount is unavailable")
+            try:
+                updater_container, = json.loads(updater.stdout)
+                updater_mounts = [
+                    item["Source"] for item in updater_container["Mounts"]
+                    if item.get("Type") == "bind" and item.get("Destination") == database_mount
+                ]
+                if (updater_container.get("Name") != "/ctf_agent_local_updater"
+                        or len(updater_mounts) != 1
+                        or not isinstance(updater_mounts[0], str)
+                        or not updater_mounts[0].startswith("/")
+                        or PurePosixPath(mounts["/database"]) !=
+                        PurePosixPath(updater_mounts[0]) / "Database" / "CTF_Agent"):
+                    raise ValueError("External database bind sources differ")
+            except (TypeError, ValueError, KeyError) as exc:
+                raise RuntimeError("External database bind sources could not be verified") from exc
         # Windows starts the application only after mounting its VHD. Docker
         # itself must never auto-restart this stack against an empty path.
         if restart_policy != "no":
@@ -451,7 +477,10 @@ def _compose_mount_environment(home: Path) -> dict[str, str]:
         auto_start = restart_policy == "unless-stopped"
     return {
         "CTF_LOCAL_DATA": mounts["/data"],
-        "CTF_LOCAL_DATABASE": mounts["/database"],
+        # Always submit the distro-local symlink on the next Compose run. A
+        # resolved inspect source is evidence of the old container only, not a
+        # safe source for a newly created container after a VHD remount.
+        "CTF_LOCAL_DATABASE": str(home / ".database-bind") if host_external else mounts["/database"],
         "CTF_LOCAL_FS_DATA": str(home / "ctf_agent_data"),
         "CTF_LOCAL_FS_DATABASE": str(database_fs_path),
         "CTF_LOCAL_DB_MOUNT": database_mount,
@@ -462,10 +491,85 @@ def _compose_mount_environment(home: Path) -> dict[str, str]:
     }
 
 
-def _rollback(home: Path, previous: str, root: Path, request: dict, mount_environment: dict[str, str]) -> bool:
+def _database_bind_failed(home: Path) -> bool:
+    marker = home / ".database-bind-failed"
+    return marker.exists() or marker.is_symlink()
+
+
+def _mounted_as_ext4(database_mount: str) -> bool:
+    with Path("/proc/self/mountinfo").open(encoding="utf-8") as stream:
+        return any(
+            line.split(" - ", 1)[0].split()[4] == database_mount
+            and line.split(" - ", 1)[1].split()[0] == "ext4"
+            for line in stream if " - " in line
+        )
+
+
+def _host_external_preflight(home: Path, mount_environment: dict[str, str]) -> None:
+    """Attest the live VHD from the WSL host before changing any containers."""
+
+    database_fs_path, database_mount = _verified_local_database(home)
+    if not database_mount:
+        raise RuntimeError("The host updater requires an external database VHD")
+    if not _mounted_as_ext4(database_mount):
+        raise RuntimeError("The external database VHD is not mounted as ext4")
+    alias = home / ".database-bind"
+    if (not alias.is_symlink() or os.readlink(alias) != str(database_fs_path)
+            or mount_environment.get("CTF_LOCAL_DATABASE") != str(alias)
+            or mount_environment.get("CTF_LOCAL_FS_DATABASE") != str(database_fs_path)):
+        raise RuntimeError("The WSL database bind does not match the mounted VHD")
+    version = (home / ".current-release").read_text(encoding="ascii").strip()
+    if version_tuple(version) is None:
+        raise RuntimeError("Installed release metadata is invalid")
+    release = home / "releases" / version
+    script = release / "deploy" / "local-compose.py"
+    runtime_script = release / "deploy" / "local_runtime.py"
+    revision_file = release / ".release-revision"
+    if (release.is_symlink() or script.is_symlink() or not script.is_file()
+            or runtime_script.is_symlink() or not runtime_script.is_file()
+            or revision_file.is_symlink() or not revision_file.is_file()):
+        raise RuntimeError("Installed release preflight is unavailable")
+    revision = revision_file.read_text(encoding="ascii").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError("Installed release revision is invalid")
+    env = dict(os.environ)
+    env.update(mount_environment)
+    env.update({
+        "CTF_LOCAL_HOME": str(home),
+        "CTF_LOCAL_UID": str(os.getuid()),
+        "CTF_LOCAL_GID": str(os.getgid()),
+        "CTF_RELEASE_SHA": revision,
+        "CTF_RELEASE_VERSION": version,
+    })
+    env.pop("CTF_UPDATE_IN_PROGRESS", None)
+    selected = subprocess.run(
+        ["python3", str(runtime_script), "select"], cwd=release, env=env,
+        capture_output=True, text=True, timeout=45, check=False,
+    )
+    if selected.returncode or not re.fullmatch(r"sha256:[0-9a-f]{64}", selected.stdout.strip()):
+        raise RuntimeError("Installed local runtime image could not be verified")
+    env["CTF_LOCAL_RUNTIME_IMAGE"] = selected.stdout.strip()
+    result = subprocess.run(
+        ["python3", str(script), "preflight"], cwd=release, env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=60, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError("Docker could not verify the live database VHD before update")
+
+
+def _rollback(home: Path, previous: str, root: Path, request: dict,
+              mount_environment: dict[str, str], *, host_external: bool = False) -> bool:
+    # The previous release may not have a database-bind guard. If the new
+    # launcher detected a stale Docker mount, restarting that release would
+    # expose the wrong database again. Keep the stack stopped for recovery.
+    if _database_bind_failed(home):
+        return False
     if mount_environment.get("CTF_LOCAL_DB_MOUNT"):
         try:
             _verified_local_database(home)
+            if host_external:
+                _host_external_preflight(home, mount_environment)
         except RuntimeError:
             return False
     target = home / "releases" / previous
@@ -481,6 +585,8 @@ def _rollback(home: Path, previous: str, root: Path, request: dict, mount_enviro
         "CTF_UPDATE_IN_PROGRESS": "true",
     })
     env.update(mount_environment)
+    if host_external:
+        env["CTF_HOST_UPDATE_ATTESTED"] = "true"
     _status(root, "rolling_back", request_id=request["id"], tag=request["tag"])
     rollback_tag = "ctf-agent-local:rollback-" + env["CTF_RELEASE_SHA"][:12]
     restored_image = subprocess.run(
@@ -521,7 +627,7 @@ def _rollback(home: Path, previous: str, root: Path, request: dict, mount_enviro
     return healthy
 
 
-def _apply(home: Path, root: Path, request: dict) -> None:
+def _apply(home: Path, root: Path, request: dict, *, host_external: bool = False) -> None:
     tag = request["tag"]
     if version_tuple(tag) is None:
         raise ValueError("Invalid update tag")
@@ -559,20 +665,31 @@ def _apply(home: Path, root: Path, request: dict) -> None:
         )
         if preserved.returncode:
             raise RuntimeError("Previous image could not be preserved")
-        mount_environment = _compose_mount_environment(home)
+        mount_environment = _compose_mount_environment(home, host_external=host_external)
+        if host_external:
+            _host_external_preflight(home, mount_environment)
         env = dict(os.environ)
         env["CTF_LOCAL_HOME"] = str(home)
         env["CTF_UPDATE_IN_PROGRESS"] = "true"
         env["CTF_LOCAL_UID"] = os.environ["CTF_LOCAL_UID"]
         env["CTF_LOCAL_GID"] = os.environ["CTF_LOCAL_GID"]
         env.update(mount_environment)
+        if host_external:
+            env["CTF_HOST_UPDATE_ATTESTED"] = "true"
         success = _run_with_heartbeat(
             ["bash", str(bundle / "installer" / "install.sh")], root, request, "installing", env=env,
         )
         if success:
             success = _healthy(root, request, expected_sha=(bundle / "COMMIT").read_text(encoding="ascii").strip())
         if not success:
-            restored = _rollback(home, previous, root, request, mount_environment)
+            if _database_bind_failed(home):
+                raise RuntimeError(
+                    "Docker could not see the verified database; the previous release was not restarted"
+                )
+            restored = _rollback(
+                home, previous, root, request, mount_environment,
+                host_external=host_external,
+            )
             if restored:
                 previous_file.write_text(previous + "\n", encoding="ascii")
             raise RuntimeError("Update failed; previous release restored" if restored else "Update and rollback failed")
@@ -580,21 +697,115 @@ def _apply(home: Path, root: Path, request: dict) -> None:
         _status(root, "completed", request_id=request["id"], tag=tag, previous=previous)
 
 
-def worker_loop() -> None:
+def _reexec_current_host_worker(home: Path) -> None:
+    """Switch the host updater to the selected release after a manual/web update."""
+
+    current = (home / ".current-release").read_text(encoding="ascii").strip()
+    if version_tuple(current) is None:
+        raise RuntimeError("Installed release metadata is invalid")
+    script = home / "releases" / current / "ctf_agent" / "release_updates.py"
+    if script.parent.parent.is_symlink() or script.is_symlink() or not script.is_file():
+        raise RuntimeError("Installed host updater is unavailable")
+    if script.resolve(strict=True) != Path(__file__).resolve(strict=True):
+        os.execv(sys.executable, [sys.executable, str(script), "--host-worker"])
+
+
+def prepare_host_worker() -> None:
+    """Clear an interrupted uninstall's stop marker only after lock handoff."""
+
+    import fcntl
+
+    home = Path(os.environ["CTF_LOCAL_HOME"]).resolve(strict=True)
+    _, mount = _verified_local_database(home)
+    if (not mount or not _mounted_as_ext4(mount)
+            or os.environ.get("CTF_LOCAL_UID") != str(os.getuid())):
+        raise RuntimeError("The host updater needs the verified WSL user and mounted ext4 database")
+    root = control_root(home / "ctf_agent_data")
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise RuntimeError("The update control directory is not owned by the WSL user")
+    lock = root / ".uninstall.lock"
+    descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_size or info.st_uid != os.getuid()):
+            raise RuntimeError("The uninstall control lock is invalid")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("An uninstall is in progress") from exc
+        if any(path.exists() or path.is_symlink() for path in
+               (root / "request.json", root / "running.json")):
+            raise RuntimeError("An update is pending or running")
+        stop = root / "stop-worker"
+        if not stop.exists() and not stop.is_symlink():
+            return
+        stop_info = stop.lstat()
+        if (not stat.S_ISREG(stop_info.st_mode) or stop_info.st_nlink != 1
+                or stop_info.st_size or stop_info.st_uid != os.getuid()):
+            raise RuntimeError("The host worker stop marker is invalid")
+        worker_lock = root / "worker.lock"
+        worker_descriptor = os.open(worker_lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            worker_info = os.fstat(worker_descriptor)
+            if (not stat.S_ISREG(worker_info.st_mode) or worker_info.st_nlink != 1
+                    or worker_info.st_size or worker_info.st_uid != os.getuid()):
+                raise RuntimeError("The host worker lock is invalid")
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    fcntl.flock(worker_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("The host updater did not stop")
+                    time.sleep(0.2)
+            if stop.lstat() != stop_info:
+                raise RuntimeError("The host worker stop marker changed")
+            stop.unlink()
+        finally:
+            os.close(worker_descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def worker_loop(*, host_external: bool = False) -> None:
     import fcntl
     home = Path(os.environ["CTF_LOCAL_HOME"]).resolve(strict=True)
-    _verified_local_database(home)
+    _, database_mount = _verified_local_database(home)
+    if host_external != bool(database_mount):
+        raise RuntimeError("The selected updater does not match this database installation")
+    if host_external:
+        expected_uid = os.environ.get("CTF_LOCAL_UID", "")
+        if (not expected_uid.isdecimal() or os.getuid() != int(expected_uid)
+                or not _mounted_as_ext4(database_mount)):
+            raise RuntimeError("The host updater needs the verified WSL user and mounted ext4 database")
     root = control_root(home / "ctf_agent_data")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = root / "worker.lock"
     with lock.open("a+b") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if host_external and ((root / "stop-worker").exists() or (root / "stop-worker").is_symlink()):
+            return
         if (root / "running.json").exists():
             (root / "running.json").unlink()
             _status(root, "failed", message="The previous update process stopped unexpectedly")
         while True:
+            if host_external and ((root / "stop-worker").exists() or (root / "stop-worker").is_symlink()):
+                return
+            if host_external and not (root / "running.json").exists():
+                _verified_local_database(home)
+                if not _mounted_as_ext4(database_mount):
+                    raise RuntimeError("The external database VHD detached while updater was running")
+                _reexec_current_host_worker(home)
             request_path = root / "request.json"
             running_path = root / "running.json"
+            drain = root.parent / "deployment-drain"
+            if drain.exists() or drain.is_symlink():
+                _status(root, "idle")
+                time.sleep(5)
+                continue
             if not request_path.exists():
                 status = read_status(root)
                 phase = status.pop("phase", "idle")
@@ -607,7 +818,7 @@ def worker_loop() -> None:
                 request = json.loads(running_path.read_text(encoding="utf-8"))
                 if not isinstance(request, dict) or not re.fullmatch(r"[0-9a-f]{32}", request.get("id", "")):
                     raise ValueError("Invalid update request")
-                _apply(home, root, request)
+                _apply(home, root, request, host_external=host_external)
             except Exception as exc:
                 message = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else "Update failed"
                 _status(root, "failed", message=message[:240])
@@ -616,4 +827,9 @@ def worker_loop() -> None:
 
 
 if __name__ == "__main__":
-    worker_loop()
+    if sys.argv[1:] == ["--prepare-host-worker"]:
+        prepare_host_worker()
+    elif sys.argv[1:] in ([], ["--host-worker"]):
+        worker_loop(host_external=sys.argv[1:] == ["--host-worker"])
+    else:
+        raise SystemExit("Unsupported updater mode")

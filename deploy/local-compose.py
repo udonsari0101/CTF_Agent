@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import time
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +38,14 @@ def _local_path(value: str) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def _verify_database_bind_alias(environment: dict[str, str], database: str) -> None:
+    home_value = environment.get("CTF_LOCAL_HOME", "")
+    alias = Path(home_value) / ".database-bind" if home_value else None
+    if (alias is None or environment.get("CTF_LOCAL_DATABASE") != str(alias)
+            or not alias.is_symlink() or os.readlink(alias) != database):
+        raise RuntimeError("The Docker database bind alias is missing or targets a different disk")
+
+
 def verify_external_database(environment: dict[str, str]) -> None:
     """Refuse to start containers against an unmounted or wrong database VHD."""
 
@@ -47,6 +59,12 @@ def verify_external_database(environment: dict[str, str]) -> None:
         if not isinstance(config, dict):
             raise RuntimeError("Local installation settings are invalid")
     mount_value = environment.get("CTF_LOCAL_DB_MOUNT", "")
+    if (mount_value and environment.get("CTF_UPDATE_IN_PROGRESS") == "true"
+            and environment.get("CTF_HOST_UPDATE_ATTESTED") != "true"):
+        raise RuntimeError(
+            "An external database VHD update requires the trusted WSL launcher; "
+            "the in-app updater cannot verify the host mount"
+        )
     configured_mount = config.get("database_mount", "")
     if not isinstance(configured_mount, str) or (configured_mount and configured_mount != mount_value):
         raise RuntimeError("The configured external database VHD is unavailable")
@@ -60,6 +78,7 @@ def verify_external_database(environment: dict[str, str]) -> None:
     database = environment.get("CTF_LOCAL_FS_DATABASE", environment.get("CTF_LOCAL_DATABASE", ""))
     if database != str(mount / "Database" / "CTF_Agent"):
         raise RuntimeError("External database path does not match its mount")
+    _verify_database_bind_alias(environment, database)
     marker = mount / ".ctf-agent-db-volume"
     with Path("/proc/self/mountinfo").open(encoding="utf-8") as stream:
         filesystems = [
@@ -68,7 +87,7 @@ def verify_external_database(environment: dict[str, str]) -> None:
             if line.split(" - ", 1)[0].split()[4] == mount_value
         ]
     updating = environment.get("CTF_UPDATE_IN_PROGRESS") == "true"
-    if (not filesystems or (not updating and "ext4" not in filesystems)
+    if (not filesystems or "ext4" not in filesystems
             or mount.is_symlink() or not mount.is_dir()
             or marker.is_symlink() or not marker.is_file()
             or marker.stat().st_size > 64):
@@ -83,6 +102,363 @@ def verify_external_database(environment: dict[str, str]) -> None:
     for path in (mount / "Database", mount / "Database" / "CTF_Agent"):
         if path.is_symlink():
             raise RuntimeError("External database path contains a symlink")
+
+
+def verify_installed_database(environment: dict[str, str]) -> dict[str, object] | None:
+    """An installed release must never boot with a newly created database."""
+
+    home_value = environment.get("CTF_LOCAL_HOME", "")
+    if not home_value:
+        return None
+    home = Path(home_value)
+    release_marker = home / ".current-release"
+    config_path = home / ".local-config.json"
+    if release_marker.is_symlink():
+        raise RuntimeError("Installed release metadata is invalid")
+    if not release_marker.is_file():
+        if config_path.exists() or config_path.is_symlink():
+            raise RuntimeError("Local installation is incomplete; refusing to create a new database")
+        # The first installation has no selected release until it is healthy.
+        return None
+    if config_path.is_symlink() or not config_path.is_file():
+        raise RuntimeError("Local installation settings are missing")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise RuntimeError("Local installation settings are invalid")
+    database_root = _local_path(environment.get(
+        "CTF_LOCAL_FS_DATABASE",
+        environment.get("CTF_LOCAL_DATABASE", str(home / "Database" / "CTF_Agent")),
+    ))
+    configured_database = config.get("database_path", str(home / "Database" / "CTF_Agent"))
+    if not isinstance(configured_database, str) or database_root != Path(configured_database):
+        raise RuntimeError("Local database path differs from the installed settings")
+    database = database_root / "sqlite" / "ctf_agent.sqlite3"
+    if database.is_symlink() or not database.is_file() or database.stat().st_size == 0:
+        raise RuntimeError(
+            "The existing local database is unavailable; refusing to start with an empty database"
+        )
+    try:
+        return _probe_sqlite(database)
+    except (sqlite3.Error, ValueError, OSError) as exc:
+        raise RuntimeError(
+            "The existing local database is not initialized; refusing to replace it"
+        ) from exc
+
+
+def _probe_sqlite(database: Path) -> dict[str, object]:
+    with closing(sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+        db.execute("PRAGMA query_only=ON")
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('meta', 'users', 'workspaces')"
+        )}
+        if tables != {"meta", "users", "workspaces"}:
+            raise ValueError("required tables are missing")
+        owner = db.execute("SELECT value FROM meta WHERE key='legacy_owner_id'").fetchone()
+        user = db.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+        if not owner or not isinstance(owner[0], str) or not owner[0] or not user:
+            raise ValueError("the initialized owner or user is missing")
+        return {"owner": owner[0]}
+
+
+def verify_first_install_database(environment: dict[str, str]) -> None:
+    """A first install may have no user yet, but its host SQLite must exist."""
+
+    database_root = _local_path(environment.get(
+        "CTF_LOCAL_FS_DATABASE", environment.get("CTF_LOCAL_DATABASE", "")))
+    database = database_root / "sqlite" / "ctf_agent.sqlite3"
+    if database.is_symlink() or not database.is_file() or database.stat().st_size == 0:
+        raise RuntimeError("The first web start did not create SQLite on the selected host database disk")
+    try:
+        with closing(sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+            db.execute("PRAGMA query_only=ON")
+            tables = {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('meta', 'users', 'workspaces')"
+            )}
+            if tables != {"meta", "users", "workspaces"}:
+                raise ValueError("required initial tables are missing")
+    except (sqlite3.Error, ValueError, OSError) as exc:
+        raise RuntimeError("The first web start did not initialize SQLite on the host disk") from exc
+
+
+@contextmanager
+def _bind_canary(environment: dict[str, str]):
+    """Prove Docker sees this live host mount, not a stale snapshot with the same DB owner."""
+
+    database = _local_path(environment.get(
+        "CTF_LOCAL_FS_DATABASE", environment.get("CTF_LOCAL_DATABASE", "")))
+    directory = database / "sqlite"
+    if directory.is_symlink() or not directory.is_dir():
+        raise RuntimeError("The original database directory is unavailable")
+    descriptor, name = tempfile.mkstemp(prefix=".ctf-agent-bind-", dir=directory)
+    path = Path(name)
+    nonce = secrets.token_hex(32)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(nonce)
+            stream.flush()
+            os.fsync(stream.fileno())
+        yield path.name, nonce
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _docker_output(command: list[str], *, timeout: int = 30) -> str:
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Docker database visibility could not be verified") from exc
+    if result.returncode:
+        raise RuntimeError("Docker database visibility could not be verified")
+    return result.stdout.strip()
+
+
+def _web_sees_canary(name: str, nonce: str) -> bool:
+    return _docker_output([
+        "docker", "exec", "--user", "0:0", "ctf_agent_local",
+        "cat", f"/database/sqlite/{name}",
+    ]) == nonce
+
+
+def _database_bind_failure_marker(environment: dict[str, str]) -> Path | None:
+    home = environment.get("CTF_LOCAL_HOME", "")
+    return Path(home) / ".database-bind-failed" if home else None
+
+
+def _mark_database_bind_failure(environment: dict[str, str]) -> None:
+    marker = _database_bind_failure_marker(environment)
+    if marker is None:
+        return
+    if marker.is_symlink() or marker.parent.is_symlink():
+        raise RuntimeError("Database bind failure marker path is invalid")
+    descriptor, name = tempfile.mkstemp(prefix=".database-bind-failed-", dir=marker.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write("database bind verification failed\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _clear_database_bind_failure(environment: dict[str, str]) -> None:
+    marker = _database_bind_failure_marker(environment)
+    if marker is not None:
+        if marker.is_symlink():
+            raise RuntimeError("Database bind failure marker path is invalid")
+        marker.unlink(missing_ok=True)
+
+
+def _stop_running_stack_on_bind_failure(environment: dict[str, str]) -> None:
+    # A stale web must not continue serving a newly initialized database.
+    # Only stop containers after the project/service identity is verified.
+    # A bind failure may be caused by Docker reporting a different database
+    # Source. Identify our web by project/service and /data before stopping;
+    # requiring the broken /database Source here would leave it running.
+    web = _current_web_container(environment, require_database_source=False)
+    if web is None and not _running_solver_containers():
+        return
+    # A solver that keeps writing a stale shadow database is unsafe even if
+    # its process is active. Stop every local writer without removing volumes.
+    _stop_local_stack(environment)
+
+
+def _current_web_container(environment: dict[str, str], *, require_database_source: bool = True) -> dict | None:
+    names = _docker_output(["docker", "ps", "-a", "--format", "{{.Names}}"])
+    if "ctf_agent_local" not in names.splitlines():
+        return None
+    value = json.loads(_docker_output(["docker", "inspect", "ctf_agent_local"]))
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        raise RuntimeError("The local web container identity is invalid")
+    container = value[0]
+    labels = (container.get("Config") or {}).get("Labels") or {}
+    mounts = {item.get("Destination"): item for item in container.get("Mounts") or []
+              if isinstance(item, dict)}
+    expected_data = environment.get("CTF_LOCAL_DATA", "")
+    expected_database = environment.get("CTF_LOCAL_DATABASE", "")
+    database_source = mounts.get("/database", {}).get("Source")
+    legacy_source = environment.get("CTF_LOCAL_FS_DATABASE", "")
+    # Docker may resolve a WSL-home symlink in Mounts.Source. HostConfig
+    # retains the bind source requested by Compose, allowing us to tell a new
+    # alias bind from a legacy direct /mnt/wsl bind with the same resolved path.
+    host_config = container.get("HostConfig") or {}
+    configured_sources = [item.get("Source") for item in host_config.get("Mounts") or []
+                          if isinstance(item, dict) and item.get("Type") == "bind"
+                          and item.get("Target") == "/database"]
+    for bind in host_config.get("Binds") or []:
+        if isinstance(bind, str):
+            fields = bind.split(":")
+            if len(fields) >= 2 and fields[1] == "/database":
+                configured_sources.append(fields[0])
+    if require_database_source and len(set(configured_sources)) > 1:
+        raise RuntimeError("The local web database bind configuration is ambiguous")
+    configured_source = configured_sources[0] if configured_sources else database_source
+    legacy_bind = bool(environment.get("CTF_LOCAL_DB_MOUNT")
+                       and legacy_source and configured_source == legacy_source
+                       and configured_source != expected_database)
+    accepted = {expected_database}
+    if environment.get("CTF_LOCAL_DB_MOUNT") and legacy_source:
+        accepted.add(legacy_source)
+    if (container.get("Name") != "/ctf_agent_local"
+            or labels.get("com.docker.compose.project") != "ctf_agent_local"
+            or labels.get("com.docker.compose.service") != "web"
+            or mounts.get("/data", {}).get("Type") != "bind"
+            or mounts["/data"].get("Source") != expected_data
+            or (require_database_source and mounts.get("/database", {}).get("Type") != "bind")
+            or (require_database_source and configured_source not in accepted)):
+        raise RuntimeError("The local web container does not match this installation")
+    container["_legacy_database_bind"] = legacy_bind
+    return container
+
+
+def _running_solver_containers() -> bool:
+    names = _docker_output(["docker", "ps", "--format", "{{.Names}}"])
+    return any(re.fullmatch(r"ctf_agent_local_(?:solver(?:_[2-9][0-9]*)?|autosolver_[2-9][0-9]*)", name)
+               for name in names.splitlines())
+
+
+def _preflight_database_binding(environment: dict[str, str], host: dict[str, object]) -> bool:
+    """Return whether existing Compose containers need fresh bind mounts."""
+
+    image = environment.get("CTF_LOCAL_RUNTIME_IMAGE", "")
+    database = environment.get("CTF_LOCAL_DATABASE", "")
+    if not image or not database:
+        raise RuntimeError("Local runtime or database path is unavailable")
+    with _bind_canary(environment) as (name, nonce):
+        try:
+            visible = _docker_output([
+                "docker", "run", "--rm", "--network", "none", "--read-only",
+                "--security-opt", "no-new-privileges", "--user", "0:0",
+                "--mount", f"type=bind,source={database},target=/probe,readonly",
+                "--entrypoint", "cat", image, f"/probe/sqlite/{name}",
+            ]) == nonce
+        except RuntimeError as exc:
+            _mark_database_bind_failure(environment)
+            _stop_running_stack_on_bind_failure(environment)
+            raise RuntimeError(
+                "Docker cannot see the original database mount. Reconnect the VHD and Docker Desktop; do not reinstall"
+            ) from exc
+        if not visible:
+            _mark_database_bind_failure(environment)
+            _stop_running_stack_on_bind_failure(environment)
+            raise RuntimeError(
+                "Docker cannot see the original database mount. Reconnect the VHD and Docker Desktop; do not reinstall"
+            )
+        try:
+            web = _current_web_container(environment)
+        except RuntimeError as exc:
+            _mark_database_bind_failure(environment)
+            _stop_running_stack_on_bind_failure(environment)
+            raise RuntimeError(
+                "The local web container has an unexpected database bind; local containers were stopped"
+            ) from exc
+        if web is None:
+            _clear_database_bind_failure(environment)
+            return False
+        running = (web.get("State") or {}).get("Running") is True
+        if running:
+            try:
+                visible = _web_sees_canary(name, nonce)
+            except RuntimeError as exc:
+                _mark_database_bind_failure(environment)
+                _stop_running_stack_on_bind_failure(environment)
+                raise RuntimeError(
+                    "The running web container database bind could not be verified"
+                ) from exc
+            if not visible:
+                _mark_database_bind_failure(environment)
+                _stop_running_stack_on_bind_failure(environment)
+                raise RuntimeError(
+                    "The running web container has a stale database bind; local containers were stopped"
+                )
+            if web.get("_legacy_database_bind"):
+                if _running_solver_containers():
+                    raise RuntimeError(
+                        "Solver containers are running; legacy database bind migration was postponed"
+                    )
+                _clear_database_bind_failure(environment)
+                return True
+            _clear_database_bind_failure(environment)
+            return False
+        if _running_solver_containers():
+            raise RuntimeError("Solver containers are running; database bind repair was cancelled")
+        _clear_database_bind_failure(environment)
+        return True
+
+
+def _verify_web_database_after_start(environment: dict[str, str], host: dict[str, object]) -> None:
+    """Do not leave a web service running against a stale bind after Compose."""
+
+    with _bind_canary(environment) as (name, nonce):
+        for attempt in range(6):
+            try:
+                web = _current_web_container(environment)
+                if not web or (web.get("State") or {}).get("Running") is not True:
+                    raise RuntimeError("The local web container is not running")
+                visible = _web_sees_canary(name, nonce)
+            except RuntimeError as exc:
+                if attempt < 5:
+                    time.sleep(1)
+                    continue
+                _mark_database_bind_failure(environment)
+                _stop_running_stack_on_bind_failure(environment)
+                raise RuntimeError(
+                    "The web database could not be verified; the coordinator was stopped"
+                ) from exc
+            if not visible:
+                _mark_database_bind_failure(environment)
+                _stop_running_stack_on_bind_failure(environment)
+                raise RuntimeError("The web container has the wrong database; the coordinator was stopped")
+            _clear_database_bind_failure(environment)
+            return
+
+
+def _stop_local_stack(environment: dict[str, str]) -> None:
+    # Emergency post-start failure: do not leave solver workers operating while
+    # their coordinator saw a different database. Compose stop keeps all data.
+    stopped = subprocess.run(_compose_base() + ALL_PROFILES + ["stop"], cwd=ROOT,
+                             env=environment, check=False)
+    if stopped.returncode:
+        raise RuntimeError("The local database writers could not be stopped")
+    listed = _docker_output([
+        "docker", "ps", "--filter", "label=io.github.ctf-agent.autoscaled=true",
+        "--filter", "name=ctf_agent_local_autosolver_", "--format",
+        '{{.ID}}|{{.Names}}|{{.Label "io.github.ctf-agent.solver-slot"}}',
+    ])
+    rows = []
+    for line in listed.splitlines():
+        parts = line.split("|")
+        if (len(parts) != 3 or not re.fullmatch(r"[0-9a-f]{12,64}", parts[0])
+                or not re.fullmatch(r"[2-9][0-9]*", parts[2])
+                or parts[1] != f"ctf_agent_local_autosolver_{parts[2]}"):
+            raise RuntimeError("An autoscaled local solver could not be verified for stopping")
+        rows.append((parts[0], int(parts[2])))
+    identifiers = []
+    for identifier, slot in rows:
+        inspected = json.loads(_docker_output(["docker", "inspect", identifier]))
+        if not isinstance(inspected, list) or len(inspected) != 1 or not isinstance(inspected[0], dict):
+            raise RuntimeError("An autoscaled local solver identity is invalid")
+        container = inspected[0]
+        labels = ((container.get("Config") or {}).get("Labels") or {})
+        mounts = {item.get("Destination"): item for item in container.get("Mounts") or []
+                  if isinstance(item, dict)}
+        if (not isinstance(container.get("Id"), str)
+                or not container["Id"].startswith(identifier)
+                or container.get("Name") != f"/ctf_agent_local_autosolver_{slot}"
+                or labels.get("io.github.ctf-agent.autoscaled") != "true"
+                or labels.get("io.github.ctf-agent.solver-slot") != str(slot)
+                or mounts.get("/data", {}).get("Type") != "bind"
+                or mounts["/data"].get("Source") != environment.get("CTF_LOCAL_DATA")):
+            raise RuntimeError("An autoscaled local solver ownership check failed")
+        identifiers.append(identifier)
+    if identifiers:
+        stopped = subprocess.run(["docker", "stop", "--time", "30", *identifiers],
+                                 cwd=ROOT, env=environment, check=False)
+        if stopped.returncode:
+            raise RuntimeError("An autoscaled database writer could not be stopped")
 
 
 def prepare_readable_storage(environment: dict[str, str]) -> Path:
@@ -472,13 +848,30 @@ def main() -> int:
     retained_dynamic: set[int] = set()
     arguments = normalize_arguments(sys.argv[1:] or ["up", "-d", "--build"])
     environment = os.environ.copy()
-    verify_external_database(environment)
-    prepare_readable_storage(environment)
-    actions = {"up", "down", "stop", "rm", "kill", "restart", "start", "ps", "logs", "config", "pull", "build"}
+    actions = {"up", "down", "stop", "rm", "kill", "restart", "start", "ps", "logs", "config", "pull", "build", "preflight", "verify-fresh-install"}
     action = next((item for item in arguments if item in actions), "up")
+    verify_external_database(environment)
+    if action == "verify-fresh-install":
+        verify_first_install_database(environment)
+        _preflight_database_binding(environment, {})
+        _verify_web_database_after_start(environment, {})
+        return 0
+    host_database = None
+    if action in {"up", "start", "restart", "preflight"}:
+        host_database = verify_installed_database(environment)
+    if action == "preflight":
+        if host_database is not None:
+            _preflight_database_binding(environment, host_database)
+        return 0
+    prepare_readable_storage(environment)
     if action in {"up", "start"} and (ROOT / ".local-runtime.json").exists():
         from local_runtime import select_image
         environment["CTF_LOCAL_RUNTIME_IMAGE"] = select_image(ROOT)
+    if action in {"up", "start"} and host_database is not None:
+        if _preflight_database_binding(environment, host_database):
+            if "--force-recreate" not in arguments:
+                arguments.append("--force-recreate")
+            print("Recreating stopped or stale local containers to refresh the database bind.", flush=True)
     if action in {"up", "start", "down", "stop", "rm", "kill"}:
         # Stop the coordinator first so it cannot claim a higher slot between
         # the host-side inspection and removal of an idle worker container.
@@ -513,6 +906,8 @@ def main() -> int:
         result = subprocess.run(command, cwd=ROOT, env=environment, check=False)
         if result.returncode:
             return result.returncode
+    if action in {"up", "start"} and host_database is not None:
+        _verify_web_database_after_start(environment, host_database)
     return 0
 
 

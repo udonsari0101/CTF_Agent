@@ -35,9 +35,41 @@ default_database="$home_dir/Database/CTF_Agent"
 database_path="${CTF_LOCAL_DATABASE:-$default_database}"
 database_fs_path="${CTF_LOCAL_FS_DATABASE:-$database_path}"
 database_mount="${CTF_LOCAL_DB_MOUNT:-}"
+if [[ -n "$database_mount" && "${CTF_UPDATE_IN_PROGRESS:-false}" == true &&
+      "${CTF_HOST_UPDATE_ATTESTED:-false}" != true ]]; then
+    echo 'An external database VHD update requires the trusted WSL launcher. The in-app updater cannot verify the host mount; do not reinstall or delete data.' >&2
+    exit 2
+fi
 if [[ "$database_path" != /* || "$database_fs_path" != /* ]]; then
     echo 'Local database paths must be absolute.' >&2
     exit 2
+fi
+# A reinstall or update must keep using its original database. If the VHD was
+# mounted but its SQLite file disappeared, init-storage and the web process
+# would otherwise silently initialize a new, empty installation on that disk.
+if [[ -e "$home_dir/.current-release" || -L "$home_dir/.current-release" ||
+      -e "$home_dir/.local-config.json" || -L "$home_dir/.local-config.json" ]]; then
+    existing_database="$database_fs_path/sqlite/ctf_agent.sqlite3"
+    if [[ -L "$existing_database" || ! -f "$existing_database" || ! -s "$existing_database" ]]; then
+        echo 'The existing local database is unavailable; refusing to replace it with an empty database.' >&2
+        exit 2
+    fi
+    python3 - "$existing_database" <<'PY'
+import pathlib, sqlite3, sys
+path = pathlib.Path(sys.argv[1])
+try:
+    with sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=5) as db:
+        db.execute("PRAGMA query_only=ON")
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('meta','users','workspaces')")}
+        owner = db.execute("SELECT value FROM meta WHERE key='legacy_owner_id'").fetchone() if "meta" in tables else None
+        user = db.execute("SELECT 1 FROM users LIMIT 1").fetchone() if "users" in tables else None
+        if tables != {"meta", "users", "workspaces"} or not owner or not owner[0] or not user:
+            raise ValueError("Required initialized data is missing")
+except (sqlite3.Error, ValueError) as exc:
+    raise SystemExit("The existing local database is not initialized; refusing to replace it") from exc
+PY
 fi
 database_volume_id=""
 if [[ -n "$database_mount" ]]; then
@@ -60,7 +92,7 @@ with open("/proc/self/mountinfo", encoding="utf-8") as stream:
         for line in stream if " - " in line
         if line.split(" - ", 1)[0].split()[4] == str(mount)
     ]
-if not filesystems or (not updating and "ext4" not in filesystems):
+if not filesystems or "ext4" not in filesystems:
     raise SystemExit("The external database VHD is not mounted as ext4")
 if updating and not (database / "sqlite" / "ctf_agent.sqlite3").is_file():
     raise SystemExit("The external database is unavailable during update")
@@ -111,6 +143,22 @@ fi
 releases="$home_dir/releases"
 target="$releases/$version"
 mkdir -p -- "$releases" "$home_dir/ctf_agent_data" "$database_fs_path"
+if [[ -n "$database_mount" ]]; then
+    # Docker Desktop's WSL integration resolves this home path through the
+    # selected distro. A direct /mnt/wsl bind can point at an old shadow mount
+    # after a reboot even when the WSL host sees the real VHD.
+    database_alias="$home_dir/.database-bind"
+    if [[ -L "$database_alias" ]]; then
+        [[ "$(readlink -- "$database_alias")" == "$database_fs_path" ]] || {
+            echo 'The database bind alias targets a different disk.' >&2; exit 2;
+        }
+    elif [[ -e "$database_alias" ]]; then
+        echo 'The database bind alias is not a symlink.' >&2; exit 2
+    else
+        ln -s -- "$database_fs_path" "$database_alias"
+    fi
+    database_path="$database_alias"
+fi
 if [[ -L "$releases" || -L "$target" ]]; then
     echo 'Release path must not be a symlink.' >&2
     exit 2
@@ -229,7 +277,19 @@ cleanup_install() {
                                 "${CTF_UPDATE_IN_PROGRESS:-false}" != true &&
                                 "$drain_released" == true && "$source_restored" == true &&
                                 "$settings_restored" == true ]]; then
-        if [[ -n "$previous_release" ]]; then
+        if [[ -e "$home_dir/.database-bind-failed" || -L "$home_dir/.database-bind-failed" ]]; then
+            echo 'Database bind verification failed. Previous releases were not started against an unverified database.' >&2
+        elif [[ -n "${database_mount:-}" &&
+                ( -e "$home_dir/ctf_agent_data/update-control/stop-worker" ||
+                  -L "$home_dir/ctf_agent_data/update-control/stop-worker" ) ]]; then
+            echo 'Uninstall is in progress; the installer did not restart the service.' >&2
+        elif [[ -n "${database_mount:-}" &&
+                ( -e "$home_dir/ctf_agent_data/update-control/request.json" ||
+                  -L "$home_dir/ctf_agent_data/update-control/request.json" ||
+                  -e "$home_dir/ctf_agent_data/update-control/running.json" ||
+                  -L "$home_dir/ctf_agent_data/update-control/running.json" ) ]]; then
+            echo 'A site update is pending or running; the installer did not restart the service.' >&2
+        elif [[ -n "$previous_release" ]]; then
             if ! restore_previous_service; then
                 echo 'The previous service could not be restored automatically; its release and data were preserved.' >&2
             fi
@@ -374,6 +434,10 @@ if [[ "$(id -u)" == 0 ]]; then
 fi
 mv -f -- "$image_ref_temp" "$target/.image-ref"
 export CTF_LOCAL_RUNTIME_IMAGE="$(python3 deploy/local_runtime.py build)"
+# Verify that Docker sees the live installed database before draining work or
+# stopping the existing service. Docker Desktop can retain a stale bind after
+# WSL remounts an external VHD, even when its Mount.Source string is correct.
+python3 deploy/local-compose.py preflight
 manage_storage_control() {
     docker run --rm -i --network none --user 0:0 --entrypoint python \
         -v "$CTF_LOCAL_FS_DATA:/data" "$image_ref" - \
@@ -392,6 +456,14 @@ mkdir -p -- "$CTF_LOCAL_FS_DATA"
 # init-storage intentionally makes /data root-owned 0750. Use a narrowly
 # scoped helper for these control files both before and after Compose runs.
 drain_token="$(manage_storage_control reserve)"
+if [[ -n "$database_mount" && "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
+    update_control="$home_dir/ctf_agent_data/update-control"
+    if [[ -e "$update_control/request.json" || -L "$update_control/request.json" ||
+          -e "$update_control/running.json" || -L "$update_control/running.json" ]]; then
+        echo 'A site update is queued or running; finish it before switching update controllers.' >&2
+        exit 1
+    fi
+fi
 drain_deadline=$(( $(date +%s) + 3300 ))
 while :; do
     claimed="$(python3 - "$CTF_LOCAL_FS_DATABASE/sqlite/ctf_agent.sqlite3" <<'PY'
@@ -465,11 +537,25 @@ PY
     if ! wait_service_healthy "$previous_image" 180; then return 1; fi
     echo "Previous CTF Agent release $previous_version restored and ready." >&2
 }
-docker image tag "$image_ref" ctf-agent-local:latest
 # Drain old claims first, then stop the old coordinators before removing this
 # install's marker and starting the new stack.
 rollout_started=true
 docker compose -f compose.local.yaml stop web solver-autoscaler
+if [[ -n "$database_mount" && "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
+    update_control="$home_dir/ctf_agent_data/update-control"
+    # Web is now stopped, so no new request can be queued. A pending or
+    # running request must finish before replacing the old Docker updater.
+    if [[ -e "$update_control/request.json" || -L "$update_control/request.json" ||
+          -e "$update_control/running.json" || -L "$update_control/running.json" ]]; then
+        echo 'A site update is queued or running; finish it before switching update controllers.' >&2
+        exit 1
+    fi
+    if docker container inspect ctf_agent_local_updater >/dev/null 2>&1; then
+        docker stop ctf_agent_local_updater >/dev/null
+    fi
+    manage_storage_control handoff >/dev/null
+fi
+docker image tag "$image_ref" ctf-agent-local:latest
 manage_storage_control release "$drain_token" >/dev/null
 drain_token=""
 python3 deploy/local-compose.py up -d --no-build
@@ -478,6 +564,12 @@ if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
         echo 'The new solver did not pass /readyz before the installation deadline.' >&2
         exit 1
     fi
+fi
+if [[ -z "$previous_version" ]]; then
+    # A healthy web on Docker Desktop can still be bound to a stale shadow of
+    # an external VHD. Verify the new SQLite on the WSL host and its live bind
+    # before selecting this release as the installed version.
+    python3 deploy/local-compose.py verify-fresh-install
 fi
 # Web updates perform their own readiness check and rollback. Manual installs
 # keep the previous release available through the remaining launcher and
@@ -526,7 +618,7 @@ if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
     chown "$CTF_LOCAL_UID":"$CTF_LOCAL_GID" "$current_temp"
     mv -f -- "$current_temp" "$home_dir/.current-release"
 fi
-if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
+if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true && -z "$database_mount" ]]; then
     updater_candidate="ctf_agent_local_updater_candidate_$$"
     if docker container inspect ctf_agent_local_updater_previous >/dev/null 2>&1 ||
        docker container inspect "$updater_candidate" >/dev/null 2>&1; then
@@ -616,6 +708,42 @@ PY
         docker rm ctf_agent_local_updater_previous >/dev/null
         updater_old_renamed=false
     fi
+fi
+if [[ -n "$database_mount" && "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
+    python3 "$target/ctf_agent/release_updates.py" --prepare-host-worker
+    status_file="$home_dir/ctf_agent_data/update-control/status.json"
+    status_before_ns="$(python3 - "$status_file" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+print(path.stat().st_mtime_ns if path.exists() else 0)
+PY
+)"
+    nohup python3 "$target/ctf_agent/release_updates.py" --host-worker \
+        </dev/null >/dev/null 2>&1 &
+    host_updater_ready=false
+    for attempt in {1..6}; do
+        if python3 - "$status_file" "$status_before_ns" <<'PY'
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    fresh = path.stat().st_mtime_ns > int(sys.argv[2])
+    value = json.loads(path.read_text(encoding="utf-8")) if fresh else {}
+    healthy = time.time() - float(value.get("updated_at", 0)) < 10
+except (OSError, ValueError, TypeError):
+    healthy = False
+raise SystemExit(0 if healthy else 1)
+PY
+        then
+            host_updater_ready=true
+            break
+        fi
+        sleep 2
+    done
+    [[ "$host_updater_ready" == true ]] || {
+        echo 'The host update controller did not become ready.' >&2; exit 1;
+    }
 fi
 new_ready=true
 printf '\nCTF Agent %s files and services configured; solver readiness requires /readyz HTTP 200.\n' "$version"
