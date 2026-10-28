@@ -64,6 +64,7 @@ if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue) -and
     Start-Process -FilePath $desktop -WindowStyle Hidden
 }
 Wait-WslDockerReady $distro -AllowRepair
+Repair-LocalRuntimeMetadata $distro $linuxHome
 $launch = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
     "CTF_LOCAL_HOME=$linuxHome", "CTF_LOCAL_DATABASE=$databasePath",
     "CTF_LOCAL_FS_DATABASE=$databasePath", "CTF_LOCAL_DB_MOUNT=$databaseMount",

@@ -258,7 +258,7 @@ io.interactive()                           # cat the flag from the REMOTE socket
 ## Remote / PoW / submission
 - Each `bash` call is a **fresh process** — for any stateful service write a `pwntools`/socket script, don't chain `nc` calls. For raw binaries over `nc`: `stty raw -echo`.
 - **PoW:** the `solve_bits` above handles sha256 leading-zero-*bits* gates; a hex-*nibble* variant checks `hexdigest().startswith('0'*n)`. redpwn/kctf gates print a token → run `curl -sSfL https://pwn.red/pow | sh -s <challenge>` or `pip install pow` then `pow <arg>`. Solve the PoW before anything else on connect.
-- **Missing address:** if you need the remote (real flag / remote-only) but `../chal_desc.md` has none and it isn't marked "none", run `request-remote "<what you need>"`, then re-read the brief (also re-read right before connecting — the operator may add it mid-run).
+- **Missing address:** if evidence from the binary or local execution proves that the real flag requires a remote service absent from `../chal_desc.md`, record the evidence and exact needed connection details in `notes/NEXT.md`, then run `request-remote "<what you need>"` once and stop this attempt. This includes a brief configured as "none" when evidence contradicts it. An unverified guess is insufficient. Re-read the brief before any later connection — the operator may add or change the address.
 - Submission is human-verified: you print the flag, the operator submits (`submit-flag "CTF{...}"`). No auto-submit.
 
 ## Determinism under ASLR / flaky remote

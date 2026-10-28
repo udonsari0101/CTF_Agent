@@ -252,9 +252,12 @@ def assemble_manual(
                 "- Remote-only triage: if the brief and file list do not identify a field, make one bounded banner or protocol probe against the supplied endpoint. Record the response, then choose a playbook. Do not wait for file-based signals that this challenge cannot provide."
             )
     if mode == "none":
-        lines.append(
-            "- Remote: **none** — there is no server for this challenge. The flag "
-            "is obtainable from the given files and the brief alone; do not look for a remote."
+        lines.extend(
+            (
+                "- Remote: **none (configured)**. Start with the brief and supplied files; do not assume that an endpoint exists.",
+                "- If concrete evidence from the files or observed behavior proves that the real flag depends on an indispensable external resource absent from the supplied inputs, do not invent an endpoint or keep repeating local analysis. Record the evidence, completed verification, and exact missing input in `notes/NEXT.md`, then run `request-remote \"<required connection detail or missing external input>\"` once.",
+                "- A missing flag, an untested hypothesis, or a generic claim that flags are remote is not enough to request input. `request-remote` ends this attempt; wait for the user to correct the challenge inputs before continuing.",
+            )
         )
     elif mode == "endpoint" and remote_access:
         lines.append(f"- Remote: `{remote}` — use normal clients such as `curl`, `nc`, pwntools, or the challenge-specific solver directly.")
@@ -368,7 +371,7 @@ def prepare_agent_workspace(
     if remote_mode == "endpoint":
         brief_lines.append(f"Remote: {remote}")
     elif remote_mode == "none":
-        brief_lines.append("Remote: none (explicitly confirmed)")
+        brief_lines.append("Remote: none (configured; reassess only if evidence proves a missing external dependency)")
     else:
         brief_lines.append("Remote: not supplied yet (unknown)")
     brief_lines.extend(("", "## Description", "", challenge_text))

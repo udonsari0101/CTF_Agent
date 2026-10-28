@@ -63,6 +63,100 @@ function Invoke-DesktopNative([string]$file, [string[]]$arguments,
     }
 }
 
+function Repair-LocalRuntimeMetadata([string]$distro, [string]$linuxHome) {
+    # A previous root-run local overlay build could leave this non-secret
+    # identity file root-owned and mode 0600. Repair only that exact file in
+    # the installed release, and only when the normal WSL user cannot read it.
+    $probe = @'
+import os,pathlib,re,stat,sys
+home=pathlib.Path(sys.argv[1])
+if not home.is_absolute() or str(home)=="/" or os.path.realpath(home)!=os.path.normpath(home):
+    raise SystemExit("Invalid installation path")
+marker=home/".current-release"
+if not marker.exists() and not marker.is_symlink():
+    print("absent")
+    raise SystemExit(0)
+if marker.is_symlink() or not marker.is_file():
+    raise SystemExit("Invalid installed release marker")
+version=marker.read_text(encoding="ascii").strip()
+if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?",version):
+    raise SystemExit("Invalid installed release version")
+release=home/"releases"/version
+if release.is_symlink() or not release.is_dir() or os.path.realpath(release)!=str(release):
+    raise SystemExit("Invalid installed release directory")
+target=release/".local-runtime.json"
+if not target.exists() and not target.is_symlink():
+    print("absent")
+    raise SystemExit(0)
+mode=target.lstat().st_mode
+if not stat.S_ISREG(mode):
+    raise SystemExit("Invalid local runtime identity file")
+try:
+    with target.open("rb") as stream:
+        stream.read(1)
+except PermissionError:
+    print("repair:%s:%s"%(os.getuid(),os.getgid()))
+else:
+    print("readable")
+'@
+    $repair = @'
+import json,os,pathlib,re,stat,sys
+home=pathlib.Path(sys.argv[1])
+uid,gid=map(int,sys.argv[2:4])
+if uid<=0 or gid<0 or not home.is_absolute() or str(home)=="/" or os.path.realpath(home)!=os.path.normpath(home):
+    raise SystemExit("Invalid local runtime repair request")
+marker=home/".current-release"
+if marker.is_symlink() or not marker.is_file():
+    raise SystemExit("Invalid installed release marker")
+version=marker.read_text(encoding="ascii").strip()
+if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?",version):
+    raise SystemExit("Invalid installed release version")
+release=home/"releases"/version
+if release.is_symlink() or not release.is_dir() or os.path.realpath(release)!=str(release):
+    raise SystemExit("Invalid installed release directory")
+target=release/".local-runtime.json"
+fd=os.open(target,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+try:
+    info=os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_size>16384:
+        raise SystemExit("Local runtime metadata is not the known root-owned file")
+    with os.fdopen(os.dup(fd),"r",encoding="utf-8") as stream:
+        value=json.load(stream)
+    if not isinstance(value,dict) or not all(key in value for key in
+            ("base_ref","base_id","runtime_id","fingerprint","files")):
+        raise SystemExit("Invalid local runtime identity")
+    os.fchown(fd,uid,gid)
+    os.fchmod(fd,0o600)
+finally:
+    os.close(fd)
+'@
+    $wrapper = 'import base64,sys;exec(base64.b64decode(sys.argv.pop(1)))'
+    $probe64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($probe))
+    $result = Invoke-DesktopNative 'wsl.exe' @('--distribution',$distro,'--exec',
+        'python3','-c',$wrapper,$probe64,$linuxHome) 15
+    if ($result.ExitCode -ne 0) {
+        throw "Could not inspect the installed local runtime metadata: $($result.Output)"
+    }
+    $status = $result.Stdout.Trim()
+    if ($status -in @('absent','readable')) { return }
+    if ($status -notmatch '^repair:([1-9][0-9]*):([0-9]+)$') {
+        throw 'The installed local runtime metadata has an unexpected state.'
+    }
+    $uid = $Matches[1]
+    $gid = $Matches[2]
+    $repair64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($repair))
+    $fixed = Invoke-DesktopNative 'wsl.exe' @('--distribution',$distro,'--user','root',
+        '--exec','python3','-c',$wrapper,$repair64,$linuxHome,$uid,$gid) 15
+    if ($fixed.ExitCode -ne 0) {
+        throw "Could not repair the previous root-owned local runtime metadata: $($fixed.Output)"
+    }
+    $verify = Invoke-DesktopNative 'wsl.exe' @('--distribution',$distro,'--exec',
+        'python3','-c',$wrapper,$probe64,$linuxHome) 15
+    if ($verify.ExitCode -ne 0 -or $verify.Stdout.Trim() -ne 'readable') {
+        throw 'The previous local runtime metadata is still unreadable after repair.'
+    }
+}
+
 function Get-DesktopDockerCli {
     $command = Get-Command docker.exe -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }

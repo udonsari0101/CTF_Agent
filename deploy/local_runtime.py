@@ -90,6 +90,13 @@ def build_image(root: Path = ROOT) -> str:
     temporary = Path(name)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            # The installer may run as root, but Start runs as the WSL user
+            # who owns the release directory. Keep metadata private to them.
+            if os.name == 'posix' and os.geteuid() == 0:
+                owner = root.stat()
+                os.fchown(stream.fileno(), owner.st_uid, owner.st_gid)
+            if os.name == 'posix':
+                os.fchmod(stream.fileno(), 0o600)
             json.dump(saved, stream, sort_keys=True, separators=(',', ':'))
             stream.write('\n')
         os.replace(temporary, root / '.local-runtime.json')

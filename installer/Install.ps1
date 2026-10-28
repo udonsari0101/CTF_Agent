@@ -745,6 +745,10 @@ if ($separateDatabase) {
         db_uuid=$dbUuid;db_task_managed=$dbTaskManaged;pending_install=$true} |
         ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
 }
+# A v0.4.22 root-run overlay build could have left the previous release's
+# metadata unreadable to this distribution's normal user. The Linux installer
+# verifies that previous image before it stages the replacement release.
+Repair-LocalRuntimeMetadata $distro $linuxHome
 $pathResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'wslpath', '-a', '-u', $installer)
 $linuxPath = @($pathResult.Output)
 if ($pathResult.ExitCode -ne 0 -or -not $linuxPath.Count -or -not $linuxPath[0].StartsWith('/')) {

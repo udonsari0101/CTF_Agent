@@ -214,7 +214,7 @@ function removeGeneratedWriteupCopy(value) {
 const solverPhases = {
   queued:'대기열',staging:'문제 준비',awaiting_credential:'계정 연결 대기',validating:'실행 환경 확인',
   running:'문제 풀이 중',flag_found:'Flag 발견',writing:'write-up 작성 중',completed:'완료',cancelled:'취소됨',
-  failed:'실패',refused:'실행 거부',needs_input:'원격 정보 필요',cleanup_blocked:'격리 정리 실패',
+  failed:'실패',refused:'실행 거부',needs_input:'추가 입력 필요',cleanup_blocked:'격리 정리 실패',
 };
 const solverProgress = {
   preparing:'문제 자료 준비',analyzing:'문제 분석',waiting_for_model:'모델 응답 대기',inspecting_files:'첨부파일 확인',executing:'풀이 실행',
@@ -439,8 +439,8 @@ function solverErrorMarkup(error, defaultTitle = '풀이 실행 오류') {
     title = i18n.t('서비스 업데이트 중');
     guidance = i18n.t('새 풀이 작업은 등록되지 않았습니다. 업데이트 완료 후 다시 시작해 주세요.');
   } else if (needsRemote) {
-    title = '원격 접속 정보가 필요합니다';
-    guidance = '문제 수정에서 원격 대상을 설정하세요.';
+    title = '추가 입력이 필요합니다';
+    guidance = '요청된 원격 접속 정보나 누락된 파일을 문제에 추가한 뒤 다시 시작하세요.';
   } else if (daybreakAccess) {
     title = 'Daybreak 실행 경로 확인 필요';
     guidance = '계정 로그인, Daybreak 권한과 서버 실행 경로를 확인하세요.';
@@ -881,7 +881,7 @@ function solverPanelMarkup(job, events = [], loading = false) {
     : job.error?.code === 'ultra_escalation_requested'
       ? `${job.ultra_escalation?.started_job_id ? '<span class="form-hint">Ultra 작업으로 이어가는 중</span>' : job.ultra_escalation?.auto_pending ? '<span class="form-hint">Ultra 전환 준비 중</span>' : job.ultra_escalation?.eligible ? '<button class="primary" data-action="approve-ultra-escalation">Ultra로 이어가기</button>' : ''}<button data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>현재 설정으로 다시 풀기</button>`
     : job.phase === 'needs_input'
-      ? `<button data-action="edit-challenge">원격 접속 정보 입력</button>${currentChallenge?.remote_mode !== 'unknown' ? `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>새 작업으로 계속 풀기</button>` : ''}`
+      ? `<button data-action="edit-challenge">문제 입력 수정</button>${currentChallenge?.remote_mode === 'endpoint' || job.input_ready_to_retry === true ? `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>계속 풀기</button>` : '<span class="form-hint">요청된 접속 정보나 파일을 먼저 추가하세요.</span>'}`
       : job.flag_rejected
       ? `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>오답을 제외하고 다시 풀기</button>`
       : job.phase === 'completed'
@@ -1311,11 +1311,13 @@ function updateSolverElapsedLabels() {
 
 function challengeInputMarkup(challenge, workspaceId) {
   const mode = challenge.remote_mode === 'none' ? 'none' : 'endpoint';
-  return `<form class="challenge-inline-input" data-workspace-id="${esc(workspaceId)}" data-challenge-id="${esc(challenge.id)}" data-edit-token="${esc(challenge.edit_token || '')}" data-name="${esc(challenge.name)}">
-    <div><strong>추가 입력 필요</strong><small>접속 정보를 입력하면 이어서 풉니다.</small></div>
+  const inputReady = challenge.latest_solver?.input_ready_to_retry === true;
+  const waitingForCorrection = mode === 'none' && !inputReady;
+  return `<form class="challenge-inline-input" data-workspace-id="${esc(workspaceId)}" data-challenge-id="${esc(challenge.id)}" data-edit-token="${esc(challenge.edit_token || '')}" data-name="${esc(challenge.name)}" data-input-ready="${inputReady}" data-original-remote-mode="${esc(challenge.remote_mode || 'unknown')}">
+    <div><strong>추가 입력 필요</strong><small>요청된 접속 정보나 파일을 추가한 뒤 이어서 풉니다.</small></div>
     <label><span class="sr-only">원격 대상</span><select name="remote_mode" aria-label="원격 대상"><option value="endpoint" ${mode === 'endpoint' ? 'selected' : ''}>접속 정보</option><option value="none" ${mode === 'none' ? 'selected' : ''}>원격 대상 없음</option></select></label>
     <label class="challenge-inline-remote${mode === 'none' ? ' is-disabled' : ''}"><span class="sr-only">원격 접속 정보</span><input name="remote" value="${esc(challenge.remote || '')}" maxlength="2000" placeholder="URL 또는 nc host port" aria-label="원격 접속 정보" ${mode === 'endpoint' ? 'required' : 'disabled'}></label>
-    <button type="submit" class="small primary">계속 풀기</button>
+    <button type="submit" class="small primary" ${waitingForCorrection ? 'disabled' : ''}>계속 풀기</button>
   </form>`;
 }
 
@@ -1633,6 +1635,9 @@ async function continueListSolver(form, data) {
   if (!currentWorkspace || currentWorkspace.id !== workspaceId) throw new Error('문제 목록을 다시 불러와 주세요.');
   const remoteMode = data.remote_mode === 'none' ? 'none' : 'endpoint';
   const remote = remoteMode === 'endpoint' ? String(data.remote || '').trim() : '';
+  if (remoteMode === 'none' && form.dataset.originalRemoteMode === 'none' && form.dataset.inputReady !== 'true') {
+    throw new Error('요청된 접속 정보나 파일을 먼저 추가하세요.');
+  }
   if (remoteMode === 'endpoint' && !remote) throw new Error('원격 접속 정보를 입력하세요.');
   const updated = await api(path(challengeId,workspaceId),{
     method:'PATCH',headers:conditional(form.dataset.editToken),body:{remote_mode:remoteMode,remote},
@@ -2464,11 +2469,15 @@ async function refreshUploads(workspaceId, challengeId) {
 async function refreshChallengeAttachmentsInPlace(workspaceId, challengeId) {
   const latest = await api(path(challengeId,workspaceId));
   if (currentChallenge?.workspace_id !== workspaceId || currentChallenge?.id !== challengeId) return;
+  const oldAttachmentIds = (currentChallenge.attachments || []).map(file => file.id).join(',');
   currentChallenge.attachments = latest.attachments || [];
   const list = detail.querySelector('.file-list');
   if (list) list.innerHTML = currentChallenge.attachments.map(file => `<div class="file-item"><div><a href="${path(challengeId,workspaceId)}/attachments/${file.id}" target="_blank" rel="noopener" download>${esc(file.original_name)}</a><small>${size(file.size)}</small></div><button class="small danger icon-action" data-action="delete-attachment" data-id="${esc(file.id)}" aria-label="${esc(file.original_name)} 삭제" title="${esc(file.original_name)} 삭제">×</button></div>`).join('');
   const heading = list?.closest('section')?.querySelector('h3 .muted');
   if (heading) heading.textContent = String(currentChallenge.attachments.length);
+  if (oldAttachmentIds !== currentChallenge.attachments.map(file => file.id).join(',') && currentSolverJob?.phase === 'needs_input') {
+    await loadSolver(workspaceId,challengeId);
+  }
 }
 
 async function uploadFile(file, workspaceId, challengeId, resumeId) {
@@ -3306,11 +3315,14 @@ document.addEventListener('change', event => {
     input.value = '';
   }
   if (input.matches?.('.challenge-inline-input select[name="remote_mode"]')) {
-    const remote = input.closest('form')?.querySelector('input[name="remote"]');
+    const form = input.closest('form');
+    const remote = form?.querySelector('input[name="remote"]');
     if (remote) {
       const enabled = input.value === 'endpoint';
       remote.disabled = !enabled; remote.required = enabled;
       remote.closest('label')?.classList.toggle('is-disabled',!enabled);
+      const submit = form.querySelector('button[type="submit"]');
+      if (submit) submit.disabled = !enabled && form.dataset.originalRemoteMode === 'none' && form.dataset.inputReady !== 'true';
     }
   }
   if (input.id === 'solver-provider-select') {

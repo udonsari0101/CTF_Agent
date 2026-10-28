@@ -1265,10 +1265,20 @@ class SolverExchangeCoordinator:
                         )
                         checkpoint_row = None
                         checkpoint = None
-                    elif checkpoint and checkpoint.reason == "needs_remote" and remote_mode == "unknown":
+                    elif (
+                        checkpoint and checkpoint.reason == "needs_remote"
+                        and (
+                            remote_mode == "unknown"
+                            or (
+                                remote_mode == "none"
+                                and checkpoint_row["source_remote_mode"] == "none"
+                                and exact_input
+                            )
+                        )
+                    ):
                         raise ExchangeError(
                             "remote_input_required",
-                            "이 문제를 계속 풀려면 원격 접속 여부 또는 접속 정보를 먼저 입력해 주세요.",
+                            "이 문제를 계속 풀려면 필요한 원격 접속 정보나 누락된 입력을 먼저 추가해 주세요.",
                             category="input",
                         )
                     else:
@@ -1580,7 +1590,9 @@ class SolverExchangeCoordinator:
                 ).fetchone()[0]
             elapsed_origin = continuation_start(db, row)
             solve_clock = continuation_elapsed(db, row)
+            input_ready_to_retry = remote_input_ready_to_retry(db, row)
         result = _public_job(row, events, position, guidance=guidance)
+        result["input_ready_to_retry"] = input_ready_to_retry
         if elapsed_origin is not None:
             result["continuation_started_at"] = elapsed_origin[0]
             result["continuation_started_running"] = elapsed_origin[1]
@@ -5323,6 +5335,39 @@ def _challenge_input_sha256(
     ).hexdigest()
 
 
+def remote_input_ready_to_retry(db: sqlite3.Connection, job: Mapping[str, Any]) -> bool:
+    """Whether a released remote-input request can be enqueued with current inputs."""
+
+    if (
+        job["job_mode"] != "solve"
+        or job["status"] != "needs_input"
+        or not job["released_ingested"]
+        or job["current_retry_source_job_id"] != job["id"]
+        or _optional_json(job["error_json"]).get("code") != "remote_input_required"
+    ):
+        return False
+    original_digest = job["challenge_input_sha256"]
+    if not isinstance(original_digest, str) or not _SHA256.fullmatch(original_digest):
+        return False
+    try:
+        current = _challenge_input_payload(
+            db, job["owner_user_id"], job["workspace_id"], job["challenge_id"],
+            include_remote=True,
+        )
+    except ExchangeError as exc:
+        if exc.code == "challenge_not_found":
+            return False
+        raise
+    if current["remote_mode"] == "unknown":
+        return False
+    current_digest = hashlib.sha256(_json_bytes(current)).hexdigest()
+    # An unchanged endpoint can still be retried, matching enqueue's existing
+    # behavior. An unchanged explicit "none" needs actual new input first.
+    return current_digest != original_digest or (
+        job["remote_mode"] == "endpoint" and current["remote_mode"] == "endpoint"
+    )
+
+
 def _challenge_base_sha256(
     db: sqlite3.Connection,
     owner_user_id: str,
@@ -6404,4 +6449,4 @@ def _utc_stamp(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
 
 
-__all__ = ["ExchangeError", "SolverExchangeCoordinator", "SolverCoordinatorPool"]
+__all__ = ["ExchangeError", "SolverExchangeCoordinator", "SolverCoordinatorPool", "remote_input_ready_to_retry"]

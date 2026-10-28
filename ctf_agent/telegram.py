@@ -41,7 +41,7 @@ _SOLVER_ALERT_REASONS = {
     "ultra_escalation_requested": "독립적인 분석 경로가 확인됐습니다. 문제 화면에서 Codex Ultra 전환을 승인할 수 있습니다.",
     "invalid_runtime": "Codex 실행 파일을 확인할 수 없습니다. 에이전트 업데이트 상태를 확인하세요.",
     "codex_runtime_unavailable": "선택한 Codex 버전이 풀이 작업자에 게시되지 않았습니다. 에이전트 업데이트 상태를 확인하세요.",
-    "remote_input_required": "원격 접속 정보가 필요합니다. 문제 화면에서 원격 대상을 입력하거나 대상 없음을 선택한 뒤 다시 시작하세요.",
+    "remote_input_required": "요청된 원격 접속 정보나 누락된 파일을 문제에 추가한 뒤 풀이를 이어가세요.",
     "auth_required": "모델 계정 연결을 확인하고 다시 로그인한 뒤 풀이를 다시 시작하세요.",
     "account_workspace_mismatch": "선택한 모델 계정을 다시 연결한 뒤 풀이를 다시 시작하세요.",
     "daybreak_route_rejected": "계정의 Daybreak 권한과 선택 모델을 확인한 뒤 다시 시도하세요.",

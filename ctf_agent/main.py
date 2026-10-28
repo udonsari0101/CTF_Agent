@@ -558,15 +558,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def latest_solver_summary(db, workspace_id: str, challenge_id: str) -> dict | None:
         """Return the current owner's newest safe run metadata for list cards."""
 
+        from .solver_exchange import remote_input_ready_to_retry
+
         row = db.execute(
-            """SELECT id,job_mode,owner_user_id,workspace_id,challenge_id,
-                       continuation_source_job_id,account_label,provider,model,
-                       reasoning_effort,service_tier,status,flag,flag_rejected_at,
-                       created_at,updated_at,released_at
-               FROM solver_jobs
-               WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?
-                 AND job_mode='solve'
-               ORDER BY created_at DESC,id DESC LIMIT 1""",
+            """SELECT j.id,j.job_mode,j.owner_user_id,j.workspace_id,j.challenge_id,
+                       j.continuation_source_job_id,j.account_label,j.provider,j.model,
+                       j.reasoning_effort,j.service_tier,j.status,j.flag,j.flag_rejected_at,
+                       j.created_at,j.updated_at,j.released_at,
+                       j.released_ingested,j.error_json,j.challenge_input_sha256,
+                       j.remote_mode,cp.source_job_id AS current_retry_source_job_id
+               FROM solver_jobs j
+               LEFT JOIN solver_retry_checkpoints cp
+                 ON cp.challenge_id=j.challenge_id
+                AND cp.workspace_id=j.workspace_id
+                AND cp.owner_user_id=j.owner_user_id
+               WHERE j.owner_user_id=? AND j.workspace_id=? AND j.challenge_id=?
+                 AND j.job_mode='solve'
+               ORDER BY j.created_at DESC,j.id DESC LIMIT 1""",
             (owner_id(), workspace_id, challenge_id),
         ).fetchone()
         if not row:
@@ -575,6 +583,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "account_label": row["account_label"],
             "status": row["status"],
             "created_at": row["created_at"],
+            "input_ready_to_retry": remote_input_ready_to_retry(db, row),
             "configuration": {
                 "provider": row["provider"],
                 "model": row["model"],

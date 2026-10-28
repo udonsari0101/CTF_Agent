@@ -4274,10 +4274,16 @@ print(json.dumps(result,separators=(",",":")))
         if remote_mode == "none":
             remote_instruction = """
 
-Authoritative remote state for this job: `none`. There is no remote service.
-The inherited original-goal sentence saying that the real flag is remote and
-local flags are fake does not apply to this challenge. Verify and submit the
-real flag from the supplied brief and files without looking for an endpoint.
+Configured remote state for this job: `none`. Start with the supplied brief and
+files; do not assume a service exists. The inherited original-goal sentence
+saying that the real flag is remote and local flags are fake does not apply to
+this challenge by itself. Verify and submit the real flag locally if possible.
+If concrete file or runtime evidence proves that the genuine flag requires an
+indispensable external resource absent from the inputs, record that evidence,
+the completed local verification, and the exact missing input in notes/NEXT.md.
+Then run `request-remote` once and stop this attempt. Do not request input just
+because the flag is missing, a hypothesis failed, or a generic prompt says
+flags are remote. Do not invent an endpoint or loop over the same local work.
 """
         elif remote_mode == "endpoint":
             remote_instruction = """
@@ -4302,8 +4308,9 @@ current directory and follow AGENTS.md. Once you have verified the real flag,
 run submit-flag \"<flag>\" and return the exact same value in `flag`. Put only
 facts needed to reproduce the solve in `private_notes`. If no flag has been
 verified yet, return an empty `flag`; the same session will receive a status
-check and continue. The read-only brief is authoritative about whether a remote
-exists. Do not include a write-up in this turn.
+check and continue. The read-only brief records the configured remote state;
+follow the evidence-based missing-input rule above if it is contradicted.
+Do not include a write-up in this turn.
 """
         else:
             result_bridge = remote_instruction + """
@@ -4315,9 +4322,9 @@ and continue the autonomous loop until you have verified the real flag.
 Once verified, run submit-flag \"<flag>\". That command is the only authoritative
 result handoff; text in your final answer is ignored. Record only reproducible
 solve facts in the notes files. Do not return an empty flag merely to report status;
-the worker owns the fixed deadline and cancellation. The read-only
-brief is authoritative about whether a remote exists. Do not write the final
-write-up in this turn.
+the worker owns the fixed deadline and cancellation. The read-only brief records
+the configured remote state; follow the evidence-based missing-input rule above
+if it is contradicted. Do not write the final write-up in this turn.
 """
         if getattr(configuration, "reasoning_effort", None) == "ultra":
             result_bridge += """
