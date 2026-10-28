@@ -216,7 +216,10 @@ def _docker_output(command: list[str], *, timeout: int = 30) -> str:
 
 def _web_sees_canary(name: str, nonce: str) -> bool:
     return _docker_output([
-        "docker", "exec", "--user", "0:0", "ctf_agent_local",
+        # The web drops every capability. Root inside that container cannot
+        # read a 0600 file owned by the WSL user without CAP_DAC_OVERRIDE.
+        # Match the host owner of the temporary nonce instead.
+        "docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}", "ctf_agent_local",
         "cat", f"/database/sqlite/{name}",
     ]) == nonce
 
