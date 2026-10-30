@@ -406,6 +406,18 @@ class CodexAccount:
         account = response.get("account")
         if account is not None and not isinstance(account, dict):
             raise ProviderError("Codex 계정 응답 형식을 확인할 수 없습니다.", "invalid_response")
+        refresh_unconfirmed = False
+        if not account:
+            # Some valid imported auth.json files produce an empty account on
+            # the refresh probe. That probe also clears the account held by the
+            # current app-server, so reload the unchanged auth file in a new
+            # process before checking the account and its live quota.
+            await self.close()
+            cached = await self.request("account/read", {"refreshToken": False})
+            account = cached.get("account")
+            if account is not None and not isinstance(account, dict):
+                raise ProviderError("Codex 계정 응답 형식을 확인할 수 없습니다.", "invalid_response")
+            refresh_unconfirmed = bool(account)
         public = None if not isinstance(account, dict) else {
             key: account.get(key) for key in ("type", "email", "planType") if key in account
         }
@@ -426,7 +438,13 @@ class CodexAccount:
                 if exc.category == "auth":
                     status = "auth_required"
                     error = exc.public()
+        if (refresh_unconfirmed and status == "authenticated"
+                and quota.get("status") not in ("available", "unavailable", "quota_exceeded")):
+            status = "auth_required"
+            error = ProviderError("Codex 인증 갱신을 확인하지 못했습니다.", "auth_required", stage="auth").public()
         result = {"status": status, "identity": public, "quota": quota}
+        if refresh_unconfirmed and status == "authenticated":
+            result["auth_refresh_unconfirmed"] = True
         if error is not None:
             result["error"] = error
         return result

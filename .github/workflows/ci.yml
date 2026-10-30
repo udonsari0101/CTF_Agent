@@ -300,3 +300,47 @@ jobs:
               finally:
                   sys.argv = old_argv
           PY
+      - name: Check Codex imported-auth refresh fallback
+        run: |
+          python - <<'PY'
+          import asyncio
+          from pathlib import Path
+
+          from ctf_agent.providers.codex import CodexAccount, ProviderError
+
+          async def check(refreshed, cached, quota_error=None):
+              account = CodexAccount(Path('/tmp/unused-codex-account'), [])
+              calls = []
+              closed = False
+              async def close():
+                  nonlocal closed
+                  closed = True
+                  calls.append(('close', None))
+              async def request(method, params=None):
+                  calls.append((method, params))
+                  if method == 'account/read':
+                      return {'account': refreshed if params['refreshToken'] else cached if closed else None}
+                  if quota_error:
+                      raise quota_error
+                  return {'rateLimits': {'primary': {'windowDurationMins': 300, 'usedPercent': 20}}}
+              account.close = close
+              account.request = request
+              return await account.snapshot(), calls
+
+          async def main():
+              identity = {'type': 'chatgpt', 'planType': 'plus'}
+              snapshot, calls = await check(None, identity)
+              assert snapshot['status'] == 'authenticated'
+              assert snapshot['auth_refresh_unconfirmed'] is True
+              assert snapshot['quota']['status'] == 'available'
+              assert [method for method, _ in calls] == ['account/read', 'close', 'account/read', 'account/rateLimits/read']
+              snapshot, _ = await check(None, identity, ProviderError('denied', 'auth_required', stage='quota', category='auth'))
+              assert snapshot['status'] == 'auth_required'
+              snapshot, _ = await check(None, None)
+              assert snapshot['status'] == 'signed_out'
+              snapshot, calls = await check(identity, identity)
+              assert snapshot['status'] == 'authenticated' and 'auth_refresh_unconfirmed' not in snapshot
+              assert [method for method, _ in calls] == ['account/read', 'account/rateLimits/read']
+
+          asyncio.run(main())
+          PY

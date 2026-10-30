@@ -9,6 +9,7 @@
 .account-list .model-help p { margin: .35rem 0; }
 .account-list .quota-limited { border-color: #6f3038; box-shadow: inset 2px 0 #ff7382; }
 .account-list .quota-alert, .account-list .quota-reason { color: #ff9da7; }
+.account-list .auth-refresh-warning { color: #f3c38e; font-size: .85rem; }
 .account-list .quota-bucket.quota-limited { border-color: #71343d; background: #100609; }
 .account-list .quota-window-exhausted { color: #ff9da7; }
 .account-list progress.quota-window-exhausted { accent-color: #ff7382; }

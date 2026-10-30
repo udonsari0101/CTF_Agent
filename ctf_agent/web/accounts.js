@@ -423,6 +423,7 @@ export async function renderAccounts(container, api, options = {}) {
         account.auth_kind === 'api_key' ? i18n.t('API 키') : null, identity.email,
         identity.planType || identity.subscriptionType].filter(Boolean).join(' · ')));
       if (snapshot.message) card.append(el('p', snapshot.message));
+      if (snapshot.auth_refresh_unconfirmed) card.append(el('p', i18n.t('현재 인증은 확인됐지만 자동 갱신을 확인하지 못했습니다. 만료 후 재로그인이 필요할 수 있습니다.'), 'auth-refresh-warning'));
       if (snapshot.error) card.append(el('p', errorText({...snapshot.error,message:snapshot.error.message || '계정 정보를 조회하지 못했습니다.'}), 'error-text'));
       card.append(el('small', `${i18n.t('마지막 조회')}: ${date(account.checked_at)}${account.stale ? ` · ${i18n.t('새로고침 필요')}` : ''}`));
       const quota = snapshot.quota;
