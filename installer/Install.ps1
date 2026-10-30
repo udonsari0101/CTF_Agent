@@ -409,7 +409,7 @@ function Get-WslCandidateInfo([string]$name, [hashtable]$versions) {
 
 function Get-WslInfo([string]$name, [hashtable]$versions) {
     $probe = @'
-import json,os,shutil,sys
+import json,os,pathlib,shutil,sys
 data={}
 try:
     for line in open('/etc/os-release',encoding='utf-8'):
@@ -418,9 +418,17 @@ try:
             data[key]=value.strip('"')
 except OSError:
     pass
+native_docker=False
+for process in pathlib.Path('/proc').glob('[0-9]*/comm'):
+    try:
+        if process.read_text(encoding='ascii').strip()=='dockerd':
+            native_docker=True
+            break
+    except (OSError,UnicodeError):
+        pass
 print(json.dumps({'id':data.get('ID',''),'version':data.get('VERSION_ID',''),
                   'home':os.path.expanduser('~'),'python':list(sys.version_info[:2]),
-                  'bash':bool(shutil.which('bash'))}))
+                  'bash':bool(shutil.which('bash')),'native_docker':native_docker}))
 '@
     $probeResult = Invoke-WslPython $name $probe
     $result = $null
@@ -445,11 +453,13 @@ print(json.dumps({'id':data.get('ID',''),'version':data.get('VERSION_ID',''),
             $score = if ($ubuntuVersion -ge [version]'24.04') { 100 } else { 90 }
         }
         elseif ($result.id -eq 'debian') { $score = 80 }
+        if ($result.native_docker) { $score = 0 }
     }
     $reason = if ($version -eq 0) { 'WSL version could not be verified' }
         elseif ($version -ne 2) { 'WSL 2 required' }
         elseif (-not $result) { "Python probe failed (exit $($probeResult.ExitCode)); try Install.cmd as administrator under this same Windows account" }
         elseif (-not $result.bash) { 'bash unavailable' }
+        elseif ($result.native_docker) { 'A native Docker Engine is running here. Use a separate WSL distro (choose N); existing containers will be left running.' }
         elseif ($score -eq 0) { 'Python 3.10+ required' }
         else { 'recommended' }
     return [pscustomobject]@{Name=$name;Version=$version;Score=$score;Reason=$reason;
@@ -467,6 +477,7 @@ function Get-OnlineUbuntu {
 
 function Install-WslDistribution([string]$name) {
     Write-Host "Installing WSL distribution: $name"
+    Write-Host 'A Linux window may open for first-run account setup. After creating the account, type exit in that Linux window to continue this installer.'
     $process = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wsl.exe') `
         -ArgumentList @('--install', '--distribution', $name) -Verb RunAs -Wait -PassThru
     if ($process.ExitCode -ne 0) {

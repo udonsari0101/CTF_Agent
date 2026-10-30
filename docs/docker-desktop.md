@@ -8,6 +8,10 @@ During installation choose whether CTF Agent starts when you sign in to Windows 
 
 The installer checks WSL 2, recommends an installed Linux distribution or offers to install Ubuntu, checks Docker Desktop and its WSL integration, and verifies at least 15 GB of free space in WSL and on the backing Windows volume. At the data path prompt, press Enter for the usual Linux filesystem location (`~/.local/share/ctf-agent` in the selected distribution). The installer stores your choice for upgrades.
 
+If the installer opens a Linux window while creating a new Ubuntu distribution, finish the Linux username and password prompts, then type `exit` at the Linux shell prompt. The Windows installer continues when that first-run window closes. In Docker Desktop, enable **Settings → Resources → WSL Integration** for the new distribution if asked.
+
+If an existing WSL distribution already runs its own Docker Engine, choose **N** at the distribution prompt to create a separate Ubuntu for CTF Agent. The installer checks that its Linux Docker client and Windows Docker Desktop connect to the same engine. It leaves the existing engine and its containers running.
+
 If installed WSL distributions appear but their readiness checks fail, review the reason shown for each distribution. Run `Install.cmd` again as administrator under the **same Windows account** that owns them. WSL registrations are per-user; installing another Ubuntu does not fix a failed readiness check for an existing distribution.
 
 ### Put only the database in a Windows folder

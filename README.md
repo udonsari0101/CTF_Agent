@@ -35,6 +35,8 @@ The screenshots use synthetic challenges and account data.
 
 1. Download the latest `CTF_Agent-*-local-windows.zip` release and extract it to a local folder.
 2. Run `Install.cmd`. The installer checks WSL 2, suggests a suitable Linux distribution, checks Docker Desktop and available disk space, then offers the usual data path inside WSL. Press Enter to use it.
+
+If your existing WSL distribution runs its own Docker Engine, select **N** to create a separate Ubuntu for Docker Desktop. After setting its Linux username and password, type `exit` in the Linux window so the installer can continue.
 3. Open <http://127.0.0.1:5050> and create the first administrator account. Connect a Codex or Claude Code account in **Agents**.
 
 Open **Administration → Service updates** to check public releases, read release notes, and install an update. `Install.cmd` can also update an existing installation. Both paths preserve the selected data directory. The installer pulls the commit-pinned public GHCR image used on servers, then builds a small verified local runtime layer for the Windows solver policy. It does not rebuild the CTF toolchain. Installation and Start report success after `/readyz` confirms the solver is ready. See the [installation guide](docs/docker-desktop.md) for requirements, troubleshooting, and Windows Explorer access to challenge files.

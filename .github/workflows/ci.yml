@@ -272,3 +272,31 @@ jobs:
               policy = json.loads(bundle.read(prefix + "app/deploy/local-seccomp.json"))
               assert isinstance(policy.get("syscalls"), list) and policy["syscalls"]
           PY
+      - name: Check first-install external database link
+        run: |
+          python - <<'PY'
+          import re
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          source = Path('installer/DatabaseDisk.ps1').read_text(encoding='utf-8')
+          match = re.search(r'function Ensure-DatabaseBindLink\b.*?\$program = @\x27\n(.*?)\n\x27@', source, re.S)
+          assert match, 'database link program missing'
+          with tempfile.TemporaryDirectory() as temp:
+              root = Path(temp)
+              database = root / 'mounted' / 'Database' / 'CTF_Agent'
+              database.mkdir(parents=True)
+              home = root / 'user' / '.local' / 'share' / 'ctf-agent'
+              program = match.group(1).replace('/mnt/wsl/ctf-agent-db/Database/CTF_Agent', database.as_posix())
+              old_argv = sys.argv
+              try:
+                  sys.argv = ['link-check', str(home), str(database), 'false']
+                  exec(compile(program, '<database-link>', 'exec'), {})
+                  assert home.is_dir() and not home.is_symlink()
+                  assert (home / '.database-bind').is_symlink()
+                  assert (home / '.database-bind').resolve() == database
+                  exec(compile(program, '<database-link>', 'exec'), {})
+              finally:
+                  sys.argv = old_argv
+          PY

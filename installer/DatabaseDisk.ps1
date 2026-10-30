@@ -261,6 +261,9 @@ if (not home.is_absolute() or str(home)=="/" or home.is_symlink()
         or database!=pathlib.Path("/mnt/wsl/ctf-agent-db/Database/CTF_Agent")
         or database.is_symlink() or database.parent.is_symlink()):
     raise SystemExit("Invalid external database bind path")
+home.mkdir(parents=True,exist_ok=True)
+if not home.is_dir() or home.is_symlink():
+    raise SystemExit("The application data directory is unavailable")
 if not database.is_dir():
     if not allow_create or database.exists():
         raise SystemExit("The external database directory is unavailable")
