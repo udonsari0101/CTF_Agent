@@ -477,6 +477,16 @@ class CTFdClient:
             if response.status in {401, 403}:
                 if allow_error_status:
                     return response, current
+                if response.headers.get("content-type", "").split(";", 1)[0].strip().lower() == "application/json":
+                    try:
+                        error = json.loads(response.content)
+                    except (ValueError, UnicodeError):
+                        error = None
+                    code = error.get("code") if isinstance(error, dict) else None
+                    if code == "competition_closed":
+                        raise CTFdError("The CTFd site has not opened challenge access yet or the competition has closed.")
+                    if code == "login_required" and self.auth_type == "token":
+                        raise CTFdError("The CTFd site did not accept this access token. Check the token or use username and password.")
                 raise CTFdError("CTFd denied access. Check the selected authentication method and challenge visibility.")
             if not 200 <= response.status < 300:
                 if allow_error_status:
@@ -497,9 +507,18 @@ class CTFdClient:
         try:
             response, login_url = self._request(self.url + "/login", self.limits.json_bytes, same_origin=True)
             parser = LoginForm()
-            parser.feed(response.content.decode("utf-8", errors="replace"))
+            login_html = response.content.decode("utf-8", errors="replace")
+            parser.feed(login_html)
             form = parser.login()
             if not form or not form["fields"]["nonce"] or len(form["fields"]["nonce"]) > 4096:
+                # Some CTFd-compatible sites use a Next.js login page and a
+                # same-origin JSON session API instead of CTFd's HTML form.
+                # Require its bootstrap marker before sending credentials to
+                # that endpoint so unrelated SSO/CAPTCHA pages still fail.
+                if ("window.__ctfdInitialRequests" in login_html
+                        and '"/api/v2/auth/check/cookie"' in login_html):
+                    self._authenticate_json_session()
+                    return
                 raise CTFdError("The site does not expose the supported CTFd password login form. Use an API token if SSO or CAPTCHA is required.")
             # The login-form nonce proves the credential POST, but CTFd
             # rotates the session nonce after a successful login.  Keep the
@@ -520,6 +539,32 @@ class CTFdClient:
             self.logged_in = True
         finally:
             self.username = self.password = ""
+
+    def _authenticate_json_session(self):
+        credentials = json.dumps(
+            {"name": self.username, "password": self.password},
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        for endpoint in ("/api/v2/auth/login/prepare", "/api/v2/auth/login"):
+            response, _ = self._request(
+                self.url + endpoint, self.limits.json_bytes, api=True,
+                method="POST", body=credentials, same_origin=True,
+                content_type="application/json", allow_error_status=True,
+            )
+            try:
+                payload = json.loads(response.content)
+            except (ValueError, UnicodeError):
+                payload = None
+            if not isinstance(payload, dict):
+                raise CTFdError("The CTFd JSON login endpoint returned an unsupported response.")
+            if endpoint.endswith("/prepare") and isinstance(payload.get("data"), dict) and payload["data"].get("needs_consent") is True:
+                raise CTFdError("Complete the CTFd site's consent step in your browser before connecting.")
+            if response.status != 200 or payload.get("success") is not True:
+                raise CTFdError("CTFd login failed. Check the username and password or complete any required browser steps.")
+        current = self._json(self.url + "/api/v1/users/me")
+        if not isinstance(current, dict):
+            raise CTFdError("The site did not confirm the authenticated CTFd session.")
+        self.logged_in = True
 
     def _json(self, url: str):
         content = self._get(url, self.limits.json_bytes, api=True)
