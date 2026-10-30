@@ -694,3 +694,11 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, #20b88c, #65ffd
 .solver-console-controls > small { color:#75919a; font-size:10px; }
 @media(max-width:760px) { .solver-console-body { flex-direction:column; } .solver-agent-tree { flex:0 0 auto; max-height:160px; border-right:0; border-bottom:1px solid #18333e; } }
 @media(max-width:580px) { .solver-console-dialog { width:calc(100vw - 12px); height:calc(100dvh - 12px); } .solver-console-head,.solver-console-stream,.solver-console-controls { padding-left:10px; padding-right:10px; } .solver-console-head-actions { gap:4px; } .solver-console-send,.solver-console-upload { align-items:stretch; flex-direction:column; } }
+.workspace-ctfd-setting { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px; border:1px solid var(--border); border-radius:9px; background:var(--surface2); }
+.workspace-ctfd-setting > div { display:grid; min-width:0; gap:5px; }
+.workspace-ctfd-setting strong { font-size:13px; }
+.workspace-ctfd-setting small { overflow-wrap:anywhere; }
+.workspace-ctfd-setting button { flex:0 0 auto; }
+.ctfd-import-manual { display:grid; gap:18px; }
+.ctfd-import-manual[hidden] { display:none; }
+@media(max-width:500px) { .workspace-ctfd-setting { align-items:stretch; flex-direction:column; } }

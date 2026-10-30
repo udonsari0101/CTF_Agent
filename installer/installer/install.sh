@@ -537,10 +537,11 @@ PY
     if ! wait_service_healthy "$previous_image" 180; then return 1; fi
     echo "Previous CTF Agent release $previous_version restored and ready." >&2
 }
-# Drain old claims first, then stop the old coordinators before removing this
-# install's marker and starting the new stack.
+# Drain old claims first, then stop every local writer before Compose checks a
+# stopped web container. Leaving idle solver containers up made both the new
+# rollout and its rollback refuse the database-bind repair.
 rollout_started=true
-docker compose -f compose.local.yaml stop web solver-autoscaler
+python3 deploy/local-compose.py quiesce
 if [[ -n "$database_mount" && "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
     update_control="$home_dir/ctf_agent_data/update-control"
     # Web is now stopped, so no new request can be queued. A pending or

@@ -1278,6 +1278,14 @@ class ImportJobs:
     def request_client(self, workspace_id, user, body, *, allow_saved=False):
         if body.get("preview_id"):
             raise CTFdError("A preview client must be consumed through its preview ID.")
+        if "use_saved_connection" in body:
+            if body["use_saved_connection"] is not True or any(
+                key in body for key in ("url", "auth_type", "token", "username", "password")
+            ):
+                raise CTFdError("Choose either the saved CTFd connection or new connection details.")
+            if not allow_saved:
+                raise CTFdError("The saved CTFd connection is not available for this request.")
+            return self.saved_client(workspace_id, user)
         if body.get("url") is not None:
             return self.client(body)
         if allow_saved:
@@ -1362,7 +1370,8 @@ class ImportJobs:
                     # therefore before DNS, login, or any remote request.
                     self.check_active(workspace_id, user["id"])
                     client = self.request_client(
-                        workspace_id, user, body, allow_saved=mode == "new"
+                        workspace_id, user, body,
+                        allow_saved=mode == "new" or body.get("use_saved_connection") is True,
                     )
                     client.cancel_event = cancellation
                     if cancellation.is_set():
@@ -1436,7 +1445,8 @@ class ImportJobs:
                 )
             return client, item["preview"], generation
         client = self.request_client(
-            workspace_id, user, body, allow_saved=mode in {"new", "refresh"}
+            workspace_id, user, body,
+            allow_saved=mode in {"new", "refresh"} or body.get("use_saved_connection") is True,
         )
         return client, None, self.saved_connection_generation(client)
 

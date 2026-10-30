@@ -52,6 +52,98 @@ jobs:
               assert pack['locale'] == locale and pack['messages']
           assert not Path('tests').exists()
           PY
+      - name: Check workspace CTFd connection reuse
+        run: |
+          python - <<'PY'
+          import tempfile
+          import time
+          from pathlib import Path
+          from fastapi.testclient import TestClient
+          from ctf_agent.db import Settings
+          from ctf_agent.main import create_app
+
+          class FakeCTFd:
+              def __init__(self, **kwargs):
+                  self.url = kwargs['url']
+                  self.auth_type = kwargs['auth_type']
+                  self.saved_connection_generation = None
+                  self.cancel_event = None
+
+              def validate(self):
+                  pass
+
+              def clear_credentials(self):
+                  pass
+
+              def preview(self, selected=None, metadata_only=False, exclude_ids=None):
+                  return {
+                      'source_url': self.url,
+                      'challenges': [{'id': 1, 'name': 'demo', 'category': 'web',
+                                      'description': 'hello', 'remote': '', 'files': []}],
+                      'errors': [], 'details_pending': metadata_only,
+                  }
+
+          with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+              root = Path(temp)
+              settings = Settings(root / 'data', root / 'db', root / 'config', root / 'logs',
+                                  storage_min_free_bytes=0, auth_mode='nologin')
+              app = create_app(settings)
+              app.state.ctfd_client_factory = FakeCTFd
+              with TestClient(app) as client:
+                  csrf = client.get('/api/auth/state').json()['csrf_token']
+                  client.headers.update({'x-csrf-token': csrf})
+                  workspace = client.post('/api/workspaces', json={'name': 'demo'})
+                  assert workspace.status_code == 201
+                  workspace_id = workspace.json()['id']
+                  base = f'/api/workspaces/{workspace_id}/ctfd'
+                  saved = client.put(base + '/connection', json={
+                      'url': 'https://saved.example', 'auth_type': 'token',
+                      'token': 'test-token',
+                  })
+                  assert saved.status_code == 200
+                  assert saved.json()['auto_submit'] is False
+                  assert 'test-token' not in str(saved.json())
+                  enabled = client.put(base + '/settings', json={'auto_submit': True})
+                  assert enabled.status_code == 200 and enabled.json()['auto_submit'] is True
+                  preview = client.post(base + '/preview', json={'use_saved_connection': True})
+                  assert preview.status_code == 200
+                  assert preview.json()['source_url'] == 'https://saved.example'
+                  mixed = client.post(base + '/preview', json={
+                      'use_saved_connection': True, 'url': 'https://other.example',
+                  })
+                  assert mixed.status_code == 422
+                  fresh = client.post(base + '/preview', json={
+                      'url': 'https://other.example', 'auth_type': 'token', 'token': 'other',
+                  })
+                  assert fresh.status_code == 200
+                  assert fresh.json()['source_url'] == 'https://other.example'
+                  assert client.get(base + '/connection').json()['url'] == 'https://saved.example'
+                  start = client.post(base + '/import', json={
+                      'preview_id': preview.json()['preview_id'], 'challenge_ids': [1],
+                  })
+                  assert start.status_code == 202
+                  for _ in range(100):
+                      job = client.get(base + '/jobs').json()['jobs'][0]
+                      if job['status'] not in {'queued', 'running'}:
+                          break
+                      time.sleep(.05)
+                  assert job['status'] == 'completed' and job['imported'] == 1
+                  challenges = client.get(f'/api/workspaces/{workspace_id}/challenges').json()['challenges']
+                  assert len(challenges) == 1 and challenges[0]['ctfd_url'] == 'https://saved.example'
+                  second = client.post('/api/workspaces', json={'name': 'password demo'})
+                  assert second.status_code == 201
+                  second_base = f"/api/workspaces/{second.json()['id']}/ctfd"
+                  password_saved = client.put(second_base + '/connection', json={
+                      'url': 'https://password.example', 'auth_type': 'password',
+                      'username': 'alice', 'password': 'test-password',
+                  })
+                  assert password_saved.status_code == 200
+                  assert 'test-password' not in str(password_saved.json())
+                  password_preview = client.post(
+                      second_base + '/preview', json={'use_saved_connection': True})
+                  assert password_preview.status_code == 200
+                  assert password_preview.json()['source_url'] == 'https://password.example'
+          PY
       - name: Check scripts and local stack
         run: |
           python -m compileall -q ctf_agent deploy/local-compose.py deploy/local_runtime.py scripts/package_local_release.py
@@ -61,6 +153,80 @@ jobs:
           bash -n installer/installer/start.sh
           sh -n deploy/submit-flag deploy/request-remote deploy/connect-remote deploy/ctf-browser
           docker compose -f compose.local.yaml config --quiet
+      - name: Check live installer handoff
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sqlite3
+          import tempfile
+          from contextlib import closing, contextmanager
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location('local_compose', 'deploy/local-compose.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          stopped = []
+          module._stop_local_stack = lambda environment: stopped.append(True)
+
+          with tempfile.TemporaryDirectory() as temp:
+              root = Path(temp)
+              data, database = root / 'data', root / 'db'
+              data.mkdir()
+              (database / 'sqlite').mkdir(parents=True)
+              (data / 'deployment-drain').touch()
+              path = database / 'sqlite' / 'ctf_agent.sqlite3'
+              with closing(sqlite3.connect(path)) as connection:
+                  connection.execute('CREATE TABLE solver_slots (slot_id TEXT)')
+                  connection.commit()
+              environment = {
+                  'CTF_LOCAL_FS_DATA': str(data),
+                  'CTF_LOCAL_FS_DATABASE': str(database),
+                  'CTF_LOCAL_DATABASE': str(database),
+                  'CTF_LOCAL_RUNTIME_IMAGE': 'test-image',
+              }
+              module._quiesce_for_installer(environment, installed=True)
+              assert stopped == [True]
+              (data / 'deployment-drain').unlink()
+              try:
+                  module._quiesce_for_installer(environment, installed=True)
+              except RuntimeError as exc:
+                  assert 'drain is unavailable' in str(exc)
+              else:
+                  raise AssertionError('Installer handoff ran without a drain')
+              (data / 'deployment-drain').touch()
+              with closing(sqlite3.connect(path)) as connection:
+                  connection.execute("INSERT INTO solver_slots VALUES ('default')")
+                  connection.commit()
+              try:
+                  module._quiesce_for_installer(environment, installed=True)
+              except RuntimeError as exc:
+                  assert 'not drained' in str(exc)
+              else:
+                  raise AssertionError('An active solve was stopped')
+              assert stopped == [True]
+
+              @contextmanager
+              def canary(_environment):
+                  yield 'canary', 'nonce'
+              module._bind_canary = canary
+              module._docker_output = lambda _command: 'nonce'
+              module._current_web_container = lambda _environment: {'State': {'Running': False}}
+              module._running_solver_containers = lambda: True
+              module._clear_database_bind_failure = lambda _environment: None
+              try:
+                  module._preflight_database_binding(environment, {})
+              except RuntimeError as exc:
+                  assert 'Solver containers are running' in str(exc)
+              else:
+                  raise AssertionError('Normal startup accepted a stopped web with live solvers')
+              assert module._preflight_database_binding(
+                  environment, {}, allow_stopped_web_with_solvers=True)
+
+          installer = Path('installer/installer/install.sh').read_text(encoding='utf-8')
+          assert installer.index('deploy/local-compose.py preflight') < installer.index('manage_storage_control reserve')
+          assert installer.index('manage_storage_control reserve') < installer.index('deploy/local-compose.py quiesce')
+          assert installer.index('deploy/local-compose.py quiesce') < installer.rindex('deploy/local-compose.py up -d --no-build')
+          PY
       - name: Check local installer bundle and protected storage controls
         run: |
           python scripts/package_local_release.py --version v0.0.0 --commit "$GITHUB_SHA" --output "$RUNNER_TEMP/ctf-local.zip"

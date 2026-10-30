@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -323,7 +324,10 @@ def _running_solver_containers() -> bool:
                for name in names.splitlines())
 
 
-def _preflight_database_binding(environment: dict[str, str], host: dict[str, object]) -> bool:
+def _preflight_database_binding(
+    environment: dict[str, str], host: dict[str, object], *,
+    allow_stopped_web_with_solvers: bool = False,
+) -> bool:
     """Return whether existing Compose containers need fresh bind mounts."""
 
     image = environment.get("CTF_LOCAL_RUNTIME_IMAGE", "")
@@ -386,10 +390,39 @@ def _preflight_database_binding(environment: dict[str, str], host: dict[str, obj
                 return True
             _clear_database_bind_failure(environment)
             return False
-        if _running_solver_containers():
+        if _running_solver_containers() and not allow_stopped_web_with_solvers:
             raise RuntimeError("Solver containers are running; database bind repair was cancelled")
         _clear_database_bind_failure(environment)
         return True
+
+
+def _quiesce_for_installer(environment: dict[str, str], *, installed: bool) -> None:
+    """Stop idle writers only after the installer has drained all solve claims."""
+
+    data = _local_path(environment.get("CTF_LOCAL_FS_DATA", environment.get("CTF_LOCAL_DATA", "")))
+    drain = data / "deployment-drain"
+    if drain.is_symlink() or not drain.is_file():
+        raise RuntimeError("The installer deployment drain is unavailable")
+    details = drain.stat()
+    if (not stat.S_ISREG(details.st_mode) or details.st_nlink != 1
+            or details.st_uid != os.getuid() or details.st_size):
+        raise RuntimeError("The installer deployment drain is invalid")
+    if installed:
+        database_root = _local_path(environment.get(
+            "CTF_LOCAL_FS_DATABASE", environment.get("CTF_LOCAL_DATABASE", "")))
+        database = database_root / "sqlite" / "ctf_agent.sqlite3"
+        if database.is_symlink() or not database.is_file():
+            raise RuntimeError("The installed database is unavailable")
+        with closing(sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True, timeout=15)) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='solver_slots'"
+            ).fetchone()
+            if table and connection.execute("SELECT 1 FROM solver_slots LIMIT 1").fetchone():
+                raise RuntimeError("Active solver jobs have not drained")
+    elif _current_web_container(environment) is not None or _running_solver_containers():
+        raise RuntimeError("Unregistered local containers require manual inspection")
+    _stop_local_stack(environment)
 
 
 def _verify_web_database_after_start(environment: dict[str, str], host: dict[str, object]) -> None:
@@ -851,7 +884,7 @@ def main() -> int:
     retained_dynamic: set[int] = set()
     arguments = normalize_arguments(sys.argv[1:] or ["up", "-d", "--build"])
     environment = os.environ.copy()
-    actions = {"up", "down", "stop", "rm", "kill", "restart", "start", "ps", "logs", "config", "pull", "build", "preflight", "verify-fresh-install"}
+    actions = {"up", "down", "stop", "rm", "kill", "restart", "start", "ps", "logs", "config", "pull", "build", "preflight", "quiesce", "verify-fresh-install"}
     action = next((item for item in arguments if item in actions), "up")
     verify_external_database(environment)
     if action == "verify-fresh-install":
@@ -860,11 +893,15 @@ def main() -> int:
         _verify_web_database_after_start(environment, {})
         return 0
     host_database = None
-    if action in {"up", "start", "restart", "preflight"}:
+    if action in {"up", "start", "restart", "preflight", "quiesce"}:
         host_database = verify_installed_database(environment)
     if action == "preflight":
         if host_database is not None:
-            _preflight_database_binding(environment, host_database)
+            _preflight_database_binding(
+                environment, host_database, allow_stopped_web_with_solvers=True)
+        return 0
+    if action == "quiesce":
+        _quiesce_for_installer(environment, installed=host_database is not None)
         return 0
     prepare_readable_storage(environment)
     if action in {"up", "start"} and (ROOT / ".local-runtime.json").exists():

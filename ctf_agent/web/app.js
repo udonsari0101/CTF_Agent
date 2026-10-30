@@ -1248,7 +1248,7 @@ async function renderWorkspace() {
   const w = currentWorkspace;
   stopChallengeListPolling();
   const content = shell('workspaces', w.name);
-  content.innerHTML = `<div class="page-head"><div><div class="eyebrow">CTF WORKSPACE</div><h1>${esc(w.name)}</h1>${w.description ? `<p>${esc(w.description)}</p>` : ''}</div><div class="head-actions"><button class="ghost icon-action" data-action="edit-workspace" aria-label="작업공간 설정" title="작업공간 설정">⚙</button><button data-action="ctfd-submit-settings">자동 제출 설정</button><button data-action="ctfd-import">CTFd 가져오기</button><button data-action="ctfd-sync" title="저장된 CTFd 연결에서 새로 추가된 문제만 확인합니다.">새 문제 동기화</button><button class="primary" data-action="new-challenge">＋ 문제 추가</button></div></div>
+  content.innerHTML = `<div class="page-head"><div><div class="eyebrow">CTF WORKSPACE</div><h1>${esc(w.name)}</h1>${w.description ? `<p>${esc(w.description)}</p>` : ''}</div><div class="head-actions"><button class="ghost icon-action" data-action="edit-workspace" aria-label="작업공간 설정" title="작업공간 설정">⚙</button><button data-action="ctfd-submit-settings">CTFd 연결</button><button data-action="ctfd-import">CTFd 가져오기</button><button data-action="ctfd-sync" title="저장된 CTFd 연결에서 새로 추가된 문제만 확인합니다.">새 문제 동기화</button><button class="primary" data-action="new-challenge">＋ 문제 추가</button></div></div>
     <div class="workspace-summary"><div class="workspace-summary-meta"><span>⚑ Flag 형식 <code>${esc(w.flag_format || '미설정')}</code></span><span>문제 <b data-workspace-challenge-count>${w.challenge_count ?? ''}</b></span></div>${resourceMeterMarkup()}</div>
     <div id="ctfd-job-area"></div><div id="challenge-area"></div>`;
   startResourcePolling(w.id);
@@ -1699,8 +1699,21 @@ function workspaceForm(edit = false) {
     <label>설명 <span class="optional">선택</span><textarea name="description" rows="3" placeholder="대회 일정이나 기억할 내용을 적어 주세요.">${esc(w.description)}</textarea></label>
     <label>Flag 형식 <span class="optional">선택</span><input name="flag_format" value="${esc(w.flag_format)}" maxlength="500"><span class="form-hint">접두어만 입력하면 {…} 형식을 적용합니다.</span></label>
     <label class="workspace-option"><input type="checkbox" name="open_challenge_after_create" ${w.open_challenge_after_create ? 'checked' : ''}><span>문제 등록 후 상세창 열기</span></label>
+    ${edit ? '<section class="workspace-ctfd-setting"><div><strong>CTFd 연결</strong><small id="workspace-ctfd-status">연결 확인 중</small></div><button type="button" data-action="workspace-ctfd-connection">연결 관리</button></section>' : ''}
     ${edit ? '<div class="danger-zone"><button class="danger small icon-action" type="button" data-action="delete-workspace" aria-label="작업공간 삭제" title="작업공간 삭제">⌫</button></div>' : ''}`, `<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">${edit ? '변경 저장' : '작업공간 만들기'}</button>`, edit ? 'edit-workspace-form' : 'new-workspace-form');
-  if (edit) modal.querySelector('form').dataset.editToken = w.edit_token || '';
+  if (edit) {
+    modal.querySelector('form').dataset.editToken = w.edit_token || '';
+    const generation = modalRendering;
+    api(`/api/workspaces/${w.id}/ctfd/connection`).then(state => {
+      if (modal.open && modalRendering === generation && modal.querySelector('#edit-workspace-form')?.dataset.workspaceId === w.id) {
+        modal.querySelector('#workspace-ctfd-status').textContent = state.connected
+          ? `${state.url} · ${state.auth_type === 'password' ? '아이디·비밀번호' : 'API 토큰'}`
+          : '연결 안 됨';
+      }
+    }).catch(() => {
+      if (modal.open && modalRendering === generation) modal.querySelector('#workspace-ctfd-status').textContent = '연결 상태를 확인할 수 없습니다.';
+    });
+  }
 }
 
 function challengeForm(edit = false) {
@@ -2678,9 +2691,43 @@ function newUserForm() {
   openModal('사용자 추가','', '<label>아이디<input name="username" autocomplete="off" maxlength="100" required></label><label>초기 비밀번호<input type="password" name="password" autocomplete="new-password" minlength="4" maxlength="1024" required><span class="form-hint">4자 이상 · 조합 조건 없음</span></label><label>권한<select name="role"><option value="user">일반 사용자</option><option value="admin">관리자</option></select></label>','<button type="button" data-action="close-modal">취소</button><button type="submit" class="primary">사용자 만들기</button>','new-user-form');
 }
 
-function importForm() {
+function syncCTFdImportSource(form) {
+  const saved = form.elements.connection_mode?.value === 'saved';
+  const manual = form.querySelector('#ctfd-import-manual');
+  manual.hidden = saved;
+  const url = form.elements.url, auth = form.elements.auth_type;
+  url.disabled = saved; url.required = !saved;
+  auth.disabled = saved;
+  for (const [id,type] of [['ctfd-token-fields','token'],['ctfd-password-fields','password']]) {
+    const fields = form.querySelector(`#${id}`), enabled = !saved && auth.value === type;
+    fields.hidden = !enabled;
+    fields.querySelectorAll('input').forEach(node => {
+      node.disabled = !enabled; node.required = enabled;
+      if (!enabled) node.value = '';
+    });
+  }
+}
+
+async function importForm() {
+  if (!currentWorkspace) return;
+  const workspaceId = currentWorkspace.id, page = rendering, hash = location.hash;
   importPreview = null;
-  openModal('CTFd 문제 가져오기', '', '<label>CTFd 사이트 주소<input name="url" inputmode="url" placeholder="ctf.example.com" required autofocus><span class="form-hint">https://를 생략하면 자동으로 붙입니다.</span></label><label>인증 방식<select id="ctfd-auth-type" name="auth_type"><option value="none">로그인 없이 가져오기</option><option value="token">API 토큰</option><option value="password">아이디와 비밀번호</option></select></label><div id="ctfd-token-fields" hidden><label>API 토큰<input name="token" type="password" autocomplete="off" disabled></label></div><div id="ctfd-password-fields" hidden><label>CTFd 아이디<input name="username" autocomplete="off" disabled></label><label>CTFd 비밀번호<input name="password" type="password" autocomplete="off" disabled></label></div><div class="notice">인증값은 가져오기 중에만 사용합니다.</div>', '<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">문제 목록 확인</button>', 'ctfd-preview-form');
+  const state = await api(`/api/workspaces/${workspaceId}/ctfd/connection`);
+  if (page !== rendering || hash !== location.hash || currentWorkspace?.id !== workspaceId) return;
+  openModal('CTFd 문제 가져오기', '', `
+    <label>연결 방식<select id="ctfd-import-source" name="connection_mode">
+      ${state.connected ? `<option value="saved">${esc(i18n.t('저장된 연결'))} · ${esc(state.url)}</option>` : ''}
+      <option value="new">새 연결 입력</option>
+    </select></label>
+    <div id="ctfd-import-manual" class="ctfd-import-manual">
+      <label>CTFd 사이트 주소<input name="url" inputmode="url" placeholder="ctf.example.com" required><span class="form-hint">https://를 생략하면 자동으로 붙입니다.</span></label>
+      <label>인증 방식<select id="ctfd-auth-type" name="auth_type"><option value="none">로그인 없이 가져오기</option><option value="token">API 토큰</option><option value="password">아이디와 비밀번호</option></select></label>
+      <div id="ctfd-token-fields" hidden><label>API 토큰<input name="token" type="password" autocomplete="off" disabled></label></div>
+      <div id="ctfd-password-fields" hidden><label>CTFd 아이디<input name="username" autocomplete="off" disabled></label><label>CTFd 비밀번호<input name="password" type="password" autocomplete="off" disabled></label></div>
+    </div>`, '<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">문제 목록 확인</button>', 'ctfd-preview-form');
+  const form = modal.querySelector('#ctfd-preview-form');
+  syncCTFdImportSource(form);
+  form.dataset.initial = formSnapshot(form);
 }
 
 function ctfdRefreshAuthForm() {
@@ -2740,8 +2787,8 @@ function ctfdSubmissionRows(history) {
 }
 
 function ctfdConnectionState(state) {
-  return `<div class="section-head"><h3>제출 연결</h3><span class="connection-state ${state.connected ? 'connected' : ''}">${state.connected ? '검증됨' : '연결 안 됨'}</span></div>
-      ${state.connected ? `<p class="ctfd-connection-meta"><strong>${esc(state.url)}</strong><small>${state.auth_type === 'password' ? '아이디·비밀번호' : 'API 토큰'}</small></p>` : '<p class="form-hint">제출 계정을 연결하세요.</p>'}
+  return `<div class="section-head"><h3>작업공간 연결</h3><span class="connection-state ${state.connected ? 'connected' : ''}">${state.connected ? '검증됨' : '연결 안 됨'}</span></div>
+      ${state.connected ? `<p class="ctfd-connection-meta"><strong>${esc(state.url)}</strong><small>${state.auth_type === 'password' ? '아이디·비밀번호' : 'API 토큰'}</small></p>` : '<p class="form-hint">CTFd 연결을 저장하세요.</p>'}
       <div class="ctfd-submit-toggle-row"><label class="ctfd-submit-toggle"><input id="ctfd-auto-submit-toggle" type="checkbox" data-saved="${Boolean(state.auto_submit)}" aria-describedby="ctfd-auto-submit-help" ${state.auto_submit ? 'checked' : ''} ${state.connected ? '' : 'disabled'}><span>Flag 자동 제출</span></label></div>
       <p id="ctfd-auto-submit-help" class="notice ctfd-submit-help ${state.auto_submit ? '' : 'muted'}">기본 OFF · CTFd 오답 패널티가 적용될 수 있습니다.</p>
       ${state.connected ? '<div class="ctfd-submit-actions"><button type="button" class="small danger ghost" data-action="disconnect-ctfd-submit">연결 해제</button></div>' : ''}`;
@@ -2773,7 +2820,7 @@ async function ctfdSubmitAction(task) {
       modal.removeAttribute('aria-busy');
       if (scope.state) {
         modal.querySelector('#ctfd-connection-state').innerHTML = ctfdConnectionState(scope.state);
-        modal.querySelector('#ctfd-connection-summary').textContent = scope.state.connected ? '연결 바꾸기' : '제출 계정 연결';
+        modal.querySelector('#ctfd-connection-summary').textContent = scope.state.connected ? '연결 바꾸기' : 'CTFd 연결';
       }
       if (scope.history) modal.querySelector('#ctfd-submission-history').innerHTML = ctfdSubmissionRows(scope.history);
       if (scope.saved) scope.form.dataset.initial = formSnapshot(scope.form);
@@ -2806,12 +2853,12 @@ async function toggleCTFdSubmit(input) {
 
 async function disconnectCTFdSubmit() {
   await ctfdSubmitAction(async scope => {
-    if (!confirm('저장된 제출용 인증과 대기 중인 자동 제출을 해제할까요?')) return;
+    if (!confirm('저장된 CTFd 연결을 해제할까요? 가져오기와 자동 제출에 더 이상 사용되지 않습니다.')) return;
     scope.state = await api(`/api/workspaces/${scope.workspaceId}/ctfd/connection`,{method:'DELETE'});
     if (ctfdSubmitCurrent(scope)) {
       modal.querySelector('#ctfd-connection-details').open = true;
       scope.focusSelector = 'input[name="url"]';
-      toast('CTFd 제출 연결을 해제했습니다.');
+      toast('CTFd 연결을 해제했습니다.');
     }
   });
 }
@@ -2828,7 +2875,7 @@ async function saveCTFdSubmitConnection(form, body) {
     form.querySelector('input[name="url"]').value = scope.state.url || body.url;
     scope.saved = true; scope.focusSelector = '#ctfd-auto-submit-toggle';
     modal.querySelector('#ctfd-connection-details').open = false;
-    toast('CTFd 제출 계정을 검증해 저장했습니다. 자동 제출은 직접 켜야 합니다.');
+    toast('CTFd 연결을 저장했습니다. 자동 제출은 직접 켜야 합니다.');
   });
 }
 
@@ -2841,10 +2888,10 @@ async function ctfdSubmitSettings() {
   ]);
   if (ticket !== ctfdSubmitRendering || generation !== modalRendering || page !== rendering || hash !== location.hash || currentWorkspace?.id !== workspaceId) return;
   const authType = state.auth_type === 'password' ? 'password' : 'token';
-  openModal('CTFd 자동 제출', '', `<div class="ctfd-submit-panel">
+  openModal('CTFd 연결·자동 제출', '', `<div class="ctfd-submit-panel">
     <section id="ctfd-connection-state" class="ctfd-connection-state">${ctfdConnectionState(state)}</section>
     <div class="divider"></div>
-    <details id="ctfd-connection-details" class="ctfd-submit-connection-details" ${state.connected ? '' : 'open'}><summary id="ctfd-connection-summary">${state.connected ? '연결 바꾸기' : '제출 계정 연결'}</summary>
+    <details id="ctfd-connection-details" class="ctfd-submit-connection-details" ${state.connected ? '' : 'open'}><summary id="ctfd-connection-summary">${state.connected ? '연결 바꾸기' : 'CTFd 연결'}</summary>
       <form id="ctfd-submit-connection-form">
         <label>CTFd 사이트 주소<input name="url" inputmode="url" value="${esc(state.url || '')}" placeholder="ctf.example.com" required><span class="form-hint">https://를 생략하면 자동으로 붙입니다.</span></label>
         <label>인증 방식<select id="ctfd-submit-auth-type" name="auth_type"><option value="token" ${authType === 'token' ? 'selected' : ''}>API 토큰</option><option value="password" ${authType === 'password' ? 'selected' : ''}>아이디와 비밀번호</option></select></label>
@@ -3129,7 +3176,7 @@ async function retryCTFdJob(button) {
     return;
   }
   ctfdRetryId = button.dataset.id;
-  importForm();
+  return importForm();
 }
 
 async function freshCTFdRefreshFromJob(button) {
@@ -3159,6 +3206,10 @@ document.addEventListener('click', event => {
     'close-solver-console': () => solverConsoleDialog?.close(),
     'open-solver-accounts': () => openSolverAccounts(),
     'new-workspace': () => workspaceForm(), 'edit-workspace': () => workspaceForm(true),
+    'workspace-ctfd-connection': () => {
+      if (formDirty()) throw new Error('작업공간 변경사항을 먼저 저장하세요.');
+      return ctfdSubmitSettings();
+    },
     'new-challenge': () => challengeForm(), 'edit-challenge': async () => { const c = currentChallenge; await saveNotes(true); if (currentChallenge === c && currentWorkspace?.id === c.workspace_id) challengeForm(true); },
     'clone-challenge': () => cloneChallenge(),
     'add-relation': () => changeRelation(),
@@ -3207,7 +3258,7 @@ document.addEventListener('click', event => {
     'delete-challenge': async () => { const c = currentChallenge; if (!confirm(`“${c.name}” 문제와 첨부파일, 노트를 삭제할까요? 되돌릴 수 없습니다.`)) return; await api(path(c.id,c.workspace_id),{method:'DELETE'}); noteDrafts.delete(noteKey(c)); if (currentChallenge === c) { stopSolverPolling(); detail.close(); } await refreshChallenges(); toast('문제를 삭제했습니다.'); },
     'delete-workspace': async () => { const w = currentWorkspace; if (!confirm(`“${w.name}” 작업공간의 모든 문제와 자료를 삭제할까요? 되돌릴 수 없습니다.`)) return; await api(`/api/workspaces/${w.id}`,{method:'DELETE'}); if (currentWorkspace?.id === w.id) { modal.close(); location.hash = ''; } toast('작업공간을 삭제했습니다.'); },
     'delete-attachment': async () => { const c = currentChallenge; if (!confirm('첨부파일을 삭제할까요?')) return; await saveNotes(true); await api(`${path(c.id,c.workspace_id)}/attachments/${button.dataset.id}`,{method:'DELETE'}); if (currentChallenge === c) await openChallenge(c.id); },
-    'ctfd-import': () => { ctfdRetryId = null; importForm(); },
+    'ctfd-import': () => { ctfdRetryId = null; return importForm(); },
     'ctfd-sync': () => previewCTFdSync(),
     'ctfd-sync-retry': () => previewCTFdSync(),
     'refresh-ctfd-challenge': () => refreshCTFdChallenge(),
@@ -3289,8 +3340,15 @@ document.addEventListener('submit', event => {
     else if (form.id === 'solver-guidance-form') { await sendSolverGuidance(body.message); }
     else if (form.id === 'solver-console-guidance-form') { await sendSolverGuidance(body.message,body.requested_delivery || 'next_turn'); }
     else if (form.id === 'ctfd-preview-form') {
-      if (!body.token) delete body.token;
-      body.url = body.url.trim(); if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(body.url)) body.url = `https://${body.url}`;
+      const saved = body.connection_mode === 'saved';
+      delete body.connection_mode;
+      if (saved) {
+        for (const key of ['url','auth_type','token','username','password']) delete body[key];
+        body.use_saved_connection = true;
+      } else {
+        if (!body.token) delete body.token;
+        body.url = body.url.trim(); if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(body.url)) body.url = `https://${body.url}`;
+      }
       const result = await api(`/api/workspaces/${currentWorkspace.id}/ctfd/preview`,{method:'POST',body}); form.reset(); showImportPreview(result,body);
     } else if (form.id === 'ctfd-import-form') {
       const ids = data.getAll('challenge').map(Number); if (!ids.length) throw new Error('가져올 문제를 선택하세요.');
@@ -3374,6 +3432,7 @@ document.addEventListener('change', event => {
       fields.querySelectorAll('input').forEach(node => { node.disabled = !enabled; node.required = enabled; if (!enabled) node.value = ''; });
     }
   }
+  if (input.id === 'ctfd-import-source') syncCTFdImportSource(input.closest('form'));
   if (input.id === 'ctfd-refresh-auth-type') {
     for (const [id,type] of [['ctfd-refresh-token-fields','token'],['ctfd-refresh-password-fields','password']]) {
       const fields = document.getElementById(id), enabled = input.value === type;
