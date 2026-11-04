@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import contextlib
 import concurrent.futures
+import errno
 import hashlib
 import inspect
 import json
+import logging
+import math
 import os
 import platform
 import re
@@ -57,6 +60,7 @@ from .solver_retry import (
 from .storage_budget import MAX_SQLITE_INTEGER, StorageBudget, StorageBudgetError
 from .solver_time import continuation_elapsed, continuation_start
 from .writeups import merge_generated_writeup, remove_generated_writeup
+from .writeup_publication import contains_internal_operation
 
 
 _ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -67,6 +71,10 @@ _ACTIVITY_HANDOFF_MAX_BYTES = 12 * 1024
 _ACTIVITY_HANDOFF_MAX_EVENTS = 96
 _ACTIVITY_HANDOFF_MAX_ITEMS = 24
 _ACTIVITY_HANDOFF_API_KEY = re.compile(r"(?i)\bsk-(?:ant|proj)-[A-Za-z0-9_-]{12,}")
+_SHARED_EVIDENCE_SECRET = re.compile(
+    r"(?i)\b(?:ctfd_[0-9a-f]{32,}|gh[pousr]_[A-Za-z0-9_]{20,}|"
+    r"sk-(?:ant|proj)-[A-Za-z0-9_-]{12,})\b"
+)
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _OPEN_STATUSES = (
     "queued",
@@ -163,6 +171,7 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
     last_event_sequence INTEGER NOT NULL DEFAULT 0,
     agents_json TEXT NOT NULL DEFAULT '[]',
+    context_usage_json TEXT NOT NULL DEFAULT '{}',
     released_ingested INTEGER NOT NULL DEFAULT 0 CHECK(released_ingested IN (0,1)),
     flag TEXT,
     writeup_markdown TEXT,
@@ -186,6 +195,12 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     writeup_hooked INTEGER NOT NULL DEFAULT 0 CHECK(writeup_hooked IN (0,1)),
     worker_instance_id TEXT,
     created_at REAL NOT NULL,
+    claimed_at REAL,
+    staged_at REAL,
+    running_at REAL,
+    first_activity_at REAL,
+    flag_at REAL,
+    writeup_at REAL,
     updated_at REAL NOT NULL,
     released_at REAL
 );
@@ -299,6 +314,79 @@ class ExchangeError(RuntimeError):
             "category": self.category,
             "retryable": self.retryable,
         }
+
+
+def _unsafe_writeup_error() -> dict[str, Any]:
+    return ExchangeError(
+        "writeup_publication_unsafe",
+        "Write-up contains a service-only operation. The Flag is preserved; revise the write-up and retry.",
+        category="output",
+        retryable=True,
+    ).public(stage="writeup")
+
+
+_STORAGE_LOG = logging.getLogger(__name__)
+
+
+def _volume_diagnostic(path: Path) -> dict[str, int | None]:
+    """Sample one volume without logging paths or challenge contents."""
+
+    try:
+        usage = shutil.disk_usage(path)
+        return {
+            "free_bytes": int(usage.free),
+            "total_bytes": int(usage.total),
+            "mount_device": int(path.stat().st_dev),
+        }
+    except OSError as exc:
+        return {"probe_errno": exc.errno}
+
+
+def _log_stage_storage_failure(exc: BaseException, data_dir: Path, database_path: Path) -> None:
+    details = getattr(exc, "diagnostics", {})
+    safe_details = {
+        key: value for key, value in details.items()
+        if key in {"observed_at_ns", "mount_device", "reserved_bytes", "requested_bytes",
+                   "projected_reserved_bytes", "minimum_free_bytes", "free_bytes", "errno"}
+        and (value is None or type(value) is int)
+    } if isinstance(details, Mapping) else {}
+    _STORAGE_LOG.warning(
+        "solver_stage_storage_failure code=%s budget=%s data=%s database=%s",
+        getattr(exc, "code", type(exc).__name__), safe_details,
+        _volume_diagnostic(data_dir), _volume_diagnostic(database_path.parent),
+    )
+
+
+def _stage_budget_error(exc: StorageBudgetError) -> ExchangeError:
+    code = exc.code
+    cases = {
+        "insufficient_space": ("insufficient_solver_storage", "풀이 작업 공간이 부족합니다. 파일은 보존했습니다.", True),
+        "write_enospc": ("solver_storage_write_enospc", "풀이 파일 기록 중 저장 공간이 부족해졌습니다. 파일을 확인한 뒤 다시 시도하세요.", True),
+        "lock_unavailable": ("solver_storage_lock_unavailable", "저장 공간 잠금을 사용할 수 없습니다. 마운트와 권한을 확인하세요.", True),
+        "free_check_failed": ("solver_storage_probe_failed", "저장 공간 상태를 조회하지 못했습니다. 마운트를 확인하세요.", True),
+        "write_permission": ("solver_storage_permission", "풀이 파일을 기록할 권한이 없습니다. 저장 경로 권한을 확인하세요.", True),
+        "reservation_missing": ("solver_storage_reservation_invalid", "풀이 파일 예약을 찾지 못했습니다. 작업 상태를 확인하세요.", False),
+        "reservation_mismatch": ("solver_storage_reservation_invalid", "풀이 파일 예약 범위가 일치하지 않습니다.", False),
+        "reservation_changed": ("solver_storage_reservation_invalid", "풀이 파일 예약이 쓰기 중 변경됐습니다.", False),
+        "state_changed": ("solver_storage_state_changed", "풀이 파일 상태가 쓰기 중 변경됐습니다.", False),
+    }
+    public_code, message, retryable = cases.get(
+        code, ("stage_storage_failed", "풀이 파일 저장 상태를 확인하지 못했습니다.", True)
+    )
+    return ExchangeError(public_code, message, category="storage", retryable=retryable)
+
+
+def _stage_io_error(exc: OSError | sqlite3.Error) -> ExchangeError:
+    code = getattr(exc, "sqlite_errorname", "")
+    if isinstance(exc, OSError) and exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+        return ExchangeError("solver_storage_write_enospc", "풀이 파일을 기록할 공간이 부족합니다.", category="storage", retryable=True)
+    if isinstance(exc, OSError) and exc.errno in {errno.EACCES, errno.EPERM}:
+        return ExchangeError("solver_storage_permission", "풀이 파일을 기록할 권한이 없습니다.", category="storage", retryable=True)
+    if code == "SQLITE_FULL":
+        return ExchangeError("solver_database_full", "풀이 데이터베이스 공간이 부족합니다.", category="storage", retryable=True)
+    if code in {"SQLITE_BUSY", "SQLITE_LOCKED"}:
+        return ExchangeError("solver_database_busy", "풀이 데이터베이스가 잠겨 있습니다.", category="storage", retryable=True)
+    return ExchangeError("stage_storage_failed", "풀이 작업 파일 또는 데이터베이스를 준비하지 못했습니다.", retryable=True)
 
 
 def normalize_writeup_refinement_instruction(value: str | None) -> str:
@@ -479,6 +567,7 @@ def _activity_checkpoint_summary(db: sqlite3.Connection, job_id: str) -> str:
     )
     budget = _ACTIVITY_HANDOFF_MAX_BYTES - len(heading.encode("utf-8"))
     selected: list[str] = []
+    child_items = 0
     rows = db.execute(
         """SELECT event_json FROM solver_job_events
            WHERE job_id=? AND kind='activity'
@@ -490,7 +579,15 @@ def _activity_checkpoint_summary(db: sqlite3.Connection, job_id: str) -> str:
             event = json.loads(row[0])
         except (TypeError, ValueError):
             continue
-        if not isinstance(event, dict) or event.get("agent_id", "root") != "root":
+        if not isinstance(event, dict):
+            continue
+        agent_id = event.get("agent_id", "root")
+        if not isinstance(agent_id, str) or not _AGENT_ID.fullmatch(agent_id):
+            continue
+        if agent_id != "root" and child_items >= 8:
+            # Preserve root observations even when an Ultra solve generated
+            # many child events. A bounded sample of child work still survives
+            # when native provider history cannot be resumed.
             continue
         phase, tool = event.get("phase"), event.get("tool")
         if phase == "completed" and tool == "analysis":
@@ -506,15 +603,140 @@ def _activity_checkpoint_summary(db: sqlite3.Connection, job_id: str) -> str:
             continue
         clean = _ACTIVITY_HANDOFF_API_KEY.sub("[redacted API key]", clean)
         quoted = clean.replace("\n", "\n  ")
+        if agent_id != "root":
+            label = f"Subagent {agent_id} {label}"
         item = f"\n- {label}: {quoted}"
         size = len(item.encode("utf-8"))
         if size > budget:
             continue
         selected.append(item)
         budget -= size
+        if agent_id != "root":
+            child_items += 1
         if len(selected) >= _ACTIVITY_HANDOFF_MAX_ITEMS:
             break
     return heading + "".join(reversed(selected)) if selected else ""
+
+
+def _related_evidence_context(
+    db: sqlite3.Connection, owner_user_id: str, workspace_id: str,
+    target_challenge_id: str,
+) -> str:
+    """Stage only explicit, current, owner-scoped evidence from linked solves.
+
+    A relation is navigation, not permission to copy another challenge's raw
+    notes, description or write-up. The user verifies each observation for this
+    specific target; a changed source invalidates that verification. Flags
+    require both an explicit opt-in and a matching accepted agent solve.
+    """
+
+    rows = db.execute(
+        """SELECT s.source_challenge_id,s.observation,s.include_flag,
+                  s.verified_at,c.name,c.category,c.flag,c.completion_source
+             FROM challenge_evidence_shares s
+             JOIN challenges c ON c.id=s.source_challenge_id
+                AND c.workspace_id=s.workspace_id
+             JOIN workspaces w ON w.id=s.workspace_id
+            WHERE s.workspace_id=? AND s.target_challenge_id=?
+              AND w.owner_user_id=? AND c.status='solved'
+              AND s.reapproval_required=0
+              AND c.updated_at=s.source_updated_at
+              AND EXISTS (
+                  SELECT 1 FROM challenge_relations r
+                   WHERE r.workspace_id=s.workspace_id
+                     AND (
+                         (r.prerequisite_id=s.target_challenge_id
+                          AND r.dependent_id=s.source_challenge_id)
+                         OR (r.dependent_id=s.target_challenge_id
+                             AND r.prerequisite_id=s.source_challenge_id)
+                     )
+              )
+            ORDER BY s.verified_at,s.source_challenge_id LIMIT 24""",
+        (workspace_id, target_challenge_id, owner_user_id),
+    ).fetchall()
+    evidence: list[dict[str, Any]] = []
+    for row in rows:
+        raw_observation = row["observation"]
+        observation = (
+            _safe_activity_text(raw_observation, 2400)
+            if isinstance(raw_observation, str)
+            and len(raw_observation) <= 1200
+            and not _CONTROL.search(raw_observation)
+            else None
+        )
+        if observation:
+            observation = _SHARED_EVIDENCE_SECRET.sub("[redacted credential]", observation)
+        flag = None
+        candidate = row["flag"]
+        if (
+            row["include_flag"] == 1
+            and row["completion_source"] == "agent"
+            and isinstance(candidate, str)
+            and 0 < len(candidate) <= 4000
+            and "\n" not in candidate and "\r" not in candidate
+            and not _CONTROL.search(candidate)
+            and db.execute(
+                """SELECT 1 FROM solver_jobs
+                    WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?
+                      AND job_mode='solve' AND released_ingested=1
+                      AND flag_rejected_at IS NULL AND flag=?
+                    LIMIT 1""",
+                (owner_user_id, workspace_id, row["source_challenge_id"], candidate),
+            ).fetchone()
+        ):
+            flag = candidate
+        if not observation and not flag:
+            continue
+        source_name = _safe_activity_text(row["name"], 256) or "Linked challenge"
+        source_category = _safe_activity_text(row["category"], 80) or ""
+        item: dict[str, Any] = {
+            "source_id": row["source_challenge_id"],
+            "source_name": source_name,
+            "source_category": source_category,
+            "provenance": {"kind": "user_verified", "verified_at": row["verified_at"]},
+        }
+        if observation:
+            item["observation"] = observation
+        if flag:
+            item["flag"] = flag
+            item["flag_provenance"] = "agent_accepted"
+        evidence.append(item)
+        if len(evidence) >= 6:
+            break
+    while evidence:
+        encoded = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) <= 32_768:
+            return encoded
+        evidence.pop()
+    return ""
+
+
+def _matching_provider_runtime(
+    source: sqlite3.Row,
+    provider: str,
+    *,
+    codex_version: str,
+    codex_runtime_sha256: str | None,
+    claude_version: str,
+    claude_runtime_sha256: str | None,
+) -> bool:
+    """Only the CLI that owns a session can invalidate its native resume.
+
+    Jobs record both runtimes for audit, but an update to the unused CLI
+    must not turn a compatible retry into a workspace-only handoff.
+    """
+
+    if provider == "codex":
+        return (
+            source["codex_version"] == codex_version
+            and source["codex_runtime_sha256"] == codex_runtime_sha256
+        )
+    if provider == "claude":
+        return (
+            source["claude_version"] == claude_version
+            and source["claude_runtime_sha256"] == claude_runtime_sha256
+        )
+    return False
 
 
 class SolverExchangeCoordinator:
@@ -586,8 +808,18 @@ class SolverExchangeCoordinator:
         with self._connect() as db:
             db.executescript(SCHEMA)
             columns = {row[1] for row in db.execute("PRAGMA table_info(solver_jobs)")}
+            # These are coordinator-observed milestones. Historical jobs keep
+            # NULL rather than fabricating timings from mutable updated_at.
+            for timing_column in (
+                "claimed_at", "staged_at", "running_at", "first_activity_at",
+                "flag_at", "writeup_at",
+            ):
+                if timing_column not in columns:
+                    db.execute(f"ALTER TABLE solver_jobs ADD COLUMN {timing_column} REAL")
             if "agents_json" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN agents_json TEXT NOT NULL DEFAULT '[]'")
+            if "context_usage_json" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN context_usage_json TEXT NOT NULL DEFAULT '{}'")
             if "ultra_escalation_mode" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN ultra_escalation_mode TEXT NOT NULL DEFAULT 'off' CHECK(ultra_escalation_mode IN ('off','ask','auto'))")
             if "ultra_source_job_id" not in columns:
@@ -1380,11 +1612,12 @@ class SolverExchangeCoordinator:
                         )
                         if saved_exact or saved_remote:
                             continuation_source_job_id = saved["source_job_id"]
-                            runtime_match = (
-                                source["codex_version"] == codex_version
-                                and source["codex_runtime_sha256"] == codex_runtime_sha256
-                                and source["claude_version"] == claude_version
-                                and source["claude_runtime_sha256"] == claude_runtime_sha256
+                            runtime_match = _matching_provider_runtime(
+                                source, configuration.provider,
+                                codex_version=codex_version,
+                                codex_runtime_sha256=codex_runtime_sha256,
+                                claude_version=claude_version,
+                                claude_runtime_sha256=claude_runtime_sha256,
                             )
                             exact_configuration = (
                                 source["account_id"] == selected.account_id
@@ -1550,7 +1783,14 @@ class SolverExchangeCoordinator:
             row = db.execute(
                 """SELECT j.*,cp.checkpoint_json AS current_retry_checkpoint_json,
                           cp.source_job_id AS current_retry_source_job_id,
-                          next.id AS ultra_started_job_id
+                          next.id AS ultra_started_job_id,
+                          (SELECT recent.id FROM solver_jobs recent
+                            WHERE recent.owner_user_id=j.owner_user_id
+                              AND recent.workspace_id=j.workspace_id
+                              AND recent.challenge_id=j.challenge_id
+                              AND recent.job_mode='solve'
+                            ORDER BY recent.created_at DESC,recent.id DESC LIMIT 1)
+                            AS latest_solve_job_id
                    FROM solver_jobs j
                    LEFT JOIN solver_retry_checkpoints cp
                      ON cp.challenge_id=j.challenge_id
@@ -1563,13 +1803,24 @@ class SolverExchangeCoordinator:
             ).fetchone()
             if not row:
                 raise ExchangeError("job_not_found", "풀이 작업을 찾을 수 없습니다.")
-            events = [
-                _optional_json(item["event_json"])
-                for item in db.execute(
-                    "SELECT event_json FROM solver_job_events WHERE job_id=? AND sequence>? ORDER BY sequence LIMIT ?",
-                    (job_id, after, limit),
+            # The private provenance ledger can contain many more entries than
+            # the sampled public activity stream. Do not spend the public page
+            # limit on hidden rows or make the UI poll through empty pages.
+            event_rows = db.execute(
+                """SELECT sequence,event_json FROM solver_job_events
+                   WHERE job_id=? AND sequence>? AND kind!='activity_evidence'
+                   ORDER BY sequence LIMIT ?""",
+                (job_id, after, limit),
+            ).fetchall()
+            events = [_optional_json(item["event_json"]) for item in event_rows]
+            event_cursor = (
+                event_rows[-1]["sequence"] if len(event_rows) == limit
+                else max(
+                    after,
+                    int(row["last_event_sequence"]),
+                    event_rows[-1]["sequence"] if event_rows else after,
                 )
-            ]
+            )
             guidance = [
                 _public_guidance(item)
                 for item in db.execute(
@@ -1592,6 +1843,7 @@ class SolverExchangeCoordinator:
             solve_clock = continuation_elapsed(db, row)
             input_ready_to_retry = remote_input_ready_to_retry(db, row)
         result = _public_job(row, events, position, guidance=guidance)
+        result["event_cursor"] = event_cursor
         result["input_ready_to_retry"] = input_ready_to_retry
         if elapsed_origin is not None:
             result["continuation_started_at"] = elapsed_origin[0]
@@ -1659,11 +1911,27 @@ class SolverExchangeCoordinator:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                """SELECT j.id,j.owner_user_id,j.error_json FROM solver_jobs j
-                   WHERE j.job_mode='solve' AND j.status='needs_input'
+                """SELECT j.id,j.owner_user_id,j.error_json,cp.checkpoint_json
+                   FROM solver_jobs j
+                   JOIN solver_retry_checkpoints cp
+                     ON cp.owner_user_id=j.owner_user_id
+                    AND cp.workspace_id=j.workspace_id
+                    AND cp.challenge_id=j.challenge_id
+                    AND cp.source_job_id=j.id
+                   WHERE j.job_mode='solve' AND j.provider='codex'
+                     AND j.flag IS NULL AND j.status='needs_input'
                      AND j.released_ingested=1 AND j.ultra_escalation_mode='auto'
                      AND j.ultra_auto_attempted=0
                      AND NOT EXISTS(SELECT 1 FROM solver_jobs child WHERE child.ultra_source_job_id=j.id)
+                     AND NOT EXISTS(
+                         SELECT 1 FROM solver_jobs recent
+                          WHERE recent.owner_user_id=j.owner_user_id
+                            AND recent.workspace_id=j.workspace_id
+                            AND recent.challenge_id=j.challenge_id
+                            AND recent.job_mode='solve'
+                            AND (recent.created_at>j.created_at
+                                 OR (recent.created_at=j.created_at AND recent.id>j.id))
+                     )
                    ORDER BY j.created_at,j.id LIMIT ?""",
                 (max(1, min(limit, 20)),),
             ).fetchall()
@@ -1673,7 +1941,13 @@ class SolverExchangeCoordinator:
                     (row["id"],),
                 )
                 error = _optional_json(row["error_json"])
-                if error.get("code") == "ultra_escalation_requested":
+                try:
+                    checkpoint = decode_checkpoint(row["checkpoint_json"])
+                except (TypeError, ValueError):
+                    checkpoint = None
+                if (error.get("code") == "ultra_escalation_requested"
+                        and checkpoint is not None
+                        and checkpoint.reason == "ultra_escalation"):
                     claimed.append((row["id"], row["owner_user_id"]))
         return claimed
 
@@ -2425,16 +2699,13 @@ class SolverExchangeCoordinator:
                 self._fail_staging(job["id"], "cancelled", None)
             except ExchangeError as exc:
                 self._fail_staging(job["id"], "refused", exc.public(stage="staging"))
-            except StorageBudgetError:
-                error = ExchangeError(
-                    "insufficient_solver_storage",
-                    "격리 복사본을 만들 저장 공간이 부족합니다. 원본 파일은 보존되었습니다.",
-                    category="storage",
-                    retryable=True,
-                )
+            except StorageBudgetError as exc:
+                _log_stage_storage_failure(exc, self.data_dir, self.database_path)
+                error = _stage_budget_error(exc)
                 self._fail_staging(job["id"], "failed", error.public(stage="staging"))
-            except (OSError, sqlite3.Error):
-                error = ExchangeError("stage_storage_failed", "문제 파일을 격리 worker에 준비하지 못했습니다.", retryable=True)
+            except (OSError, sqlite3.Error) as exc:
+                _log_stage_storage_failure(exc, self.data_dir, self.database_path)
+                error = _stage_io_error(exc)
                 self._fail_staging(job["id"], "failed", error.public(stage="staging"))
             else:
                 self.last_block = None
@@ -2555,11 +2826,11 @@ class SolverExchangeCoordinator:
                 (row["owner_user_id"], timestamp),
             )
             db.execute(
-                """UPDATE solver_jobs SET status='staging',
+                """UPDATE solver_jobs SET status='staging',claimed_at=COALESCE(claimed_at,?),
                        previous_challenge_status=COALESCE(previous_challenge_status,?),
                        worker_instance_id=?,updated_at=?
                    WHERE id=?""",
-                (challenge["status"], worker_instance_id, timestamp, row["id"]),
+                (timestamp, challenge["status"], worker_instance_id, timestamp, row["id"]),
             )
             if row["job_mode"] == "solve":
                 db.execute(
@@ -2598,18 +2869,13 @@ class SolverExchangeCoordinator:
                     self.last_block = exc.public(stage="staging")
                     return False
                 self._fail_staging(job["id"], "refused", exc.public(stage="staging"))
-            except StorageBudgetError:
-                self.last_block = ExchangeError(
-                    "insufficient_solver_storage",
-                    "격리 복사본을 만들 저장 공간이 부족합니다. 원본 파일은 보존되었습니다.",
-                    category="storage",
-                    retryable=True,
-                ).public(stage="staging")
+            except StorageBudgetError as exc:
+                _log_stage_storage_failure(exc, self.data_dir, self.database_path)
+                self.last_block = _stage_budget_error(exc).public(stage="staging")
                 return False
-            except (OSError, sqlite3.Error):
-                self.last_block = ExchangeError(
-                    "stage_storage_failed", "문제 파일을 격리 worker에 준비하지 못했습니다.", retryable=True
-                ).public(stage="staging")
+            except (OSError, sqlite3.Error) as exc:
+                _log_stage_storage_failure(exc, self.data_dir, self.database_path)
+                self.last_block = _stage_io_error(exc).public(stage="staging")
                 return False
             return True
         manifest = _read_json_file(active / "manifest.json", 512 * 1024)
@@ -3252,8 +3518,8 @@ class SolverExchangeCoordinator:
                     reservation, "solver", job["owner_user_id"], job["workspace_id"],
                     job["challenge_id"], total, prepare=prepare_stage,
                 )
-            except StorageBudgetError:
-                if continuation is None:
+            except StorageBudgetError as exc:
+                if continuation is None or exc.code != "insufficient_space":
                     raise
                 continuation = None
                 total -= continuation_bytes
@@ -3415,10 +3681,12 @@ class SolverExchangeCoordinator:
                 raise _StageCancelled
             os.replace(staging, active)
             _fsync(self.exchange)
+            staged_at = self.clock()
             with self._connect() as db:
                 db.execute(
-                    "UPDATE solver_jobs SET status='staging',worker_instance_id=?,updated_at=? WHERE id=?",
-                    (worker_instance_id, self.clock(), job["id"]),
+                    """UPDATE solver_jobs SET status='staging',worker_instance_id=?,
+                       staged_at=COALESCE(staged_at,?),updated_at=? WHERE id=?""",
+                    (worker_instance_id, staged_at, staged_at, job["id"]),
                 )
             # Directory metadata and temporary rename headroom remain reserved
             # until the complete active tree and database slot are durable.
@@ -3460,34 +3728,9 @@ class SolverExchangeCoordinator:
             )
             related_context = ""
             if job["job_mode"] == "solve":
-                related_rows = db.execute(
-                    """SELECT c.id,c.name,c.category,c.description,c.completion_source,c.flag,c.notes,w.markdown
-                         FROM challenge_relations r
-                         JOIN challenges c ON c.id=CASE WHEN r.prerequisite_id=?
-                             THEN r.dependent_id ELSE r.prerequisite_id END
-                             AND c.workspace_id=r.workspace_id
-                         LEFT JOIN challenge_writeups w ON w.challenge_id=c.id
-                        WHERE r.workspace_id=? AND (r.prerequisite_id=? OR r.dependent_id=?)
-                          AND c.status='solved'
-                        ORDER BY r.created_at,c.id LIMIT 6""",
-                    (job["challenge_id"], job["workspace_id"],
-                     job["challenge_id"], job["challenge_id"]),
-                ).fetchall()
-                if related_rows:
-                    related_data = [
-                        {"id": row["id"], "name": row["name"], "completion_source": row["completion_source"],
-                         "category": row["category"], "description": (row["description"] or "")[:1200],
-                         "flag": row["flag"], "notes": (row["notes"] or "")[:1800],
-                         "writeup": (row["markdown"] or "")[:1800]}
-                        for row in related_rows
-                    ]
-                    while related_data:
-                        related_context = json.dumps(related_data, ensure_ascii=False)
-                        if len(related_context.encode("utf-8")) <= 32_768:
-                            break
-                        related_data.pop()
-                    if not related_data:
-                        related_context = ""
+                related_context = _related_evidence_context(
+                    db, job["owner_user_id"], job["workspace_id"], job["challenge_id"],
+                )
             current_input_sha256 = _challenge_input_sha256(
                 db,
                 job["owner_user_id"],
@@ -3818,7 +4061,7 @@ class SolverExchangeCoordinator:
             current = db.execute("SELECT * FROM solver_jobs WHERE id=?", (job["id"],)).fetchone()
             if not current or event["sequence"] != current["last_event_sequence"] + 1:
                 return
-            if event["kind"] == "activity" and event.get("agent_id") not in (None, "root"):
+            if event["kind"] in {"activity", "activity_evidence", "context_usage"} and event.get("agent_id") not in (None, "root"):
                 agents = _agent_nodes(current["agents_json"])
                 if not any(agent.get("id") == event["agent_id"] for agent in agents):
                     raise ExchangeError(
@@ -3836,7 +4079,45 @@ class SolverExchangeCoordinator:
             )
             stored_event = event
             refinement_error = None
-            if is_refinement and event["kind"] in {"flag", "writeup"}:
+            prior_writeup_error = _optional_json(current["error_json"])
+            publication_error = (
+                _unsafe_writeup_error()
+                if event["kind"] == "writeup"
+                and (
+                    contains_internal_operation(event["writeup_markdown"])
+                    or isinstance(prior_writeup_error, dict)
+                    and prior_writeup_error.get("code") == "writeup_publication_unsafe"
+                )
+                else None
+            )
+            release_publication_error = (
+                _unsafe_writeup_error()
+                if event["kind"] == "released"
+                and contains_internal_operation(event.get("writeup_markdown"))
+                else None
+            )
+            if publication_error is not None:
+                # A worker result is untrusted even when its local validator
+                # accepted it. Never persist the raw Markdown in the event log.
+                stored_event = {
+                    "protocol": event["protocol"],
+                    "job_id": event["job_id"],
+                    "sequence": event["sequence"],
+                    "kind": "error",
+                    "error": publication_error,
+                    "terminal": False,
+                    "created_at": event["created_at"],
+                }
+            elif release_publication_error is not None:
+                # The release can repeat a candidate even when the earlier
+                # write-up event was rejected. Keep the durable event clean.
+                stored_event = {
+                    **event,
+                    "status": "failed",
+                    "error": release_publication_error,
+                }
+                stored_event.pop("writeup_markdown", None)
+            if is_refinement and publication_error is None and event["kind"] in {"flag", "writeup"}:
                 if event["kind"] == "flag":
                     refinement_error = ExchangeError(
                         "writeup_refinement_flag_event",
@@ -3868,6 +4149,7 @@ class SolverExchangeCoordinator:
                     output_valid = bool(
                         challenge
                         and isinstance(current["flag"], str)
+                        and not contains_internal_operation(event["writeup_markdown"])
                         and valid_writeup(
                             event["writeup_markdown"], challenge["name"], current["flag"], current["writeup_locale"]
                         )
@@ -3895,7 +4177,7 @@ class SolverExchangeCoordinator:
                         "terminal": False,
                         "created_at": event["created_at"],
                     }
-            if manual_override and event["kind"] == "writeup" and refinement_error is None:
+            if manual_override and event["kind"] == "writeup" and refinement_error is None and publication_error is None:
                 stored_event = {
                     "protocol": event["protocol"],
                     "job_id": event["job_id"],
@@ -3914,10 +4196,16 @@ class SolverExchangeCoordinator:
                 return
             updates: dict[str, Any] = {"last_event_sequence": event["sequence"], "updated_at": timestamp}
             kind = event["kind"]
-            if refinement_error is not None:
+            # Only provider-originated activity is a defensible first-output
+            # proxy. Progress heartbeats and worker preparation are not model
+            # responses; the public metric is deliberately named first activity.
+            if kind in {"activity", "activity_evidence", "agent"} and current["first_activity_at"] is None:
+                updates["first_activity_at"] = timestamp
+            if refinement_error is not None or publication_error is not None:
                 updates.update(
                     error_json=json.dumps(
-                        refinement_error, ensure_ascii=False, separators=(",", ":")
+                        publication_error or refinement_error,
+                        ensure_ascii=False, separators=(",", ":")
                     ),
                     writeup_hooked=1,
                     cancel_requested=1,
@@ -3970,6 +4258,8 @@ class SolverExchangeCoordinator:
                 state = event["status"]
                 if state in {"running", "writing", "awaiting_credential"}:
                     updates["status"] = state
+                    if state == "running" and current["running_at"] is None:
+                        updates["running_at"] = timestamp
                 elif state == "interrupted":
                     updates["status"] = "awaiting_credential"
             elif kind == "flag":
@@ -3988,6 +4278,8 @@ class SolverExchangeCoordinator:
                 if manual_override:
                     updates.update(cancel_requested=1, flag_hooked=1, writeup_hooked=1)
                 else:
+                    if current["flag_at"] is None:
+                        updates["flag_at"] = timestamp
                     db.execute(
                         """UPDATE challenges SET flag=?,status='flag_found',completion_source=NULL,updated_at=?
                            WHERE id=? AND workspace_id=?""",
@@ -4007,6 +4299,8 @@ class SolverExchangeCoordinator:
                     updates.update(status="writing", cancel_requested=1, flag_hooked=1, writeup_hooked=1)
                 else:
                     updates.update(status="writing", writeup_markdown=event["writeup_markdown"])
+                    if current["writeup_at"] is None:
+                        updates["writeup_at"] = timestamp
                     writeup_timestamp = _utc_stamp(timestamp)
                     previous = db.execute(
                         "SELECT markdown FROM challenge_writeups WHERE challenge_id=?",
@@ -4048,6 +4342,16 @@ class SolverExchangeCoordinator:
             elif kind == "agent":
                 agents = _merge_agent_event(current["agents_json"], event, current["provider"])
                 updates["agents_json"] = json.dumps(agents, ensure_ascii=False, separators=(",", ":"))
+            elif kind == "context_usage":
+                if not event["source"].startswith(current["provider"] + "_"):
+                    raise ExchangeError("invalid_worker_event", "Invalid context source.", category="safety")
+                snapshots = _context_usage_snapshots(current["context_usage_json"])
+                snapshots[event["agent_id"]] = {
+                    key: event[key] for key in (
+                        "state", "source", "used_tokens", "window_tokens", "observed_at"
+                    )
+                }
+                updates["context_usage_json"] = json.dumps(snapshots, separators=(",", ":"))
             elif kind == "guidance":
                 guidance = db.execute(
                     """SELECT id,message,status FROM solver_job_guidance
@@ -4106,6 +4410,20 @@ class SolverExchangeCoordinator:
                 # Keep the challenge at flag_found while making the job itself
                 # terminal so a later retry is possible.
                 final_status = "failed" if status_value == "flag_found" else status_value
+                if (
+                    release_publication_error is not None
+                    or isinstance(prior_writeup_error, dict)
+                    and prior_writeup_error.get("code") == "writeup_publication_unsafe"
+                ):
+                    final_status = "failed"
+                    updates.update(
+                        error_json=json.dumps(
+                            release_publication_error or prior_writeup_error,
+                            ensure_ascii=False, separators=(",", ":"),
+                        ),
+                        writeup_markdown=None,
+                        writeup_hooked=1,
+                    )
                 refinement_release_error: dict[str, Any] | None = None
                 if is_refinement and status_value == "completed":
                     # A rejected write-up/flag event already recorded the
@@ -4171,6 +4489,7 @@ class SolverExchangeCoordinator:
                             release_matches
                             and challenge
                             and isinstance(current["flag"], str)
+                            and not contains_internal_operation(candidate)
                             and valid_writeup(
                                 candidate, challenge["name"], current["flag"], current["writeup_locale"]
                             )
@@ -4241,6 +4560,10 @@ class SolverExchangeCoordinator:
                     # or notify it when cancellation or a provider/auth/quota/
                     # policy failure wins the terminal outcome.
                     updates.update(writeup_markdown=None, writeup_hooked=1)
+                if is_refinement and final_status == "completed" and current["writeup_at"] is None:
+                    # Refinement publishes only after the terminal release
+                    # revalidates the source and commits the replacement.
+                    updates["writeup_at"] = timestamp
                 updates.update(status=final_status, released_ingested=1)
                 agents = _agent_nodes(current["agents_json"])
                 if agents:
@@ -4303,6 +4626,12 @@ class SolverExchangeCoordinator:
             row = db.execute("SELECT * FROM solver_jobs WHERE id=?", (job_id,)).fetchone()
         if not row:
             return False
+        if row["writeup_markdown"] and contains_internal_operation(row["writeup_markdown"]):
+            changed = self._quarantine_unsafe_writeup(job_id, row["writeup_markdown"]) or changed
+            with self._connect() as db:
+                row = db.execute("SELECT * FROM solver_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return changed
         if row["flag"] and not row["flag_hooked"]:
             candidate = row["flag"]
             if not self._invoke(
@@ -4313,7 +4642,7 @@ class SolverExchangeCoordinator:
                 candidate,
                 row["id"],
             ):
-                return False
+                return changed
             with self._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 timestamp = self.clock()
@@ -4341,6 +4670,8 @@ class SolverExchangeCoordinator:
             and not row["writeup_hooked"]
             and (row["job_mode"] != "writeup_refine" or refinement_released)
         ):
+            if contains_internal_operation(row["writeup_markdown"]):
+                return self._quarantine_unsafe_writeup(job_id, row["writeup_markdown"]) or changed
             if not self._invoke(
                 self.on_writeup_committed,
                 row["owner_user_id"],
@@ -4354,6 +4685,30 @@ class SolverExchangeCoordinator:
                 db.execute("UPDATE solver_jobs SET writeup_hooked=1,updated_at=? WHERE id=?", (self.clock(), job_id))
             changed = True
         return changed
+
+    def _quarantine_unsafe_writeup(self, job_id: str, candidate: str) -> bool:
+        """Block legacy callback replay without altering published documents."""
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM solver_jobs WHERE id=?", (job_id,)).fetchone()
+            if (
+                row is None
+                or row["writeup_markdown"] != candidate
+                or row["writeup_hooked"]
+                or not contains_internal_operation(candidate)
+            ):
+                return False
+            db.execute(
+                """UPDATE solver_jobs SET writeup_markdown=NULL,writeup_hooked=1,
+                   status=CASE WHEN status='completed' THEN 'failed' ELSE status END,
+                   error_json=?,updated_at=? WHERE id=?""",
+                (
+                    json.dumps(_unsafe_writeup_error(), ensure_ascii=False, separators=(",", ":")),
+                    self.clock(), job_id,
+                ),
+            )
+        return True
 
     @staticmethod
     def _invoke(callback: Callable[..., Any] | None, *args: Any) -> bool:
@@ -5565,6 +5920,41 @@ def _agent_nodes(raw: str) -> list[dict[str, Any]]:
     return value if all(isinstance(node, dict) for node in value) else []
 
 
+def _context_usage_snapshots(raw: str) -> dict[str, dict[str, Any]]:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(value, dict) or len(value) > _MAX_AGENT_NODES + 1:
+        return {}
+    return {
+        agent_id: snapshot for agent_id, snapshot in value.items()
+        if isinstance(agent_id, str) and _AGENT_ID.fullmatch(agent_id)
+        and isinstance(snapshot, dict)
+    }
+
+
+def _public_context_usage(raw: str, agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    snapshots = _context_usage_snapshots(raw)
+    result = []
+    for agent in agents:
+        agent_id = agent["id"]
+        snapshot = snapshots.get(agent_id, {})
+        state = snapshot.get("state", "unavailable")
+        used = snapshot.get("used_tokens") if state == "available" else None
+        window = snapshot.get("window_tokens") if state == "available" else None
+        result.append({
+            "agent_id": agent_id,
+            "state": state,
+            "source": snapshot.get("source"),
+            "used_tokens": used,
+            "window_tokens": window,
+            "percent": round(used * 100 / window, 1) if used is not None and window else None,
+            "observed_at": snapshot.get("observed_at"),
+        })
+    return result
+
+
 def _merge_agent_event(raw: str, event: dict[str, Any], provider: str) -> list[dict[str, Any]]:
     agents = _agent_nodes(raw)
     if event["provider"] != provider:
@@ -5591,6 +5981,47 @@ def _merge_agent_event(raw: str, event: dict[str, Any], provider: str) -> list[d
     return agents
 
 
+def _timing_seconds(start: object, end: object) -> float | None:
+    if (
+        not isinstance(start, (int, float)) or isinstance(start, bool)
+        or not isinstance(end, (int, float)) or isinstance(end, bool)
+        or not math.isfinite(start) or not math.isfinite(end) or end < start
+    ):
+        return None
+    return round(end - start, 3)
+
+
+def _public_timing(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Coordinator-observed milestones; missing historical evidence stays NULL."""
+
+    queued = row["created_at"]
+    claimed = row["claimed_at"]
+    staged = row["staged_at"]
+    running = row["running_at"]
+    activity = row["first_activity_at"]
+    flag = row["flag_at"]
+    writeup = row["writeup_at"]
+    released = row["released_at"]
+    return {
+        "source": "coordinator_observed",
+        "queued_at": queued,
+        "claimed_at": claimed,
+        "staged_at": staged,
+        "running_at": running,
+        "first_activity_at": activity,
+        "flag_at": flag,
+        "writeup_at": writeup,
+        "released_at": released,
+        "queue_seconds": _timing_seconds(queued, claimed),
+        "staging_seconds": _timing_seconds(claimed, staged),
+        "preparation_seconds": _timing_seconds(staged, running),
+        "first_activity_wait_seconds": _timing_seconds(running, activity),
+        "time_to_flag_seconds": _timing_seconds(running, flag),
+        "flag_to_writeup_seconds": _timing_seconds(flag, writeup),
+        "run_to_release_seconds": _timing_seconds(running, released),
+    }
+
+
 def _public_job(
     row: Mapping[str, Any],
     events: list[dict[str, Any]],
@@ -5603,11 +6034,12 @@ def _public_job(
         row["job_mode"] != "writeup_refine"
         or (row["status"] == "completed" and row["released_ingested"])
     )
-    if not refinement_published:
-        events = [
-            {key: value for key, value in event.items() if key != "writeup_markdown"}
-            for event in events
-        ]
+    events = [
+        {key: value for key, value in event.items() if key != "writeup_markdown"}
+        if not refinement_published or contains_internal_operation(event.get("writeup_markdown"))
+        else event
+        for event in events
+    ]
     try:
         if row["job_mode"] == "writeup_refine":
             checkpoint = None
@@ -5616,12 +6048,35 @@ def _public_job(
             checkpoint = decode_checkpoint(current if current is not None else row["retry_checkpoint_json"])
     except (KeyError, TypeError, ValueError):
         checkpoint = None
+    agents = [
+        {
+            "id": "root", "parent_id": None, "label": "Main agent",
+            "status": row["status"],
+            "provider": row["provider"], "model": row["model"],
+        },
+        *_agent_nodes(row["agents_json"]),
+    ]
+    ultra_eligible = bool(
+        row["job_mode"] == "solve"
+        and row["status"] == "needs_input"
+        and row["released_ingested"]
+        and row["ultra_escalation_mode"] in {"ask", "auto"}
+        and row["provider"] == "codex"
+        and row["flag"] is None
+        and error.get("code") == "ultra_escalation_requested"
+        and checkpoint is not None
+        and checkpoint.reason == "ultra_escalation"
+        and row["current_retry_source_job_id"] == row["id"]
+        and row["latest_solve_job_id"] == row["id"]
+        and row["ultra_started_job_id"] is None
+    )
     result = {
         "id": row["id"],
         "job_mode": row["job_mode"],
         "writeup_locale": row["writeup_locale"],
         "workspace_id": row["workspace_id"],
         "challenge_id": row["challenge_id"],
+        "account_id": row["account_id"],
         "account_label": row["account_label"],
         "status": row["status"],
         "continuation_mode": row["continuation_mode"],
@@ -5638,28 +6093,13 @@ def _public_job(
         "max_reasoning_available": bool(row["max_reasoning_available"]),
         "ultra_escalation": {
             "mode": row["ultra_escalation_mode"],
-            "eligible": bool(
-                row["job_mode"] == "solve"
-                and row["status"] == "needs_input"
-                and row["released_ingested"]
-                and row["ultra_escalation_mode"] in {"ask", "auto"}
-                and isinstance(error, dict)
-                and error.get("code") == "ultra_escalation_requested"
-                and checkpoint is not None
-                and checkpoint.reason == "ultra_escalation"
-                and row["current_retry_source_job_id"] == row["id"]
-                and row["ultra_started_job_id"] is None
-            ),
+            "eligible": ultra_eligible,
             "started_job_id": row["ultra_started_job_id"],
             "source_job_id": row["ultra_source_job_id"],
             "auto_pending": bool(
-                row["ultra_escalation_mode"] == "auto"
+                ultra_eligible
+                and row["ultra_escalation_mode"] == "auto"
                 and not row["ultra_auto_attempted"]
-                and row["status"] == "needs_input"
-                and row["released_ingested"]
-                and row["ultra_started_job_id"] is None
-                and isinstance(error, dict)
-                and error.get("code") == "ultra_escalation_requested"
             ),
         },
         "runtime_version": row["claude_version"] if row["provider"] == "claude" else row["codex_version"],
@@ -5687,22 +6127,19 @@ def _public_job(
             if checkpoint else None
         ),
         "writeup_markdown": (
-            row["writeup_markdown"] if refinement_published else None
+            row["writeup_markdown"]
+            if refinement_published and not contains_internal_operation(row["writeup_markdown"])
+            else None
         ),
         "error": error or None,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "released_at": row["released_at"],
+        "timing": _public_timing(row),
         "last_event_sequence": row["last_event_sequence"],
         "events": events,
-        "agents": [
-            {
-                "id": "root", "parent_id": None, "label": "Main agent",
-                "status": row["status"],
-                "provider": row["provider"], "model": row["model"],
-            },
-            *_agent_nodes(row["agents_json"]),
-        ],
+        "agents": agents,
+        "context_usage": _public_context_usage(row["context_usage_json"], agents),
         "guidance": guidance or [],
     }
     if position is not None:
@@ -5739,9 +6176,18 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
         "progress": common | {"code", "reason", "from_effort", "to_effort"},
         "activity": common | {
             "phase", "tool", "summary", "command", "output", "message",
-            "exit_code", "duration_ms", "agent_id"
+            "exit_code", "duration_ms", "agent_id", "activity_id",
+            "command_truncated", "output_truncated",
+        },
+        "activity_evidence": common | {
+            "activity_id", "correlatable", "phase", "tool", "agent_id", "command_bytes",
+            "output_bytes", "command_truncated", "output_truncated",
+            "exit_code", "duration_ms",
         },
         "agent": common | {"agent_id", "parent_id", "label", "status", "provider", "model"},
+        "context_usage": common | {
+            "agent_id", "state", "source", "used_tokens", "window_tokens", "observed_at",
+        },
         "guidance": common | {
             "guidance_id", "state", "message", "provider_delivery", "error_code"
         },
@@ -5830,7 +6276,34 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
             type(duration_ms) is not int or not 0 <= duration_ms <= 2**63 - 1
         ):
             raise ExchangeError("invalid_worker_event", "worker 활동 결과를 확인할 수 없습니다.", category="safety")
-    if kind == "activity":
+    if kind in {"activity", "activity_evidence"}:
+        activity_id = value.get("activity_id")
+        if activity_id is not None and (
+            not isinstance(activity_id, str) or not re.fullmatch(r"[0-9a-f]{32}", activity_id)
+        ):
+            raise ExchangeError("invalid_worker_event", "Invalid activity identity.", category="safety")
+        if kind == "activity_evidence":
+            if (
+                activity_id is None
+                or type(value.get("correlatable")) is not bool
+                or value.get("phase") not in {"started", "completed"}
+                or value.get("tool") not in {"shell", "web_search", "file", "tool", "agent"}
+                or any(type(value.get(field)) is not int or not 0 <= value[field] <= 2**31 - 1
+                       for field in ("command_bytes", "output_bytes"))
+                or any(type(value.get(field)) is not bool
+                       for field in ("command_truncated", "output_truncated"))
+                or (value.get("exit_code") is not None and (
+                    type(value["exit_code"]) is not int or not -(2**31) <= value["exit_code"] <= 2**31 - 1
+                ))
+                or (value.get("duration_ms") is not None and (
+                    type(value["duration_ms"]) is not int or not 0 <= value["duration_ms"] <= 2**63 - 1
+                ))
+            ):
+                raise ExchangeError("invalid_worker_event", "Invalid activity evidence.", category="safety")
+        else:
+            for field in ("command_truncated", "output_truncated"):
+                if field in value and type(value[field]) is not bool:
+                    raise ExchangeError("invalid_worker_event", "Invalid activity truncation.", category="safety")
         agent_id = value.get("agent_id")
         if agent_id is not None and (
             not isinstance(agent_id, str) or not _AGENT_ID.fullmatch(agent_id)
@@ -5856,6 +6329,26 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
             ))
         ):
             raise ExchangeError("invalid_worker_event", "Invalid subagent event.", category="safety")
+    if kind == "context_usage":
+        used = value.get("used_tokens")
+        window = value.get("window_tokens")
+        observed = value.get("observed_at")
+        available = value.get("state") == "available"
+        if (
+            set(value) != allowed["context_usage"]
+            or not isinstance(value.get("agent_id"), str)
+            or not _AGENT_ID.fullmatch(value["agent_id"])
+            or value.get("state") not in {"available", "compacting", "awaiting_usage", "unavailable"}
+            or value.get("source") not in {"codex_last_response", "claude_last_request_input"}
+            or type(observed) not in {int, float} or not math.isfinite(observed)
+            or not 0 <= observed <= 20_000_000_000
+            or (available and (
+                type(used) is not int or type(window) is not int
+                or not 0 <= used <= window <= 1_000_000_000 or window == 0
+            ))
+            or (not available and (used is not None or window is not None))
+        ):
+            raise ExchangeError("invalid_worker_event", "Invalid context observation.", category="safety")
     if kind == "guidance":
         state = value.get("state")
         delivery = value.get("provider_delivery")

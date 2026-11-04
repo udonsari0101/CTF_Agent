@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS ctfd_submit_connections (
     auth_type TEXT NOT NULL CHECK(auth_type IN ('token','password')),
     credentials_ciphertext TEXT NOT NULL,
     auto_submit INTEGER NOT NULL DEFAULT 0 CHECK(auto_submit IN (0,1)),
+    submit_ready INTEGER NOT NULL DEFAULT 0 CHECK(submit_ready IN (0,1)),
+    submit_check_reason TEXT NOT NULL DEFAULT '',
     max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts BETWEEN 1 AND 3),
     generation TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -59,12 +61,14 @@ CREATE TABLE IF NOT EXISTS ctfd_submit_jobs (
     ctfd_id INTEGER NOT NULL,
     flag_digest TEXT NOT NULL,
     completion_source TEXT NOT NULL CHECK(completion_source IN ('manual','agent')),
+    source_solver_job_id TEXT,
     status TEXT NOT NULL CHECK(status IN (
         'queued','running','retry','correct','already_solved','incorrect',
         'rate_limited','auth_error','network_error','paused','partial','failed',
         'superseded','disabled'
     )),
     attempts INTEGER NOT NULL DEFAULT 0,
+    dispatch_started INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_started IN (0,1)),
     next_attempt_at INTEGER NOT NULL,
     result_code TEXT,
     display_message TEXT,
@@ -177,6 +181,61 @@ class CTFdSubmitService:
                     "ALTER TABLE ctfd_submit_connections ADD COLUMN max_attempts "
                     "INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts BETWEEN 1 AND 3)"
                 )
+            if "submit_ready" not in columns:
+                db.execute(
+                    "ALTER TABLE ctfd_submit_connections ADD COLUMN submit_ready "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(submit_ready IN (0,1))"
+                )
+                # Existing token connections were authenticated when saved.
+                # Password sessions need a fresh post-login CSRF check before
+                # automatic submission can be re-enabled.
+                db.execute(
+                    "UPDATE ctfd_submit_connections SET submit_ready=1 WHERE auth_type='token'"
+                )
+                db.execute(
+                    "UPDATE ctfd_submit_connections SET auto_submit=0 "
+                    "WHERE auth_type='password'"
+                )
+                db.execute(
+                    "UPDATE ctfd_submit_jobs SET status='disabled',result_code='submit_readiness_unknown',"
+                    "display_message='비밀번호 연결의 제출 준비 상태를 다시 확인해야 합니다.',"
+                    "completed_at=?,updated_at=? WHERE status IN ('queued','retry') AND attempts=0 "
+                    "AND workspace_id IN (SELECT workspace_id FROM ctfd_submit_connections "
+                    "WHERE auth_type='password')",
+                    (_stamp(), _stamp()),
+                )
+            if "submit_check_reason" not in columns:
+                db.execute(
+                    "ALTER TABLE ctfd_submit_connections ADD COLUMN submit_check_reason "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+                db.execute(
+                    "UPDATE ctfd_submit_connections SET submit_check_reason='recheck_required' "
+                    "WHERE auth_type='password' AND submit_ready=0"
+                )
+            job_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(ctfd_submit_jobs)")
+            }
+            if "dispatch_started" not in job_columns:
+                db.execute(
+                    "ALTER TABLE ctfd_submit_jobs ADD COLUMN dispatch_started "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_started IN (0,1))"
+                )
+                # A running claim from an older release may already have sent
+                # its POST. Treat it as uncertain rather than retrying it.
+                db.execute(
+                    "UPDATE ctfd_submit_jobs SET dispatch_started=1 WHERE status='running'"
+                )
+                db.execute(
+                    "UPDATE ctfd_submit_jobs SET status='network_error',dispatch_started=1,"
+                    "result_code='outcome_unknown',"
+                    "display_message='이전 버전에서 제출을 시도했지만 응답을 확인할 수 없습니다. CTFd에서 확인하세요.',"
+                    "completed_at=?,updated_at=? "
+                    "WHERE status IN ('queued','retry') AND attempts>0",
+                    (_stamp(), _stamp()),
+                )
+            if "source_solver_job_id" not in job_columns:
+                db.execute("ALTER TABLE ctfd_submit_jobs ADD COLUMN source_solver_job_id TEXT")
             db.execute(
                 "UPDATE ctfd_submit_jobs SET status='network_error',result_code='retry_limit',"
                 "display_message='자동 제출 재시도 한도에 도달했습니다.',completed_at=?,updated_at=? "
@@ -495,7 +554,7 @@ class CTFdSubmitService:
                             client.cancel_event = cancellation
                         if cancellation.is_set():
                             raise CTFdError("The workspace or user is no longer available.")
-                        client.validate()
+                        submit_ready, submit_check_reason = client.submission_readiness()
                     finally:
                         client.clear_credentials()
                     ciphertext = self.vault.encrypt(
@@ -519,15 +578,17 @@ class CTFdSubmitService:
                         # enable it again.
                         db.execute(
                             """INSERT INTO ctfd_submit_connections
-                               (workspace_id,owner_user_id,url,auth_type,credentials_ciphertext,auto_submit,max_attempts,generation,created_at,updated_at)
-                               VALUES(?,?,?,?,?,?,?,?,?,?)
+                               (workspace_id,owner_user_id,url,auth_type,credentials_ciphertext,auto_submit,submit_ready,submit_check_reason,max_attempts,generation,created_at,updated_at)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                                 ON CONFLICT(workspace_id) DO UPDATE SET
                                   owner_user_id=excluded.owner_user_id,url=excluded.url,auth_type=excluded.auth_type,
                                   credentials_ciphertext=excluded.credentials_ciphertext,generation=excluded.generation,
-                                  auto_submit=0,max_attempts=excluded.max_attempts,
+                                  auto_submit=0,submit_ready=excluded.submit_ready,
+                                  submit_check_reason=excluded.submit_check_reason,max_attempts=excluded.max_attempts,
                                   updated_at=excluded.updated_at""",
                             (workspace_id, user["id"], url, body.auth_type, ciphertext,
-                             0, MAX_ATTEMPTS, generation, timestamp, timestamp),
+                             0, int(submit_ready), submit_check_reason, MAX_ATTEMPTS,
+                             generation, timestamp, timestamp),
                         )
                         # Jobs created for an older credential/site generation
                         # must never silently submit through a newly connected
@@ -542,8 +603,13 @@ class CTFdSubmitService:
                             )
                         ]
                         db.execute(
-                            "UPDATE ctfd_submit_jobs SET status='disabled',result_code='connection_replaced',"
-                            "display_message='CTFd 연결이 변경되어 이 자동 제출을 취소했습니다.',completed_at=?,updated_at=? "
+                            "UPDATE ctfd_submit_jobs SET "
+                            "status=CASE WHEN status='running' AND dispatch_started=1 THEN 'network_error' ELSE 'disabled' END,"
+                            "result_code=CASE WHEN status='running' AND dispatch_started=1 THEN 'outcome_unknown' ELSE 'connection_replaced' END,"
+                            "display_message=CASE WHEN status='running' AND dispatch_started=1 "
+                            "THEN '연결 변경 중 제출이 이미 시작되어 결과가 불명확합니다. CTFd에서 확인하세요.' "
+                            "ELSE 'CTFd 연결이 변경되어 이 자동 제출을 취소했습니다.' END,"
+                            "completed_at=?,updated_at=? "
                             "WHERE workspace_id=? AND status IN ('queued','retry','running') AND connection_generation!=?",
                             (timestamp, timestamp, workspace_id, generation),
                         )
@@ -563,17 +629,20 @@ class CTFdSubmitService:
         self.app.state.require_workspace_owner(workspace_id, user)
         with self.db() as db:
             row = db.execute(
-                "SELECT url,auth_type,auto_submit,created_at,updated_at FROM ctfd_submit_connections "
+                "SELECT url,auth_type,auto_submit,submit_ready,submit_check_reason,created_at,updated_at FROM ctfd_submit_connections "
                 "WHERE workspace_id=? AND owner_user_id=?",
                 (workspace_id, user["id"]),
             ).fetchone()
         if not row:
-            return {"connected": False, "auto_submit": False}
+            return {"connected": False, "auto_submit": False, "submit_ready": False,
+                    "submit_check_reason": "not_connected"}
         return {
             "connected": True,
             "url": row["url"],
             "auth_type": row["auth_type"],
             "auto_submit": bool(row["auto_submit"]),
+            "submit_ready": bool(row["submit_ready"]),
+            "submit_check_reason": row["submit_check_reason"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -671,13 +740,16 @@ class CTFdSubmitService:
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT 1 FROM ctfd_submit_connections WHERE workspace_id=? AND owner_user_id=?",
+                "SELECT submit_ready FROM ctfd_submit_connections WHERE workspace_id=? AND owner_user_id=?",
                 (workspace_id, user["id"]),
             ).fetchone()
             if not row:
                 if enabled:
                     raise HTTPException(409, "자동 제출을 켜기 전에 CTFd 계정을 연결하고 검증하세요.")
-                return {"connected": False, "auto_submit": False}
+                return {"connected": False, "auto_submit": False, "submit_ready": False,
+                        "submit_check_reason": "not_connected"}
+            if enabled and not row["submit_ready"]:
+                raise HTTPException(409, "CTFd 조회는 가능하지만 제출 인증 준비가 확인되지 않았습니다. 연결을 다시 저장하거나 API 토큰을 사용하세요.")
             db.execute(
                 "UPDATE ctfd_submit_connections SET auto_submit=?,updated_at=? "
                 "WHERE workspace_id=? AND owner_user_id=?",
@@ -694,8 +766,12 @@ class CTFdSubmitService:
                     )
                 ]
                 db.execute(
-                    "UPDATE ctfd_submit_jobs SET status='disabled',result_code='auto_submit_disabled',"
-                    "display_message='자동 제출이 꺼져 이 Flag를 전송하지 않았습니다.',"
+                    "UPDATE ctfd_submit_jobs SET "
+                    "status=CASE WHEN status='running' AND dispatch_started=1 THEN 'network_error' ELSE 'disabled' END,"
+                    "result_code=CASE WHEN status='running' AND dispatch_started=1 THEN 'outcome_unknown' ELSE 'auto_submit_disabled' END,"
+                    "display_message=CASE WHEN status='running' AND dispatch_started=1 "
+                    "THEN '자동 제출을 끄기 전에 전송이 시작되어 결과가 불명확합니다. CTFd에서 확인하세요.' "
+                    "ELSE '자동 제출이 꺼져 이 Flag를 전송하지 않았습니다.' END,"
                     "completed_at=?,updated_at=? WHERE workspace_id=? AND owner_user_id=? "
                     "AND status IN ('queued','retry','running')",
                     (_stamp(), _stamp(), workspace_id, user["id"]),
@@ -740,8 +816,13 @@ class CTFdSubmitService:
                 (workspace_id, user["id"]),
             )
             db.execute(
-                "UPDATE ctfd_submit_jobs SET status='disabled',result_code='connection_deleted',"
-                "display_message='CTFd 연결이 삭제되어 이 자동 제출을 취소했습니다.',completed_at=?,updated_at=? "
+                "UPDATE ctfd_submit_jobs SET "
+                "status=CASE WHEN status='running' AND dispatch_started=1 THEN 'network_error' ELSE 'disabled' END,"
+                "result_code=CASE WHEN status='running' AND dispatch_started=1 THEN 'outcome_unknown' ELSE 'connection_deleted' END,"
+                "display_message=CASE WHEN status='running' AND dispatch_started=1 "
+                "THEN '연결 해제 전에 제출이 시작되어 결과가 불명확합니다. CTFd에서 확인하세요.' "
+                "ELSE 'CTFd 연결이 삭제되어 이 자동 제출을 취소했습니다.' END,"
+                "completed_at=?,updated_at=? "
                 "WHERE workspace_id=? AND owner_user_id=? AND status IN ('queued','retry','running')",
                 (timestamp, timestamp, workspace_id, user["id"]),
             )
@@ -751,7 +832,8 @@ class CTFdSubmitService:
                 409,
                 "CTFd 연결은 해제했지만 전송 중인 요청을 중단하고 있습니다. 잠시 후 상태를 다시 확인하세요.",
             )
-        return {"connected": False, "auto_submit": False}
+        return {"connected": False, "auto_submit": False, "submit_ready": False,
+                "submit_check_reason": "not_connected"}
 
     def _cancel_resource(self, workspace_id: str, user: dict, *, challenge_id: str | None,
                          wait_seconds: float) -> bool:
@@ -820,7 +902,12 @@ class CTFdSubmitService:
                 )
             ]
             db.execute(
-                f"""UPDATE ctfd_submit_jobs SET status='disabled',result_code=?,display_message=?,
+                f"""UPDATE ctfd_submit_jobs SET
+                     status=CASE WHEN status='running' AND dispatch_started=1 THEN 'network_error' ELSE 'disabled' END,
+                     result_code=CASE WHEN status='running' AND dispatch_started=1 THEN 'outcome_unknown' ELSE ? END,
+                     display_message=CASE WHEN status='running' AND dispatch_started=1
+                       THEN '삭제 요청 전에 제출이 시작되어 결과가 불명확합니다. CTFd에서 확인하세요.'
+                       ELSE ? END,
                      completed_at=?,updated_at=? WHERE {condition}
                      AND status IN ('queued','retry','running')""",
                 (result_code, display_message, timestamp, timestamp, *parameters),
@@ -867,7 +954,8 @@ class CTFdSubmitService:
             )
 
     def enqueue_flag(self, owner_user_id: str, workspace_id: str, challenge_id: str,
-                     flag: str, completion_source: str = "agent") -> bool:
+                     flag: str, completion_source: str = "agent",
+                     source_solver_job_id: str | None = None) -> bool:
         """Queue a committed flag; false means an intentional no-op.
 
         SQLite failures propagate so the safe application hook can distinguish
@@ -902,6 +990,14 @@ class CTFdSubmitService:
                         type(row["max_attempts"]) is not int or
                         not 1 <= row["max_attempts"] <= MAX_ATTEMPTS):
                     return False
+                if source_solver_job_id is not None:
+                    source = db.execute(
+                        """SELECT 1 FROM solver_jobs WHERE id=? AND owner_user_id=?
+                           AND workspace_id=? AND challenge_id=?""",
+                        (source_solver_job_id, owner_user_id, workspace_id, challenge_id),
+                    ).fetchone()
+                    if not source:
+                        source_solver_job_id = None
                 # Keep the historic attempts ceiling as a rollback-safe remote
                 # call budget. A one-call QA job starts at MAX_ATTEMPTS-1, so
                 # both this release and an older compatible release make one
@@ -910,10 +1006,11 @@ class CTFdSubmitService:
                 inserted = db.execute(
                     """INSERT OR IGNORE INTO ctfd_submit_jobs
                        (id,workspace_id,challenge_id,owner_user_id,connection_generation,ctfd_id,
-                        flag_digest,completion_source,status,attempts,next_attempt_at,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?, 'queued',?,?,?,?)""",
+                         flag_digest,completion_source,source_solver_job_id,status,attempts,
+                         next_attempt_at,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?, 'queued',?,?,?,?)""",
                     (uuid.uuid4().hex, workspace_id, challenge_id, owner_user_id,
-                     row["generation"], row["ctfd_id"], digest, completion_source,
+                     row["generation"], row["ctfd_id"], digest, completion_source, source_solver_job_id,
                      initial_attempts, int(time.time()), timestamp, timestamp),
                 ).rowcount
         except CTFdError:
@@ -949,7 +1046,8 @@ class CTFdSubmitService:
             # concurrent OFF/delete transaction can publish a new cancel.
             self._job_cancel_marker(row["id"]).unlink(missing_ok=True)
             changed = db.execute(
-                "UPDATE ctfd_submit_jobs SET status='running',attempts=attempts+1,updated_at=? "
+                "UPDATE ctfd_submit_jobs SET status='running',attempts=attempts+1,"
+                "dispatch_started=0,updated_at=? "
                 "WHERE id=? AND status IN ('queued','retry')",
                 (_stamp(), row["id"]),
             ).rowcount
@@ -970,7 +1068,7 @@ class CTFdSubmitService:
         with self.db() as db:
             row = db.execute(
                 """SELECT j.*,c.flag,c.status AS challenge_status,c.completion_source AS current_source,
-                          s.url,s.auth_type,s.credentials_ciphertext,s.auto_submit,s.generation,
+                          s.url,s.auth_type,s.credentials_ciphertext,s.auto_submit,s.submit_ready,s.generation,
                           w.owner_user_id AS workspace_owner,u.active AS owner_active
                    FROM ctfd_submit_jobs j
                    JOIN challenges c ON c.id=j.challenge_id AND c.workspace_id=j.workspace_id
@@ -985,7 +1083,7 @@ class CTFdSubmitService:
         details = dict(row)
         if (not details["owner_active"] or details["workspace_owner"] != job["owner_user_id"] or
                 not details["generation"] or details["generation"] != job["connection_generation"] or
-                not details["auto_submit"]):
+                not details["auto_submit"] or not details["submit_ready"]):
             disabled = not details["owner_active"]
             self._finish(
                 job["id"], "disabled",
@@ -1014,23 +1112,41 @@ class CTFdSubmitService:
         return details, credentials
 
     def _interrupt_job(self, job: dict) -> None:
+        """Retry only when the remote submission was never dispatched."""
+
         timestamp = _stamp()
-        retry = job["attempts"] < MAX_ATTEMPTS
         with self.db() as db:
             db.execute(
-                """UPDATE ctfd_submit_jobs SET status=?,result_code='worker_stopping',
-                     display_message=?,next_attempt_at=?,completed_at=?,updated_at=?
+                """UPDATE ctfd_submit_jobs SET
+                     status=CASE WHEN dispatch_started=1 OR attempts>=? THEN 'network_error' ELSE 'retry' END,
+                     result_code=CASE WHEN dispatch_started=1 THEN 'outcome_unknown' ELSE 'worker_stopping' END,
+                     display_message=CASE WHEN dispatch_started=1
+                       THEN '제출 응답을 확인하지 못했습니다. 중복 전송을 막기 위해 자동 재시도하지 않습니다.'
+                       ELSE '제출 전 작업이 중단되었습니다.' END,
+                     next_attempt_at=?,
+                     completed_at=CASE WHEN dispatch_started=1 OR attempts>=? THEN ? ELSE NULL END,
+                     updated_at=?
                    WHERE id=? AND status='running'""",
-                (
-                    "retry" if retry else "network_error",
-                    "서버 종료로 제출이 중단되어 다음 시작 때 다시 시도합니다."
-                    if retry else "서버 종료로 제출이 중단되었고 재시도 한도에 도달했습니다.",
-                    int(time.time()),
-                    None if retry else timestamp,
-                    timestamp,
-                    job["id"],
-                ),
+                (MAX_ATTEMPTS, int(time.time()), MAX_ATTEMPTS, timestamp,
+                 timestamp, job["id"]),
             )
+
+    def _mark_dispatch_started(self, job_id: str) -> bool:
+        """Persist the last safe point before the outbound POST."""
+
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return bool(db.execute(
+                "UPDATE ctfd_submit_jobs SET dispatch_started=1,updated_at=? "
+                "WHERE id=? AND status='running' AND dispatch_started=0",
+                (_stamp(), job_id),
+            ).rowcount)
+
+    def _mark_outcome_unknown(self, job_id: str) -> None:
+        self._finish(
+            job_id, "network_error", "outcome_unknown",
+            "제출 응답을 확인하지 못했습니다. 중복 전송을 막기 위해 자동 재시도하지 않습니다.",
+        )
 
     def _job_still_running(self, job_id: str) -> bool:
         with self.db() as db:
@@ -1050,15 +1166,103 @@ class CTFdSubmitService:
             db.execute(
                 "UPDATE ctfd_submit_jobs SET status='retry',result_code='worker_interrupted',"
                 "next_attempt_at=?,completed_at=NULL,updated_at=? "
-                "WHERE status='running' AND attempts<?",
+                "WHERE status='running' AND dispatch_started=0 AND attempts<?",
                 (int(time.time()), timestamp, MAX_ATTEMPTS),
             )
             db.execute(
-                "UPDATE ctfd_submit_jobs SET status='network_error',result_code='worker_interrupted',"
-                "display_message='The automatic submission retry limit was reached after a worker interruption.',"
+                "UPDATE ctfd_submit_jobs SET status='network_error',"
+                "result_code=CASE WHEN dispatch_started=1 THEN 'outcome_unknown' ELSE 'retry_limit' END,"
+                "display_message=CASE WHEN dispatch_started=1 "
+                "THEN '제출 응답을 확인하지 못했습니다. 중복 전송을 막기 위해 자동 재시도하지 않습니다.' "
+                "ELSE '제출 전 작업이 중단되었고 재시도 한도에 도달했습니다.' END,"
                 "completed_at=?,updated_at=? WHERE status='running'",
                 (timestamp, timestamp),
             )
+            # A crashed reconciliation is read-only and can safely resume.
+            db.execute(
+                "UPDATE ctfd_submit_jobs SET result_code='outcome_unknown' "
+                "WHERE status='network_error' AND result_code='outcome_unknown_checking'"
+            )
+
+    def _reconcile_unknown_once(self) -> bool:
+        """Inspect remote evidence once, without ever resending an uncertain flag."""
+
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT j.id,j.owner_user_id,j.workspace_id,j.ctfd_id,j.flag_digest,
+                          j.connection_generation,c.flag,s.url,s.auth_type,
+                          s.credentials_ciphertext,s.generation
+                     FROM ctfd_submit_jobs j
+                     LEFT JOIN challenges c ON c.id=j.challenge_id
+                     LEFT JOIN ctfd_submit_connections s ON s.workspace_id=j.workspace_id
+                    WHERE j.status='network_error' AND j.result_code='outcome_unknown'
+                    ORDER BY j.updated_at,j.id LIMIT 1"""
+            ).fetchone()
+            if row is None:
+                return False
+            db.execute(
+                "UPDATE ctfd_submit_jobs SET result_code='outcome_unknown_checking',updated_at=? "
+                "WHERE id=? AND status='network_error' AND result_code='outcome_unknown'",
+                (_stamp(), row["id"]),
+            )
+        details = dict(row)
+        code = "remote_check_unavailable"
+        message = "제출 결과를 확인할 수 없습니다. CTFd에서 직접 확인하세요. 자동 재전송은 하지 않습니다."
+        credentials = None
+        client = None
+        try:
+            if (details["generation"] == details["connection_generation"]
+                    and details["credentials_ciphertext"] and details["url"]):
+                credentials = self.vault.decrypt(
+                    details["credentials_ciphertext"],
+                    scope=self._scope(details["owner_user_id"], details["workspace_id"]),
+                )
+                if credentials.get("auth_type") == details["auth_type"]:
+                    client = self._factory(credentials, details["url"])
+                    if hasattr(client, "cancel_event"):
+                        client.cancel_event = _CombinedCancellation(
+                            self.stop_event,
+                            _FileCancellation(self._job_cancel_marker(details["id"])),
+                        )
+                    solved = client.challenge_solved_by_me(details["ctfd_id"])
+                    code = "remote_solved" if solved else "remote_unsolved"
+                    message = (
+                        "CTFd에서 해결 상태가 확인됐지만 이번 제출의 응답은 불명확합니다. 자동 재전송은 하지 않습니다."
+                        if solved else
+                        "CTFd에서 아직 해결되지 않은 것으로 보입니다. 이전 제출의 처리 여부는 불명확해 자동 재전송하지 않습니다."
+                    )
+                    flag = details["flag"]
+                    if (isinstance(flag, str) and _flag_digest(flag) == details["flag_digest"]
+                            and hasattr(client, "submission_status_for_flag")):
+                        history = client.submission_status_for_flag(details["ctfd_id"], flag)
+                        if history in {"correct", "incorrect", "partial", "submitted"}:
+                            code = "remote_submission_" + history
+                            message = {
+                                "correct": "CTFd 제출 기록에서 이 Flag의 정답 처리를 확인했습니다. 자동 재전송은 하지 않습니다.",
+                                "incorrect": "CTFd 제출 기록에서 이 Flag의 오답 처리를 확인했습니다. 자동 재전송은 하지 않습니다.",
+                                "partial": "CTFd 제출 기록에서 이 Flag의 부분 처리를 확인했습니다. 자동 재전송은 하지 않습니다.",
+                                "submitted": "CTFd 제출 기록에서 이 Flag를 확인했습니다. 결과는 CTFd에서 확인하세요.",
+                            }[history]
+        except Exception:
+            # Reconciliation is best effort and must not kill the durable
+            # worker or expose plugin/remote exception text to the UI.
+            pass
+        finally:
+            if client is not None:
+                try:
+                    client.clear_credentials()
+                except Exception:
+                    pass
+            if credentials is not None:
+                credentials.clear()
+        with self.db() as db:
+            db.execute(
+                "UPDATE ctfd_submit_jobs SET result_code=?,display_message=?,updated_at=? "
+                "WHERE id=? AND status='network_error' AND result_code='outcome_unknown_checking'",
+                (code, message, _stamp(), details["id"]),
+            )
+        return True
 
     def process_once(self) -> bool:
         lease = ProcessFileLock(self.worker_lock_path)
@@ -1073,7 +1277,7 @@ class CTFdSubmitService:
     def _process_once_locked(self) -> bool:
         job = self._claim()
         if not job:
-            return False
+            return self._reconcile_unknown_once()
         try:
             return self._process_claimed(job)
         finally:
@@ -1111,6 +1315,32 @@ class CTFdSubmitService:
             # any response already in flight is also ignored by _finish().
             if not self._job_still_running(job["id"]):
                 return True
+            ready, reason = client.submission_readiness()
+            if not ready:
+                self._finish(
+                    job["id"], "auth_error", reason,
+                    "CTFd 조회는 가능하지만 제출 인증 준비가 확인되지 않았습니다. 연결을 다시 저장하거나 API 토큰을 사용하세요.",
+                )
+                return True
+            if not self._job_still_running(job["id"]):
+                return True
+            if hasattr(client, "challenge_submission_state"):
+                remote_state = client.challenge_submission_state(job["ctfd_id"])
+                if remote_state.get("solved_by_me") is True:
+                    self._handle_result(job, {"status": "already_solved"})
+                    return True
+                if remote_state.get("attempt_limit_reached") is True:
+                    self._handle_result(job, {"status": "attempt_limit"})
+                    return True
+            if self.stop_event.is_set() or job["_cancel_event"].is_set():
+                self._interrupt_job(job)
+                return True
+            if not self._mark_dispatch_started(job["id"]):
+                return True
+            job["dispatch_started"] = 1
+            if self.stop_event.is_set() or job["_cancel_event"].is_set():
+                self._interrupt_job(job)
+                return True
             result = client.submit(job["ctfd_id"], details["flag"])
         except CTFdError as exc:
             if self.stop_event.is_set():
@@ -1123,12 +1353,13 @@ class CTFdSubmitService:
             if self.stop_event.is_set():
                 self._interrupt_job(job)
             else:
-                self._retry_or_finish(job, "transport_error")
+                if job.get("dispatch_started"):
+                    self._mark_outcome_unknown(job["id"])
+                else:
+                    self._retry_or_finish(job, "transport_error")
         else:
-            if self.stop_event.is_set():
-                self._interrupt_job(job)
-            else:
-                self._handle_result(job, result)
+            # A definitive remote response remains useful during shutdown.
+            self._handle_result(job, result)
         finally:
             if client is not None:
                 try:
@@ -1149,10 +1380,16 @@ class CTFdSubmitService:
         elif any(term in lowered for term in (
                 "timed out", "time limit", "could not be resolved", "remote request failed",
                 "response ended", "http 500", "http 502", "http 503", "http 504")):
-            self._retry_or_finish(job, "network_error")
+            if job.get("dispatch_started"):
+                self._mark_outcome_unknown(job["id"])
+            else:
+                self._retry_or_finish(job, "network_error")
         else:
-            self._finish(job["id"], "failed", "remote_error",
-                         "CTFd가 자동 제출을 처리하지 못했습니다. 연결과 문제 정보를 확인하세요.")
+            if job.get("dispatch_started"):
+                self._mark_outcome_unknown(job["id"])
+            else:
+                self._finish(job["id"], "failed", "remote_error",
+                             "CTFd가 자동 제출을 처리하지 못했습니다. 연결과 문제 정보를 확인하세요.")
 
     def _retry_or_finish(self, job: dict, code: str) -> None:
         if job["attempts"] < MAX_ATTEMPTS:
@@ -1182,11 +1419,15 @@ class CTFdSubmitService:
             "authentication_required": ("auth_error", "authentication_failed", "CTFd가 저장된 인증 정보를 거부했습니다. 계정을 다시 연결하세요."),
             "paused": ("paused", "ctf_paused", "CTFd가 일시 중지되었습니다. Flag는 로컬에 그대로 저장되어 있습니다."),
             "partial": ("partial", "partial", "CTFd가 부분 정답으로 처리했습니다. CTFd 사이트에서 확인하세요."),
+            "attempt_limit": ("rate_limited", "attempt_limit", "CTFd의 이 문제 제출 시도 한도에 도달했습니다. 자동으로 제출하지 않습니다."),
         }
         local_status, code, message = mapping.get(
             status,
             ("failed", "unsupported_response", "CTFd가 지원하지 않는 제출 결과를 반환했습니다."),
         )
+        if code == "unsupported_response" and job.get("dispatch_started"):
+            self._mark_outcome_unknown(job["id"])
+            return
         self._finish(job["id"], local_status, code, message,
                      solve=local_status in {"correct", "already_solved"}, job=job)
 
@@ -1226,7 +1467,7 @@ class CTFdSubmitService:
         self.app.state.require_workspace_owner(workspace_id, user)
         with self.db() as db:
             rows = db.execute(
-                """SELECT j.id,j.challenge_id,j.ctfd_id,j.completion_source,j.status,
+                """SELECT j.id,j.challenge_id,j.ctfd_id,j.completion_source,j.source_solver_job_id,j.status,
                            (j.attempts-(? - COALESCE(s.max_attempts,?))) AS attempts,
                            j.result_code,j.display_message,j.created_at,j.updated_at,j.completed_at,
                            c.name AS challenge_name

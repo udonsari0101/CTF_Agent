@@ -21,6 +21,7 @@ data/
 runtime/
 workspaces/
 .local/
+docs/local/
 *.sqlite
 *.sqlite3
 *.db

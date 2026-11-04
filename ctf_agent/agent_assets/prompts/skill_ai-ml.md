@@ -4,6 +4,8 @@ AI/ML CTFs split two ways. **(A) You're handed model files** → the win is stat
 
 **Workflow (base owns the phases):** record file formats + model architecture (layers, shapes, config) into `notes/ANALYSIS.md`; write the exact lever (`negate finetune delta`, `targeted PGD to class N`, `pickle __reduce__→os.system`, `hidden-text indirect injection`) + the measured primitive into `notes/VULN.md` behind a **check**; log dead prompts/attacks + POISON flags in `notes/NEXT.md`; put the attack in `solver.py`; verify the flag format against `../chal_desc.md`.
 
+The image guarantees Python's `pickletools`, `file`, `unzip`, `strings` and general-purpose analysis packages, but does not pin PyTorch, TensorFlow, Transformers, ONNX, safetensors, OpenCV, Fickling, PickleScan, ModelScan, PEFT or foolbox. Probe imports first, use static inspection without loading untrusted models, and acquire only a needed compatible package in the job scratch. Do not assume large model weights or dependencies are already cached.
+
 ## Triage — what you were given → attack
 
 | Observation | Path |
@@ -17,7 +19,7 @@ AI/ML CTFs split two ways. **(A) You're handed model files** → the win is stat
 | Chatbot / agent / "system prompt hides the flag" | LLM prompt injection (§LLM) |
 | A pickle you must *submit* that the server deserializes | **craft** `__reduce__` RCE (§pickle) |
 
-Quick format probe: `file model.*`; for a `.pt` (it's a zip): `unzip -l model.pt` (see `data.pkl` inside); HF dirs load with `transformers.AutoModel`/`AutoModelForCausalLM.from_pretrained('./dir')`.
+Quick format probe: `file model.*`; many `.pt` files are zip archives, so try `unzip -l model.pt` and inspect `data.pkl` if present. HF model loading with `transformers.AutoModel`/`AutoModelForCausalLM.from_pretrained('./dir')` requires an optional compatible installation and a trusted artifact.
 
 ---
 
@@ -26,13 +28,9 @@ Quick format probe: `file model.*`; for a `.pt` (it's a zip): `unzip -l model.pt
 `torch.load`, `pickle.load`, `joblib.load`, `np.load(...,allow_pickle=True)`, Keras `.h5` Lambda layers — all run attacker code on load. Inspect the opcode stream first; only *then* load, and only in a throwaway sandbox (no network) if you must.
 
 ```bash
-pip install fickling picklescan modelscan
-fickling model.pkl                 # decompile pickle → pseudo-python (shows GLOBAL/REDUCE calls)
-fickling --check-safety model.pkl  # static verdict: does it import os/subprocess/exec?
-fickling --trace model.pkl         # step the pickle VM, printing ops, WITHOUT running reduces
-picklescan -p model.pkl            # scan for dangerous globals (also reads .pt zips)
-modelscan -p model.pt              # Protect AI scanner: pt/h5/pkl/savedmodel/keras
 python3 -c "import pickletools,sys; pickletools.dis(open('model.pkl','rb'))"  # raw opcodes, never executes
+# Optional after confirming compatibility and installing into this job scratch:
+# fickling model.pkl; picklescan -p model.pkl; modelscan -p model.pt
 ```
 
 Red flag in the dump: a `GLOBAL` pulling `os`/`posix`/`subprocess`/`builtins`/`nt` followed by `REDUCE` — that's the payload; read the string arg to see the command (may itself hide the flag path or a callback). Safe path: prefer `safetensors`; on torch ≥2.6 `torch.load(..., weights_only=True)` refuses arbitrary globals; for numpy keep `allow_pickle=False`.

@@ -15,8 +15,15 @@ CTF Agent - Windows local installation
 4. Connect a Codex or Claude Code account in Agents.
 
 Requirements: x64 Windows, WSL 2, Docker Desktop with its WSL 2 engine and
-integration enabled for the selected distribution, internet access, and at
-least 15 GB of available space in WSL and on its backing Windows volume.
+integration enabled for the selected distribution, and internet access.
+Installation leaves at least 5 GiB free on the WSL data filesystem and its
+Windows backing volume. Before pulling a new image it requires an estimated
+10 GiB of extra work space (15 GiB total); if that exact release image is
+cached, it requires 2 GiB extra (7 GiB total). A separate database drive
+needs at least 5 GiB free. Docker Desktop's image VHDX is checked separately,
+including a disk-image location changed in Docker Desktop settings. If its
+location cannot be detected, the installer stops before changing service
+data. Set CTF_AGENT_DOCKER_DATA_ROOT to that disk-image folder and rerun.
 
 If installed WSL distributions are listed but readiness checks fail, read the
 reason shown for each one. Retry Install.cmd as administrator under the same

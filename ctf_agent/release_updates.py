@@ -27,6 +27,7 @@ REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
 MAX_ARCHIVE_BYTES = 150 * 1024 * 1024
 MAX_UNPACKED_BYTES = 300 * 1024 * 1024
+LOCAL_MINIMUM_REMAINING_BYTES = 5 * 1024**3
 _LATEST_CACHE: dict[str, tuple[float, dict]] = {}
 _LATEST_LOCK = threading.Lock()
 
@@ -627,6 +628,21 @@ def _rollback(home: Path, previous: str, root: Path, request: dict,
     return healthy
 
 
+def _require_local_update_staging_space(home: Path, database: Path,
+                                        *, external_database: bool) -> None:
+    """Reserve bounded archive/extraction space before downloading an update.
+
+    The release installer checks Docker image pull and overlay headroom after
+    it knows whether the immutable image digest is cached locally.
+    """
+
+    required = LOCAL_MINIMUM_REMAINING_BYTES + MAX_ARCHIVE_BYTES + MAX_UNPACKED_BYTES
+    if shutil.disk_usage(home).free < required:
+        raise ValueError("The local application disk needs at least 5 GiB free after update archive extraction")
+    if external_database and shutil.disk_usage(database).free < LOCAL_MINIMUM_REMAINING_BYTES:
+        raise ValueError("The external database needs at least 5 GiB free before updating")
+
+
 def _apply(home: Path, root: Path, request: dict, *, host_external: bool = False) -> None:
     tag = request["tag"]
     if version_tuple(tag) is None:
@@ -635,14 +651,13 @@ def _apply(home: Path, root: Path, request: dict, *, host_external: bool = False
     previous = previous_file.read_text(encoding="ascii").strip() if previous_file.exists() else ""
     if version_tuple(previous) is None or version_tuple(tag) <= version_tuple(previous):
         raise ValueError("Release is not newer than the installed version")
-    if shutil.disk_usage(home).free < 15 * 1024**3:
-        raise ValueError("At least 15 GB free space is required for an update")
     database_fs_path, database_mount = _verified_local_database(home)
     if database_mount:
         if not (database_fs_path / "sqlite" / "ctf_agent.sqlite3").is_file():
             raise ValueError("The existing external database is unavailable")
-        if shutil.disk_usage(database_fs_path).free < 1024**3:
-            raise ValueError("The external database needs at least 1 GB free before updating")
+    _require_local_update_staging_space(
+        home, database_fs_path, external_database=bool(database_mount)
+    )
     latest = latest_release()
     if latest["tag"] != tag:
         raise ValueError("Requested release is no longer latest")

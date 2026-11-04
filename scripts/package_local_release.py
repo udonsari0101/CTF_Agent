@@ -42,6 +42,7 @@ INSTALLER_FILES = {
     "installer/Install.ps1": "Install.ps1",
     "installer/DatabaseDisk.ps1": "DatabaseDisk.ps1",
     "installer/DockerDesktop.ps1": "DockerDesktop.ps1",
+    "installer/DockerDisk.ps1": "DockerDisk.ps1",
     "installer/Start.cmd": "Start.cmd",
     "installer/Start.ps1": "Start.ps1",
     "installer/Uninstall.cmd": "Uninstall.cmd",
@@ -51,6 +52,7 @@ INSTALLER_FILES = {
     "installer/installer/start.sh": "installer/start.sh",
     "installer/installer/uninstall.py": "installer/uninstall.py",
     "installer/installer/storage_control.py": "installer/storage_control.py",
+    "installer/installer/storage_preflight.py": "installer/storage_preflight.py",
 }
 
 

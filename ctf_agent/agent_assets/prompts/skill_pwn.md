@@ -2,22 +2,20 @@
 
 Shared, read-only playbook for one userland (or kernel) binary-exploitation target. **base.md owns the loop, submission/POISON, belief≠proof, local-build/PoW-general, per-file/function decomposition, boundaries, the notes model, and "never fabricate — measure it."** This file is pwn-specific decision tables, recipes, and tools only. The exploit lives in `solver.py`; remote `host:port` + flag path are in `../chal_desc.md`; findings go in `notes/{ANALYSIS,VULN,NEXT}.md`; cores/logs/scratch in `tmp/`.
 
-## Toolbox (install on demand; don't preinstall everything)
-```
-pip install pwntools ropper ROPgadget      # ELF/ROP/cyclic/shellcraft/remote; gadget search
-gem install one_gadget seccomp-tools        # execve one-shots; syscall-filter dump
-```
-- **Core:** `pwntools`, `gdb`+`pwndbg`/`gef`, `one_gadget ./libc.so.6`, `ROPgadget`/`ropper` (`ropr` is faster on huge bins), `seccomp-tools dump`, `checksec`, `patchelf`, `objdump -d -Mintel`, `strace`/`ltrace`.
+## Toolbox
+The image includes pwntools, ROPgadget, ropper, GDB, pwndbg, checksec, patchelf, binutils and QEMU user/system emulation. Check each optional command with `command -v` before use. Ruby `one_gadget`/`seccomp-tools`, `gef`, `ropr`, AFL++ and `pwninit` are not preinstalled; acquire only a needed extra into this job's scratch.
+
+- **Core:** `pwntools`, `gdb`+`pwndbg`, `ROPgadget`/`ropper`, `checksec`, `patchelf`, `objdump -d -Mintel`, `strace`/`ltrace`. Use `one_gadget` or `seccomp-tools` only if available.
 - **libc matching:** `pwninit` + `glibc-all-in-one`; ID a leaked libc at libc.rip / libc.blukat.me / libc-database `./find`; no version → pwntools `DynELF(leak, elf=elf)` resolves symbols from a leak alone.
 - **Find the crash:** compile source with `-fsanitize=address,undefined` to pinpoint the overflow; or fuzz (AFL++ / libFuzzer) to a crashing input, then reason from it.
-- **Kernel:** `extract-vmlinux`/`vmlinux-to-elf`, `qemu -s -S` + gef, `cpio`. (`one_gadget` n/a in kernel.)
+- **Kernel:** `qemu-system-x86_64 -s -S` + GDB multiarch and `cpio` are installed. `extract-vmlinux`/`vmlinux-to-elf` and gef are optional. (`one_gadget` does not apply in kernel.)
 
 ## Recon: let checksec pick the strategy
 ```
 file ./chall
 checksec --file=./chall                     # or: pwn checksec ./chall
 strings -n 6 ./chall | grep -iE 'flag|/bin/sh|system|cat|token|%[dspx]'
-seccomp-tools dump ./chall                   # execve blocked? → ORW / seccomp-bypass table below
+# Optional, only if installed: seccomp-tools dump ./chall
 ```
 Mitigation → what it forces on you:
 
@@ -44,8 +42,10 @@ Base owns the "sanitizer/fuzz as ground-truth oracle" framing — here are the p
 ```
 gcc -g -fsanitize=address,undefined -fno-omit-frame-pointer chall.c -o chall.asan
 ./chall.asan < crash.bin                 # report names file:line + overflow direction/size
-clang -g -fsanitize=address,fuzzer harness.c -o fuzz && ./fuzz -max_len=512 corpus/
-afl-cc chall.c -o chall.afl && afl-fuzz -i seeds -o out -- ./chall.afl @@   # binary-only: afl-qemu (-Q)
+# Optional libFuzzer only if clang is installed:
+# clang -g -fsanitize=address,fuzzer harness.c -o fuzz && ./fuzz -max_len=512 corpus/
+# Optional AFL++ only after checking command -v afl-cc and afl-fuzz:
+# afl-cc chall.c -o chall.afl && afl-fuzz -i seeds -o out -- ./chall.afl @@
 ```
 The crash *site* is usually not the bug — walk the call stack back to the writer, in gdb:
 ```
@@ -82,9 +82,8 @@ off = cyclic_find(p.corefile.read(p.corefile.rsp, 8), n=8)   # n=8 for 64-bit; h
 ## libc: identify the exact build, then anchor every symbol
 A leaked libc pointer is worthless until you know the exact build — every offset depends on it.
 ```
-pwninit --bin ./chall --libc ./libc.so.6   # patchelf's interp/rpath to the given libc+ld, drops a template
-./find printf 560 system 390               # libc-database: match low-3-nibbles of ≥2 leaked syms (or paste at libc.rip)
-./download 2.31-0ubuntu9.9_amd64           # glibc-all-in-one: fetch that exact build + its ld to run/debug locally
+# Optional helpers only if installed for this job: pwninit, libc-database ./find, glibc-all-in-one ./download
+# pwninit --bin ./chall --libc ./libc.so.6
 ```
 Anchor everything to the identified file — never to "typical" offsets from memory:
 ```python
@@ -97,7 +96,7 @@ system = libc.sym['system']; binsh = next(libc.search(b'/bin/sh\x00'))
 d = DynELF(lambda a: leak_bytes(a), elf=elf)   # leak_bytes(addr) -> raw bytes at addr
 system = d.lookup('system', 'libc')
 ```
-`one_gadget ./libc.so.6` gives single-jump `execve("/bin/sh")` gadgets — each has a register/stack constraint (e.g. `[rsp+0x40]==NULL`). Verify it holds at call time; else fall back to ret2libc.
+If the optional `one_gadget` is installed, `one_gadget ./libc.so.6` lists single-jump `execve("/bin/sh")` gadgets. Each has a register/stack constraint (e.g. `[rsp+0x40]==NULL`). Verify it holds at call time; otherwise use installed pwntools/ROPgadget for ret2libc or ORW.
 
 ## Heap technique by glibc version — record the version in `notes/ANALYSIS.md` first
 Get the version (`strings libc.so.6 | grep 'GNU C Library'` or the Ubuntu tag); it changes everything.
@@ -155,7 +154,9 @@ rop.system(binsh)
 payload = flat({OFFSET: rop.chain()})
 ```
 
-## seccomp: bypass the syscall filter (`seccomp-tools dump` shows the policy)
+## seccomp: inspect the filter before choosing a syscall path
+Use the supplied source or binary disassembly to establish the filter. `seccomp-tools dump` is an optional helper, not part of the image; `strace` can show observed syscall failures when ptrace is permitted but does not dump the BPF policy.
+
 | Filter blocks | Bypass |
 |---|---|
 | `execve` (59) only | `execveat` (322), or just ORW (`openat`+`read`+`write`) |
@@ -176,7 +177,7 @@ gdb -q ./chall -ex 'b *cmp_site' -ex run -ex 'x/s $rsi' -ex 'p/d (int)$rax' -ex 
 
 ## Kernel pwn primer (challenge ships `bzImage` + `rootfs.cpio` + `run.sh`)
 ```
-extract-vmlinux ./bzImage > vmlinux        # or vmlinux-to-elf ./bzImage vmlinux  (keeps symbols)
+# Optional extractor only if available: extract-vmlinux ./bzImage > vmlinux
 zcat rootfs.cpio | cpio -idv               # edit init → root shell for local dev, then repack
 # run.sh usually has -s (gdbstub :1234); add -S to pause at boot
 gdb-multiarch vmlinux -ex 'target remote :1234'    # gef: kbase / ksymaddr
@@ -206,7 +207,7 @@ Heap spray — **match the vulnerable object's `kmalloc` cache size** to the spr
 - Widen a race window: **`userfaultfd`**/**FUSE** (your handler stalls a `copy_from_user`) or **`MADV_DONTNEED`** to force a re-fault — classic for double-fetch / TOCTOU / UAF races.
 
 ## Apple-Silicon (arm64 host)
-`uname -m` = arm64 → do NOT run x86-64 challenge binaries natively. Debug under emulation: `qemu-x86_64-static -g 1234 ./chall` + `gdb-multiarch -ex 'target remote :1234'` (or `qdb`). Static RE (Ghidra/angr) is arch-agnostic; hit the remote for real dynamic behavior.
+`uname -m` = arm64 → do not run x86-64 challenge binaries natively. The image ships `qemu-x86_64` (not `qemu-x86_64-static`): use `qemu-x86_64 -g 1234 ./chall` + `gdb-multiarch -ex 'target remote :1234'`. Static RE (Ghidra/angr) is arch-agnostic; use any provided remote for real dynamic behavior.
 
 ## pwntools solver skeleton — land it locally, flip one flag for remote
 ```python
@@ -253,7 +254,7 @@ rop.system(next(libc.search(b'/bin/sh\x00')))
 io.sendline(flat({OFFSET: rop.chain()}))
 io.interactive()                           # cat the flag from the REMOTE socket
 ```
-`python3 solver.py` local, `... REMOTE` target, `... GDB` debug. (Local build → fake flag; the real flag is on the remote — base §1/§5.)
+`python3 solver.py` local, `... REMOTE` target when provided, `... GDB` debug. A local build may use a placeholder; verify Flag provenance from the challenge evidence (base §1/§5).
 
 ## Remote / PoW / submission
 - Each `bash` call is a **fresh process** — for any stateful service write a `pwntools`/socket script, don't chain `nc` calls. For raw binaries over `nc`: `stty raw -echo`.
@@ -264,7 +265,7 @@ io.interactive()                           # cat the flag from the REMOTE socket
 ## Determinism under ASLR / flaky remote
 - Prefer a **full leak** over a partial-overwrite brute — determinism beats a 1/16 guess.
 - Before blaming ASLR, fix stack alignment: a `movaps` fault in `system` is deterministic and masquerades as flakiness.
-- Local debugging with ASLR off: `echo 0 | sudo tee /proc/sys/kernel/randomize_va_space` (if permitted) — but re-verify with ASLR **on** before trusting the chain remotely.
+- If local debugging needs deterministic addresses, use GDB's process-scoped `set disable-randomization on` where permitted; re-verify with ASLR **on** before trusting the chain remotely. Do not change the host-wide `/proc/sys/kernel/randomize_va_space` setting.
 - When a real brute is unavoidable, loop it and detect the hit:
 ```python
 for _ in range(300):
@@ -282,5 +283,5 @@ for _ in range(300):
 ## Getting the flag out
 - Shell → `cat <flagfile>` / `ls -la`; the filename is usually in `../chal_desc.md`.
 - No shell (ORW/seccomp) → your chain must `open`+`read`+`write` that exact path to stdout.
-- The real flag prints on the **remote** socket — confirm you ran with `REMOTE` before submitting. Record the winning offset / libc-base / gadget chain in `notes/VULN.md` (the proven primitive) so a retry resumes from the last proven rung; log dead ends and POISON in `notes/NEXT.md`.
+- If the challenge supplies a remote service, confirm the genuine Flag on that socket before submitting. For a local-only challenge, verify against its supplied checker or artifact instead. Record the winning offset / libc-base / gadget chain in `notes/VULN.md` (the proven primitive) so a retry resumes from the last proven rung; log dead ends and POISON in `notes/NEXT.md`.
 - Cross-category pivot (RE to understand the binary, crypto to break a check, web/misc for the delivery surface) → open `../../skills/<cat>.md`.

@@ -171,19 +171,25 @@ function Get-DesktopDockerCli {
 
 function Get-WslDockerState([string]$distro) {
     $linux = Invoke-DesktopNative 'wsl.exe' @('--distribution', $distro,
-        '--exec', 'docker', 'info', '--format', '{{.ServerVersion}}') 12
-    if ($linux.ExitCode -eq 0) {
-        return [pscustomobject]@{Ready=$true;EngineReady=$true;SharedToolsMissing=$false;
-            Detail=$linux.Output;WindowsDetail=''}
-    }
+        '--exec', 'docker', 'info', '--format={{.ID}}') 12
     $docker = Get-DesktopDockerCli
     # Always inspect the local Desktop engine, never a user's remote context.
     $windows = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
-        'info', '--format', '{{.ServerVersion}}') 8
+        'info', '--format={{.ID}}') 8
+    $linuxId = $linux.Stdout.Trim()
+    $windowsId = $windows.Stdout.Trim()
+    $validId = '^[A-Za-z0-9][A-Za-z0-9:-]{7,127}$'
+    $bothReady = $linux.ExitCode -eq 0 -and $windows.ExitCode -eq 0 -and
+        $linuxId -match $validId -and $windowsId -match $validId
+    if ($bothReady -and $linuxId -eq $windowsId) {
+        return [pscustomobject]@{Ready=$true;EngineReady=$true;SharedToolsMissing=$false;
+            EngineMismatch=$false;Detail=$linux.Output;WindowsDetail=$windows.Output}
+    }
     $missing = Invoke-DesktopNative 'wsl.exe' @('--distribution', $distro, '--exec',
         '/bin/sh', '-c', 'test -L /usr/bin/docker && test "$(readlink /usr/bin/docker)" = /mnt/wsl/docker-desktop/cli-tools/usr/bin/docker && test ! -x /mnt/wsl/docker-desktop/cli-tools/usr/bin/docker') 8
     return [pscustomobject]@{Ready=$false;EngineReady=($windows.ExitCode -eq 0);
-        SharedToolsMissing=($missing.ExitCode -eq 0);Detail=$linux.Output;
+        SharedToolsMissing=($missing.ExitCode -eq 0);EngineMismatch=($bothReady -and $linuxId -ne $windowsId);
+        Detail=$linux.Output;
         WindowsDetail=$windows.Output}
 }
 
@@ -195,6 +201,9 @@ function Wait-WslDockerReady([string]$distro, [int]$timeoutSeconds = 90,
     while ($watch.Elapsed.TotalSeconds -lt $timeoutSeconds) {
         $state = Get-WslDockerState $distro
         if ($state.Ready) { return }
+        if ($state.EngineMismatch) {
+            throw "The selected WSL distribution is connected to a different Docker Engine. Its existing containers were not changed. Rerun Install.cmd and choose N for a dedicated Ubuntu distribution, then enable Docker Desktop WSL Integration for that distribution."
+        }
         if ($state.EngineReady -and $state.SharedToolsMissing) {
             if (-not $AllowRepair -or $repaired) { break }
             $docker = Get-DesktopDockerCli

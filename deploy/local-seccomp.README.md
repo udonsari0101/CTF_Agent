@@ -1,7 +1,10 @@
 # Local solver namespace profile
 
-The local Docker Desktop solver needs nested unprivileged namespaces for
-Codex 0.164.0's bubblewrap sandbox. The normal Docker profile blocks these.
+The local Docker Desktop solver needs unprivileged namespace operations for
+Codex's workspace-write execution path. The normal Docker profile blocks these.
+This describes the local profile; server deployments use a separate AppArmor
+command boundary and Codex's external-sandbox policy. The solver image does
+not install a standalone `bwrap` executable.
 `local-seccomp.json` retains Moby's default-deny profile and its other rules,
 and additionally permits `clone`, `unshare`, `setns`, `mount`, `umount2`, and
 `pivot_root`. Kernel capability checks still apply. The solver remains

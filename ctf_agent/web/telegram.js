@@ -108,6 +108,13 @@ export async function renderTelegram(container, api) {
       </div>` : '';
     container.innerHTML = `
       <div class="section-head"><div><h2>Telegram 알림</h2></div><span class="connection-state ${linked ? 'connected' : ''}">${i18n.t(linked ? '연결됨' : '연결 안 됨')}</span></div>
+      <form class="telegram-bot-form" data-telegram-name-form autocomplete="off">
+        <label for="telegram-instance-name">${i18n.t('알림에 표시할 설치 이름')}</label>
+        <div class="line-actions">
+          <input id="telegram-instance-name" name="name" type="text" maxlength="80" value="${escapeHtml(state.instance_name || '')}" placeholder="CTF Agent" aria-label="${i18n.t('알림에 표시할 설치 이름')}">
+          <button type="submit" class="small" data-telegram-name-save>${i18n.t('이름 저장')}</button>
+        </div>
+      </form>
       <form class="telegram-bot-form" data-telegram-bot-form autocomplete="off">
         <label for="telegram-bot-token">봇 토큰</label>
         <div class="line-actions">
@@ -172,6 +179,24 @@ export async function renderTelegram(container, api) {
   });
 
   container.addEventListener('submit', async event => {
+    const nameForm = event.target.closest('[data-telegram-name-form]');
+    if (nameForm) {
+      event.preventDefault();
+      const button = nameForm.querySelector('[data-telegram-name-save]');
+      button.disabled = true;
+      message();
+      try {
+        const name = nameForm.querySelector('[name="name"]').value;
+        const state = await api('/api/telegram/instance-name', {method:'PUT', body:{name}});
+        paint(state);
+        message(i18n.t('설치 이름을 저장했습니다.'));
+      } catch (error) {
+        message(error.message || i18n.t('설치 이름을 저장하지 못했습니다.'), true);
+      } finally {
+        if (button.isConnected) button.disabled = false;
+      }
+      return;
+    }
     const form = event.target.closest('[data-telegram-bot-form]');
     if (!form) return;
     event.preventDefault();

@@ -4,6 +4,8 @@ Read-only playbook for forensics/stego — file / disk / memory / network. Usual
 
 Files by role: extraction/recovery script → `solver.py`; artifact inventory + what each held → `notes/ANALYSIS.md`; the carrier + exactly how to extract it → `notes/VULN.md`; dead-ends + the next channel to try → `notes/NEXT.md`; carved/scratch/decoded files → `tmp/`; when an extracted payload is really another category (crypto/rev/web) → `../../skills/<cat>.md`.
 
+The image includes Binwalk, ExifTool, pngcheck, Pillow, StegSeek, Steghide, SoX, FFmpeg, TShark, Volatility 3, John and Sleuth Kit. `zsteg`, `bkcrack`, `hashcat`, `outguess`, ImageMagick, Aircrack-ng and GUI/online tools below are optional. Check availability before a command; use the installed byte/bit-level tools first, and acquire a specialized tool only when the artifact calls for it. No `rockyou.txt` wordlist is bundled.
+
 ## Triage — extensions lie, identify by bytes
 Run the cheap tools, then extract the ONE hypothesized channel (metadata / appended-EOF / LSB / packet-metadata / deleted-file / macro / leftover-history). Every extracted output is a NEW artifact — re-run `file` on it; 3–4 nested wrappers is normal.
 ```
@@ -18,9 +20,9 @@ Flag format is in `../chal_desc.md`.
 ## Artifact → tool decision table
 | Artifact | First move | Then |
 |---|---|---|
-| suspicious image (generic) | **Aperi'solve** — one shot runs zsteg/steghide/outguess/binwalk/exiftool + superimposes all planes | stegsolve *Data-Extract* / *Image-Combine* (XOR two near-identical imgs) |
-| PNG/BMP/GIF | `zsteg -a` (ALL planes) | data after `IEND`; IHDR-height brute vs stored CRC; `pngcheck -v`; alpha plane; PLTE |
-| JPEG | `stegseek img.jpg rockyou.txt` | `steghide`/`outguess -r`; ELA; `exiftool -b -ThumbnailImage`; **not** zsteg |
+| suspicious image (generic) | `file`, `exiftool`, `binwalk`, `pngcheck`, then inspect likely channel | Aperi'solve/stegsolve are optional external services or GUI tools |
+| PNG/BMP/GIF | `pngcheck -v` and Pillow channel/LSB inspection; optional `zsteg -a` | data after `IEND`; IHDR-height brute vs stored CRC; alpha plane; PLTE |
+| JPEG | `exiftool`, `steghide`; `stegseek img.jpg tmp/words.txt` only with a prepared wordlist | optional `outguess -r`; ELA; `exiftool -b -ThumbnailImage`; **not** zsteg |
 | WAV/audio | `sox -n spectrogram` / `ffmpeg showspectrumpic` | LSB; `multimon-ng` DTMF/Morse; SSTV; `sox … oops` (L−R); MP3Stego/DeepSound; `minimodem`/`fldigi` |
 | video | `ffprobe` ALL streams (0:0 is a decoy) | subtitle/attachment stream; `np.maximum` frame composite |
 | RF-IQ / logic capture | `inspectrum` · `rtl_433` · URH | `sigrok-cli` UART/I2C/SPI; check Manchester |
@@ -31,7 +33,7 @@ Flag format is in `../chal_desc.md`.
 | disk.img | `mmls` / `gdisk -l` → mount RO | `fls`/`icat`/`tsk_recover`; fsck+`lsdel`; carve slack |
 | .docm/.xlsm | `olevba` | `oledump.py`; unzip XML |
 | .pdf | `pdfid.py` / `pdf-parser.py` | dump stream; `pdfdetach` |
-| locked archive | list; obvious pw; `bkcrack` known-plaintext | `*2john`→`john`/`hashcat`; fix hdr len@26/28 |
+| locked archive | list; obvious pw; `zip2john`/`john` if present | optional `bkcrack` when ZipCrypto known plaintext exists; fix hdr len@26/28 |
 | container / repo | `docker history --no-trunc` | `git fsck --unreachable`; `.DS_Store` |
 
 ## Magic bytes & file repair
@@ -55,11 +57,11 @@ unzip suspect.jpg                               # polyglot test
 ## Images & stego
 PNG/BMP → LSB tools; JPEG → DCT tools. Check metadata/comments/appended data *before* deep stego.
 ```
-zsteg -a img.png                                # full LSB/channel scan — ALL planes, not just bit 0
-zsteg -E 'b1,rgb,lsb,xy' img.png                # extract one channel guess
-steghide extract -sf img.jpg                    # JPEG/BMP/WAV, prompts passphrase (try empty + rockyou)
-outguess -r out.jpg msg.txt                     # JPEG algo distinct from steghide/jsteg
-magick in.png -alpha extract a.png              # data hiding in fully-opaque alpha LSBs
+command -v zsteg >/dev/null && zsteg -a img.png  # optional full LSB/channel scan
+command -v zsteg >/dev/null && zsteg -E 'b1,rgb,lsb,xy' img.png
+steghide extract -sf img.jpg                    # JPEG/BMP/WAV, prompts passphrase
+command -v outguess >/dev/null && outguess -r out.jpg msg.txt  # optional JPEG extractor
+command -v magick >/dev/null && magick in.png -alpha extract a.png # optional alpha view
 ```
 - **After `IEND`** (PNG) / after `FF D9` (JPEG) = appended payload — carve trailing bytes.
 - **Cropped PNG**: IHDR height was shrunk but IDAT still holds the full image — brute the height field, keep the value whose IHDR **CRC32 matches the stored CRC** (or set height large, let a lenient decoder render the rest).
@@ -168,9 +170,9 @@ Watch for text hidden under images and in PDF incremental-update revisions. A ZI
 ```
 7z l s.7z ; unzip -l s.zip                       # list, don't extract yet
 zip2john locked.zip > h.txt                      # or rar2john/7z2john/pdf2john/office2john/keepass2john
-hashcat -m 13600 h.txt rockyou.txt               # zip=13600 rar5=13000 pdf=10500 office=9600 keepass=13400
+john --wordlist=tmp/words.txt h.txt              # prepare a candidate list; hashcat is optional
 ```
-- **Known-plaintext ZipCrypto → `bkcrack`, not brute force.** 12+ known plaintext bytes: `bkcrack -C archive.zip -c target.ext -p known.txt` → internal keys → `bkcrack -C archive.zip -k <k0> <k1> <k2> -D out.zip` (or `-U` to re-key). Known file is often a header (a sibling's `[Content_Types].xml`, PNG magic, a shared license).
+- **Known-plaintext ZipCrypto:** inspect whether 12+ bytes of plaintext are known before trying passwords. If optional `bkcrack` is available, `bkcrack -C archive.zip -c target.ext -p known.txt` recovers internal keys; then `bkcrack -C archive.zip -k <k0> <k1> <k2> -D out.zip` (or `-U` to re-key). Known file is often a header (a sibling's `[Content_Types].xml`, PNG magic, a shared license).
 - **Corrupted ZIP header**: local-file-header stores name-length @ **offset 26** and extra-field-length @ **offset 28** (2-byte LE) — patch both to true values (cross-check central directory). `zip -FF broken.zip --out fixed.zip` recovers many cases; fallback `zlib.decompress(raw[off:], -15)` brute-forced over offsets.
 - **Nested**: `binwalk --dd='.*'` unwraps recursively. **KeePass KDBX4/Argon2**: stock `keepass2john` fails → use the ivanmrsulja fork or `keepass4brute` (`hashcat -m13400`). `tar --occurrence=N -xO` extracts the Nth of duplicate-named entries. Magicless compressor → trial `brotli`/`zstd`/`lzma` until one succeeds.
 - Try obvious passwords first (challenge name, empty, "password") and check metadata/sibling artifacts for the passphrase before burning hours.

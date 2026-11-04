@@ -1,6 +1,6 @@
 # Skill Module: unknown (triage first)
 
-Category is unknown. Pure routing: turn the first cheap observations into a category, open `../../skills/<cat>.md`, and behave as that module. Don't open a disassembler, write a payload, or hit the remote until one category wins on evidence — a wrong call burns the whole budget on the wrong toolchain.
+Category is unknown. Turn the first cheap observations into a provisional category, open `../../skills/<cat>.md`, and revise that choice when new evidence warrants it. A supplied remote can be the only useful category signal: after reading the brief, make one protocol-appropriate, non-destructive first contact if it helps classify the target. Save the response under `tmp/` and inspect it before further requests; do not fuzz or brute-force during triage. For a target with no files, follow `../../skills/remote_only.md`. Do not start expensive decompilation or build an exploit before there is a concrete lead.
 
 ## Cheap signal sweep (before anything expensive)
 
@@ -15,7 +15,7 @@ binwalk <f>; unzip -l <f>              # containers / trailing appended data
 exiftool <img>                         # metadata / GPS (osint vs. in-file stego)
 ```
 
-`file`/`ls`/`wc`/`strings`/`head` cost nothing and eliminate categories. Spend them first; open ghidra / send requests only after a category wins.
+Use the cheap local checks that fit the supplied files. Avoid running `binwalk` or `strings` over a multi-gigabyte artifact by default; inspect a small sample or metadata first. A one-request remote banner, HTTP header, or protocol greeting can settle an otherwise ambiguous category. Record its observed result, then choose the next playbook.
 
 ## Verb map — read `../chal_desc.md` first, it often names the class
 
@@ -63,7 +63,7 @@ Also record: remote host/port (network is OPEN), the flag format, files provided
 
 ## Commit and hand off
 
-When two independent signals agree (e.g. `file` says ELF **and** the brief says "get a shell", or checksec + a live socket), stop triaging. Record the **decisive signal + decision** in `notes/ANALYSIS.md` (`category: X — because <file/strings/service-banner/framework/magic-bytes>`), then open `../../skills/<cat>.md` and act as that module. **If a diff/patch or two source versions are provided, the changed lines ARE the planted bug** — the diff already picks the category and the site; start there.
+Stop triaging as soon as one observation or a small combination of clues gives a useful next action. Record the **evidence + provisional decision** in `notes/ANALYSIS.md` (`category: X — because <file/strings/service-banner/framework/magic-bytes>`), then open `../../skills/<cat>.md` and act as that module. A category label from the platform is a hint, not a gate; change playbooks when observations contradict it. **If a diff/patch or two source versions are provided, inspect the changed lines** as candidate sites; confirm reachability and behavior before calling any change the bug.
 
 **Contradictory evidence** (an ELF *and* a web app *and* a pcap) ⇒ multi-stage. Pick the category of the **first artifact you must break to progress**, log the rest as later stages in `notes/NEXT.md`, and do that one. Don't run every playbook at once.
 

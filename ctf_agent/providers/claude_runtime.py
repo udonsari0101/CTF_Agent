@@ -187,7 +187,7 @@ class ClaudeRuntime(CodexRuntime):
         command = self.version_command(previous) if previous else [shutil.which("claude")]
         if not command or not command[0]:
             raise ProviderError("이전 Claude Code 실행 파일을 찾지 못했습니다.", "unavailable")
-        self._verifying_version = previous or os.environ.get("CTF_IMAGE_CLAUDE_VERSION", "2.1.310")
+        self._verifying_version = previous or os.environ.get("CTF_IMAGE_CLAUDE_VERSION", "2.1.311")
         await self.verify(command)
         try:
             self.save({"selected": previous, "previous": current["selected"], "updated_at": time.time()})

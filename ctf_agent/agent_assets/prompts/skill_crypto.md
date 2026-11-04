@@ -33,16 +33,16 @@ Quick check: `python3 -c "d=open('f','rb').read();print(len(d),len(set(d)))"`; `
 
 ## Tooling fast-path
 
-- **SageMath is the fast path** for anything algebraic (factoring, Coppersmith, discrete log, curves, lattices/LLL): `sage script.sage` or `sage -python x.py`. Fall back to pycryptodome+sympy+z3 only if Sage is missing.
+- The image includes `gp` (PARI/GP), `fpylll`, `gmpy2`, `sympy`, `z3` and PyCryptodome. Start with the cheapest matching one. **SageMath is optional, not preinstalled**; check `command -v sage` before `sage script.sage` or `sage -python x.py`, and acquire it only if its algebraic operations are necessary.
 - `from Crypto.Util.number import long_to_bytes, bytes_to_long, isPrime, inverse, GCD`; ciphers via `Crypto.Cipher`. `gmpy2` for fast bigint/iroot; `sympy` for `factorint, nextprime, discrete_log` (small).
-- **z3/cvc5**: constraint-solve PRNG/LCG/bit-twiddling when algebra is ugly. z3/cvc5/BKZ don't scale on cores — **race N processes** (different seeds/tactics) under `timeout`, take first hit.
-- **factordb FIRST for every modulus**: `curl -s "http://factordb.com/api?query=<N>"` (or `factordb-pycli`). Many CTF `n` are pre-factored. Big/generic semiprime with no structure → `cado-nfs`. Record recovered factors in `notes/VULN.md`.
+- **z3 is installed; cvc5 is optional**. Constraint-solve PRNG/LCG/bit-twiddling when algebra is ugly. Large SMT/BKZ jobs may not scale; bound trials with `timeout` and compare distinct approaches.
+- Check a supplied RSA modulus against FactorDB's public API when relevant: `curl -s "https://factordb.com/api?query=<N>"`. Treat its result as a lead, verify factors with `p*q==n`. `factordb-pycli` and `cado-nfs` are optional extras. Record recovered factors in `notes/VULN.md`.
 
 ---
 
 ## RSA — decision tree by tell (cheapest first)
 
-**First move:** `RsaCtfTool -n N -e E --uncipher C` auto-sweeps most branches; kick off `factordb` + `roca-detect` alongside. Then walk manually by cost:
+**First move:** inspect `n,e,c` and test cheap structure (shared factors, small exponent, close primes, weak `d` via installed `owiener`); check FactorDB when useful. `RsaCtfTool` and `roca-detect` are optional, not image commands. If installed or acquired for this job, use them as additional hypotheses, then verify their output. Walk the branches by cost:
 - **factordb hit** → decrypt.
 - **e small (3,5,17), single ct, `m^e<n`** → integer e-th root `iroot(c,e)`; if inexact, `m` wrapped → retry `iroot(c+k·n,e)` small `k`.
 - **e small, same `m` to ≥e recipients** → **Håstad broadcast**: CRT the `c_i mod n_i`, then e-th root. With affine pad `a_i m+b_i` → CRT + Coppersmith.
@@ -69,7 +69,7 @@ def fermat(n):
         b,ok=integer_nthroot(a*a-n,2)
         if ok: return a-b,a+b
         a+=1
-# Coppersmith high bits of p (Sage): p=p_high+x, |x|<2^kbits, p~n^0.5
+# Coppersmith high bits of p (optional SageMath only): p=p_high+x, |x|<2^kbits, p~n^0.5
 P.<x>=PolynomialRing(Zmod(n))                       # MONIC in x
 x0=(p_high+x).small_roots(X=2^kbits,beta=0.5)[0]
 p=int(p_high+x0); q=n//p
@@ -125,7 +125,7 @@ d=((s1*k-z1)*inverse(r,n))%n
 
 **Trigger:** linear relations mod `q` with one unknown *small / biased / truncated / partially leaked*. Cases: **HNP** (partial-nonce ECDSA/DSA), **truncated/low-bit LCG**, **subset-sum/knapsack**, **Coppersmith** (small modular root), **LWE/CVP**, approximate-GCD. Build a basis whose short vectors encode the small unknown.
 
-**Ladder (cheapest first):** `M.LLL()` → `M.BKZ(block_size=20..35)` → **Babai nearest-plane / CVP** (inhomogeneous "target" problems). Use **`fpylll`** + **`flatter`** (far faster on big/ill-scaled bases); reach for **`defund/coppersmith`** (multivariate `small_roots`) and **`jvdsn/crypto-attacks`** (ready HNP/Coppersmith/LCG/LWE) rather than re-deriving.
+**Ladder (cheapest first):** installed `fpylll` LLL/BKZ → **Babai nearest-plane / CVP** (inhomogeneous "target" problems). SageMath's `M.LLL()`/`M.BKZ()`, `flatter`, `defund/coppersmith` and `jvdsn/crypto-attacks` are optional extras; verify availability before following their recipes.
 
 **When LLL/BKZ returns garbage — the four usual bugs:**
 1. **Scaling** — weight the columns holding the small unknowns so their term dominates; balance entry magnitudes.

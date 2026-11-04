@@ -75,6 +75,33 @@ function orderedQuotaBuckets(quota, identity) {
     priority(left.bucket) - priority(right.bucket) || left.index - right.index).map(item => item.bucket);
 }
 
+function quotaRemaining(used) {
+  return typeof used === 'number' && Number.isFinite(used)
+    ? Math.max(0, Math.min(100, 100 - used)) : null;
+}
+
+// A zero-remaining window deserves a visible warning, but only a current
+// provider limit/status can say that execution is blocked. Cached snapshots
+// from a failed refresh are historical readings, not a live refusal.
+export function quotaDisplayState(account) {
+  const quota = account?.snapshot?.quota || {};
+  const stale = account?.stale === true || quota.stale === true;
+  const readable = quota.status === 'available' || quota.status === 'quota_exceeded';
+  const buckets = orderedQuotaBuckets(quota, account?.snapshot?.identity)
+    .filter(bucket => bucket && typeof bucket === 'object').map(bucket => {
+      const windows = (Array.isArray(bucket.windows) ? bucket.windows : [])
+        .filter(window => window && typeof window === 'object').map(window => {
+        const remaining = quotaRemaining(window.used_percent);
+        return {window, remaining, exhausted: !stale && readable && remaining === 0};
+      });
+      return {bucket, windows, blocked: !stale && bucket.limited === true,
+        exhausted: windows.some(item => item.exhausted)};
+    });
+  return {stale, buckets,
+    blocked: !stale && (quota.limited === true || quota.status === 'quota_exceeded'),
+    exhausted: buckets.some(item => item.exhausted)};
+}
+
 export async function renderAccounts(container, api, options = {}) {
   container.replaceChildren();
   const shell = el('section', undefined, 'account-management');
@@ -409,10 +436,13 @@ export async function renderAccounts(container, api, options = {}) {
     const pendingLogins = [];
     const liveAccountIds = new Set(data.accounts.map(account => account.id));
     for (const id of modelTargets.keys()) if (!liveAccountIds.has(id)) modelTargets.delete(id);
-    accounts.replaceChildren();
-    if (!data.accounts.length) accounts.append(el('p', '등록된 계정이 없습니다.'));
+    const existingCards = new Map([...accounts.children]
+      .filter(child => child.dataset.accountId)
+      .map(child => [child.dataset.accountId, child]));
+    for (const child of [...accounts.children]) if (!child.dataset.accountId) child.remove();
     for (const account of data.accounts) {
       const card = el('section', undefined, 'card');
+      card.dataset.accountId = account.id;
       const snapshot = account.snapshot || {};
       card.append(el('h3', `${account.label} · ${account.provider}${account.selected ? ` · ${i18n.t('현재 선택')}` : ''}`));
       const identity = snapshot.identity || {};
@@ -423,37 +453,31 @@ export async function renderAccounts(container, api, options = {}) {
         account.auth_kind === 'api_key' ? i18n.t('API 키') : null, identity.email,
         identity.planType || identity.subscriptionType].filter(Boolean).join(' · ')));
       if (snapshot.message) card.append(el('p', snapshot.message));
+      if (snapshot.auth_refresh_unconfirmed) card.append(el('p', i18n.t('현재 인증은 확인됐지만 자동 갱신을 확인하지 못했습니다. 만료 후 재로그인이 필요할 수 있습니다.'), 'auth-refresh-warning'));
       if (snapshot.error) card.append(el('p', errorText({...snapshot.error,message:snapshot.error.message || '계정 정보를 조회하지 못했습니다.'}), 'error-text'));
       card.append(el('small', `${i18n.t('마지막 조회')}: ${date(account.checked_at)}${account.stale ? ` · ${i18n.t('새로고침 필요')}` : ''}`));
       const quota = snapshot.quota;
       if (quota) {
-        const exhaustedClaudeWindow = account.provider === 'claude' && ['available', 'quota_exceeded'].includes(quota.status)
-          && Array.isArray(quota.buckets) && quota.buckets.some(bucket => Array.isArray(bucket.windows) && bucket.windows.some(window =>
-            typeof window.used_percent === 'number' && Number.isFinite(window.used_percent) && window.used_percent >= 100));
+        const quotaView = quotaDisplayState(account);
         if (quota.stale) card.append(el('p', '최근 조회 실패: 아래 사용량은 이전 조회 값입니다.'));
         if (quota.message) card.append(el('p', quota.message));
         if (quota.error) card.append(el('p', errorText({...quota.error,message:quota.error.message || '사용량을 조회하지 못했습니다.'}), 'error-text'));
-        if (quota.limited || exhaustedClaudeWindow) {
+        if (quotaView.stale) card.className += ' quota-stale';
+        else if (quotaView.blocked) {
           card.className += ' quota-limited';
           card.append(el('p', '현재 계정의 사용량 제한에 도달했습니다. 초기화 뒤 새로고침하거나 다른 등록 계정을 선택해 주세요.', 'quota-alert'));
-        }
-        for (const bucket of orderedQuotaBuckets(quota,identity)) {
-          const exhaustedWindows = account.provider === 'claude' && ['available', 'quota_exceeded'].includes(quota.status)
-            && Array.isArray(bucket.windows) && bucket.windows.some(window =>
-              typeof window.used_percent === 'number' && Number.isFinite(window.used_percent) && window.used_percent >= 100);
-          const bucketLimited = bucket.limited || exhaustedWindows;
-          const list = el('div', undefined, `quota-bucket${bucketLimited ? ' quota-limited' : ''}`);
+        } else if (quotaView.exhausted) card.className += ' quota-exhausted';
+        for (const bucketState of quotaView.buckets) {
+          const {bucket} = bucketState;
+          const list = el('div', undefined, `quota-bucket${bucketState.blocked ? ' quota-limited' : ''}${bucketState.exhausted ? ' quota-exhausted' : ''}${quotaView.stale ? ' quota-stale' : ''}`);
           list.setAttribute('aria-label', `${bucket.name || bucket.id || 'Codex'} 사용량`);
           list.append(el('strong', bucket.name || bucket.id));
-          if (bucketLimited) {
+          if (bucketState.blocked) {
             const reason = quotaLimitLabels[bucket.reached_type] || (bucket.spend_control_reached ? '설정된 지출 한도에 도달했습니다.' : quotaLimitLabels.rate_limit_reached);
             list.append(el('p', reason, 'quota-reason'));
           }
-          if (!bucket.windows.length) list.append(el('p', '사용량 구간이 제공되지 않았습니다.'));
-          for (const window of bucket.windows) {
-            const used = window.used_percent;
-            const remaining = typeof used === 'number' && Number.isFinite(used) ? Math.max(0, Math.min(100, 100 - used)) : null;
-            const windowExhausted = exhaustedWindows && remaining === 0;
+          if (!bucketState.windows.length) list.append(el('p', '사용량 구간이 제공되지 않았습니다.'));
+          for (const {window,remaining,exhausted:windowExhausted} of bucketState.windows) {
             list.append(el('p', `${i18n.t(window.label)}: ${remaining == null ? i18n.t('남은 사용량 미제공') : `${remaining}% ${i18n.t('남음')}`} · ${i18n.t('초기화')} ${date(window.resets_at)}`, windowExhausted ? 'quota-window-exhausted' : undefined));
             if (remaining != null) {
               const meter = el('progress'); meter.max = 100; meter.value = remaining;
@@ -481,6 +505,9 @@ export async function renderAccounts(container, api, options = {}) {
       const login = el('div');
       const models = modelTargets.get(account.id) || el('div');
       modelTargets.set(account.id, models);
+      // Build the refreshed card without moving an open settings form. Removing
+      // even the same <select> for one render closes its native dropdown.
+      const modelSlot = el('div');
       const controls = el('div', undefined, 'actions');
       const upload = el('div');
       const apiKey = el('div');
@@ -496,11 +523,32 @@ export async function renderAccounts(container, api, options = {}) {
           await load();
         }));
       if (account.provider === 'codex') controls.append(button('auth.json 업로드', () => authUpload(account, upload)));
-      card.append(controls, login, models, upload, apiKey); accounts.append(card);
+      card.append(controls, login, modelSlot, upload, apiKey);
+      const existing = existingCards.get(account.id);
+      existingCards.delete(account.id);
+      if (existing?.contains(models)) {
+        // Update quotas and account metadata in place while the model form and
+        // its ancestors stay connected, preserving focus and unsaved choices.
+        existing.className = card.className;
+        const next = [...card.childNodes];
+        const slotIndex = next.indexOf(modelSlot);
+        for (const child of [...existing.childNodes]) if (child !== models) child.remove();
+        next.forEach((child, index) => {
+          if (child === modelSlot) return;
+          if (index < slotIndex) existing.insertBefore(child, models);
+          else existing.append(child);
+        });
+      } else {
+        modelSlot.replaceWith(models);
+        if (existing) existing.replaceWith(card);
+        else accounts.append(card);
+      }
       if (['starting', 'pending'].includes(account.login?.status)) {
         pendingLogins.push(action(() => showLogin(account, login, false)));
       }
     }
+    for (const stale of existingCards.values()) stale.remove();
+    if (!data.accounts.length) accounts.append(el('p', '등록된 계정이 없습니다.'));
     await Promise.all(pendingLogins);
     return data;
   }

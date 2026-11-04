@@ -29,6 +29,9 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = push ]; then test "$revision" = "$GITHUB_SHA"; fi
           git merge-base --is-ancestor "$revision" origin/main
           git checkout --detach "$revision"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ctf-agent-public"
+          digest="$(docker manifest inspect --verbose "$image:$revision" | jq -er '.Descriptor.digest')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           python3 scripts/package_local_release.py --version "$RELEASE_TAG" --commit "$revision"
           (cd dist && sha256sum --check "CTF_Agent-${RELEASE_TAG}-local-windows.zip.sha256")
           python3 - <<'PY'
@@ -41,10 +44,11 @@ jobs:
           prefix = f'CTF_Agent-{tag}/'
           with ZipFile(archive) as bundle:
               names = set(bundle.namelist())
-              required = {'Install.cmd', 'Install.ps1', 'DatabaseDisk.ps1', 'DockerDesktop.ps1',
+              required = {'Install.cmd', 'Install.ps1', 'DatabaseDisk.ps1', 'DockerDesktop.ps1', 'DockerDisk.ps1',
                           'Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1',
                           'installer/install.sh', 'installer/start.sh',
                           'installer/uninstall.py', 'installer/storage_control.py',
+                          'installer/storage_preflight.py',
                           'app/Dockerfile.updater', 'app/Dockerfile.local-runtime',
                           'app/deploy/local_runtime.py', 'app/deploy/local-seccomp.json',
                           'app/deploy/local-seccomp.README.md', 'app/deploy/moby-profiles-LICENSE',

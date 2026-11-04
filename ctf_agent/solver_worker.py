@@ -68,6 +68,11 @@ from .solver_retry import (
     solver_artifact_from_bytes,
 )
 from .request_remote import MAX_REQUEST_BYTES
+from .writeup_publication import (
+    contains_internal_operation,
+    public_solution_notes,
+    public_solver_source,
+)
 
 try:  # The production worker is Linux; keeping importability aids unit tests.
     import resource
@@ -76,10 +81,10 @@ except ImportError:  # pragma: no cover - Windows development host
 
 
 EXCHANGE_PROTOCOL = 1
-REQUIRED_CODEX_VERSION = os.environ.get("CTF_IMAGE_CODEX_VERSION", "0.164.0")
+REQUIRED_CODEX_VERSION = os.environ.get("CTF_IMAGE_CODEX_VERSION", "0.166.0")
 if not re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", REQUIRED_CODEX_VERSION):
     raise RuntimeError("CTF_IMAGE_CODEX_VERSION must be an exact semantic version")
-REQUIRED_CLAUDE_VERSION = os.environ.get("CTF_IMAGE_CLAUDE_VERSION", "2.1.310")
+REQUIRED_CLAUDE_VERSION = os.environ.get("CTF_IMAGE_CLAUDE_VERSION", "2.1.311")
 if not re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", REQUIRED_CLAUDE_VERSION):
     raise RuntimeError("CTF_IMAGE_CLAUDE_VERSION must be an exact semantic version")
 def _nonnegative_int_setting(name: str, default: int) -> int:
@@ -128,6 +133,7 @@ LIVE_ACTIVITY_FULL_FIDELITY_EVENTS = 1_500
 LIVE_ACTIVITY_SAMPLE_INTERVAL_SECONDS = 60.0
 MAX_LIVE_AGENT_EVENTS = 256
 MAX_LIVE_AGENT_NODES = 64
+MAX_LIVE_CONTEXT_EVENTS = 1_000
 MAX_LIVE_COMMAND_BYTES = 2_048
 MAX_LIVE_OUTPUT_BYTES = 8 * 1_024
 MAX_LIVE_MESSAGE_BYTES = 4 * 1_024
@@ -316,6 +322,8 @@ def _english_explanations_present(sections: dict[str, str], challenge_name: str)
 def _valid_writeup(markdown: str, challenge_name: str, flag: str, locale: str = "ko") -> bool:
     """Validate the stable, locale-specific, Notion-ready write-up contract."""
 
+    if contains_internal_operation(markdown):
+        return False
     lines = markdown.splitlines()
     if not lines or lines[0].strip() != f"# {challenge_name}":
         return False
@@ -345,6 +353,8 @@ def _writeup_validation_issues(
     """Return bounded editorial hints without exposing document contents."""
 
     issues: list[str] = []
+    if contains_internal_operation(markdown):
+        issues.append("Internal submission or service command must be removed")
     lines = markdown.splitlines()
     if not lines or lines[0].strip() != f"# {challenge_name}":
         issues.append("첫 줄의 문제 제목 불일치")
@@ -472,12 +482,13 @@ def _markdown_code_fence(source: str) -> str:
     return f"{fence}python\n{source.rstrip()}\n{fence}"
 
 
-def _include_solver_source(markdown: str, source: str) -> str:
+def _include_solver_source(markdown: str, source: str, locale: str = "ko") -> str:
     """Ensure the worker-verified solver.py is reproduced in the code section."""
 
     if not source or source.rstrip() in markdown:
         return markdown
-    code_heading = re.search(r"(?m)^## 풀이 코드 및 명령어[ \t]*$", markdown)
+    code_heading_name = "Code and Commands" if locale == "en" else _WRITEUP_TEMPLATE_SECTIONS[4]
+    code_heading = re.search(rf"(?m)^## {re.escape(code_heading_name)}[ \t]*$", markdown)
     flag_heading = re.search(r"(?m)^## Flag[ \t]*$", markdown)
     if code_heading is None or flag_heading is None or flag_heading.start() <= code_heading.end():
         return markdown
@@ -2568,6 +2579,46 @@ def _provider_agent_id(provider: str, raw_id: object) -> str | None:
     return f"{provider}:{hashlib.sha256(raw_id.encode('utf-8')).hexdigest()[:24]}"
 
 
+def _provider_activity_id(provider: str, session_id: object, raw_id: object) -> str | None:
+    """Correlate provider tool start/result without exposing provider identifiers."""
+
+    if not isinstance(session_id, str) or not isinstance(raw_id, str):
+        return None
+    if not session_id or not raw_id or len(session_id) > 256 or len(raw_id) > 256:
+        return None
+    if _WRITEUP_INSTRUCTION_CONTROL.search(session_id) or _WRITEUP_INSTRUCTION_CONTROL.search(raw_id):
+        return None
+    source = f"{provider}\0{session_id}\0{raw_id}".encode("utf-8")
+    return hashlib.sha256(source).hexdigest()[:32]
+
+
+def _claude_activity_tool(name: object) -> str:
+    if not isinstance(name, str):
+        return "tool"
+    if name == "Bash":
+        return "shell"
+    if name == "WebSearch":
+        return "web_search"
+    if name in {"Task", "Agent", "Workflow"}:
+        return "agent"
+    if name in {"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep"}:
+        return "file"
+    return "tool"
+
+
+def _claude_tool_result_text(content: object) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "") for part in content
+            if isinstance(part, Mapping)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+    return None
+
+
 async def _emit_agent_event(
     driver: object,
     agent_id: str,
@@ -2606,6 +2657,106 @@ async def _emit_agent_event(
     driver.agent_events += 1
     await reporter(**node)
     return True
+
+
+def _context_count(value: object, *, positive: bool = False) -> int | None:
+    if type(value) is not int or value < int(positive) or value > 1_000_000_000:
+        return None
+    return value
+
+
+def _codex_context_sample(params: object) -> tuple[int, int] | None:
+    """Only the latest response, never the cumulative session or account quota."""
+
+    usage = params.get("tokenUsage") if isinstance(params, Mapping) else None
+    last = usage.get("last") if isinstance(usage, Mapping) else None
+    used = _context_count(last.get("totalTokens")) if isinstance(last, Mapping) else None
+    window = _context_count(usage.get("modelContextWindow"), positive=True) if isinstance(usage, Mapping) else None
+    if used is None or window is None or used > window:
+        return None
+    return used, window
+
+
+def _claude_context_sample(message: object) -> tuple[str, int] | None:
+    """Latest request input (including cache), not cumulative result.modelUsage."""
+
+    if not isinstance(message, Mapping):
+        return None
+    model = message.get("model")
+    usage = message.get("usage")
+    if (
+        not isinstance(model, str) or not 1 <= len(model) <= 120
+        or not isinstance(usage, Mapping) or "input_tokens" not in usage
+    ):
+        return None
+    parts = tuple(_context_count(usage.get(name, 0)) for name in (
+        "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+    ))
+    if any(part is None for part in parts):
+        return None
+    used = sum(parts)
+    return (model, used) if used <= 1_000_000_000 else None
+
+
+def _claude_context_windows(result: object) -> dict[str, int]:
+    model_usage = result.get("modelUsage") if isinstance(result, Mapping) else None
+    if not isinstance(model_usage, Mapping):
+        return {}
+    windows: dict[str, int] = {}
+    for model, usage in model_usage.items():
+        if not isinstance(model, str) or not isinstance(usage, Mapping):
+            continue
+        window = _context_count(usage.get("contextWindow"), positive=True)
+        if window is not None:
+            windows[model] = window
+    return windows
+
+
+async def _emit_context_usage(
+    driver: object, agent_id: str, state: str, source: str,
+    used_tokens: int | None = None, window_tokens: int | None = None,
+    *, observed_at: float | None = None,
+) -> None:
+    reporter = getattr(driver, "context_reporter", None)
+    if reporter is None:
+        return
+    if agent_id != "root" and agent_id not in driver.agent_nodes:
+        return
+    # Once the bounded event budget is exhausted, invalidate all displayed
+    # percentages exactly once. Future provider updates cannot leave stale
+    # numeric readings that appear live indefinitely.
+    if driver.context_events >= MAX_LIVE_CONTEXT_EVENTS:
+        if driver.context_budget_closed:
+            return
+        driver.context_budget_closed = True
+        now = time.time()
+        for known_id, prior in tuple(driver.context_snapshots.items()):
+            if prior[0] != "available":
+                continue
+            source_name = prior[1]
+            driver.context_snapshots[known_id] = ("unavailable", source_name, None, None)
+            driver.context_last_emit_at[known_id] = now
+            driver.context_events += 1
+            await reporter(
+                agent_id=known_id, state="unavailable", source=source_name,
+                used_tokens=None, window_tokens=None, observed_at=now,
+            )
+        return
+    snapshot = (state, source, used_tokens, window_tokens)
+    now = time.time()
+    if (
+        driver.context_snapshots.get(agent_id) == snapshot
+        and now - driver.context_last_emit_at.get(agent_id, 0) < 60
+    ):
+        return
+    driver.context_snapshots[agent_id] = snapshot
+    driver.context_last_emit_at[agent_id] = now
+    driver.context_events += 1
+    await reporter(
+        agent_id=agent_id, state=state, source=source,
+        used_tokens=used_tokens, window_tokens=window_tokens,
+        observed_at=now if observed_at is None else observed_at,
+    )
 
 
 class CodexAppServer:
@@ -2699,12 +2850,18 @@ class CodexAppServer:
         self._first_solve_tool_at: float | None = None
         self.guidance_mailbox: GuidanceMailbox | None = None
         self.activity_reporter: Callable[..., Awaitable[None]] | None = None
+        self.evidence_reporter: Callable[..., Awaitable[None]] | None = None
         self.activity_events = 0
         self._next_activity_sample_at: float | None = None
         self.agent_reporter: Callable[..., Awaitable[None]] | None = None
         self.agent_events = 0
         self.agent_nodes: dict[str, dict[str, Any]] = {}
         self.thread_agents: dict[str, str] = {}
+        self.context_reporter: Callable[..., Awaitable[None]] | None = None
+        self.context_events = 0
+        self.context_snapshots: dict[str, tuple[object, ...]] = {}
+        self.context_last_emit_at: dict[str, float] = {}
+        self.context_budget_closed = False
         self._deferred_guidance_ids: set[str] = set()
         self.pid = -1
 
@@ -2720,7 +2877,37 @@ class CodexAppServer:
         exit_code: object = None,
         duration_ms: object = None,
         agent_id: object = None,
+        activity_id: str | None = None,
     ) -> None:
+        activity_agent_id = agent_id if agent_id is not None else getattr(self, "_current_event_agent_id", None)
+        if activity_agent_id != "root" and (
+            not isinstance(activity_agent_id, str) or activity_agent_id not in self.agent_nodes
+        ):
+            activity_agent_id = None
+        command_bytes = len(command.encode("utf-8", errors="replace")) if isinstance(command, str) else 0
+        output_bytes = len(output.encode("utf-8", errors="replace")) if isinstance(output, str) else 0
+        command_truncated = command_bytes > MAX_LIVE_COMMAND_BYTES
+        output_truncated = output_bytes > MAX_LIVE_OUTPUT_BYTES
+        # This metadata ledger is independent of the sampled, bounded UI log.
+        # It contains no raw command, output, or provider-assigned identifier.
+        if self.evidence_reporter is not None and tool in {"shell", "web_search", "file", "tool", "agent"}:
+            evidence: dict[str, Any] = {
+                "activity_id": activity_id or uuid.uuid4().hex,
+                "correlatable": activity_id is not None,
+                "phase": phase,
+                "tool": tool,
+                "command_bytes": min(command_bytes, 2**31 - 1),
+                "output_bytes": min(output_bytes, 2**31 - 1),
+                "command_truncated": command_truncated,
+                "output_truncated": output_truncated,
+            }
+            if activity_agent_id is not None:
+                evidence["agent_id"] = activity_agent_id
+            if type(exit_code) is int:
+                evidence["exit_code"] = exit_code
+            if type(duration_ms) is int and duration_ms >= 0:
+                evidence["duration_ms"] = duration_ms
+            await self.evidence_reporter(**evidence)
         if self.activity_reporter is None or self.activity_events >= MAX_LIVE_ACTIVITY_EVENTS:
             return
         if self.activity_events >= LIVE_ACTIVITY_FULL_FIDELITY_EVENTS:
@@ -2736,17 +2923,20 @@ class CodexAppServer:
             "tool": tool,
             "summary": summary,
         }
-        activity_agent_id = agent_id if agent_id is not None else getattr(self, "_current_event_agent_id", None)
-        if activity_agent_id == "root" or (
-            isinstance(activity_agent_id, str) and activity_agent_id in self.agent_nodes
-        ):
+        if activity_agent_id is not None:
             payload["agent_id"] = activity_agent_id
+        if activity_id is not None:
+            payload["activity_id"] = activity_id
         safe_command = _safe_activity_text(command)
         if safe_command:
             payload["command"] = safe_command
         safe_output = _safe_activity_text(output, MAX_LIVE_OUTPUT_BYTES)
         if safe_output:
             payload["output"] = safe_output
+        if command_truncated:
+            payload["command_truncated"] = True
+        if output_truncated:
+            payload["output_truncated"] = True
         safe_message = _safe_activity_text(message, MAX_LIVE_MESSAGE_BYTES)
         if safe_message:
             payload["message"] = safe_message
@@ -4027,6 +4217,30 @@ print(json.dumps(result,separators=(",",":")))
                     safe_rate_limit_snapshot(values.get("rateLimits")),
                 )
                 self.rate_limit_context = latest_rate_limit
+            elif method == "thread/tokenUsage/updated":
+                source_thread_id = values.get("threadId")
+                source_agent_id = (
+                    "root" if source_thread_id == thread_id else self.thread_agents.get(source_thread_id)
+                    if isinstance(source_thread_id, str) else None
+                )
+                if source_agent_id is not None and (
+                    source_agent_id != "root" or values.get("turnId") == self.turn_id
+                ):
+                    sample = _codex_context_sample(values)
+                    prior_state = self.context_snapshots.get(source_agent_id, (None,))[0]
+                    # Token updates can arrive while Codex is compacting.
+                    # Keep that transition visible until the item completes.
+                    if prior_state == "compacting":
+                        continue
+                    if sample is not None:
+                        await _emit_context_usage(
+                            self, source_agent_id, "available", "codex_last_response",
+                            sample[0], sample[1],
+                        )
+                    elif prior_state != "awaiting_usage":
+                        await _emit_context_usage(
+                            self, source_agent_id, "unavailable", "codex_last_response",
+                        )
             elif method in ("item/started", "item/completed"):
                 source_thread_id = values.get("threadId", thread_id)
                 if source_thread_id != thread_id and source_thread_id not in self.thread_agents:
@@ -4037,6 +4251,16 @@ print(json.dumps(result,separators=(",",":")))
                 self._current_event_agent_id = source_agent_id
                 item = values.get("item")
                 item_type = item.get("type") if isinstance(item, dict) else None
+                if item_type == "contextCompaction":
+                    await _emit_context_usage(
+                        self, source_agent_id,
+                        "compacting" if method == "item/started" else "awaiting_usage",
+                        "codex_last_response",
+                    )
+                item_activity_id = _provider_activity_id(
+                    "codex", source_thread_id,
+                    item.get("id") if isinstance(item, Mapping) else None,
+                )
                 if (
                     method == "item/completed" and source_agent_id == "root"
                     and item_type in {"commandExecution", "webSearch"}
@@ -4071,6 +4295,7 @@ print(json.dumps(result,separators=(",",":")))
                         "Subagent dispatch started" if method == "item/started" else "Subagent handoff completed",
                         message=item.get("prompt") if isinstance(item, Mapping) else None,
                         agent_id=source_agent_id,
+                        activity_id=item_activity_id,
                     )
                 elif item_type == "subAgentActivity":
                     await self._track_codex_agent_item(item, source_thread_id, manifest)
@@ -4113,6 +4338,7 @@ print(json.dumps(result,separators=(",",":")))
                         ),
                         exit_code=item.get("exitCode") if isinstance(item, Mapping) else None,
                         duration_ms=item.get("durationMs") if isinstance(item, Mapping) else None,
+                        activity_id=item_activity_id,
                     )
                 elif item_type == "webSearch":
                     await self._report_activity(
@@ -4124,12 +4350,14 @@ print(json.dumps(result,separators=(",",":")))
                             if isinstance(item, Mapping)
                             else None
                         ),
+                        activity_id=item_activity_id,
                     )
                 elif item_type == "fileChange":
                     await self._report_activity(
                         "started" if method == "item/started" else "completed",
                         "file",
                         "파일 변경" if method == "item/started" else "파일 변경 완료",
+                        activity_id=item_activity_id,
                     )
                 elif item_type == "reasoning" and method == "item/started":
                     await self._report_activity("started", "analysis", "분석 중")
@@ -4578,6 +4806,8 @@ is a fresh isolated job; do not repeat completed work.
         ) or ""
         if _CONTROL.search(solver_source):
             solver_source = ""
+        solver_source = public_solver_source(solver_source)
+        notes = public_solution_notes(notes)
         category = getattr(manifest, "category", "") or "미지정"
         is_refinement = getattr(manifest, "job_mode", "solve") == "writeup_refine"
         locale = getattr(manifest, "writeup_locale", "ko")
@@ -4596,7 +4826,9 @@ is a fresh isolated job; do not repeat completed work.
                 "문제 설명": fact_values.pop("문제 설명"),
                 "Flag 형식": getattr(manifest, "flag_format", ""),
             }
-            fact_values["현재 write-up"] = getattr(manifest, "source_writeup", "")
+            fact_values["현재 write-up"] = public_solution_notes(
+                getattr(manifest, "source_writeup", "")
+            )
         facts = json.dumps(
             fact_values,
             ensure_ascii=False,
@@ -4719,6 +4951,16 @@ Improve the existing write-up's accuracy, clarity and reproducibility. If the ad
 
 <template>{template}</template>
 <verified_facts>{facts}</verified_facts>"""
+        publication_instruction = (
+            "Write-up에는 문제 풀이에 필요한 코드와 명령만 포함하세요. "
+            "submit-flag, request-remote, connect-remote, CTFd 자동 제출, "
+            "서비스 내부 경로와 에이전트 운영 단계는 본문과 코드에서 모두 제외하세요."
+            if locale == "ko" else
+            "Include only challenge solution code and commands. Omit submit-flag, "
+            "request-remote, connect-remote, CTFd auto-submission, internal service "
+            "paths and agent operation steps from prose and code."
+        )
+        prompt = f"{prompt}\n\n{publication_instruction}"
         schema = {
             "type": "object",
             "additionalProperties": False,
@@ -4771,7 +5013,7 @@ Correction attempt: {correction_attempt}/{MAX_WRITEUP_STYLE_ATTEMPTS - 1}
 <template>{template}</template>
 <verified_facts>{facts}</verified_facts>
 <draft>{markdown}</draft>"""
-            markdown = await generate(correction)
+            markdown = await generate(f"{correction}\n\n{publication_instruction}")
         if not _valid_writeup(markdown, manifest.challenge_name, flag, locale):
             raise WorkerRefusal(
                 "writeup_style_invalid",
@@ -4780,7 +5022,7 @@ Correction attempt: {correction_attempt}/{MAX_WRITEUP_STYLE_ATTEMPTS - 1}
                 retryable=True,
                 stage="writeup",
             )
-        markdown = _include_solver_source(markdown, solver_source)
+        markdown = _include_solver_source(markdown, solver_source, locale)
         if (
             len(markdown) > MAX_OUTPUT_TEXT
             or _CONTROL.search(markdown)
@@ -4868,12 +5110,19 @@ class ClaudePrintDriver(CodexAppServer):
         self._discovery_command_execution_seen = False
         self.guidance_mailbox: GuidanceMailbox | None = None
         self.activity_reporter: Callable[..., Awaitable[None]] | None = None
+        self.evidence_reporter: Callable[..., Awaitable[None]] | None = None
         self.activity_events = 0
         self._next_activity_sample_at: float | None = None
         self.agent_reporter: Callable[..., Awaitable[None]] | None = None
         self.agent_events = 0
         self.agent_nodes: dict[str, dict[str, Any]] = {}
         self.tool_agents: dict[str, str] = {}
+        self.context_reporter: Callable[..., Awaitable[None]] | None = None
+        self.context_events = 0
+        self.context_snapshots: dict[str, tuple[object, ...]] = {}
+        self.context_last_emit_at: dict[str, float] = {}
+        self.context_budget_closed = False
+        self.activity_tool_types: dict[str, str] = {}
         self.pid = -1
         self.session_id: str | None = None
         self.resume_session_id: str | None = None
@@ -5324,6 +5573,10 @@ class ClaudePrintDriver(CodexAppServer):
         initialized = False
         result: dict[str, Any] | None = None
         session = self.session_id
+        # Claude supplies per-request input counts on assistant messages, but
+        # its resolved contextWindow arrives only in the final result. Retain
+        # the sample time so a delayed result does not look freshly measured.
+        context_samples: dict[str, tuple[str, int, float]] = {}
         while line := await process.stdout.readline():
             total += len(line)
             events += 1
@@ -5375,6 +5628,15 @@ class ClaudePrintDriver(CodexAppServer):
                 if child_agent_id is None:
                     continue
                 message = event.get("message")
+                if event_type == "assistant":
+                    sample = _claude_context_sample(message)
+                    if sample is not None:
+                        sampled_at = time.time()
+                        context_samples[child_agent_id] = (*sample, sampled_at)
+                        await _emit_context_usage(
+                            self, child_agent_id, "unavailable", "claude_last_request_input",
+                            observed_at=sampled_at,
+                        )
                 content = message.get("content") if isinstance(message, Mapping) else None
                 if isinstance(content, list):
                     for block in content[:200]:
@@ -5387,20 +5649,26 @@ class ClaudePrintDriver(CodexAppServer):
                             )
                         elif event_type == "assistant" and block.get("type") == "tool_use":
                             await self._track_claude_agent_tool(block, child_agent_id, manifest)
+                            activity_id = _provider_activity_id("claude", session, block.get("id"))
+                            tool_type = _claude_activity_tool(block.get("name"))
+                            if activity_id is not None:
+                                self.activity_tool_types[activity_id] = tool_type
                             tool_input = block.get("input")
                             await self._report_activity(
-                                "started", "agent" if block.get("name") in {"Task", "Agent", "Workflow"} else "tool",
+                                "started", tool_type,
                                 "Subagent tool", command=(
                                     tool_input.get("command") or tool_input.get("query")
                                     if isinstance(tool_input, Mapping) else None
-                                ), agent_id=child_agent_id,
+                                ), agent_id=child_agent_id, activity_id=activity_id,
                             )
                         elif event_type == "user" and block.get("type") == "tool_result":
                             await self._complete_claude_agent_tool(block)
+                            activity_id = _provider_activity_id("claude", session, block.get("tool_use_id"))
+                            tool_type = self.activity_tool_types.pop(activity_id, "tool") if activity_id else "tool"
                             await self._report_activity(
-                                "completed", "tool", "Subagent tool result",
-                                output=block.get("content") if isinstance(block.get("content"), str) else None,
-                                agent_id=child_agent_id,
+                                "completed", tool_type, "Subagent tool result",
+                                output=_claude_tool_result_text(block.get("content")),
+                                agent_id=child_agent_id, activity_id=activity_id,
                             )
                 continue
             if subagent_event and event_type == "system" and event.get("subtype") == "init":
@@ -5475,6 +5743,14 @@ class ClaudePrintDriver(CodexAppServer):
                     recognized = self._api_failure(event)
                     raise AppServerFailure(recognized or {"code": "provider_error", "retryable": True})
                 message = event.get("message")
+                sample = _claude_context_sample(message)
+                if sample is not None:
+                    sampled_at = time.time()
+                    context_samples["root"] = (*sample, sampled_at)
+                    await _emit_context_usage(
+                        self, "root", "unavailable", "claude_last_request_input",
+                        observed_at=sampled_at,
+                    )
                 content = message.get("content") if isinstance(message, Mapping) else None
                 if isinstance(content, list):
                     text_parts: list[str] = []
@@ -5504,6 +5780,10 @@ class ClaudePrintDriver(CodexAppServer):
                             raise WorkerRefusal("unexpected_remote_tool", "Claude가 허용하지 않은 도구를 요청했습니다.")
                         await self._track_claude_agent_tool(block, "root", manifest)
                         if name != "StructuredOutput":
+                            activity_id = _provider_activity_id("claude", session, block.get("id"))
+                            tool_type = _claude_activity_tool(name)
+                            if activity_id is not None:
+                                self.activity_tool_types[activity_id] = tool_type
                             self._discovery_command_execution_seen = True
                             await progress(
                                 "executing" if name in {"Bash", "Task", "Agent", "Workflow"} else "inspecting_files"
@@ -5518,13 +5798,7 @@ class ClaudePrintDriver(CodexAppServer):
                             )
                             await self._report_activity(
                                 "started",
-                                "shell"
-                                if name == "Bash"
-                                else "web_search"
-                                if name == "WebSearch"
-                                else "agent"
-                                if name in {"Task", "Agent", "Workflow"}
-                                else "file",
+                                tool_type,
                                 "명령 실행"
                                 if name == "Bash"
                                 else "웹 검색"
@@ -5533,6 +5807,7 @@ class ClaudePrintDriver(CodexAppServer):
                                 if name in {"Task", "Agent", "Workflow"}
                                 else "파일 검사",
                                 command=command,
+                                activity_id=activity_id,
                             )
                     if text_parts:
                         await self._report_activity(
@@ -5559,20 +5834,14 @@ class ClaudePrintDriver(CodexAppServer):
                         if not isinstance(block, Mapping) or block.get("type") != "tool_result":
                             continue
                         await self._complete_claude_agent_tool(block)
-                        raw_output = block.get("content")
-                        if isinstance(raw_output, list):
-                            raw_output = "\n".join(
-                                item.get("text", "")
-                                for item in raw_output
-                                if isinstance(item, Mapping)
-                                and item.get("type") == "text"
-                                and isinstance(item.get("text"), str)
-                            )
+                        activity_id = _provider_activity_id("claude", session, block.get("tool_use_id"))
+                        tool_type = self.activity_tool_types.pop(activity_id, "tool") if activity_id else "tool"
                         await self._report_activity(
                             "completed",
-                            "tool",
+                            tool_type,
                             "도구 출력",
-                            output=raw_output,
+                            output=_claude_tool_result_text(block.get("content")),
+                            activity_id=activity_id,
                         )
                 continue
             if event_type == "system" and event.get("subtype") == "api_retry":
@@ -5580,11 +5849,27 @@ class ClaudePrintDriver(CodexAppServer):
                 # it; only the bounded progress category reaches the web app.
                 await progress("waiting_for_model")
                 continue
+            if event_type == "system" and event.get("subtype") == "compact_boundary":
+                agent_id = self._current_event_agent_id
+                if agent_id is not None:
+                    context_samples.pop(agent_id, None)
+                    await _emit_context_usage(
+                        self, agent_id, "awaiting_usage", "claude_last_request_input",
+                    )
+                continue
             if event_type == "result":
                 if not initialized or result is not None or event_session != session:
                     raise AppServerFailure({"code": "invalid_response"})
                 if event.get("subtype") != "success" or event.get("is_error") is not False:
                     raise AppServerFailure(self._api_failure(event) or {"code": "provider_error", "retryable": True})
+                windows = _claude_context_windows(event)
+                for agent_id, (model, used, sampled_at) in context_samples.items():
+                    window = windows.get(model)
+                    if window is not None and used <= window:
+                        await _emit_context_usage(
+                            self, agent_id, "available", "claude_last_request_input",
+                            used, window, observed_at=sampled_at,
+                        )
                 result_outcome = _bounded_soft_turn_outcome(
                     event.get("result"),
                     command_execution_seen=self._discovery_command_execution_seen,
@@ -7029,13 +7314,25 @@ class SolverWorker:
                     raise asyncio.CancelledError
                 writer.emit("activity", **details)
 
+            async def evidence(**details: Any):
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError
+                writer.emit("activity_evidence", **details)
+
             async def agent(**details: Any):
                 if cancel_event.is_set():
                     raise asyncio.CancelledError
                 writer.emit("agent", **details)
 
+            async def context(**details: Any):
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError
+                writer.emit("context_usage", **details)
+
             driver.activity_reporter = activity
+            driver.evidence_reporter = evidence
             driver.agent_reporter = agent
+            driver.context_reporter = context
 
             flag = prior.get("flag") if isinstance(prior.get("flag"), str) else manifest.resume_flag
             if manifest.job_mode == "writeup_refine":

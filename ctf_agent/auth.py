@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import inspect
 import ipaddress
+import re
 import secrets
 import sqlite3
 import threading
@@ -21,6 +22,10 @@ from pydantic import BaseModel, Field, field_validator
 from .password_policy import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH
 
 COOKIE = "ctf_session"
+PERSISTENT_SESSION_SECONDS = 30 * 24 * 60 * 60
+_DIRECT_BEARER_PATH = re.compile(
+    r"/api/transfers/direct/invitations/([0-9a-f]{32})/(prepare|chunks|complete)\Z"
+)
 
 
 def stamp():
@@ -43,7 +48,12 @@ class Login(BaseModel):
     # Keep accepting historical passwords shorter than the current creation
     # policy so an upgraded installation never locks out an existing user.
     password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
+    remember: bool = False
     _username = field_validator("username")(username_value)
+
+
+class SessionPreference(BaseModel):
+    remember: bool
 
 
 class FirstAdmin(BaseModel):
@@ -119,7 +129,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
 
     def password_api_disabled(path: str) -> bool:
         return settings.auth_mode == "nologin" and (
-            path in {"/api/auth/login", "/api/auth/setup", "/api/auth/logout", "/api/auth/password", "/api/auth/username"}
+            path in {"/api/auth/login", "/api/auth/setup", "/api/auth/logout", "/api/auth/password", "/api/auth/username", "/api/auth/session/refresh"}
             or path == "/api/admin/users"
             or path.startswith("/api/admin/users/")
         )
@@ -164,7 +174,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
         if not token or len(token) > 200:
             return None
         with database() as db:
-            return db.execute("""SELECT s.token_hash,s.csrf_token,s.expires_at,u.* FROM sessions s
+            return db.execute("""SELECT s.token_hash,s.csrf_token,s.expires_at,s.persistent,u.* FROM sessions s
                 JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.active=1""",
                 (hashlib.sha256(token.encode()).hexdigest(), int(time.time()))).fetchone()
 
@@ -179,7 +189,10 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
             if not hmac.compare_digest(request.headers.get("x-csrf-token", "").encode(), session["csrf_token"].encode()):
                 raise HTTPException(403, "세션이 변경되었습니다. 새로고침 후 다시 시도하세요.")
         request.state.user = safe_user(session)
-        request.state.session = {"csrf_token": session["csrf_token"], "token_hash": session["token_hash"]}
+        request.state.session = {
+            "csrf_token": session["csrf_token"], "token_hash": session["token_hash"],
+            "persistent": bool(session["persistent"]) if "persistent" in session.keys() else False,
+        }
         return request.state.user
 
     def require_admin(request: Request) -> dict:
@@ -190,6 +203,32 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
 
     app.state.require_auth = require_auth
     app.state.require_admin = require_admin
+
+    def direct_bearer_request(scope):
+        """Only the three scoped receiver mutations bypass cookie/CSRF auth."""
+        match = _DIRECT_BEARER_PATH.fullmatch(scope.get("path", ""))
+        if match is None:
+            return None
+        expected_method = "PUT" if match.group(2) == "chunks" else "POST"
+        return match if scope.get("method") == expected_method else None
+
+    def preauthorize_direct_bearer(scope):
+        match = direct_bearer_request(scope)
+        if match is None:
+            return False
+        # Authenticate before reading up to 8 MiB of request body. The route
+        # repeats this check because it owns the invitation state transition.
+        manager = getattr(app.state, "direct_transfers", None)
+        headers = [value for key, value in scope.get("headers", ())
+                   if key.lower() == b"authorization"]
+        if manager is None or len(headers) != 1:
+            raise HTTPException(401, "Invitation authorization failed.")
+        try:
+            authorization = headers[0].decode("ascii")
+            manager.preauthorize(match.group(1), authorization)
+        except (UnicodeError, ValueError):
+            raise HTTPException(401, "Invitation authorization failed.") from None
+        return True
 
     def preauthorize_body_request(scope):
         # Read no body until every non-login mutation has a live session and
@@ -202,6 +241,8 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
         if scope.get("path") == "/api/auth/setup":
             return None if settings.auth_mode == "password" and settings.allow_web_bootstrap else (404, "초기 설정을 사용할 수 없습니다.")
         try:
+            if preauthorize_direct_bearer(scope):
+                return None
             require_auth(Request(scope))
             return None
         except HTTPException as exc:
@@ -220,7 +261,9 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
                 )
             if request.url.path == "/api/auth/setup" and not settings.allow_web_bootstrap:
                 return JSONResponse({"detail": "초기 설정을 사용할 수 없습니다."}, status_code=404)
-            if request.url.path.startswith("/api/") and request.url.path not in ("/api/auth/state", "/api/auth/login", "/api/auth/setup"):
+            if (request.url.path.startswith("/api/")
+                    and request.url.path not in ("/api/auth/state", "/api/auth/login", "/api/auth/setup")
+                    and not direct_bearer_request(request.scope)):
                 try:
                     user_context.set(require_auth(request))
                 except HTTPException as exc:
@@ -229,8 +272,8 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
         finally:
             user_context.reset(context_token)
 
-    def issue_session_cookie(response, token):
-        max_age = settings.session_hours * 3600
+    def issue_session_cookie(response, token, max_age=None):
+        max_age = settings.session_hours * 3600 if max_age is None else max_age
         response.set_cookie(COOKIE, token, max_age=max_age, httponly=True, secure=settings.cookie_secure, samesite="strict", path="/")
 
     @app.get("/api/auth/state")
@@ -250,6 +293,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
             "csrf_token": session["csrf_token"] if session else None,
             "user": safe_user(session) if session else None,
             "username": session["username"] if session else None,
+            "session_persistent": bool(session["persistent"]) if session and not automatic_session else False,
         }
 
     @app.post("/api/auth/setup")
@@ -331,7 +375,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
         # changes. A login that verified the old hash just before a password
         # change must never create a valid session after that change commits.
         token, csrf = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
-        max_age = settings.session_hours * 3600
+        max_age = PERSISTENT_SESSION_SECONDS if payload.remember else settings.session_hours * 3600
         raced = False
         with database() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -351,13 +395,34 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
                 )
                 db.execute("DELETE FROM sessions WHERE expires_at<=?", (timestamp,))
                 db.execute("UPDATE users SET last_login_at=? WHERE id=?", (stamp(), user["id"]))
-                db.execute("INSERT INTO sessions(token_hash,csrf_token,expires_at,user_id) VALUES(?,?,?,?)",
-                           (hashlib.sha256(token.encode()).hexdigest(), csrf, timestamp + max_age, user["id"]))
+                db.execute("INSERT INTO sessions(token_hash,csrf_token,expires_at,user_id,persistent) VALUES(?,?,?,?,?)",
+                           (hashlib.sha256(token.encode()).hexdigest(), csrf, timestamp + max_age, user["id"], int(payload.remember)))
                 user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if raced:
             raise HTTPException(401, "The account credentials changed while signing in. Try again.")
-        issue_session_cookie(response, token)
-        return {"authenticated": True, "csrf_token": csrf, "username": user["username"], "user": safe_user(user)}
+        issue_session_cookie(response, token, max_age)
+        return {"authenticated": True, "csrf_token": csrf, "username": user["username"], "user": safe_user(user),
+                "session_persistent": payload.remember}
+
+    @app.post("/api/auth/session/refresh", dependencies=[Depends(require_auth)])
+    def refresh_session(payload: SessionPreference, request: Request, response: Response):
+        """Rotate only this browser's cookie when its owner changes the option."""
+        timestamp = int(time.time())
+        max_age = PERSISTENT_SESSION_SECONDS if payload.remember else settings.session_hours * 3600
+        token, csrf = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            replaced = db.execute(
+                """UPDATE sessions SET token_hash=?,csrf_token=?,expires_at=?,persistent=?
+                   WHERE token_hash=? AND user_id=? AND expires_at>?""",
+                (token_hash, csrf, timestamp + max_age, int(payload.remember),
+                 request.state.session["token_hash"], request.state.user["id"], timestamp),
+            ).rowcount
+            if replaced != 1:
+                raise HTTPException(401, "세션이 만료되었습니다. 다시 로그인하세요.")
+        issue_session_cookie(response, token, max_age)
+        return {"ok": True, "csrf_token": csrf, "session_persistent": payload.remember}
 
     @app.post("/api/auth/logout", dependencies=[Depends(require_auth)])
     def logout(request: Request, response: Response):

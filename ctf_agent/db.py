@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,7 +60,8 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL, last_login_at TEXT
 );
 CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY, csrf_token TEXT NOT NULL, expires_at INTEGER NOT NULL
+    token_hash TEXT PRIMARY KEY, csrf_token TEXT NOT NULL, expires_at INTEGER NOT NULL,
+    persistent INTEGER NOT NULL DEFAULT 0 CHECK(persistent IN (0,1))
 );
 CREATE TABLE IF NOT EXISTS login_attempts (client TEXT NOT NULL, attempted_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts(client, attempted_at);
@@ -93,6 +95,24 @@ CREATE TABLE IF NOT EXISTS challenge_relations (
 );
 CREATE INDEX IF NOT EXISTS idx_challenge_relations_dependent
     ON challenge_relations(workspace_id,dependent_id,prerequisite_id);
+-- Sharing evidence is directional even though challenge links are not.
+-- A link alone never exports another challenge's notes, write-up or flag.
+CREATE TABLE IF NOT EXISTS challenge_evidence_shares (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    target_challenge_id TEXT NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+    source_challenge_id TEXT NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+    observation TEXT NOT NULL DEFAULT '' CHECK(length(observation) <= 1200),
+    include_flag INTEGER NOT NULL DEFAULT 0 CHECK(include_flag IN (0,1)),
+    reapproval_required INTEGER NOT NULL DEFAULT 0 CHECK(reapproval_required IN (0,1)),
+    source_updated_at TEXT NOT NULL,
+    verified_by_user_id TEXT NOT NULL,
+    verified_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id,target_challenge_id,source_challenge_id),
+    CHECK(target_challenge_id <> source_challenge_id),
+    CHECK(observation <> '' OR include_flag=1)
+);
+CREATE INDEX IF NOT EXISTS idx_challenge_evidence_source
+    ON challenge_evidence_shares(workspace_id,source_challenge_id,target_challenge_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_challenges_ctfd ON challenges(workspace_id, ctfd_url, ctfd_id)
     WHERE ctfd_id IS NOT NULL AND ctfd_url IS NOT NULL;
 CREATE TABLE IF NOT EXISTS attachments (
@@ -117,11 +137,26 @@ def connect(settings: Settings) -> sqlite3.Connection:
 def initialize(settings: Settings) -> None:
     for directory in (settings.data_dir, settings.db_dir, settings.config_dir, settings.log_dir):
         directory.mkdir(parents=True, exist_ok=True)
-    with connect(settings) as connection:
+    with closing(connect(settings)) as connection, connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(SCHEMA)
         connection.execute("BEGIN IMMEDIATE")
         metadata = dict(connection.execute("SELECT key,value FROM meta").fetchall())
+        session_columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
+        if "persistent" not in session_columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN persistent INTEGER NOT NULL DEFAULT 0"
+            )
+        evidence_columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(challenge_evidence_shares)"
+            )
+        }
+        if "reapproval_required" not in evidence_columns:
+            connection.execute(
+                "ALTER TABLE challenge_evidence_shares ADD COLUMN "
+                "reapproval_required INTEGER NOT NULL DEFAULT 0"
+            )
         owner_id = metadata.get("legacy_owner_id")
         if not owner_id:
             owner_id = uuid.uuid4().hex

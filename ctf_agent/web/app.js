@@ -1,6 +1,7 @@
 // A relative import inherits the release-specific asset directory emitted by
 // the server, preventing a new app.js from loading a cached older dependency.
 import {renderAccounts} from './accounts.js';
+import {renderAdminCliVersions} from './admin_versions.js';
 const i18n = globalThis.ctfI18n || {locale:'ko',t:value=>value,picker:()=>'',init:async()=>{}};
 
 const app = document.querySelector('#app');
@@ -9,6 +10,7 @@ const detail = document.querySelector('#detail');
 const statuses = {pending:'시작 전',running:'작업 중',stopped:'중단',failed:'실패',flag_found:'Flag 발견',solved:'완료'};
 let csrf = '', workspaces = [], currentWorkspace = null, currentChallenge = null;
 let sessionUser = null;
+let sessionPersistent = false;
 let authMode = 'password';
 const activeUploads = new Map();
 const uploadViews = new Map();
@@ -28,11 +30,16 @@ let writeupPrefetchGeneration = 0;
 let selectedStatus = '', selectedCategory = '', selectedSort = 'added_desc', search = '', disposeAccounts = null, importPreview = null;
 let disposeTelegram = null;
 let ctfdRetryId = null;
+let ctfdJobsPollTimer = null, ctfdJobsRequestGeneration = 0;
 const activeCTFdChallengeRefreshes = new Map();
 const watchedCTFdRefreshJobs = new Set();
 let rendering = 0, challengeRendering = 0, listRendering = 0, detailBusy = false;
 let modalRendering = 0, ctfdSubmitRendering = 0;
 let challengeFileDragDepth = 0;
+let transferState = null;
+let transferExportController = null;
+let directInviteState = null, directInviteTimer = null, directSendBusy = false;
+const TRANSFER_CHUNK_BYTES = 8 * 1024 * 1024;
 let solverRendering = 0, solverPollTimer = null, currentSolverJob = null;
 let resourcePollTimer = null, resourceRequestGeneration = 0;
 let challengeListPollTimer = null, challengeListPollGeneration = 0, challengeListSignatures = new Map(), challengeListCategories = '';
@@ -45,18 +52,22 @@ let solverProvider = (() => { try { return localStorage.getItem('ctf-solver-prov
 let solverAccounts = [], solverAccountId = '', solverModels = [], solverModel = '';
 let solverReasoning = '', solverServiceTier = null, solverUltracode = false, solverOptionsState = 'idle', solverOptionsError = '';
 let solverUltraEscalationMode = 'ask';
+let solverRetryIssue = '', solverRetryRequiresSelection = false;
+let solverConfigurationJobId = '';
 let solverOptionsGeneration = 0;
 let sidebarCollapsed = (() => { try { return localStorage.getItem('ctf-sidebar-collapsed') === 'true'; } catch { return false; } })();
 let solverLogExpanded = false, solverConsoleDialog = null;
 let solverConfirmDialog = null;
 let solverConsoleAgentId = 'root', solverConsoleFollowLatest = true;
 const solverCollapsedAgentIds = new Set();
+const solverConsoleCardStates = new Map();
 const noteDrafts = new Map();
 const busyForms = new WeakSet();
 const ctfdJobMarkupCache = new WeakMap();
 const challengeReturnRoute = /^w\/[0-9a-f]{32}\/c\/[0-9a-f]{32}$/;
 let accountsReturnTarget = null, accountsReturnPending = false;
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const tr = value => esc(i18n.t(value));
 const date = value => new Date(value).toLocaleDateString(i18n.locale === 'ko' ? 'ko-KR' : 'en-US', {month:'short',day:'numeric',timeZone:'Asia/Seoul'});
 const size = value => value < 1024 ? `${value} B` : value < 1024**2 ? `${(value/1024).toFixed(1)} KB` : value < 1024**3 ? `${(value/1024**2).toFixed(1)} MB` : value < 1024**4 ? `${(value/1024**3).toFixed(2)} GB` : `${(value/1024**4).toFixed(2)} TB`;
 const badge = status => `<span class="status status-${esc(status)}">${esc(statuses[status] || status)}</span>`;
@@ -300,12 +311,14 @@ function stopSolverPolling() {
   currentSolverGuidance = [];
   solverEventCursor = 0;
   solverGuidanceDraft = '';
-  solverConsoleAgentId = 'root'; solverConsoleFollowLatest = true; solverCollapsedAgentIds.clear();
+  solverConsoleAgentId = 'root'; solverConsoleFollowLatest = true; solverCollapsedAgentIds.clear(); solverConsoleCardStates.clear();
   solverListedFlag = '';
   solverSyncedWriteup = '';
   solverAccounts = []; solverAccountId = ''; solverModels = []; solverModel = '';
   solverReasoning = ''; solverServiceTier = null; solverUltracode = false; solverOptionsState = 'idle'; solverOptionsError = '';
   solverUltraEscalationMode = 'ask';
+  solverRetryIssue = ''; solverRetryRequiresSelection = false;
+  solverConfigurationJobId = '';
   writeupRefineJob = null; writeupRefineEvents = []; writeupRefineError = null; writeupRefineInstruction = '';
 }
 
@@ -519,7 +532,7 @@ function solverEventMarkup(events, job = null) {
   const agentLabels = new Map((Array.isArray(job?.agents) ? job.agents : [])
     .filter(agent => agent && typeof agent.id === 'string' && agent.id !== 'root')
     .map(agent => [agent.id,String(agent.label || agent.id)]));
-  return `<ol class="solver-events" aria-label="풀이 진행 기록">${events.map(event => {
+  return `<ol class="solver-events" aria-label="풀이 진행 기록">${events.map((event,index) => {
     const code = event.progress?.code || event.progress_code || event.code;
     const label = solverEventLabel(event);
     const detailText = solverEventDetail(event);
@@ -529,8 +542,172 @@ function solverEventMarkup(events, job = null) {
       ? ` · ${esc(event.from_effort || '')} → max · MAX_REQUIRED + 작업 근거 확인`
       : '';
     const agentLabel = event.kind === 'agent' ? null : agentLabels.get(event.agent_id);
-    return `<li class="solver-event solver-event-${esc(event.kind || 'status')}"><span><strong>${agentLabel ? `<span class="solver-event-agent">${esc(agentLabel)}</span>` : ''}${esc(label)}${percentSuffix}${escalationSuffix}</strong>${detailText ? `<code>${esc(detailText)}</code>` : ''}</span><small>${esc(solverEventTime(event))}</small></li>`;
+    return `<li class="solver-event solver-event-${esc(event.kind || 'status')}" data-event-sequence="${solverEventSequence(event) || index + 1}"><span><strong>${agentLabel ? `<span class="solver-event-agent">${esc(agentLabel)}</span>` : ''}${esc(label)}${percentSuffix}${escalationSuffix}</strong>${detailText ? `<code>${esc(detailText)}</code>` : ''}</span><small>${esc(solverEventTime(event))}</small></li>`;
   }).join('')}</ol>`;
+}
+
+function reconcileCompactSolverLog(log, events, active) {
+  const count = log?.querySelector('summary b');
+  if (count) count.textContent = String(events.length);
+  const state = log?.querySelector('.solver-live-state');
+  if (state) {
+    state.textContent = active ? 'LIVE' : 'END';
+    state.classList.toggle('live',active);
+  }
+  const console = log?.querySelector('.solver-live-console');
+  if (!console) return;
+  if (!events.length) {
+    if (!console.querySelector('.solver-log-empty')) console.innerHTML = solverEventMarkup(events);
+    return;
+  }
+  let list = console.querySelector(':scope > .solver-events');
+  if (!list) {
+    console.innerHTML = solverEventMarkup(events);
+    return;
+  }
+  const existing = new Map([...list.children].filter(item => item.dataset?.eventSequence)
+    .map(item => [item.dataset.eventSequence,item]));
+  const keep = new Set();
+  for (const [index,event] of events.entries()) {
+    const key = String(solverEventSequence(event) || index + 1);
+    keep.add(key);
+    let item = existing.get(key);
+    if (!item) {
+      const template = document.createElement('template');
+      template.innerHTML = solverEventMarkup([event]);
+      item = template.content.querySelector('li');
+      item.dataset.eventSequence = key;
+    }
+    if (list.children[index] !== item) list.insertBefore(item,list.children[index] || null);
+  }
+  for (const [key,item] of existing) if (!keep.has(key)) item.remove();
+}
+
+function solverConsoleEntries(events) {
+  const entries = [], paired = new Map();
+  for (const [index,event] of events.entries()) {
+    if (!event || typeof event !== 'object') continue;
+    const activityId = typeof event.activity_id === 'string' && /^[0-9a-f]{32}$/.test(event.activity_id)
+      ? event.activity_id : '';
+    const agentId = typeof event.agent_id === 'string' ? event.agent_id : 'root';
+    const groupKey = event.kind === 'activity' && activityId
+      ? `activity:${agentId}:${activityId}`
+      : event.kind === 'agent' && agentId !== 'root' ? `agent:${agentId}` : '';
+    if (groupKey && paired.has(groupKey)) {
+      paired.get(groupKey).events.push(event);
+      continue;
+    }
+    const entry = {key:groupKey || `event:${solverEventSequence(event) || index + 1}`,events:[event]};
+    entries.push(entry);
+    if (groupKey) paired.set(groupKey,entry);
+  }
+  return entries;
+}
+
+function solverConsoleText(value) {
+  return typeof value === 'string'
+    ? value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g,'').trim()
+    : '';
+}
+
+function solverConsoleField(label, value, truncated = false) {
+  const content = solverConsoleText(value);
+  if (!content) return '';
+  return `<div class="solver-console-field"><div class="solver-console-field-head"><strong>${esc(label)}</strong>${truncated ? '<small>일부만 표시</small>' : ''}</div><pre>${esc(content)}</pre></div>`;
+}
+
+function solverConsoleEntryRevision(entry, agentLabels) {
+  const first = entry.events[0];
+  return `${entry.events.map(event => solverEventSequence(event)).join(',')}:${entry.events.map(event => event.phase || event.status || '').join(',')}:${agentLabels.get(first.agent_id) || ''}`;
+}
+
+function solverConsoleEntryMarkup(entry, agentLabels) {
+  const events = entry.events;
+  const first = events[0], latest = events[events.length - 1];
+  const activity = first.kind === 'activity';
+  const agent = first.kind === 'agent';
+  const completed = activity ? events.some(event => event.phase === 'completed')
+    : agent ? ['completed','failed','interrupted','cancelled','stopped'].includes(latest.status) : true;
+  const running = (activity || agent) && !completed;
+  const failed = activity ? events.some(event => Number.isInteger(event.exit_code) && event.exit_code !== 0)
+    : agent && latest.status === 'failed';
+  const agentLabel = agent ? latest.label || latest.agent_id
+    : agentLabels.get(first.agent_id) || '';
+  const title = agent ? (agentLabel || '하위 에이전트')
+    : activity ? solverConsoleText(first.summary || latest.summary) || solverEventLabel(first)
+      : solverEventLabel(latest);
+  const toolLabel = activity ? ({shell:'명령',web_search:'검색',file:'파일',analysis:'분석',tool:'도구',agent:'하위 에이전트'}[first.tool] || first.tool || '도구')
+    : agent ? '하위 에이전트' : '진행';
+  const state = failed ? '실패' : running ? '진행 중' : activity || agent ? '완료' : '';
+  const duration = events.findLast?.(event => Number.isInteger(event.duration_ms))?.duration_ms;
+  const durationText = Number.isInteger(duration) ? duration >= 1000 ? `${(duration / 1000).toFixed(1)}s` : `${duration}ms` : '';
+  const exitCode = events.findLast?.(event => Number.isInteger(event.exit_code))?.exit_code;
+  const meta = [agentLabel && !agent ? agentLabel : '',durationText,Number.isInteger(exitCode) ? `exit ${exitCode}` : ''].filter(Boolean);
+  const preferredOpen = solverConsoleCardStates.has(entry.key) ? solverConsoleCardStates.get(entry.key) : running;
+  const command = events.find(event => solverConsoleText(event.command));
+  const output = [...events].reverse().find(event => solverConsoleText(event.output));
+  const messages = events.map(event => solverConsoleText(event.message)).filter(Boolean);
+  const distinctMessages = [...new Set(messages)];
+  const body = activity
+    ? `${solverConsoleField(first.tool === 'web_search' ? '검색어' : '명령',command?.command,events.some(event => event.command_truncated))}
+       ${solverConsoleField('결과',output?.output,events.some(event => event.output_truncated))}
+       ${distinctMessages.map(message => solverConsoleField('내용',message)).join('')}`
+    : agent
+      ? `<div class="solver-console-agent-meta">${[latest.provider,latest.model,latest.parent_id ? `상위 ${latest.parent_id}` : ''].filter(Boolean).map(esc).join(' · ')}</div>
+         <ol class="solver-console-agent-states">${events.map(event => `<li>${esc(solverEventLabel(event))}<small>${esc(solverEventTime(event))}</small></li>`).join('')}</ol>`
+      : `${solverConsoleField('내용',solverEventDetail(latest))}`;
+  return `<details class="solver-console-card${running ? ' running' : ''}${failed ? ' failed' : ''}" data-log-key="${esc(entry.key)}" data-log-revision="${esc(solverConsoleEntryRevision(entry,agentLabels))}" ${preferredOpen ? 'open' : ''}>
+    <summary><span class="solver-console-card-icon" aria-hidden="true">${running ? '◌' : failed ? '×' : '✓'}</span><span class="solver-console-card-title"><strong>${esc(title)}</strong><small>${esc([toolLabel,...meta].join(' · '))}</small></span><span class="solver-console-card-state">${esc(state)}</span><time>${esc(solverEventTime(latest))}</time></summary>
+    <div class="solver-console-card-body">${body || '<p class="solver-console-no-detail">자세한 기록이 없습니다.</p>'}</div>
+  </details>`;
+}
+
+function solverConsoleTimelineMarkup(events, job = null) {
+  if (!events.length) return '<p class="solver-log-empty">아직 기록이 없습니다.</p>';
+  const agentLabels = new Map((Array.isArray(job?.agents) ? job.agents : [])
+    .filter(agent => agent && typeof agent.id === 'string')
+    .map(agent => [agent.id,String(agent.label || agent.id)]));
+  return `<div class="solver-console-timeline">${solverConsoleEntries(events).map(entry => solverConsoleEntryMarkup(entry,agentLabels)).join('')}</div>`;
+}
+
+function reconcileSolverConsoleTimeline(stream, events, job = null) {
+  const entries = solverConsoleEntries(events);
+  if (!entries.length) {
+    if (!stream.querySelector('.solver-log-empty')) stream.innerHTML = '<p class="solver-log-empty">아직 기록이 없습니다.</p>';
+    return;
+  }
+  stream.querySelector('.solver-log-empty')?.remove();
+  let timeline = stream.querySelector(':scope > .solver-console-timeline');
+  if (!timeline) {
+    timeline = document.createElement('div');
+    timeline.className = 'solver-console-timeline';
+    stream.replaceChildren(timeline);
+  }
+  const agentLabels = new Map((Array.isArray(job?.agents) ? job.agents : [])
+    .filter(agent => agent && typeof agent.id === 'string')
+    .map(agent => [agent.id,String(agent.label || agent.id)]));
+  const existing = new Map([...timeline.children].filter(card => card.dataset?.logKey)
+    .map(card => [card.dataset.logKey,card]));
+  const keep = new Set();
+  for (const [index, entry] of entries.entries()) {
+    keep.add(entry.key);
+    const revision = solverConsoleEntryRevision(entry,agentLabels);
+    let card = existing.get(entry.key);
+    if (!card || card.dataset.logRevision !== revision) {
+      const template = document.createElement('template');
+      template.innerHTML = solverConsoleEntryMarkup(entry,agentLabels);
+      const replacement = template.content.firstElementChild;
+      replacement.dataset.logRevision = revision;
+      if (card) {
+        solverConsoleCardStates.set(entry.key,card.open);
+        replacement.open = card.open;
+        card.replaceWith(replacement);
+      }
+      card = replacement;
+    }
+    if (timeline.children[index] !== card) timeline.insertBefore(card,timeline.children[index] || null);
+  }
+  for (const [key,card] of existing) if (!keep.has(key)) card.remove();
 }
 
 function solverAgentNodes(job) {
@@ -550,6 +727,18 @@ function solverConsoleEvents(job, events) {
     return events;
   }
   return events.filter(event => event.kind === 'activity' && event.agent_id === solverConsoleAgentId);
+}
+
+function solverContextUsageMarkup(job, agentId = solverConsoleAgentId) {
+  const usage = (Array.isArray(job?.context_usage) ? job.context_usage : [])
+    .find(item => item && item.agent_id === agentId);
+  const compacting = usage?.state === 'compacting' || usage?.state === 'compaction';
+  const hasPercent = typeof usage?.percent === 'number' && Number.isFinite(usage.percent)
+    && usage.percent >= 0 && usage.percent <= 100;
+  const label = compacting ? i18n.t('압축 중') : hasPercent ? `${Math.round(usage.percent)}%` : i18n.t('알 수 없음');
+  const agent = agentId === 'root' ? i18n.t('메인 에이전트') : agentId;
+  const title = `${agent} · ${i18n.t('컨텍스트 사용량')}: ${label}`;
+  return `<span class="solver-console-context${compacting ? ' compacting' : hasPercent ? ' measured' : ' unknown'}" title="${esc(title)}" aria-label="${esc(title)}">${tr('컨텍스트')} ${esc(label)}</span>`;
 }
 
 function solverAgentTreeMarkup(job, events) {
@@ -631,12 +820,18 @@ function toggleSolverLogSize(button) {
         toggle.setAttribute('aria-pressed','false');
       }
     });
+    solverConsoleDialog.addEventListener('toggle', event => {
+      const card = event.target;
+      if (card?.matches?.('.solver-console-card') && card.dataset.logKey) {
+        solverConsoleCardStates.set(card.dataset.logKey,card.open);
+      }
+    }, true);
   }
-  const provider = (currentSolverJob.model || currentSolverJob.configuration || {}).provider;
+  const provider = currentSolverJob.provider || currentSolverJob.configuration?.provider;
   const active = solverIsActive(currentSolverJob) && currentSolverJob.guidance_allowed !== false;
   const agentTree = solverAgentTreeMarkup(currentSolverJob,currentSolverEvents);
-  solverConsoleDialog.innerHTML = `<header class="solver-console-head"><div><strong>${esc(currentChallenge?.name || '세션 로그')}</strong><small>${esc(solverJobId(currentSolverJob))}</small></div><div class="solver-console-head-actions"><button type="button" class="small ghost solver-console-bottom hidden" data-action="solver-console-bottom" aria-label="맨 아래로 이동">↓ 맨 아래</button><button type="button" class="small ghost" data-action="close-solver-console" aria-label="세션 로그 닫기">닫기</button></div></header>
-    <div class="solver-console-body"><aside class="solver-agent-tree${agentTree ? '' : ' hidden'}" aria-label="에이전트 활동">${agentTree}</aside><div class="solver-console-stream" role="log" aria-live="polite">${solverEventMarkup(solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null)}</div></div>
+  solverConsoleDialog.innerHTML = `<header class="solver-console-head"><div><strong>${esc(currentChallenge?.name || '세션 로그')}</strong><small>${esc(solverJobId(currentSolverJob))}</small>${solverContextUsageMarkup(currentSolverJob)}</div><div class="solver-console-head-actions"><button type="button" class="small ghost solver-console-bottom hidden" data-action="solver-console-bottom" aria-label="맨 아래로 이동">↓ 맨 아래</button><button type="button" class="small ghost" data-action="close-solver-console" aria-label="세션 로그 닫기">닫기</button></div></header>
+    <div class="solver-console-body"><aside class="solver-agent-tree${agentTree ? '' : ' hidden'}" aria-label="에이전트 활동">${agentTree}</aside><div class="solver-console-stream" role="log" aria-live="polite">${solverConsoleTimelineMarkup(solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null)}</div></div>
     <div class="solver-console-controls"><form id="solver-console-guidance-form" class="solver-console-guidance${active ? '' : ' hidden'}">
       <label for="solver-console-message">메인 세션 추가 명령</label><textarea id="solver-console-message" name="message" maxlength="16384" rows="3" placeholder="풀이 방향이나 확인할 내용을 입력" required>${esc(solverGuidanceDraft)}</textarea>
       <div class="solver-console-send"><select name="requested_delivery" aria-label="명령 전달 방식" ${provider === 'claude' ? 'disabled' : ''}><option value="same_turn">현재 턴에 개입</option><option value="next_turn" ${provider === 'claude' ? 'selected' : ''}>다음 턴에 전달</option></select><button type="submit" class="primary">전송</button></div>
@@ -704,6 +899,14 @@ function toggleSolverAgentBranch(button) {
 
 function paintSolverConsole() {
   if (!solverConsoleDialog?.open) return;
+  const heading = solverConsoleDialog.querySelector('.solver-console-head > div:first-child');
+  if (heading) {
+    const title = heading.querySelector('strong'), id = heading.querySelector('small');
+    if (title) title.textContent = currentChallenge?.name || '세션 로그';
+    if (id) id.textContent = solverJobId(currentSolverJob);
+    const badge = heading.querySelector('.solver-console-context');
+    if (badge) badge.outerHTML = solverContextUsageMarkup(currentSolverJob);
+  }
   const stream = solverConsoleDialog.querySelector('.solver-console-stream');
   if (!stream) return;
   const tree = solverConsoleDialog.querySelector('.solver-agent-tree');
@@ -713,14 +916,31 @@ function paintSolverConsole() {
     if (tree.innerHTML !== markup) tree.innerHTML = markup;
   }
   const scrollTop = stream.scrollTop;
-  const markup = solverEventMarkup(solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null);
-  if (stream.innerHTML !== markup) {
-    stream.innerHTML = markup;
-    stream.scrollTop = solverConsoleFollowLatest ? stream.scrollHeight : scrollTop;
-  } else if (solverConsoleFollowLatest) stream.scrollTop = stream.scrollHeight;
+  const streamTop = stream.getBoundingClientRect().top;
+  const anchor = solverConsoleFollowLatest ? null : [...stream.querySelectorAll('.solver-console-card[data-log-key]')]
+    .find(card => card.getBoundingClientRect().bottom > streamTop);
+  const anchorKey = anchor?.dataset.logKey;
+  const anchorOffset = anchor ? anchor.getBoundingClientRect().top - streamTop : 0;
+  for (const card of stream.querySelectorAll('.solver-console-card[data-log-key]')) {
+    solverConsoleCardStates.set(card.dataset.logKey,card.open);
+  }
+  reconcileSolverConsoleTimeline(stream,solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null);
+  if (solverConsoleFollowLatest) stream.scrollTop = stream.scrollHeight;
+  else {
+    const nextAnchor = anchorKey ? [...stream.querySelectorAll('.solver-console-card[data-log-key]')]
+      .find(card => card.dataset.logKey === anchorKey) : null;
+    stream.scrollTop = nextAnchor ? scrollTop + nextAnchor.getBoundingClientRect().top - streamTop - anchorOffset : scrollTop;
+  }
   paintSolverConsoleBottomButton();
   const form = solverConsoleDialog.querySelector('#solver-console-guidance-form');
-  if (form) form.classList.toggle('hidden', !solverIsActive(currentSolverJob) || currentSolverJob.guidance_allowed === false);
+  if (form) {
+    form.classList.toggle('hidden', !solverIsActive(currentSolverJob) || currentSolverJob?.guidance_allowed === false);
+    const delivery = form.querySelector('select[name="requested_delivery"]');
+    if (delivery) {
+      delivery.disabled = currentSolverJob?.provider === 'claude';
+      if (delivery.disabled) delivery.value = 'next_turn';
+    }
+  }
 }
 
 function solverWriteup(job = currentSolverJob) {
@@ -757,6 +977,17 @@ function solverWriteupArtifact(writeup) {
   return `<div class="solver-artifact solver-writeup-artifact"><strong>write-up</strong><div class="actions"><button type="button" class="small ghost icon-action" data-action="copy-solver-writeup" aria-label="write-up 복사" title="write-up 복사">▤</button><button type="button" class="small ghost icon-action" data-action="download-solver-writeup" aria-label="write-up Markdown 다운로드" title="write-up Markdown 다운로드">⇩</button></div><details class="writeup-preview"><summary>미리보기</summary><div class="markdown-preview">${safeMarkdown(writeup)}</div></details><div id="writeup-refine-container">${writeupRefinementMarkup()}</div></div>`;
 }
 
+function solverRetryConfiguration(job) {
+  const config = job?.configuration;
+  if (job?.job_mode !== 'solve' || !config || !['codex','claude'].includes(config.provider)) return null;
+  return {
+    provider:config.provider, accountId:job.account_id || '', accountLabel:job.account_label || '',
+    model:config.model || '', reasoning:config.reasoning_effort || '',
+    serviceTier:config.service_tier || null, ultracode:config.ultracode === true,
+    ultraEscalationMode:job.ultra_escalation?.mode || 'off',
+  };
+}
+
 function solverSelectedAccount() {
   return solverAccounts.find(account => account.id === solverAccountId && account.provider === solverProvider) || null;
 }
@@ -765,8 +996,42 @@ function solverSelectedModel() {
   return solverModels.find(item => solverModel && solverModel === (item.model || item.id)) || null;
 }
 
+function solverRetryWarningMarkup() {
+  if (!solverRetryIssue) return '';
+  const canConfirm = solverOptionsState === 'ready' && Boolean(solverSelectedAccount() && solverSelectedModel() && solverReasoning);
+  return `<div class="notice error-notice solver-retry-warning" role="status"><p>${esc(solverRetryIssue)} 아래 설정을 확인해 주세요.</p>${canConfirm ? '<div class="actions"><button type="button" class="small" data-action="confirm-solver-retry-settings">현재 설정으로 계속</button></div>' : ''}</div>`;
+}
+
+function clearSolverRetryWarning() {
+  solverRetryIssue = '';
+  solverRetryRequiresSelection = false;
+}
+
+function solverConfigurationMatchesVisibleForm() {
+  const form = document.querySelector('#solver-panel > .solver-configuration');
+  if (!form) return true;
+  for (const [id, expected] of [
+    ['solver-provider-select',solverProvider],
+    ['solver-account-select',solverAccountId],
+    ['solver-model-select',solverModel],
+    ['solver-reasoning-select',solverReasoning],
+    ['solver-ultra-escalation',solverUltraEscalationMode],
+  ]) {
+    const field = form.querySelector(`#${id}`);
+    if (field && field.value !== expected) return false;
+  }
+  const fast = form.querySelector('#solver-fast-toggle');
+  if (fast && fast.checked !== (solverServiceTier === 'fast')) return false;
+  const ultracode = form.querySelector('#solver-ultracode-toggle');
+  if (ultracode && ultracode.checked !== solverUltracode) return false;
+  return true;
+}
+
 function solverConfigurationReady() {
-  return solverOptionsState === 'ready' && Boolean(solverSelectedAccount() && solverSelectedModel() && solverReasoning);
+  return solverOptionsState === 'ready'
+    && !solverRetryRequiresSelection
+    && Boolean(solverSelectedAccount() && solverSelectedModel() && solverReasoning)
+    && solverConfigurationMatchesVisibleForm();
 }
 
 function solverUltraEscalationEligible() {
@@ -788,10 +1053,10 @@ function solverProviderSelector() {
       <span class="form-hint solver-config-help" role="status">계정 설정을 불러오는 중</span></div>`;
   }
   if (solverOptionsState === 'error') {
-    return `<div class="solver-configuration">${provider}<p class="notice error-notice solver-config-state">${esc(solverOptionsError || '계정 설정을 불러오지 못했습니다.')}</p><a class="button-link" href="#accounts" data-action="open-solver-accounts">계정 관리</a></div>`;
+    return `<div class="solver-configuration">${provider}<p class="notice error-notice solver-config-state">${esc(solverOptionsError || '계정 설정을 불러오지 못했습니다.')}</p>${solverRetryWarningMarkup()}<a class="button-link" href="#accounts" data-action="open-solver-accounts">계정 관리</a></div>`;
   }
   if (!available.length) {
-    return `<div class="solver-configuration">${provider}<p class="notice muted solver-config-state">이 공급자에 로그인된 계정이 없습니다.</p><a class="button-link" href="#accounts" data-action="open-solver-accounts">계정 연결하기</a></div>`;
+    return `<div class="solver-configuration">${provider}<p class="notice muted solver-config-state">이 공급자에 로그인된 계정이 없습니다.</p>${solverRetryWarningMarkup()}<a class="button-link" href="#accounts" data-action="open-solver-accounts">계정 연결하기</a></div>`;
   }
   const accountOptions = available.map(account => `<option value="${esc(account.id)}" ${account.id === solverAccountId ? 'selected' : ''}>${esc(account.label)}${account.selected ? ' · 기본' : ''}</option>`).join('');
   const modelOptions = solverModels.map(item => { const value = item.model || item.id; return value ? `<option value="${esc(value)}" ${value === solverModel ? 'selected' : ''}>${esc(item.displayName || value)}</option>` : ''; }).join('');
@@ -807,6 +1072,7 @@ function solverProviderSelector() {
     <label>추론 수준<select id="solver-reasoning-select" aria-label="문제 풀이 추론 수준" ${effortOptions ? '' : 'disabled'}>${effortOptions || '<option>지원 정보 없음</option>'}</select></label>
     ${supportsFast ? `<label class="solver-fast-choice"><input id="solver-fast-toggle" type="checkbox" ${solverServiceTier === 'fast' ? 'checked' : ''}>1.5배 Fast 실행</label>` : supportsUltracode ? `<label class="solver-ultracode-choice"><input id="solver-ultracode-toggle" type="checkbox" ${solverUltracode ? 'checked' : ''}>Ultracode</label>` : '<span class="solver-fast-placeholder" aria-hidden="true"></span>'}
     ${ultraChoice}
+    ${solverRetryWarningMarkup()}
     <span class="form-hint solver-config-help">이번 실행에만 적용</span>
   </div>`;
 }
@@ -879,7 +1145,7 @@ function solverPanelMarkup(job, events = [], loading = false) {
   const controls = active
     ? `<button class="danger" data-action="cancel-solver" ${job.cancel_requested ? 'disabled' : ''}>${job.cancel_requested ? '중단 처리 중' : '풀이 중단'}</button>`
     : job.error?.code === 'ultra_escalation_requested'
-      ? `${job.ultra_escalation?.started_job_id ? '<span class="form-hint">Ultra 작업으로 이어가는 중</span>' : job.ultra_escalation?.auto_pending ? '<span class="form-hint">Ultra 전환 준비 중</span>' : job.ultra_escalation?.eligible ? '<button class="primary" data-action="approve-ultra-escalation">Ultra로 이어가기</button>' : ''}<button data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>현재 설정으로 다시 풀기</button>`
+      ? `${job.ultra_escalation?.started_job_id ? '<span class="form-hint">Ultra 작업으로 이어가는 중</span>' : job.ultra_escalation?.auto_pending ? '<span class="form-hint">Ultra 전환 준비 중</span>' : job.ultra_escalation?.eligible ? '<button class="primary" data-action="approve-ultra-escalation">Ultra로 이어가기</button>' : '<span class="form-hint">이전 Ultra 요청이 만료됐습니다. 현재 설정으로 다시 풀 수 있습니다.</span>'}<button data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>현재 설정으로 다시 풀기</button>`
     : job.phase === 'needs_input'
       ? `<button data-action="edit-challenge">문제 입력 수정</button>${currentChallenge?.remote_mode === 'endpoint' || job.input_ready_to_retry === true ? `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>계속 풀기</button>` : '<span class="form-hint">요청된 접속 정보나 파일을 먼저 추가하세요.</span>'}`
       : job.flag_rejected
@@ -1170,7 +1436,7 @@ function showLogin(expired = false, configured = true, setupAvailable = false) {
     <div class="brand"><img src="/assets/icon.svg" alt=""><div>CTF Workspace</div></div>
     <h1>로그인</h1>
     ${!configured ? '<p>관리자 초기 비밀번호가 설정되지 않았습니다.</p>' : expired ? '<p>세션이 만료되었습니다.</p>' : ''}
-    <form id="login-form"><label>아이디<input name="username" autocomplete="username" value="${esc(sessionUser?.username || '')}" maxlength="100" required autofocus></label><label>비밀번호<input type="password" name="password" autocomplete="current-password" maxlength="1024" required></label><button class="primary" ${configured ? '' : 'disabled'}>로그인 <span aria-hidden="true">→</span></button></form>
+    <form id="login-form"><label>아이디<input name="username" autocomplete="username" value="${esc(sessionUser?.username || '')}" maxlength="100" required autofocus></label><label>비밀번호<input type="password" name="password" autocomplete="current-password" maxlength="1024" required></label><label class="login-remember"><input type="checkbox" name="remember" value="true">이 기기에서 30일 로그인 유지</label><button class="primary" ${configured ? '' : 'disabled'}>로그인 <span aria-hidden="true">→</span></button></form>
   </div></main>`;
 }
 
@@ -1238,7 +1504,7 @@ function renderOverview() {
   const total = workspaces.reduce((sum, w) => sum + w.challenge_count, 0);
   const solved = workspaces.reduce((sum, w) => sum + w.solved_count, 0);
   const running = workspaces.reduce((sum, w) => sum + w.running_count, 0);
-  content.innerHTML = `<div class="page-head"><div><div class="eyebrow">WORKSPACES</div><h1>작업공간</h1></div><button class="primary" data-action="new-workspace">＋ 작업공간 만들기</button></div>
+  content.innerHTML = `<div class="page-head"><div><div class="eyebrow">WORKSPACES</div><h1>작업공간</h1></div><div class="head-actions"><button data-action="receive-workspace-direct">${tr('직접 받기')}</button><button data-action="import-workspace-transfer">${tr('ZIP 가져오기')}</button><button class="primary" data-action="new-workspace">＋ 작업공간 만들기</button></div></div>
     <div class="stats"><div class="stat"><div class="stat-label">전체 작업공간</div><div class="stat-value">${workspaces.length}</div></div><div class="stat"><div class="stat-label">등록된 문제</div><div class="stat-value">${total}</div></div><div class="stat"><div class="stat-label">작업 중</div><div class="stat-value">${running}</div></div><div class="stat"><div class="stat-label">완료한 문제</div><div class="stat-value accent">${solved}</div><div class="stat-note">${total ? Math.round(solved / total * 100) : 0}%</div></div></div>
     <div class="section-head"><h2>내 작업공간 <span class="muted">${workspaces.length}</span></h2></div>
     ${workspaces.length ? `<div class="cards">${workspaces.map(w => `<a class="workspace-card" href="#w/${w.id}"><div class="card-top"><span class="folder-icon">⚑</span><span class="tag ${w.running_count ? '' : 'muted'}">${w.running_count ? `${w.running_count} ${i18n.t('작업 중')}` : 'WORKSPACE'}</span></div><h3>${esc(w.name)}</h3>${w.description ? `<p>${esc(w.description)}</p>` : ''}<div class="card-bottom"><span>${i18n.t('문제')} ${w.challenge_count}</span><span>${i18n.t('완료')} ${w.solved_count}</span><span class="card-arrow">↗</span></div></a>`).join('')}</div>` : `<div class="empty"><div class="empty-icon">⚑</div><h2>작업공간이 없습니다.</h2><button class="primary" data-action="new-workspace">＋ 새 작업공간</button></div>`}`;
@@ -1248,9 +1514,9 @@ async function renderWorkspace() {
   const w = currentWorkspace;
   stopChallengeListPolling();
   const content = shell('workspaces', w.name);
-  content.innerHTML = `<div class="page-head"><div><div class="eyebrow">CTF WORKSPACE</div><h1>${esc(w.name)}</h1>${w.description ? `<p>${esc(w.description)}</p>` : ''}</div><div class="head-actions"><button class="ghost icon-action" data-action="edit-workspace" aria-label="작업공간 설정" title="작업공간 설정">⚙</button><button data-action="ctfd-submit-settings">자동 제출 설정</button><button data-action="ctfd-import">CTFd 가져오기</button><button data-action="ctfd-sync" title="저장된 CTFd 연결에서 새로 추가된 문제만 확인합니다.">새 문제 동기화</button><button class="primary" data-action="new-challenge">＋ 문제 추가</button></div></div>
+  content.innerHTML = `<div class="page-head"><div><div class="eyebrow">CTF WORKSPACE</div><h1>${esc(w.name)}</h1>${w.description ? `<p>${esc(w.description)}</p>` : ''}</div><div class="head-actions"><button class="ghost icon-action" data-action="edit-workspace" aria-label="작업공간 설정" title="작업공간 설정">⚙</button><button data-action="receive-workspace-direct">${tr('직접 받기')}</button><button data-action="send-workspace-direct">${tr('직접 보내기')}</button><button data-action="import-workspace-transfer">${tr('ZIP 가져오기')}</button><button data-action="export-workspace-transfer">${tr('ZIP 내보내기')}</button><button data-action="ctfd-submit-settings">CTFd 연결</button><button data-action="ctfd-import">CTFd 가져오기 <span class="ctfd-import-badge" hidden></span></button><button data-action="ctfd-sync" title="저장된 CTFd 연결에서 새로 추가된 문제만 확인합니다.">새 문제 동기화</button><button class="primary" data-action="new-challenge">＋ 문제 추가</button></div></div>
     <div class="workspace-summary"><div class="workspace-summary-meta"><span>⚑ Flag 형식 <code>${esc(w.flag_format || '미설정')}</code></span><span>문제 <b data-workspace-challenge-count>${w.challenge_count ?? ''}</b></span></div>${resourceMeterMarkup()}</div>
-    <div id="ctfd-job-area"></div><div id="challenge-area"></div>`;
+    <div id="challenge-area"></div>`;
   startResourcePolling(w.id);
   await refreshChallenges();
   startChallengeListPolling(w.id);
@@ -1262,11 +1528,15 @@ function challengeRunSummary(challenge) {
   const configuration = run?.configuration || challenge.solver_configuration || null;
   if (!configuration || typeof configuration !== 'object') return '';
   const phase = run?.phase || run?.status;
+  const phaseLabel = phase === 'needs_input' && run?.input_request_kind === 'ultra_escalation'
+    ? i18n.t('Ultra 전환 제안')
+    : phase === 'needs_input' && run?.input_request_kind === 'remote_input'
+      ? i18n.t('원격 정보 요청') : phase && (solverPhases[phase] || statuses[phase] || phase);
   const parts = [run?.account_label, configuration.provider, configuration.model,
     configuration.reasoning_effort && `${i18n.t('추론')} ${configuration.reasoning_effort}`,
     configuration.ultracode ? 'Ultracode' : null,
     configuration.service_tier === 'fast' ? 'Fast 1.5×' : null,
-    phase && (solverPhases[phase] || statuses[phase] || phase),
+    phaseLabel,
     phase === 'queued' && run?.queue_block_reason === 'service_update' ? i18n.t('서비스 업데이트 중') : null];
   return parts.filter(Boolean).map(esc).join('<span aria-hidden="true">/</span>');
 }
@@ -1321,6 +1591,14 @@ function challengeInputMarkup(challenge, workspaceId) {
   </form>`;
 }
 
+function challengeAttentionMarkup(challenge, kind) {
+  const ultra = kind === 'ultra_escalation';
+  return `<div class="challenge-inline-attention" role="status">
+    <div><strong>${esc(i18n.t(ultra ? 'Ultra 전환 제안' : '추가 입력 필요'))}</strong><small>${esc(i18n.t(ultra ? '이전 분석을 이어받아 Ultra로 계속할 수 있는지 확인하세요.' : '필요한 내용을 문제 상세에서 확인하세요.'))}</small></div>
+    <button type="button" class="small primary" data-action="open-challenge" data-id="${esc(challenge.id)}">${esc(i18n.t(ultra ? '전환 확인' : '요청 확인'))}</button>
+  </div>`;
+}
+
 function challengeCardMarkup(challenge, workspaceId) {
   const category = challenge.category || '미분류';
   const statusLabel = statuses[challenge.status] || challenge.status;
@@ -1334,6 +1612,7 @@ function challengeCardMarkup(challenge, workspaceId) {
   const liveElapsed = liveSession && challenge.status === 'running'
     ? solverElapsedMarkup(latestRun) : '';
   const needsInput = runPhase === 'needs_input';
+  const inputRequestKind = latestRun?.input_request_kind;
   const canStart = !needsInput && ['pending','stopped','failed'].includes(challenge.status);
   const startKey = `${workspaceId}:${challenge.id}`;
   const starting = canStart && startingListSolvers.has(startKey);
@@ -1344,7 +1623,9 @@ function challengeCardMarkup(challenge, workspaceId) {
     ${challenge.description ? `<p class="challenge-card-description">${esc(challenge.description)}</p>` : ''}
     ${runSummary ? `<div class="challenge-run-summary" aria-label="최근 실행 설정">${runSummary}</div>` : ''}
     ${challenge.flag ? `<div class="challenge-card-flag"><code>${esc(challenge.flag)}</code><span>FLAG READY</span></div>` : manual ? '<div class="challenge-card-note">수동 완료</div>' : ''}
-    ${needsInput ? challengeInputMarkup(challenge,workspaceId) : ''}
+    ${needsInput ? inputRequestKind === 'remote_input'
+      ? challengeInputMarkup(challenge,workspaceId)
+      : challengeAttentionMarkup(challenge,inputRequestKind) : ''}
     <footer class="challenge-card-footer"><span class="challenge-updated">${esc(date(challenge.updated_at))}</span><div class="challenge-card-actions">
       ${challenge.flag ? `<button type="button" class="small ghost icon-action flag-action" data-action="copy-list-flag" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" aria-label="${esc(challenge.name)} Flag 복사" title="Flag 복사">⚑</button>` : ''}
       ${canCopyWriteup ? `<button type="button" class="small ghost icon-action writeup-action" data-action="copy-list-writeup" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-writeup-stamp="${esc(writeupStamp(challenge))}" aria-label="${esc(challenge.name)} write-up 복사" title="write-up 복사">▤</button>` : ''}
@@ -1681,6 +1962,11 @@ function startChallengeListPolling(workspaceId) {
 }
 
 function openModal(title, subtitle, body, footer, formId) {
+  if (transferState?.running) { transferState.paused = true; transferState.controller?.abort(); }
+  transferState = null;
+  transferExportController?.abort(); transferExportController = null;
+  if (directInviteTimer !== null) clearTimeout(directInviteTimer);
+  directInviteTimer = null; directInviteState = null;
   ++modalRendering;
   resetChallengeFileDrag();
   modal.removeAttribute('aria-busy');
@@ -1692,6 +1978,424 @@ function openModal(title, subtitle, body, footer, formId) {
   if (!modal.open) modal.showModal();
 }
 
+function transferFilename(name, scope) {
+  const cleaned = String(name || scope).replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').replace(/^[ .]+|[ .]+$/g,'').slice(0,100);
+  return `${cleaned || scope}-${scope}.zip`;
+}
+
+function showTransferExport(scope) {
+  const workspace = currentWorkspace;
+  const challenge = scope === 'challenge' ? currentChallenge : null;
+  if (!workspace || (scope === 'challenge' && (!challenge || challenge.workspace_id !== workspace.id))) throw new Error(i18n.t('내보낼 자료를 다시 선택하세요.'));
+  const name = challenge?.name || workspace.name;
+  openModal(i18n.t(scope === 'challenge' ? '문제 ZIP 내보내기' : '작업공간 ZIP 내보내기'), name,
+    `<div class="transfer-explainer"><p>${tr('문제 기록과 첨부파일을 ZIP으로 다운로드합니다. 계정, 로그인 정보, CTFd 연결, 풀이 세션은 포함되지 않습니다.')}</p><label class="transfer-remote-option"><input id="transfer-include-remote" type="checkbox"><span><strong>${tr('원격 접속 정보 포함')}</strong><small>${tr('서버 주소, URL, 접속 명령을 ZIP에 넣습니다. 필요한 경우에만 선택하세요.')}</small></span></label><p class="form-hint">${tr('설명과 노트의 자유 입력 내용은 그대로 포함될 수 있습니다. 공유 전에 확인하세요.')}</p><p id="transfer-export-status" class="form-hint" role="status"></p></div>`,
+    `<button type="button" data-action="close-modal">${tr('취소')}</button><button type="button" class="primary" data-action="download-transfer">${tr('ZIP 다운로드')}</button>`);
+  modal.dataset.kind = 'transfer-export';
+  modal.dataset.transferScope = scope;
+  modal.dataset.workspaceId = workspace.id;
+  modal.dataset.challengeId = challenge?.id || '';
+  modal.dataset.transferName = name;
+}
+
+async function downloadTransfer() {
+  if (modal.dataset.kind !== 'transfer-export' || transferExportController) return;
+  const scope = modal.dataset.transferScope, workspaceId = modal.dataset.workspaceId, challengeId = modal.dataset.challengeId;
+  const includeRemote = modal.querySelector('#transfer-include-remote')?.checked === true;
+  const endpoint = scope === 'challenge'
+    ? `${path(challengeId,workspaceId)}/transfer`
+    : `/api/workspaces/${workspaceId}/transfer`;
+  const url = `${endpoint}?include_remote=${includeRemote}`;
+  const filename = transferFilename(modal.dataset.transferName,scope);
+  const controller = new AbortController();
+  transferExportController = controller;
+  const status = modal.querySelector('#transfer-export-status');
+  if (status) status.textContent = i18n.t('ZIP을 준비하는 중입니다…');
+  try {
+    // The File System Access API streams directly to disk. Other browsers use
+    // their native download manager, which also avoids buffering the ZIP in JS.
+    if (typeof window.showSaveFilePicker !== 'function') {
+      const link = document.createElement('a');
+      link.href = url; link.download = filename;
+      document.body.append(link); link.click(); link.remove();
+      if (modal.dataset.kind === 'transfer-export') modal.close();
+      toast(i18n.t('ZIP 다운로드를 시작했습니다.'));
+      return;
+    }
+    const handle = await window.showSaveFilePicker({suggestedName:filename,types:[{description:'ZIP archive',accept:{'application/zip':['.zip']}}]});
+    if (controller.signal.aborted) return;
+    const response = await fetch(url, {
+      headers:csrf ? {'X-CSRF-Token':csrf} : {}, credentials:'same-origin', signal:controller.signal,
+    });
+    if (!response.ok) {
+      let payload = {};
+      try { payload = await response.json(); } catch {}
+      throw new Error(typeof payload.detail === 'string' ? payload.detail : payload.detail?.message || payload.message || `${i18n.t('다운로드에 실패했습니다')} (${response.status}).`);
+    }
+    if (!response.body) throw new Error(i18n.t('이 브라우저에서는 스트리밍 다운로드를 사용할 수 없습니다.'));
+    const writable = await handle.createWritable();
+    if (status?.isConnected) status.textContent = i18n.t('ZIP을 디스크에 저장하는 중입니다…');
+    await response.body.pipeTo(writable,{signal:controller.signal});
+    if (controller.signal.aborted) return;
+    if (modal.dataset.kind === 'transfer-export') modal.close();
+    toast(i18n.t('ZIP을 저장했습니다.'));
+  } catch (error) {
+    if (error.name !== 'AbortError') {
+      if (status?.isConnected) status.textContent = error.message;
+      throw error;
+    }
+  } finally {
+    if (transferExportController === controller) transferExportController = null;
+  }
+}
+
+function showTransferImport(scope, workspaceId = '') {
+  if (scope === 'challenge' && !workspaceId) throw new Error(i18n.t('가져올 작업공간을 먼저 선택하세요.'));
+  openModal(i18n.t(scope === 'challenge' ? '문제 ZIP 가져오기' : '작업공간 ZIP 가져오기'),
+    scope === 'challenge' ? `${currentWorkspace?.name || i18n.t('작업공간')} · ${i18n.t('새 문제 추가')}` : i18n.t('새 작업공간으로 복원'),
+    `<div class="transfer-explainer"><p>${tr(scope === 'challenge' ? '문제 ZIP 한 개를 이 작업공간에 추가합니다.' : '작업공간 ZIP을 새 작업공간으로 가져옵니다.')} ${tr('원본 ID와 무관하게 새 ID가 부여됩니다.')}</p><label>${tr('ZIP 파일')}<input id="transfer-archive" type="file" accept=".zip,application/zip,application/x-zip-compressed"></label><p class="form-hint">${tr('같은 파일을 다시 선택하면 서버에 저장된 지점부터 이어 올릴 수 있습니다.')}</p><div id="transfer-upload-status" class="transfer-upload-status" role="status" aria-live="polite">${tr('ZIP 파일을 선택하세요.')}</div><div id="transfer-preview" class="transfer-preview" hidden></div></div>`,
+    `<button type="button" data-action="close-modal">${tr('닫기')}</button><button type="button" class="ghost" data-action="pause-transfer-upload" hidden>${tr('일시 중지')}</button><button type="button" class="danger ghost" data-action="cancel-transfer-upload" hidden>${tr('업로드 취소')}</button><button type="button" data-action="start-transfer-upload" disabled>${tr('업로드 및 미리보기')}</button><button type="button" class="primary" data-action="confirm-transfer-import" hidden>${tr('가져오기')}</button>`);
+  // Keep this dialog free of a form so choosing a file does not trigger the
+  // unrelated unsaved-edit guard used by workspace and challenge forms.
+  modal.dataset.kind = 'transfer-import';
+  transferState = {kind:'import',scope,workspaceId,file:null,uploadId:'',storageKey:'',offset:0,preview:null,running:false,importing:false,paused:false,cancelled:false,controller:null};
+}
+
+function transferUploadStatus(state, message, offset = state.offset || 0) {
+  if (transferState !== state || modal.dataset.kind !== 'transfer-import') return;
+  const area = modal.querySelector('#transfer-upload-status');
+  const total = state.file?.size || 0;
+  if (area) area.innerHTML = `<span>${esc(message)}</span>${total ? `<progress max="${total}" value="${Math.min(total,Math.max(0,offset))}"></progress><small>${esc(size(offset))} / ${esc(size(total))}</small>` : ''}`;
+  const start = modal.querySelector('[data-action="start-transfer-upload"]');
+  const pause = modal.querySelector('[data-action="pause-transfer-upload"]');
+  const cancel = modal.querySelector('[data-action="cancel-transfer-upload"]');
+  const confirm = modal.querySelector('[data-action="confirm-transfer-import"]');
+  if (start) { start.disabled = !state.file || state.running || state.importing; start.hidden = Boolean(state.preview); start.textContent = i18n.t(state.uploadId ? '이어 올리고 미리보기' : '업로드 및 미리보기'); }
+  if (pause) pause.hidden = !state.running;
+  if (cancel) { cancel.hidden = !state.uploadId; cancel.disabled = state.importing; }
+  if (confirm) { confirm.hidden = !state.preview; confirm.disabled = state.running || state.importing || state.preview?.sufficient_space === false || state.preview?.scope !== state.scope; }
+}
+
+async function transferFileIdentity(file) {
+  const metadata = `${file.name}:${file.size}:${file.lastModified}`;
+  if (!globalThis.crypto?.subtle) return {fingerprint:metadata,sha256:null};
+  const full = file.size <= 64 * 1024 * 1024;
+  const sampleBytes = 1024 * 1024;
+  const bytes = full ? await file.arrayBuffer() : await new Blob([
+    file.slice(0,sampleBytes), file.slice(Math.max(0,file.size - sampleBytes)), metadata,
+  ]).arrayBuffer();
+  const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),value => value.toString(16).padStart(2,'0')).join('');
+  return {fingerprint:digest,sha256:full ? digest : null};
+}
+
+function transferStorageKey(state, file, fingerprint) {
+  return `ctf-transfer:${sessionUser?.id || 'local'}:${state.scope}:${file.name}:${file.size}:${file.lastModified}:${fingerprint}`;
+}
+
+function transferPreviewMarkup(preview, scope) {
+  const scopeMismatch = preview.scope !== scope;
+  const names = Array.isArray(preview.challenges) ? preview.challenges : [];
+  const collisions = Array.isArray(preview.name_collisions) ? preview.name_collisions : [];
+  return `<div class="section-head"><h3>${tr('가져오기 미리보기')}</h3><span class="tag ${scopeMismatch ? 'muted' : ''}">${tr(preview.scope === 'challenge' ? '문제' : '작업공간')}</span></div>
+    <dl class="transfer-preview-facts"><div><dt>${tr('이름')}</dt><dd>${esc(preview.name)}</dd></div><div><dt>${tr('문제')}</dt><dd>${esc(preview.challenge_count)}</dd></div><div><dt>${tr('첨부파일')}</dt><dd>${esc(preview.attachment_count)} · ${esc(size(Number(preview.attachment_bytes || 0)))}</dd></div><div><dt>${tr('원격 접속 정보')}</dt><dd>${tr(preview.remote_endpoints_included ? '포함됨' : '제외됨')}</dd></div></dl>
+    ${scopeMismatch ? `<p class="notice error-notice">${tr(scope === 'challenge' ? '문제 ZIP을 선택하세요.' : '작업공간 ZIP을 선택하세요.')} ${tr(preview.scope === 'challenge' ? '이 파일은 문제 ZIP입니다.' : '이 파일은 작업공간 ZIP입니다.')}</p>` : ''}
+    ${preview.sufficient_space === false ? `<p class="notice error-notice">${tr('저장 공간이 부족합니다. 공간을 확보한 뒤 다시 시도하세요.')}</p>` : ''}
+    ${collisions.length ? `<p class="notice">${tr('같은 이름이 이미 있습니다:')} ${collisions.map(esc).join(', ')}. ${tr('가져온 항목은 새 ID로 추가됩니다.')}</p>` : ''}
+    <p class="form-hint">${tr('계정과 연결 인증 정보는 제외됩니다. 설명과 노트의 자유 입력 내용에는 민감한 정보가 있을 수 있습니다.')}</p>
+    ${names.length ? `<details><summary>${tr('문제 목록')} ${names.length}</summary><ul>${names.map(item => `<li>${esc(item.name)} <small>${esc(item.category || i18n.t('미분류'))} · ${tr('첨부')} ${esc(item.attachment_count || 0)}</small></li>`).join('')}</ul></details>` : ''}`;
+}
+
+async function startTransferUpload() {
+  const state = transferState;
+  if (!state?.file || state.running || state.importing) return;
+  const file = state.file;
+  state.running = true; state.paused = false; state.cancelled = false; state.preview = null;
+  const controller = new AbortController(); state.controller = controller;
+  transferUploadStatus(state,i18n.t('파일 확인 중…'));
+  try {
+    const identity = await transferFileIdentity(file);
+    if (state.paused || transferState !== state) return;
+    state.storageKey = transferStorageKey(state,file,identity.fingerprint);
+    let savedId = '';
+    try { savedId = localStorage.getItem(state.storageKey) || ''; } catch {}
+    let upload = null, resumed = false;
+    if (savedId) {
+      try { upload = await api(`/api/transfers/uploads/${encodeURIComponent(savedId)}`,{signal:controller.signal}); resumed = true; }
+      catch (error) {
+        if (![404,410].includes(error.status)) throw error;
+        try { localStorage.removeItem(state.storageKey); } catch {}
+      }
+      if (upload && ((upload.size !== undefined && Number(upload.size) !== file.size) || !Number.isSafeInteger(Number(upload.offset)) || Number(upload.offset) < 0 || Number(upload.offset) > file.size)) {
+        upload = null; resumed = false;
+        try { localStorage.removeItem(state.storageKey); } catch {}
+      }
+    }
+    if (!upload) upload = await api('/api/transfers/uploads',{method:'POST',body:{size:file.size,...(identity.sha256 ? {sha256:identity.sha256} : {})},signal:controller.signal});
+    if (state.paused || transferState !== state) return;
+    state.uploadId = upload.upload_id || upload.id || (resumed ? savedId : '');
+    if (!state.uploadId) throw new Error(i18n.t('서버가 업로드 ID를 반환하지 않았습니다.'));
+    try { localStorage.setItem(state.storageKey,state.uploadId); } catch {}
+    let offset = Number(upload.offset || 0);
+    state.offset = offset;
+    transferUploadStatus(state,i18n.t('ZIP 업로드 중…'),offset);
+    while (offset < file.size) {
+      if (state.paused || transferState !== state) return;
+      const chunk = file.slice(offset,Math.min(file.size,offset + TRANSFER_CHUNK_BYTES));
+      const result = await api(`/api/transfers/uploads/${encodeURIComponent(state.uploadId)}/chunks?offset=${offset}`,{
+        method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:chunk,signal:controller.signal,
+      });
+      const next = Number(result.offset);
+      if (!Number.isSafeInteger(next) || next <= offset || next > file.size) throw new Error(i18n.t('서버가 잘못된 업로드 위치를 반환했습니다.'));
+      offset = next;
+      state.offset = offset;
+      transferUploadStatus(state,i18n.t('ZIP 업로드 중…'),offset);
+    }
+    if (state.paused || transferState !== state) return;
+    transferUploadStatus(state,i18n.t('ZIP 검증 중…'),offset);
+    if (!(upload.finalized === true || upload.status === 'finalized')) {
+      await api(`/api/transfers/uploads/${encodeURIComponent(state.uploadId)}/finalize`,{method:'POST',signal:controller.signal});
+    }
+    if (state.paused || transferState !== state) return;
+    const query = state.workspaceId ? `?workspace_id=${encodeURIComponent(state.workspaceId)}` : '';
+    const result = await api(`/api/transfers/uploads/${encodeURIComponent(state.uploadId)}/preview${query}`,{signal:controller.signal});
+    const preview = result.preview || result;
+    state.preview = preview;
+    const area = modal.querySelector('#transfer-preview');
+    if (area) { area.innerHTML = transferPreviewMarkup(preview,state.scope); area.hidden = false; }
+    transferUploadStatus(state,i18n.t('업로드를 마쳤습니다. 아래 내용을 확인하고 가져오기를 누르세요.'),file.size);
+  } catch (error) {
+    if (error.name !== 'AbortError') {
+      transferUploadStatus(state,`${i18n.t('오류')}: ${error.message}`);
+      throw error;
+    }
+  } finally {
+    state.running = false;
+    if (state.controller === controller) state.controller = null;
+    if (transferState === state && state.cancelled) transferUploadStatus(state,i18n.t('임시 업로드를 삭제했습니다. 다른 ZIP을 선택할 수 있습니다.'));
+    else if (transferState === state && state.paused) transferUploadStatus(state,i18n.t('일시 중지했습니다. 같은 파일을 선택해 이어 올릴 수 있습니다.'));
+    else if (transferState === state) transferUploadStatus(state,modal.querySelector('#transfer-upload-status span')?.textContent || i18n.t('ZIP 파일을 선택하세요.'));
+  }
+}
+
+async function cancelTransferUpload() {
+  const state = transferState;
+  if (!state || state.importing) return;
+  state.paused = true; state.cancelled = true;
+  state.controller?.abort();
+  const uploadId = state.uploadId;
+  if (uploadId) await api(`/api/transfers/uploads/${encodeURIComponent(uploadId)}`,{method:'DELETE'});
+  try { if (state.storageKey) localStorage.removeItem(state.storageKey); } catch {}
+  state.uploadId = ''; state.offset = 0; state.preview = null;
+  const area = modal.querySelector('#transfer-preview');
+  if (area) { area.innerHTML = ''; area.hidden = true; }
+  transferUploadStatus(state,i18n.t('임시 업로드를 삭제했습니다. 다른 ZIP을 선택할 수 있습니다.'));
+}
+
+async function confirmTransferImport() {
+  const state = transferState;
+  if (!state?.preview || !state.uploadId || state.running || state.importing) return;
+  if (state.preview.scope !== state.scope || state.preview.sufficient_space === false) throw new Error(i18n.t('미리보기를 확인하세요.'));
+  state.importing = true;
+  transferUploadStatus(state,i18n.t('가져오는 중…'),state.file?.size || 0);
+  try {
+    const result = await api(`/api/transfers/uploads/${encodeURIComponent(state.uploadId)}/import`,{
+      method:'POST',body:state.workspaceId ? {workspace_id:state.workspaceId} : {},
+    });
+    try { if (state.storageKey) localStorage.removeItem(state.storageKey); } catch {}
+    const workspaceId = result.workspace_id || state.workspaceId;
+    const challengeId = result.challenge_id || result.challenge_ids?.[0];
+    modal.close();
+    if (state.scope === 'workspace') {
+      if (!workspaceId) throw new Error(i18n.t('가져온 작업공간을 찾을 수 없습니다. 화면을 새로고침하세요.'));
+      location.hash = `w/${workspaceId}`;
+      toast(i18n.t('작업공간 ZIP을 가져왔습니다.'));
+    } else {
+      if (currentWorkspace?.id === workspaceId) {
+        await refreshChallenges();
+        if (challengeId) await openChallenge(challengeId);
+      } else location.hash = `w/${workspaceId}${challengeId ? `/c/${challengeId}` : ''}`;
+      toast(i18n.t('문제 ZIP을 가져왔습니다.'));
+    }
+  } finally {
+    state.importing = false;
+    if (transferState === state) transferUploadStatus(state,i18n.t('가져오기를 다시 시도할 수 있습니다.'),state.file?.size || 0);
+  }
+}
+
+function directInvitationKey(scope, workspaceId) {
+  return `ctf-direct-invitation:${sessionUser?.id || 'local'}:${scope}:${workspaceId || 'new'}`;
+}
+
+function directInvitationStatus(status) {
+  return i18n.t({issued:'수락 대기',uploading:'전송 중',completed:'가져오기 완료',revoked:'초대 취소됨',expired:'초대 만료됨'}[status] || '상태 확인 중');
+}
+
+function paintDirectInvitation(state) {
+  if (directInviteState !== state || modal.dataset.kind !== 'direct-invite') return;
+  const status = modal.querySelector('#direct-invite-status');
+  const credentials = modal.querySelector('#direct-invite-credentials');
+  const missingToken = modal.querySelector('#direct-invite-missing-token');
+  const result = modal.querySelector('#direct-invite-result');
+  const create = modal.querySelector('[data-action="create-direct-invitation"]');
+  const revoke = modal.querySelector('[data-action="revoke-direct-invitation"]');
+  const active = ['issued','uploading'].includes(state.status);
+  if (status) {
+    status.textContent = state.error || (state.invitationId
+      ? `${directInvitationStatus(state.status)}${state.expiresAt ? ` · ${i18n.t('만료 시각')} ${new Date(state.expiresAt * 1000).toLocaleString(i18n.locale === 'ko' ? 'ko-KR' : 'en-US')}` : ''}`
+      : i18n.t('초대를 발급하면 URL과 토큰을 한 번 표시합니다.'));
+    status.classList.toggle('error-text',Boolean(state.error) && state.error !== i18n.t('초대 발급 중…'));
+  }
+  if (credentials) {
+    credentials.hidden = !(state.url && state.token);
+    const url = credentials.querySelector('#direct-invite-url'), token = credentials.querySelector('#direct-invite-token');
+    if (url) url.value = state.url || '';
+    if (token) token.value = state.token || '';
+  }
+  if (missingToken) missingToken.hidden = !(state.invitationId && active && !state.token);
+  if (result) {
+    result.hidden = state.status !== 'completed';
+    const imported = state.result || {};
+    result.innerHTML = state.status === 'completed'
+      ? `<p>${tr('대상 설치에서 가져오기를 마쳤습니다.')}</p>${imported.workspace_id ? `<button type="button" data-action="open-direct-result">${tr('가져온 자료 열기')}</button>` : ''}` : '';
+  }
+  if (create) { create.hidden = Boolean(state.invitationId && active); create.disabled = state.busy; create.textContent = i18n.t(state.invitationId ? '새 초대 발급' : '초대 발급'); }
+  if (revoke) { revoke.hidden = !state.invitationId || !active; revoke.disabled = state.busy; }
+}
+
+async function pollDirectInvitation(state) {
+  if (!state.invitationId || directInviteState !== state) return;
+  if (directInviteTimer !== null) clearTimeout(directInviteTimer);
+  directInviteTimer = null;
+  try {
+    const result = await api(`/api/transfers/direct/invitations/${encodeURIComponent(state.invitationId)}`);
+    if (directInviteState !== state || modal.dataset.kind !== 'direct-invite') return;
+    state.status = result.status || state.status;
+    state.expiresAt = result.expires_at || state.expiresAt;
+    state.result = result.result || null;
+    state.error = '';
+    paintDirectInvitation(state);
+  } catch (error) {
+    if (directInviteState !== state) return;
+    state.error = error.message;
+    paintDirectInvitation(state);
+  }
+  if (directInviteState === state && ['issued','uploading'].includes(state.status)) {
+    directInviteTimer = setTimeout(() => pollDirectInvitation(state),4000);
+  }
+}
+
+function showDirectInvitation(scope, workspaceId = '') {
+  if (scope === 'challenge' && !workspaceId) throw new Error(i18n.t('가져올 작업공간을 먼저 선택하세요.'));
+  openModal(i18n.t(scope === 'challenge' ? '문제 직접 받기' : '작업공간 직접 받기'),
+    scope === 'challenge' ? `${currentWorkspace?.name || i18n.t('작업공간')} · ${i18n.t('새 문제 추가')}` : i18n.t('새 작업공간으로 복원'),
+    `<div class="direct-transfer"><p>${tr('이 설치에서 일회용 초대를 발급한 뒤, 보내는 설치에 URL과 토큰을 입력하세요.')}</p><label>${tr('최대 ZIP 크기')}<select id="direct-max-size"><option value="2147483648">2 GB</option><option value="10737418240">10 GB</option><option value="21474836480" selected>20 GB</option></select></label><p class="form-hint">${tr('초대는 1시간 후 만료됩니다. URL과 토큰은 보내는 설치에만 전달하세요.')}</p><div id="direct-invite-status" class="direct-status" role="status" aria-live="polite"></div><div id="direct-invite-credentials" class="direct-credentials" hidden><label>${tr('초대 URL')}<input id="direct-invite-url" type="text" readonly></label><button type="button" class="small ghost" data-action="copy-direct-url">${tr('URL 복사')}</button><label>${tr('초대 토큰')}<input id="direct-invite-token" type="text" readonly></label><button type="button" class="small ghost" data-action="copy-direct-token">${tr('토큰 복사')}</button></div><p id="direct-invite-missing-token" class="form-hint" hidden>${tr('이 초대의 토큰은 다시 표시되지 않습니다. 새 초대를 발급하려면 현재 초대를 취소하세요.')}</p><div id="direct-invite-result" class="direct-result" hidden></div></div>`,
+    `<button type="button" data-action="close-modal">${tr('닫기')}</button><button type="button" class="danger ghost" data-action="revoke-direct-invitation" hidden>${tr('초대 취소')}</button><button type="button" class="primary" data-action="create-direct-invitation">${tr('초대 발급')}</button>`);
+  modal.dataset.kind = 'direct-invite';
+  const state = {scope,workspaceId,invitationId:'',url:'',token:'',status:'',expiresAt:0,result:null,error:'',busy:false};
+  directInviteState = state;
+  const key = directInvitationKey(scope,workspaceId);
+  try { state.invitationId = localStorage.getItem(key) || ''; } catch {}
+  paintDirectInvitation(state);
+  if (state.invitationId) pollDirectInvitation(state);
+}
+
+async function createDirectInvitation() {
+  const state = directInviteState;
+  if (!state || state.busy) return;
+  state.busy = true; state.error = i18n.t('초대 발급 중…'); paintDirectInvitation(state);
+  try {
+    const maxSize = Number(modal.querySelector('#direct-max-size')?.value);
+    const result = await api('/api/transfers/direct/invitations',{
+      method:'POST',body:{scope:state.scope,...(state.workspaceId ? {workspace_id:state.workspaceId} : {}),max_size:maxSize,ttl_seconds:3600},
+    });
+    if (directInviteState !== state) return;
+    state.invitationId = result.invitation_id;
+    state.url = result.url; state.token = result.token;
+    state.status = result.status || 'issued'; state.expiresAt = result.expires_at || 0;
+    state.result = null; state.error = '';
+    try { localStorage.setItem(directInvitationKey(state.scope,state.workspaceId),state.invitationId); } catch {}
+    paintDirectInvitation(state);
+    if (['issued','uploading'].includes(state.status)) directInviteTimer = setTimeout(() => pollDirectInvitation(state),4000);
+  } catch (error) {
+    if (directInviteState === state) {
+      state.error = error.code === 'origin_unconfigured'
+        ? i18n.t('초대를 발급할 수 없습니다. 관리자에게 CTF_PUBLIC_ORIGIN을 이 설치의 공개 HTTPS 주소로 설정해 달라고 요청하세요.')
+        : error.message;
+      paintDirectInvitation(state);
+    }
+    throw error;
+  } finally {
+    state.busy = false;
+    if (directInviteState === state) paintDirectInvitation(state);
+  }
+}
+
+async function revokeDirectInvitation() {
+  const state = directInviteState;
+  if (!state?.invitationId || state.busy) return;
+  state.busy = true; paintDirectInvitation(state);
+  try {
+    await api(`/api/transfers/direct/invitations/${encodeURIComponent(state.invitationId)}`,{method:'DELETE'});
+    if (directInviteState !== state) return;
+    if (directInviteTimer !== null) clearTimeout(directInviteTimer);
+    directInviteTimer = null;
+    try { localStorage.removeItem(directInvitationKey(state.scope,state.workspaceId)); } catch {}
+    state.status = 'revoked'; state.url = ''; state.token = ''; state.error = '';
+    paintDirectInvitation(state);
+  } finally {
+    state.busy = false;
+    if (directInviteState === state) paintDirectInvitation(state);
+  }
+}
+
+function openDirectResult() {
+  const state = directInviteState, result = state?.result;
+  if (!result?.workspace_id) return;
+  const route = `w/${result.workspace_id}${state.scope === 'challenge' && result.challenge_id ? `/c/${result.challenge_id}` : ''}`;
+  modal.close();
+  location.hash = route;
+}
+
+function showDirectSend(scope) {
+  const workspace = currentWorkspace, challenge = scope === 'challenge' ? currentChallenge : null;
+  if (!workspace || (scope === 'challenge' && (!challenge || challenge.workspace_id !== workspace.id))) throw new Error(i18n.t('보낼 자료를 다시 선택하세요.'));
+  openModal(i18n.t(scope === 'challenge' ? '문제 직접 보내기' : '작업공간 직접 보내기'),challenge?.name || workspace.name,
+    `<div class="direct-transfer"><p>${tr('받는 설치에서 직접 받기 초대를 발급하고, 아래에 URL과 토큰을 입력하세요. 파일은 서버 간에 직접 전송됩니다.')}</p><label>${tr('초대 URL')}<input id="direct-send-url" type="url" placeholder="https://…" autocomplete="off" spellcheck="false"></label><label>${tr('초대 토큰')}<input id="direct-send-token" type="password" autocomplete="off" spellcheck="false"></label><label class="transfer-remote-option"><input id="direct-include-remote" type="checkbox"><span><strong>${tr('원격 접속 정보 포함')}</strong><small>${tr('서버 주소, URL, 접속 명령을 전송합니다. 필요한 경우에만 선택하세요.')}</small></span></label><p class="form-hint">${tr('설명과 노트의 자유 입력 내용은 그대로 전송될 수 있습니다.')}</p><div id="direct-send-status" class="direct-status" role="status" aria-live="polite"></div></div>`,
+    `<button type="button" data-action="close-modal">${tr('닫기')}</button><button type="button" class="primary" data-action="start-direct-send">${tr('전송 시작')}</button>`);
+  modal.dataset.kind = 'direct-send'; modal.dataset.transferScope = scope;
+  modal.dataset.workspaceId = workspace.id; modal.dataset.challengeId = challenge?.id || '';
+}
+
+async function startDirectSend() {
+  if (modal.dataset.kind !== 'direct-send' || directSendBusy) return;
+  const invitationUrl = modal.querySelector('#direct-send-url')?.value.trim() || '';
+  const token = modal.querySelector('#direct-send-token')?.value.trim() || '';
+  let url;
+  try { url = new URL(invitationUrl); } catch { throw new Error(i18n.t('올바른 HTTPS 초대 URL을 입력하세요.')); }
+  if (url.protocol !== 'https:') throw new Error(i18n.t('올바른 HTTPS 초대 URL을 입력하세요.'));
+  if (!token) throw new Error(i18n.t('초대 토큰을 입력하세요.'));
+  const scope = modal.dataset.transferScope, workspaceId = modal.dataset.workspaceId, challengeId = modal.dataset.challengeId;
+  const endpoint = scope === 'challenge' ? `${path(challengeId,workspaceId)}/transfer/direct` : `/api/workspaces/${workspaceId}/transfer/direct`;
+  const status = modal.querySelector('#direct-send-status');
+  directSendBusy = true;
+  if (status) { status.textContent = i18n.t('서버 간 전송 중… 창을 닫지 마세요.'); status.classList.remove('error-text'); }
+  try {
+    const result = await api(endpoint,{method:'POST',body:{invitation_url:invitationUrl,token,include_remote:modal.querySelector('#direct-include-remote')?.checked === true}});
+    if (modal.dataset.kind !== 'direct-send') return;
+    const tokenInput = modal.querySelector('#direct-send-token');
+    if (tokenInput) tokenInput.value = '';
+    if (status) status.textContent = `${i18n.t('전송을 마쳤습니다.')} ${i18n.t('대상 작업공간 ID')}: ${result.workspace_id || '—'}`;
+    const start = modal.querySelector('[data-action="start-direct-send"]');
+    if (start) start.hidden = true;
+    toast(i18n.t('직접 전송을 마쳤습니다.'));
+  } catch (error) {
+    if (status?.isConnected) { status.textContent = `${i18n.t('전송 실패')}: ${error.message}`; status.classList.add('error-text'); }
+    throw error;
+  } finally {
+    directSendBusy = false;
+  }
+}
+
 function workspaceForm(edit = false) {
   const w = edit ? currentWorkspace : {};
   openModal(edit ? '작업공간 설정' : '새 작업공간 만들기', '', `
@@ -1699,8 +2403,21 @@ function workspaceForm(edit = false) {
     <label>설명 <span class="optional">선택</span><textarea name="description" rows="3" placeholder="대회 일정이나 기억할 내용을 적어 주세요.">${esc(w.description)}</textarea></label>
     <label>Flag 형식 <span class="optional">선택</span><input name="flag_format" value="${esc(w.flag_format)}" maxlength="500"><span class="form-hint">접두어만 입력하면 {…} 형식을 적용합니다.</span></label>
     <label class="workspace-option"><input type="checkbox" name="open_challenge_after_create" ${w.open_challenge_after_create ? 'checked' : ''}><span>문제 등록 후 상세창 열기</span></label>
+    ${edit ? '<section class="workspace-ctfd-setting"><div><strong>CTFd 연결</strong><small id="workspace-ctfd-status">연결 확인 중</small></div><button type="button" data-action="workspace-ctfd-connection">연결 관리</button></section>' : ''}
     ${edit ? '<div class="danger-zone"><button class="danger small icon-action" type="button" data-action="delete-workspace" aria-label="작업공간 삭제" title="작업공간 삭제">⌫</button></div>' : ''}`, `<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">${edit ? '변경 저장' : '작업공간 만들기'}</button>`, edit ? 'edit-workspace-form' : 'new-workspace-form');
-  if (edit) modal.querySelector('form').dataset.editToken = w.edit_token || '';
+  if (edit) {
+    modal.querySelector('form').dataset.editToken = w.edit_token || '';
+    const generation = modalRendering;
+    api(`/api/workspaces/${w.id}/ctfd/connection`).then(state => {
+      if (modal.open && modalRendering === generation && modal.querySelector('#edit-workspace-form')?.dataset.workspaceId === w.id) {
+        modal.querySelector('#workspace-ctfd-status').textContent = state.connected
+          ? `${state.url} · ${state.auth_type === 'password' ? '아이디·비밀번호' : 'API 토큰'}`
+          : '연결 안 됨';
+      }
+    }).catch(() => {
+      if (modal.open && modalRendering === generation) modal.querySelector('#workspace-ctfd-status').textContent = '연결 상태를 확인할 수 없습니다.';
+    });
+  }
 }
 
 function challengeForm(edit = false) {
@@ -1752,8 +2469,24 @@ function relatedChallengeMarkup(challenge) {
   const linkedIds = new Set(linked.map(item => item.id));
   const available = relatedCandidates.filter(item => item.id !== challenge.id && !linkedIds.has(item.id));
   return `<h3>연결된 문제</h3><div class="related-challenge-list">${linked.length ? linked.map(item =>
-    `<div class="file-item"><div><button type="button" class="small ghost" data-action="open-related-challenge" data-id="${esc(item.id)}">${esc(relatedChallengeLabel(item))}</button><small>${esc(statuses[item.status] || item.status)}</small></div><button type="button" class="small danger icon-action" data-action="remove-relation" data-id="${esc(item.id)}" aria-label="문제 연결 해제" title="문제 연결 해제">×</button></div>`).join('') : '<p class="muted">없음</p>'}</div>
+    `<div class="file-item related-item"><div><button type="button" class="small ghost" data-action="open-related-challenge" data-id="${esc(item.id)}">${esc(relatedChallengeLabel(item))}</button><small>${esc(statuses[item.status] || item.status)}${item.evidence_reapproval_required ? ` · ${tr('재확인 필요')}` : item.evidence_stale ? ' · 공유 자료 재확인 필요' : item.evidence_active ? ' · 검증 자료 공유 중' : ''}</small></div>${item.status === 'solved' ? `<button type="button" class="small ghost" data-action="edit-related-evidence" data-id="${esc(item.id)}">${item.evidence_reapproval_required ? tr('재확인') : item.evidence_verified_at ? '공유 수정' : '자료 공유'}</button>` : ''}<button type="button" class="small danger icon-action" data-action="remove-relation" data-id="${esc(item.id)}" aria-label="문제 연결 해제" title="문제 연결 해제">×</button></div>`).join('') : '<p class="muted">없음</p>'}</div>
     ${available.length ? `<div class="related-add"><label class="sr-only" for="related-challenge-select">연결할 문제 선택</label><select id="related-challenge-select"><option value="">문제 선택</option>${available.map(item => `<option value="${esc(item.id)}">${esc(relatedChallengeLabel(item))}</option>`).join('')}</select><button type="button" class="small ghost" data-action="add-relation">연결</button></div>` : ''}`;
+}
+
+function editRelatedEvidence(relatedId) {
+  const target = currentChallenge;
+  const source = target?.related_challenges?.find(item => item.id === relatedId);
+  if (!target || !source || source.status !== 'solved') throw new Error('완료한 연결 문제를 선택하세요.');
+  const flagChoice = source.evidence_can_share_flag
+    ? `<label class="related-evidence-flag"><input type="checkbox" name="include_flag" ${source.evidence_include_flag ? 'checked' : ''}>검증된 Flag도 공유</label>` : '';
+  const footer = `${source.evidence_verified_at ? '<button type="button" class="danger ghost" data-action="stop-related-evidence">공유 해제</button>' : ''}<button type="button" data-action="close-modal">취소</button><button type="submit" class="primary">공유 저장</button>`;
+  openModal('검증 자료 공유', source.name,
+    `<label>확인한 관찰<textarea name="observation" maxlength="1200" placeholder="이 문제와 관련된 검증 사실만 입력하세요.">${esc(source.evidence_observation || '')}</textarea></label>${flagChoice}<p class="form-hint">현재 문제의 다음 풀이에만 전달됩니다. 원본 노트와 라이트업은 공유하지 않습니다.</p>`,
+    footer, 'related-evidence-form');
+  const form = modal.querySelector('#related-evidence-form');
+  form.dataset.workspaceId = target.workspace_id;
+  form.dataset.challengeId = target.id;
+  form.dataset.relatedId = source.id;
 }
 
 async function loadRelatedChallenges(challenge) {
@@ -1798,7 +2531,7 @@ async function openChallenge(id, focusSolverSession = false, expandSolverSession
   const refreshingFromCTFd = activeCTFdChallengeRefreshes.has(refreshKey);
   const ctfdRefreshButton = c.ctfd_id !== null && c.ctfd_id !== undefined && c.ctfd_url
     ? `<button class="small ghost icon-action" data-action="refresh-ctfd-challenge" aria-label="CTFd 원본에서 문제 새로고침" title="CTFd 원본에서 문제 새로고침" aria-describedby="ctfd-refresh-help" ${refreshingFromCTFd ? 'disabled aria-busy="true"' : ''}>${refreshingFromCTFd ? '…' : '↻'}</button>` : '';
-  detail.innerHTML = `<div class="dialog-head"><div><div class="eyebrow">${esc(c.category || 'CHALLENGE')}</div><h2 id="challenge-title">${esc(c.name)}</h2><p>${esc(currentWorkspace.name)}</p></div><div class="line-actions">${ctfdRefreshButton}<button class="small icon-action" data-action="clone-challenge" aria-label="문제 복제" title="문제 복제">⧉</button><button class="small icon-action" data-action="edit-challenge" aria-label="문제 수정" title="문제 수정">✎</button><button class="icon-btn icon-action" data-action="close-detail" aria-label="문제 닫기" title="문제 닫기">×</button></div></div>
+  detail.innerHTML = `<div class="dialog-head"><div><div class="eyebrow">${esc(c.category || 'CHALLENGE')}</div><h2 id="challenge-title">${esc(c.name)}</h2><p>${esc(currentWorkspace.name)}</p></div><div class="line-actions">${ctfdRefreshButton}<button class="small" data-action="receive-challenge-direct" title="${tr('이 작업공간에 문제 직접 받기')}">${tr('직접 받기')}</button><button class="small" data-action="send-challenge-direct">${tr('직접 보내기')}</button><button class="small" data-action="import-challenge-transfer" title="${tr('이 작업공간에 문제 ZIP 가져오기')}">${tr('ZIP 가져오기')}</button><button class="small" data-action="export-challenge-transfer">${tr('ZIP 내보내기')}</button><button class="small icon-action" data-action="clone-challenge" aria-label="문제 복제" title="문제 복제">⧉</button><button class="small icon-action" data-action="edit-challenge" aria-label="문제 수정" title="문제 수정">✎</button><button class="icon-btn icon-action" data-action="close-detail" aria-label="문제 닫기" title="문제 닫기">×</button></div></div>
     <div class="detail-grid"><div class="detail-main">${c.description ? `<h3>문제 설명</h3><div class="description">${esc(c.description)}</div>` : ''}
     ${c.remote_mode === 'endpoint' && c.remote ? `<h3>원격 접속 정보</h3><div class="description"><code>${esc(c.remote)}</code></div>` : c.remote_mode === 'none' ? '<span class="tag muted">원격 대상 없음</span>' : '<span class="tag muted">원격 정보 미등록</span>'}
     <div class="section-head"><h3>풀이 노트</h3><span class="tag muted">MARKDOWN</span></div>
@@ -1909,6 +2642,24 @@ function solverFilename() {
   return (currentChallenge.name.replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').replace(/^[ .]+|[ .]+$/g,'').slice(0,100) || 'challenge') + '-writeup.md';
 }
 
+function replaceSolverPanelPreservingConfiguration(panel, markup, preserveLog = false) {
+  const existing = panel.querySelector(':scope > .solver-configuration');
+  const template = document.createElement('template');
+  template.innerHTML = markup;
+  const children = Array.from(template.content.children);
+  const oldLog = preserveLog ? panel.querySelector(':scope > .solver-session-log') : null;
+  const logIndex = children.findIndex(node => node.classList.contains('solver-session-log'));
+  if (oldLog && logIndex >= 0) children[logIndex] = oldLog;
+  if (!existing) { panel.replaceChildren(...children); return; }
+  const index = children.findIndex(node => node.classList.contains('solver-configuration'));
+  if (index < 0) { panel.replaceChildren(...children); return; }
+  // Keep the native select in the live DOM: detaching it closes an open menu.
+  while (panel.firstChild && panel.firstChild !== existing) panel.firstChild.remove();
+  while (existing.nextSibling) existing.nextSibling.remove();
+  for (const child of children.slice(0,index)) panel.insertBefore(child,existing);
+  for (const child of children.slice(index + 1)) panel.append(child);
+}
+
 function paintSolver(job, events, workspaceId, challengeId, generation, guidance = []) {
   if (!solverContext(workspaceId,challengeId,generation)) return;
   let refreshDashboard = false;
@@ -1920,30 +2671,30 @@ function paintSolver(job, events, workspaceId, challengeId, generation, guidance
     currentSolverGuidance = [];
     solverEventCursor = 0;
     solverGuidanceDraft = '';
-    solverConsoleAgentId = 'root'; solverConsoleFollowLatest = true; solverCollapsedAgentIds.clear();
+    solverConsoleAgentId = 'root'; solverConsoleFollowLatest = true; solverCollapsedAgentIds.clear(); solverConsoleCardStates.clear();
   }
   currentSolverJob = job;
   currentSolverEvents = mergeSolverEvents(currentSolverEvents,events);
   currentSolverGuidance = mergeSolverGuidance(currentSolverGuidance,guidance);
   solverEventCursor = Math.max(solverEventCursor,...currentSolverEvents.map(solverEventSequence));
+  const reportedCursor = Number(job?.event_cursor);
+  if (Number.isSafeInteger(reportedCursor) && reportedCursor >= 0) solverEventCursor = Math.max(solverEventCursor,reportedCursor);
   const previousConsole = panel.querySelector('.solver-live-console');
   const previousLog = panel.querySelector('.solver-session-log');
   const previousLogOpen = previousLog?.open;
   const previousScroll = Number(previousConsole?.scrollTop || 0);
   const followLatest = !previousConsole || Number(previousConsole.scrollHeight || 0) - previousScroll - Number(previousConsole.clientHeight || 0) < 32;
   const guidanceFocused = document.activeElement?.id === 'solver-guidance-message' && solverIsActive(job);
-  if (!guidanceFocused) panel.innerHTML = solverPanelMarkup(job,currentSolverEvents);
+  if (!guidanceFocused) replaceSolverPanelPreservingConfiguration(panel,solverPanelMarkup(job,currentSolverEvents),Boolean(previousLog && previousJobId === nextJobId));
   else {
     refreshSolverContinuation(panel,job);
-    const console = panel.querySelector('.solver-live-console');
-    if (console) console.innerHTML = solverEventMarkup(currentSolverEvents);
-    const count = panel.querySelector('.solver-session-log summary b');
-    if (count) count.textContent = String(currentSolverEvents.length);
+    reconcileCompactSolverLog(panel.querySelector('.solver-session-log'),currentSolverEvents,solverIsActive(job));
     const guidanceHistory = panel.querySelector('.solver-guidance-history-slot');
     if (guidanceHistory) guidanceHistory.innerHTML = solverGuidanceHistoryMarkup();
   }
   const nextConsole = panel.querySelector('.solver-live-console');
   const nextLog = panel.querySelector('.solver-session-log');
+  if (!guidanceFocused && nextLog && nextLog === previousLog) reconcileCompactSolverLog(nextLog,currentSolverEvents,solverIsActive(job));
   if (nextLog && previousLog && previousJobId === nextJobId) nextLog.open = previousLogOpen;
   if (nextConsole) nextConsole.scrollTop = followLatest ? nextConsole.scrollHeight : previousScroll;
   paintSolverConsole();
@@ -2057,8 +2808,10 @@ async function pollSolverJob(jobId, workspaceId, challengeId, generation) {
     // Opening a challenge while its job is already active skips account/model
     // loading.  Load it as soon as that polled job becomes terminal so retry
     // controls do not remain permanently disabled in the "확인 중" state.
-    if (!solverIsActive(normalized.job) && solverOptionsState !== 'ready') {
-      await loadSolverConfiguration(workspaceId,challengeId,generation);
+    if (!solverIsActive(normalized.job) && (
+      solverOptionsState === 'idle' || solverConfigurationJobId !== solverJobId(normalized.job)
+    )) {
+      await loadSolverConfiguration(workspaceId,challengeId,generation,'',normalized.job);
     }
     scheduleSolverPoll(normalized.job,workspaceId,challengeId,generation);
   } catch (error) {
@@ -2071,11 +2824,41 @@ async function pollSolverJob(jobId, workspaceId, challengeId, generation) {
 function repaintSolverConfiguration(workspaceId, challengeId, generation) {
   if (!solverContext(workspaceId,challengeId,generation) || solverIsActive(currentSolverJob)) return;
   const panel = document.querySelector('#solver-panel');
-  if (panel) panel.innerHTML = solverPanelMarkup(currentSolverJob,currentSolverEvents);
+  if (!panel) return;
+  const current = panel.querySelector(':scope > .solver-configuration');
+  if (!current) {
+    panel.innerHTML = solverPanelMarkup(currentSolverJob,currentSolverEvents);
+    return;
+  }
+  const template = document.createElement('template');
+  template.innerHTML = solverProviderSelector();
+  const next = template.content.querySelector('.solver-configuration');
+  if (!next) return;
+  const focused = current.contains(document.activeElement) ? document.activeElement.closest('label') : null;
+  const nextFocused = focused?.querySelector('[id]')?.id
+    ? next.querySelector(`[id="${focused.querySelector('[id]').id}"]`)?.closest('label') : null;
+  if (focused?.parentElement === current && nextFocused?.parentElement === next) {
+    // Reconcile the other fields while an open select and its label stay put.
+    const children = Array.from(next.children);
+    const index = children.indexOf(nextFocused);
+    while (current.firstChild && current.firstChild !== focused) current.firstChild.remove();
+    while (focused.nextSibling) focused.nextSibling.remove();
+    for (const child of children.slice(0,index)) current.insertBefore(child,focused);
+    for (const child of children.slice(index + 1)) current.append(child);
+  } else if (!focused) current.replaceWith(next);
+  // A focused field absent from the new state updates when focus leaves.
+  panel.querySelectorAll('[data-action="start-solver"]').forEach(button => {
+    button.disabled = !solverConfigurationReady();
+  });
 }
 
-async function loadSolverConfiguration(workspaceId, challengeId, generation, preferredAccountId = '') {
+async function loadSolverConfiguration(workspaceId, challengeId, generation, preferredAccountId = '', retryJob = null) {
   const ticket = ++solverOptionsGeneration;
+  const retry = solverRetryConfiguration(retryJob);
+  const issues = [];
+  solverConfigurationJobId = solverJobId(currentSolverJob);
+  clearSolverRetryWarning();
+  if (retry) solverProvider = retry.provider;
   solverOptionsState = 'loading'; solverOptionsError = '';
   repaintSolverConfiguration(workspaceId,challengeId,generation);
   try {
@@ -2083,7 +2866,14 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
     if (!solverContext(workspaceId,challengeId,generation) || ticket !== solverOptionsGeneration) return;
     solverAccounts = Array.isArray(payload?.accounts) ? payload.accounts.filter(account => account && typeof account.id === 'string') : [];
     const available = solverAccounts.filter(account => account.provider === solverProvider && account.snapshot?.status === 'authenticated');
-    const preferred = preferredAccountId || solverAccountId;
+    if (retry) {
+      const previous = solverAccounts.find(item => item.id === retry.accountId);
+      const label = retry.accountLabel || '이전 계정';
+      if (!retry.accountId) issues.push('이전 실행 계정을 식별할 수 없습니다.');
+      else if (!previous || previous.provider !== retry.provider) issues.push(`이전 실행 계정(${label})을 찾을 수 없습니다.`);
+      else if (previous.snapshot?.status !== 'authenticated') issues.push(`이전 실행 계정(${label})에 다시 로그인해야 합니다.`);
+    }
+    const preferred = preferredAccountId || retry?.accountId || solverAccountId;
     const account = available.find(item => item.id === preferred)
       || available.find(item => item.selected === true)
       || available[0]
@@ -2091,6 +2881,8 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
     solverAccountId = account?.id || '';
     solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null; solverUltracode = false;
     if (!account) {
+      solverRetryIssue = issues.join(' ');
+      solverRetryRequiresSelection = Boolean(solverRetryIssue);
       solverOptionsState = 'ready';
       repaintSolverConfiguration(workspaceId,challengeId,generation);
       return;
@@ -2099,26 +2891,43 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
     if (!solverContext(workspaceId,challengeId,generation) || ticket !== solverOptionsGeneration) return;
     if (catalog?.status !== 'available' || !Array.isArray(catalog.models)) throw new Error('선택한 계정의 모델 목록을 사용할 수 없습니다.');
     solverModels = catalog.models.filter(item => item && typeof (item.model || item.id) === 'string');
-    const chosen = solverModels.find(item => (item.model || item.id) === account.model)
+    const chosen = solverModels.find(item => (item.model || item.id) === (retry?.model || account.model))
+      || solverModels.find(item => (item.model || item.id) === account.model)
       || solverModels.find(item => item.isDefault === true || item.default === true)
       || solverModels[0]
       || null;
     solverModel = chosen ? (chosen.model || chosen.id) : '';
+    if (retry?.model && solverModel !== retry.model) issues.push(`이전 모델(${retry.model})을 현재 계정에서 사용할 수 없습니다.`);
     const efforts = Array.isArray(chosen?.supportedReasoningEfforts)
       ? chosen.supportedReasoningEfforts.map(item => item?.reasoningEffort).filter(Boolean) : [];
-    solverReasoning = efforts.includes(account.reasoning_effort) ? account.reasoning_effort
+    solverReasoning = retry?.reasoning && efforts.includes(retry.reasoning) ? retry.reasoning
+      : efforts.includes(account.reasoning_effort) ? account.reasoning_effort
       : efforts.includes(chosen?.defaultReasoningEffort) ? chosen.defaultReasoningEffort
       : efforts[0] || '';
+    if (retry?.reasoning && solverReasoning !== retry.reasoning) issues.push(`이전 추론 수준(${retry.reasoning})을 현재 모델에서 사용할 수 없습니다.`);
     const tiers = Array.isArray(chosen?.serviceTiers) ? chosen.serviceTiers.map(item => item?.id).filter(Boolean) : [];
-    solverServiceTier = account.service_tier === 'fast' && tiers.includes('fast') ? 'fast' : null;
+    solverServiceTier = retry ? (retry.serviceTier === 'fast' && tiers.includes('fast') ? 'fast' : null)
+      : account.service_tier === 'fast' && tiers.includes('fast') ? 'fast' : null;
+    if (retry?.serviceTier === 'fast' && solverServiceTier !== 'fast') issues.push('이전 Fast 티어를 현재 모델에서 사용할 수 없습니다.');
     solverUltracode = solverProvider === 'claude' && chosen?.supportsUltracode === true
-      && (chosen.model || chosen.id) === account.model && account.ultracode === true;
+      && (retry ? retry.ultracode : (chosen.model || chosen.id) === account.model && account.ultracode === true);
+    if (retry?.ultracode && !solverUltracode) issues.push('이전 Ultracode 설정을 현재 모델에서 사용할 수 없습니다.');
+    if (retry) {
+      solverUltraEscalationMode = ['ask','auto','off'].includes(retry.ultraEscalationMode) ? retry.ultraEscalationMode : 'off';
+      if (solverUltraEscalationMode !== 'off' && !solverUltraEscalationEligible()) {
+        issues.push('이전 Ultra 전환 설정을 현재 모델에서 사용할 수 없습니다.');
+      }
+    }
+    solverRetryIssue = issues.join(' ');
+    solverRetryRequiresSelection = Boolean(solverRetryIssue);
     solverOptionsState = 'ready';
   } catch (error) {
     if (!solverContext(workspaceId,challengeId,generation) || ticket !== solverOptionsGeneration) return;
     solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null; solverUltracode = false;
     solverOptionsState = 'error';
     solverOptionsError = error.message || '계정 설정을 불러오지 못했습니다.';
+    solverRetryIssue = issues.join(' ');
+    solverRetryRequiresSelection = Boolean(solverRetryIssue);
   }
   repaintSolverConfiguration(workspaceId,challengeId,generation);
 }
@@ -2138,7 +2947,7 @@ async function loadSolver(workspaceId, challengeId) {
       await pollSolverJob(linkedUltraJob,workspaceId,challengeId,generation);
     } else {
       paintSolver(normalized.job,normalized.events,workspaceId,challengeId,generation,normalized.guidance);
-      if (!solverIsActive(normalized.job)) await loadSolverConfiguration(workspaceId,challengeId,generation);
+      if (!solverIsActive(normalized.job)) await loadSolverConfiguration(workspaceId,challengeId,generation,'',normalized.job);
       scheduleSolverPoll(normalized.job,workspaceId,challengeId,generation);
     }
   } catch (error) {
@@ -2161,7 +2970,7 @@ async function startSolver() {
   if (solverPollTimer) clearTimeout(solverPollTimer);
   const generation = ++solverRendering;
   solverPollTimer = null; currentSolverJob = null; currentSolverEvents = []; currentSolverGuidance = []; solverEventCursor = 0; solverGuidanceDraft = ''; solverListedFlag = ''; solverSyncedWriteup = '';
-  solverConsoleAgentId = 'root'; solverConsoleFollowLatest = true; solverCollapsedAgentIds.clear();
+  solverConsoleAgentId = 'root'; solverConsoleFollowLatest = true; solverCollapsedAgentIds.clear(); solverConsoleCardStates.clear();
   if (!solverContext(workspaceId,challengeId,generation)) return;
   const panel = document.querySelector('#solver-panel');
   panel.innerHTML = solverPanelMarkup(null,[],true);
@@ -2181,6 +2990,7 @@ async function startSolver() {
     paintSolver(normalized.job,normalized.events,workspaceId,challengeId,generation,normalized.guidance);
     const id = solverJobId(normalized.job);
     if (id && solverIsActive(normalized.job)) await pollSolverJob(id,workspaceId,challengeId,generation);
+    else if (!solverIsActive(normalized.job)) await loadSolverConfiguration(workspaceId,challengeId,generation,'',normalized.job);
   } catch (error) {
     if (solverContext(workspaceId,challengeId,generation)) panel.innerHTML = `${solverPanelMarkup(null)}${solverErrorMarkup(error)}`;
     throw error;
@@ -2573,7 +3383,7 @@ function renderSettings() {
   const content = shell('settings', '개인 설정');
   const credentialSettings = authMode === 'password' ? `
     <section class="settings-card"><h2>로그인 아이디 변경</h2><form id="username-form"><label>아이디<input name="new_username" value="${esc(sessionUser?.username)}" autocomplete="username" maxlength="100" required></label><label>현재 비밀번호<input type="password" name="current_password" autocomplete="current-password" maxlength="1024" required></label><div><button class="primary">아이디 변경</button></div></form></section>
-    <div class="divider"></div><section class="settings-card"><h2>비밀번호 변경</h2><form id="password-form"><label>현재 비밀번호<input type="password" name="current_password" autocomplete="current-password" maxlength="1024" required></label><label>새 비밀번호<input type="password" name="new_password" autocomplete="new-password" minlength="4" maxlength="1024" required><span class="form-hint">최소 4자</span></label><label>새 비밀번호 확인<input type="password" name="confirmation" autocomplete="new-password" minlength="4" maxlength="1024" required></label><div><button class="primary">비밀번호 변경</button></div></form><div class="divider"></div><button class="ghost" data-action="logout">로그아웃</button></section><div class="divider"></div>` : '';
+    <div class="divider"></div><section class="settings-card"><h2>비밀번호 변경</h2><form id="password-form"><label>현재 비밀번호<input type="password" name="current_password" autocomplete="current-password" maxlength="1024" required></label><label>새 비밀번호<input type="password" name="new_password" autocomplete="new-password" minlength="4" maxlength="1024" required><span class="form-hint">최소 4자</span></label><label>새 비밀번호 확인<input type="password" name="confirmation" autocomplete="new-password" minlength="4" maxlength="1024" required></label><div><button class="primary">비밀번호 변경</button></div></form><div class="divider"></div><div class="actions"><button class="ghost" data-action="toggle-session-persistence">${sessionPersistent ? '30일 로그인 해제' : '이 기기에서 30일 로그인 유지'}</button><button class="ghost" data-action="logout">로그아웃</button></div></section><div class="divider"></div>` : '';
   content.innerHTML = `<div class="page-head"><div><div class="eyebrow">PERSONAL SETTINGS</div><h1>개인 설정</h1></div></div>
     ${credentialSettings}<section id="telegram-settings"></section>`;
   const container = document.querySelector('#telegram-settings');
@@ -2660,7 +3470,8 @@ async function renderAdmin() {
     const content = shell('admin','관리자 설정');
     content.innerHTML = `<div class="page-head"><div><div class="eyebrow">ADMIN SETTINGS</div><h1>관리자 설정</h1></div></div>
       ${solverCapacityAdminMarkup(capacity)}<div class="divider"></div>
-      <section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section id="release-update-panel" class="settings-card"></section>`;
+      <section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section id="admin-cli-version-panel" class="settings-card"></section><div class="divider"></div><section id="release-update-panel" class="settings-card"></section>`;
+    renderAdminCliVersions(document.querySelector('#admin-cli-version-panel'), api, {scope:sessionUser.id, locale:i18n.locale});
     refreshReleaseUpdatePanel();
     return;
   }
@@ -2670,7 +3481,8 @@ async function renderAdmin() {
   content.innerHTML = `<div class="page-head"><div><div class="eyebrow">ADMIN SETTINGS</div><h1>사용자 관리</h1></div><button class="primary" data-action="new-user">＋ 사용자 추가</button></div>
     <div class="table-wrap"><table class="challenge-table"><thead><tr><th>아이디</th><th>권한</th><th>상태</th><th>최근 로그인</th><th>작업공간 / 계정</th><th>Telegram</th><th>관리</th></tr></thead><tbody>${result.users.map(user => `<tr><td class="challenge-title">${esc(user.username)}${user.id === sessionUser.id ? ' <span class="tag">나</span>' : ''}</td><td><select data-action="user-role" data-id="${user.id}" aria-label="${esc(user.username)} 권한"><option value="user" ${user.role === 'user' ? 'selected' : ''}>일반 사용자</option><option value="admin" ${user.role === 'admin' ? 'selected' : ''}>관리자</option></select></td><td>${user.active ? '활성' : '비활성'}</td><td>${user.last_login_at ? date(user.last_login_at) : '기록 없음'}</td><td>${user.workspace_count} / ${user.account_count}</td><td>${user.telegram_linked ? (user.telegram_enabled ? '알림 켜짐' : '연결됨 · 알림 꺼짐') : '미연결'}${user.telegram_last_failure_at ? '<br><small>최근 전송 오류 기록</small>' : ''}</td><td><div class="actions">${adminUserActiveButton(user,activeAdminCount)}<button class="small" data-action="user-password" data-id="${user.id}" data-name="${esc(user.username)}">비밀번호 초기화</button></div></td></tr>`).join('')}</tbody></table></div>
     <div class="divider"></div>${solverCapacityAdminMarkup(capacity)}
-    <div class="divider"></div><section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section id="release-update-panel" class="settings-card"></section>`;
+    <div class="divider"></div><section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section id="admin-cli-version-panel" class="settings-card"></section><div class="divider"></div><section id="release-update-panel" class="settings-card"></section>`;
+  renderAdminCliVersions(document.querySelector('#admin-cli-version-panel'), api, {scope:sessionUser.id, locale:i18n.locale});
   refreshReleaseUpdatePanel();
 }
 
@@ -2678,9 +3490,58 @@ function newUserForm() {
   openModal('사용자 추가','', '<label>아이디<input name="username" autocomplete="off" maxlength="100" required></label><label>초기 비밀번호<input type="password" name="password" autocomplete="new-password" minlength="4" maxlength="1024" required><span class="form-hint">4자 이상 · 조합 조건 없음</span></label><label>권한<select name="role"><option value="user">일반 사용자</option><option value="admin">관리자</option></select></label>','<button type="button" data-action="close-modal">취소</button><button type="submit" class="primary">사용자 만들기</button>','new-user-form');
 }
 
-function importForm() {
+function syncCTFdImportSource(form) {
+  const saved = form.elements.connection_mode?.value === 'saved';
+  const manual = form.querySelector('#ctfd-import-manual');
+  manual.hidden = saved;
+  const url = form.elements.url, auth = form.elements.auth_type;
+  url.disabled = saved; url.required = !saved;
+  auth.disabled = saved;
+  for (const [id,type] of [['ctfd-token-fields','token'],['ctfd-password-fields','password']]) {
+    const fields = form.querySelector(`#${id}`), enabled = !saved && auth.value === type;
+    fields.hidden = !enabled;
+    fields.querySelectorAll('input').forEach(node => {
+      node.disabled = !enabled; node.required = enabled;
+      if (!enabled) node.value = '';
+    });
+  }
+}
+
+function ctfdImportHistoryMarkup() {
+  return `<section class="ctfd-import-history" aria-labelledby="ctfd-import-history-title">
+    <div class="section-head ctfd-import-history-head"><h3 id="ctfd-import-history-title">가져오기 기록</h3><button type="button" class="small ghost icon-action" data-action="refresh-ctfd-jobs" aria-label="CTFd 가져오기 기록 새로고침" title="CTFd 가져오기 기록 새로고침">↻</button></div>
+    <div id="ctfd-job-area" role="region" tabindex="0" aria-label="CTFd 가져오기 기록"><p class="form-hint">기록을 불러오는 중입니다.</p></div>
+  </section>`;
+}
+
+function showCTFdImportProgress(workspaceId) {
+  openModal('CTFd 가져오기', '', ctfdImportHistoryMarkup(),
+    '<button type="button" data-action="close-modal">닫기</button><button type="button" class="primary" data-action="ctfd-import">다른 문제 가져오기</button>');
+  modal.dataset.kind = 'ctfd-import'; modal.dataset.workspaceId = workspaceId;
+}
+
+async function importForm() {
+  if (!currentWorkspace) return;
+  const workspaceId = currentWorkspace.id, page = rendering, hash = location.hash;
   importPreview = null;
-  openModal('CTFd 문제 가져오기', '', '<label>CTFd 사이트 주소<input name="url" inputmode="url" placeholder="ctf.example.com" required autofocus><span class="form-hint">https://를 생략하면 자동으로 붙입니다.</span></label><label>인증 방식<select id="ctfd-auth-type" name="auth_type"><option value="none">로그인 없이 가져오기</option><option value="token">API 토큰</option><option value="password">아이디와 비밀번호</option></select></label><div id="ctfd-token-fields" hidden><label>API 토큰<input name="token" type="password" autocomplete="off" disabled></label></div><div id="ctfd-password-fields" hidden><label>CTFd 아이디<input name="username" autocomplete="off" disabled></label><label>CTFd 비밀번호<input name="password" type="password" autocomplete="off" disabled></label></div><div class="notice">인증값은 가져오기 중에만 사용합니다.</div>', '<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">문제 목록 확인</button>', 'ctfd-preview-form');
+  const state = await api(`/api/workspaces/${workspaceId}/ctfd/connection`);
+  if (page !== rendering || hash !== location.hash || currentWorkspace?.id !== workspaceId) return;
+  openModal('CTFd 문제 가져오기', '', `
+    <label>연결 방식<select id="ctfd-import-source" name="connection_mode">
+      ${state.connected ? `<option value="saved">${esc(i18n.t('저장된 연결'))} · ${esc(state.url)}</option>` : ''}
+      <option value="new">새 연결 입력</option>
+    </select></label>
+    <div id="ctfd-import-manual" class="ctfd-import-manual">
+      <label>CTFd 사이트 주소<input name="url" inputmode="url" placeholder="ctf.example.com" required><span class="form-hint">https://를 생략하면 자동으로 붙입니다.</span></label>
+      <label>인증 방식<select id="ctfd-auth-type" name="auth_type"><option value="none">로그인 없이 가져오기</option><option value="token">API 토큰</option><option value="password">아이디와 비밀번호</option></select></label>
+      <div id="ctfd-token-fields" hidden><label>API 토큰<input name="token" type="password" autocomplete="off" disabled></label></div>
+      <div id="ctfd-password-fields" hidden><label>CTFd 아이디<input name="username" autocomplete="off" disabled></label><label>CTFd 비밀번호<input name="password" type="password" autocomplete="off" disabled></label></div>
+    </div>${ctfdImportHistoryMarkup()}`, '<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">문제 목록 확인</button>', 'ctfd-preview-form');
+  modal.dataset.kind = 'ctfd-import'; modal.dataset.workspaceId = workspaceId;
+  const form = modal.querySelector('#ctfd-preview-form');
+  syncCTFdImportSource(form);
+  form.dataset.initial = formSnapshot(form);
+  pollCTFdJobs(workspaceId);
 }
 
 function ctfdRefreshAuthForm() {
@@ -2740,10 +3601,15 @@ function ctfdSubmissionRows(history) {
 }
 
 function ctfdConnectionState(state) {
-  return `<div class="section-head"><h3>제출 연결</h3><span class="connection-state ${state.connected ? 'connected' : ''}">${state.connected ? '검증됨' : '연결 안 됨'}</span></div>
-      ${state.connected ? `<p class="ctfd-connection-meta"><strong>${esc(state.url)}</strong><small>${state.auth_type === 'password' ? '아이디·비밀번호' : 'API 토큰'}</small></p>` : '<p class="form-hint">제출 계정을 연결하세요.</p>'}
-      <div class="ctfd-submit-toggle-row"><label class="ctfd-submit-toggle"><input id="ctfd-auto-submit-toggle" type="checkbox" data-saved="${Boolean(state.auto_submit)}" aria-describedby="ctfd-auto-submit-help" ${state.auto_submit ? 'checked' : ''} ${state.connected ? '' : 'disabled'}><span>Flag 자동 제출</span></label></div>
-      <p id="ctfd-auto-submit-help" class="notice ctfd-submit-help ${state.auto_submit ? '' : 'muted'}">기본 OFF · CTFd 오답 패널티가 적용될 수 있습니다.</p>
+  const reason = {
+    csrf_unavailable:'이 사이트의 로그인 세션에서 제출용 CSRF 토큰을 확인하지 못했습니다.',
+    challenge_access_unavailable:'문제 목록 접근을 확인하지 못했습니다.',
+    recheck_required:'제출 인증 상태를 다시 확인해야 합니다. 연결을 다시 저장하세요.',
+  }[state.submit_check_reason] || '제출 인증 상태를 확인하지 못했습니다. 연결을 다시 저장하세요.';
+  return `<div class="section-head"><h3>작업공간 연결</h3><span class="connection-state ${state.connected ? 'connected' : ''}">${state.connected ? (state.submit_ready ? '제출 인증 준비됨' : '조회 확인됨') : '연결 안 됨'}</span></div>
+      ${state.connected ? `<p class="ctfd-connection-meta"><strong>${esc(state.url)}</strong><small>${state.auth_type === 'password' ? '아이디·비밀번호' : 'API 토큰'}</small></p>` : '<p class="form-hint">CTFd 연결을 저장하세요.</p>'}
+      <div class="ctfd-submit-toggle-row"><label class="ctfd-submit-toggle"><input id="ctfd-auto-submit-toggle" type="checkbox" data-saved="${Boolean(state.auto_submit)}" aria-describedby="ctfd-auto-submit-help" ${state.auto_submit ? 'checked' : ''} ${state.submit_ready ? '' : 'disabled'}><span>Flag 자동 제출</span></label></div>
+      <p id="ctfd-auto-submit-help" class="notice ctfd-submit-help ${state.auto_submit ? '' : 'muted'}">${state.connected && !state.submit_ready ? esc(reason) : '기본 OFF · CTFd 오답 패널티가 적용될 수 있습니다.'}</p>
       ${state.connected ? '<div class="ctfd-submit-actions"><button type="button" class="small danger ghost" data-action="disconnect-ctfd-submit">연결 해제</button></div>' : ''}`;
 }
 
@@ -2773,7 +3639,7 @@ async function ctfdSubmitAction(task) {
       modal.removeAttribute('aria-busy');
       if (scope.state) {
         modal.querySelector('#ctfd-connection-state').innerHTML = ctfdConnectionState(scope.state);
-        modal.querySelector('#ctfd-connection-summary').textContent = scope.state.connected ? '연결 바꾸기' : '제출 계정 연결';
+        modal.querySelector('#ctfd-connection-summary').textContent = scope.state.connected ? '연결 바꾸기' : 'CTFd 연결';
       }
       if (scope.history) modal.querySelector('#ctfd-submission-history').innerHTML = ctfdSubmissionRows(scope.history);
       if (scope.saved) scope.form.dataset.initial = formSnapshot(scope.form);
@@ -2806,12 +3672,12 @@ async function toggleCTFdSubmit(input) {
 
 async function disconnectCTFdSubmit() {
   await ctfdSubmitAction(async scope => {
-    if (!confirm('저장된 제출용 인증과 대기 중인 자동 제출을 해제할까요?')) return;
+    if (!confirm('저장된 CTFd 연결을 해제할까요? 가져오기와 자동 제출에 더 이상 사용되지 않습니다.')) return;
     scope.state = await api(`/api/workspaces/${scope.workspaceId}/ctfd/connection`,{method:'DELETE'});
     if (ctfdSubmitCurrent(scope)) {
       modal.querySelector('#ctfd-connection-details').open = true;
       scope.focusSelector = 'input[name="url"]';
-      toast('CTFd 제출 연결을 해제했습니다.');
+      toast('CTFd 연결을 해제했습니다.');
     }
   });
 }
@@ -2828,7 +3694,7 @@ async function saveCTFdSubmitConnection(form, body) {
     form.querySelector('input[name="url"]').value = scope.state.url || body.url;
     scope.saved = true; scope.focusSelector = '#ctfd-auto-submit-toggle';
     modal.querySelector('#ctfd-connection-details').open = false;
-    toast('CTFd 제출 계정을 검증해 저장했습니다. 자동 제출은 직접 켜야 합니다.');
+    toast('CTFd 연결을 저장했습니다. 자동 제출은 직접 켜야 합니다.');
   });
 }
 
@@ -2841,10 +3707,10 @@ async function ctfdSubmitSettings() {
   ]);
   if (ticket !== ctfdSubmitRendering || generation !== modalRendering || page !== rendering || hash !== location.hash || currentWorkspace?.id !== workspaceId) return;
   const authType = state.auth_type === 'password' ? 'password' : 'token';
-  openModal('CTFd 자동 제출', '', `<div class="ctfd-submit-panel">
+  openModal('CTFd 연결·자동 제출', '', `<div class="ctfd-submit-panel">
     <section id="ctfd-connection-state" class="ctfd-connection-state">${ctfdConnectionState(state)}</section>
     <div class="divider"></div>
-    <details id="ctfd-connection-details" class="ctfd-submit-connection-details" ${state.connected ? '' : 'open'}><summary id="ctfd-connection-summary">${state.connected ? '연결 바꾸기' : '제출 계정 연결'}</summary>
+    <details id="ctfd-connection-details" class="ctfd-submit-connection-details" ${state.connected ? '' : 'open'}><summary id="ctfd-connection-summary">${state.connected ? '연결 바꾸기' : 'CTFd 연결'}</summary>
       <form id="ctfd-submit-connection-form">
         <label>CTFd 사이트 주소<input name="url" inputmode="url" value="${esc(state.url || '')}" placeholder="ctf.example.com" required><span class="form-hint">https://를 생략하면 자동으로 붙입니다.</span></label>
         <label>인증 방식<select id="ctfd-submit-auth-type" name="auth_type"><option value="token" ${authType === 'token' ? 'selected' : ''}>API 토큰</option><option value="password" ${authType === 'password' ? 'selected' : ''}>아이디와 비밀번호</option></select></label>
@@ -2861,18 +3727,25 @@ async function ctfdSubmitSettings() {
 
 function showImportPreview(result, credentials) {
   importPreview = {mode:'import', workspaceId:currentWorkspace?.id, result, credentials: result.preview_id ? null : credentials};
-  openModal('가져올 문제 선택', `${result.challenges.length}개 · ${result.source_url}`, `<div class="import-preview">${result.challenges.map(c => `<label class="import-row"><input type="checkbox" name="challenge" value="${c.id}" checked><span>${esc(c.name)} <small>${esc(c.category || '미분류')} · 첨부 ${result.details_pending ? '가져올 때 확인' : (c.files || []).length}</small></span></label>`).join('') || '<p>가져올 문제가 없습니다.</p>'}</div>${result.errors.length ? `<div class="notice error-notice">${importErrors(result.errors)}</div>` : ''}<p class="form-hint">기존 문제는 변경하지 않습니다.</p>`, '<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">선택한 문제 가져오기</button>', 'ctfd-import-form');
+  openModal('가져올 문제 선택', `${result.challenges.length}개 · ${result.source_url}`, `<div class="import-preview">${result.challenges.map(c => `<label class="import-row"><input type="checkbox" name="challenge" value="${c.id}" checked><span>${esc(c.name)} <small>${esc(c.category || '미분류')} · 첨부 ${result.details_pending ? '가져올 때 확인' : (c.files || []).length}</small></span></label>`).join('') || '<p>가져올 문제가 없습니다.</p>'}</div>${result.errors.length ? `<div class="notice error-notice">${importErrors(result.errors)}</div>` : ''}<p class="form-hint">기존 문제는 변경하지 않습니다.</p>${ctfdImportHistoryMarkup()}`, '<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">선택한 문제 가져오기</button>', 'ctfd-import-form');
+  modal.dataset.kind = 'ctfd-import'; modal.dataset.workspaceId = importPreview.workspaceId;
+  pollCTFdJobs(importPreview.workspaceId);
 }
 
 function showCTFdSyncPreview(result, workspaceId) {
   const challenges = Array.isArray(result?.challenges) ? result.challenges : [];
+  const sourceStatuses = Array.isArray(result?.source_statuses) ? result.source_statuses : [];
   const existingCount = Number.isInteger(result?.existing_count) && result.existing_count >= 0 ? result.existing_count : 0;
   const newCount = Number.isInteger(result?.new_count) && result.new_count >= 0 ? result.new_count : challenges.length;
   const errors = Array.isArray(result?.errors) ? result.errors : [];
   importPreview = {mode:'sync', workspaceId, result};
   const rows = challenges.map(c => `<label class="import-row"><input type="checkbox" name="challenge" value="${esc(c.id)}" checked><span>${esc(c.name)} <small>${esc(c.category || '미분류')} · 첨부 ${result.details_pending ? '동기화할 때 확인' : (c.files || []).length}</small></span></label>`).join('');
+  const unavailable = sourceStatuses.filter(item => item.state !== 'visible');
+  const sourceLabels = {hidden:'원본에서 숨김',locked:'원본에서 잠김',unlisted:'원본 목록에서 확인되지 않음'};
+  const unavailableRows = unavailable.map(item => `<div class="import-row ctfd-source-status"><span><strong>${esc(item.name || `CTFd #${item.remote_id}`)}</strong><small>CTFd #${esc(item.remote_id)} · ${esc(sourceLabels[item.state] || '원본 상태 미확인')}</small></span><button type="button" class="small ghost" data-action="open-ctfd-source-challenge" data-workspace-id="${esc(workspaceId)}" data-id="${esc(item.challenge_id)}">문제 보기</button></div>`).join('');
   const body = `<div class="ctfd-sync-counts"><span><strong>${newCount}</strong> 신규</span><span><strong>${existingCount}</strong> 기존 유지</span></div>
     <div class="import-preview">${rows || '<p>새로 추가된 문제가 없습니다.</p>'}</div>
+    ${unavailableRows ? `<div class="section-head"><h3>원본 상태 확인 필요</h3></div><div class="import-preview">${unavailableRows}</div><p class="form-hint">목록에 없다고 삭제된 것으로 단정하지 않습니다. 로컬 문제와 풀이 자료는 유지됩니다.</p>` : ''}
     ${errors.length ? `<div class="notice error-notice">${importErrors(errors)}</div>` : ''}
     <p class="notice muted">기존 상태, Flag, 풀이 노트, write-up, 첨부파일은 변경하지 않습니다.</p>`;
   const footer = challenges.length
@@ -2894,7 +3767,7 @@ async function startCTFdSync(form, challengeIds) {
   await api(`/api/workspaces/${workspaceId}/ctfd/sync`,{
     method:'POST', body:{preview_id:preview.result.preview_id,challenge_ids:challengeIds},
   });
-  importPreview = null; modal.close();
+  importPreview = null; showCTFdImportProgress(workspaceId);
   if (currentWorkspace?.id === workspaceId) {
     await refreshChallenges();
     await pollCTFdJobs(workspaceId);
@@ -2979,9 +3852,43 @@ function showCTFdRefreshConnectionFallback(error, challenge) {
   modal.dataset.workspaceId = challenge.workspace_id;
 }
 
+function showCTFdRefreshPreview(result, challenge) {
+  if (currentChallenge?.id !== challenge.id || currentWorkspace?.id !== challenge.workspace_id) return;
+  const fields = Array.isArray(result.field_diff) ? result.field_diff : [];
+  const labels = {name:'이름', category:'분야', description:'문제 설명', remote:'원격 접속 정보'};
+  const rows = fields.filter(item => item.changed).map(item => {
+    const locked = item.local_override || !item.selectable;
+    const status = locked ? '로컬 수정 유지' : '원본 변경';
+    return `<div class="import-row"><label><input type="checkbox" name="field" value="${esc(item.field)}" ${locked ? 'disabled' : 'checked'}><strong>${esc(labels[item.field] || item.field)}</strong> · ${status}</label>
+      <details><summary>변경 내용</summary><div><small>현재</small><pre style="max-height:12rem;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere">${esc(item.current || '(없음)')}</pre><small>CTFd</small><pre style="max-height:12rem;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere">${esc(item.incoming || '(없음)')}</pre></div></details></div>`;
+  }).join('');
+  const files = result.challenges?.[0]?.files || [];
+  importPreview = {mode:'refresh',workspaceId:challenge.workspace_id,challengeId:challenge.id,result};
+  openModal('CTFd 변경 확인', challenge.name,
+    `<div class="import-preview">${rows || '<p>문제 정보의 변경사항이 없습니다.</p>'}</div>
+     <p class="form-hint">원본 첨부파일 ${files.length}개를 다시 확인합니다. 로컬에서 추가한 파일과 풀이 기록은 유지됩니다.</p>
+     ${Array.isArray(result.errors) && result.errors.length ? `<div class="notice error-notice">${importErrors(result.errors)}</div>` : ''}`,
+    '<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">선택한 변경 적용</button>',
+    'ctfd-refresh-preview-form');
+  const form = modal.querySelector('#ctfd-refresh-preview-form');
+  form.dataset.workspaceId = challenge.workspace_id;
+  form.dataset.challengeId = challenge.id;
+  form.dataset.initial = formSnapshot(form);
+  modal.dataset.kind = 'ctfd-refresh-preview'; modal.dataset.workspaceId = challenge.workspace_id;
+}
+
+async function previewCTFdChallengeRefresh(credentials = {}) {
+  const challenge = currentChallenge;
+  if (!challenge?.ctfd_url || challenge.ctfd_id === null || challenge.ctfd_id === undefined ||
+      currentWorkspace?.id !== challenge.workspace_id) throw new Error('CTFd에서 가져온 문제만 새로고침할 수 있습니다.');
+  const result = await api(`/api/workspaces/${challenge.workspace_id}/challenges/${challenge.id}/ctfd/refresh/preview`,
+    {method:'POST',body:credentials});
+  showCTFdRefreshPreview(result,challenge);
+}
+
 async function refreshCTFdChallenge() {
   const challenge = currentChallenge;
-  try { return await launchCTFdChallengeRefresh({}); }
+  try { return await previewCTFdChallengeRefresh({}); }
   catch (error) {
     const imported = challenge?.ctfd_id !== null && challenge?.ctfd_id !== undefined && challenge?.ctfd_url;
     if (imported && currentChallenge === challenge && currentWorkspace?.id === challenge.workspace_id) {
@@ -3000,15 +3907,12 @@ async function startAuthenticatedCTFdRefresh(form, body) {
   if (body.auth_type === 'token') { delete body.username; delete body.password; }
   else if (body.auth_type === 'password') delete body.token;
   else { delete body.token; delete body.username; delete body.password; }
-  let started = false;
   try {
-    await launchCTFdChallengeRefresh(body);
-    started = true;
+    await previewCTFdChallengeRefresh(body);
   } finally {
     for (const key of ['token','username','password']) if (Object.hasOwn(body,key)) body[key] = '';
     for (const input of form.querySelectorAll('input[name="token"],input[name="username"],input[name="password"]')) input.value = '';
   }
-  if (started) modal.close();
 }
 
 const ctfdJobLabels = {queued:'대기',running:'가져오는 중',completed:'완료',partial:'일부 실패',failed:'실패',cancelled:'취소',interrupted:'중단'};
@@ -3032,12 +3936,35 @@ function ctfdJobMarkup(job) {
 }
 
 function ctfdJobsMarkup(jobs) {
+  if (!jobs.length) return '<p class="form-hint">가져오기 기록이 없습니다.</p>';
   const active = jobs.filter(job => ctfdActiveJobStatuses.has(job.status));
   const history = jobs.filter(job => !ctfdActiveJobStatuses.has(job.status));
   const recent = history.slice(0,ctfdVisibleHistoryLimit);
   const older = history.slice(ctfdVisibleHistoryLimit);
   const folded = older.length ? `<details class="ctfd-job-history"><summary>이전 CTFd 가져오기 기록 ${older.length}개 보기</summary><div class="ctfd-job-history-list">${older.map(ctfdJobMarkup).join('')}</div></details>` : '';
   return `${active.map(ctfdJobMarkup).join('')}${recent.map(ctfdJobMarkup).join('')}${folded}`;
+}
+
+function updateCTFdImportButton(jobs, workspaceId) {
+  if (currentWorkspace?.id !== workspaceId) return;
+  const button = document.querySelector('.head-actions [data-action="ctfd-import"]');
+  const badge = button?.querySelector('.ctfd-import-badge');
+  if (!badge) return;
+  const activeCount = jobs.filter(job => ctfdActiveJobStatuses.has(job.status)).length;
+  const latestFinished = jobs.find(job => !ctfdActiveJobStatuses.has(job.status));
+  const issue = ['failed','partial','interrupted'].includes(latestFinished?.status);
+  const label = activeCount ? (activeCount === 1 ? '진행 중' : `진행 ${activeCount}`)
+    : issue ? (latestFinished.status === 'partial' ? '일부 실패' : latestFinished.status === 'interrupted' ? '중단' : '실패') : '';
+  badge.hidden = !label;
+  badge.textContent = label;
+  badge.classList.toggle('is-failed', Boolean(issue && !activeCount));
+  if (label) {
+    button.setAttribute('aria-label', `CTFd 가져오기 · ${label}`);
+    button.title = `CTFd 가져오기 · ${label}`;
+  } else {
+    button.removeAttribute('aria-label');
+    button.removeAttribute('title');
+  }
 }
 
 function updateCTFdJobs(area, jobs) {
@@ -3094,14 +4021,20 @@ function reflectActiveCTFdRefreshes(jobs, workspaceId) {
 }
 
 async function pollCTFdJobs(workspaceId) {
-  const area = document.querySelector('#ctfd-job-area');
-  if (!area || currentWorkspace?.id !== workspaceId) return;
+  if (ctfdJobsPollTimer) { clearTimeout(ctfdJobsPollTimer); ctfdJobsPollTimer = null; }
+  if (currentWorkspace?.id !== workspaceId) return;
+  const generation = ++ctfdJobsRequestGeneration;
   try {
     const result = await api(`/api/workspaces/${workspaceId}/ctfd/jobs`);
-    if (!area.isConnected || currentWorkspace?.id !== workspaceId) return;
+    if (generation !== ctfdJobsRequestGeneration || currentWorkspace?.id !== workspaceId) return;
     const completedRefresh = reflectActiveCTFdRefreshes(result.jobs,workspaceId);
-    updateCTFdJobs(area,result.jobs);
-    if (result.jobs.some(job => ['queued','running'].includes(job.status))) setTimeout(() => { if (area.isConnected) pollCTFdJobs(workspaceId); },2000);
+    updateCTFdImportButton(result.jobs,workspaceId);
+    const area = modal.open && modal.dataset.kind === 'ctfd-import' && modal.dataset.workspaceId === workspaceId
+      ? modal.querySelector('#ctfd-job-area') : null;
+    if (area) updateCTFdJobs(area,result.jobs);
+    if (result.jobs.some(job => ctfdActiveJobStatuses.has(job.status))) {
+      ctfdJobsPollTimer = setTimeout(() => { if (currentWorkspace?.id === workspaceId) pollCTFdJobs(workspaceId); },2000);
+    }
     else {
       if (completedRefresh?.status === 'completed' && Number(completedRefresh.refreshed || 0) > 0 && currentChallenge?.id === completedRefresh.target_challenge_id && detail.open) {
         rememberNotes();
@@ -3111,10 +4044,14 @@ async function pollCTFdJobs(workspaceId) {
       await refreshChallenges();
     }
   } catch (error) {
-    if (area.isConnected && currentWorkspace?.id === workspaceId) {
-      ctfdJobMarkupCache.delete(area);
-      area.textContent = error.message;
-      setTimeout(() => { if (area.isConnected && currentWorkspace?.id === workspaceId) pollCTFdJobs(workspaceId); },2000);
+    if (generation === ctfdJobsRequestGeneration && currentWorkspace?.id === workspaceId) {
+      const area = modal.open && modal.dataset.kind === 'ctfd-import' && modal.dataset.workspaceId === workspaceId
+        ? modal.querySelector('#ctfd-job-area') : null;
+      if (area) {
+        ctfdJobMarkupCache.delete(area);
+        area.textContent = error.message;
+      }
+      ctfdJobsPollTimer = setTimeout(() => { if (currentWorkspace?.id === workspaceId) pollCTFdJobs(workspaceId); },2000);
     }
   }
 }
@@ -3129,12 +4066,13 @@ async function retryCTFdJob(button) {
     return;
   }
   ctfdRetryId = button.dataset.id;
-  importForm();
+  return importForm();
 }
 
 async function freshCTFdRefreshFromJob(button) {
   const workspaceId = currentWorkspace?.id, challengeId = button.dataset.challengeId;
   if (!workspaceId || !challengeId) throw new Error('새로고침할 문제를 다시 선택하세요.');
+  if (modal.open && modal.dataset.kind === 'ctfd-import') modal.close();
   await openChallenge(challengeId);
   if (currentWorkspace?.id !== workspaceId || currentChallenge?.id !== challengeId) throw new Error('문제를 다시 연 뒤 새로고침해 주세요.');
   try { await refreshCTFdChallenge(); }
@@ -3149,7 +4087,15 @@ document.addEventListener('click', event => {
   if (!button || button.disabled) return;
   const action = button.dataset.action;
   const actions = {
-    'logout': async () => { if (authMode !== 'password') return; await api('/api/auth/logout',{method:'POST'}); csrf = ''; showLogin(); noteDrafts.clear(); detail.innerHTML = ''; modal.innerHTML = ''; },
+    'logout': async () => { if (authMode !== 'password') return; await api('/api/auth/logout',{method:'POST'}); csrf = ''; sessionPersistent = false; showLogin(); noteDrafts.clear(); detail.innerHTML = ''; modal.innerHTML = ''; },
+    'toggle-session-persistence': async () => {
+      if (authMode !== 'password') return;
+      const result = await api('/api/auth/session/refresh',{method:'POST',body:{remember:!sessionPersistent}});
+      csrf = result.csrf_token;
+      sessionPersistent = result.session_persistent === true;
+      button.textContent = sessionPersistent ? '30일 로그인 해제' : '이 기기에서 30일 로그인 유지';
+      toast(sessionPersistent ? '이 기기의 로그인을 30일간 유지합니다.' : '이 기기의 로그인이 기본 기간으로 변경됐습니다.');
+    },
     'toggle-sidebar': () => toggleSidebar(button),
     'toggle-resource-meter': () => toggleResourceMeter(button),
     'toggle-solver-log-size': () => toggleSolverLogSize(button),
@@ -3159,6 +4105,29 @@ document.addEventListener('click', event => {
     'close-solver-console': () => solverConsoleDialog?.close(),
     'open-solver-accounts': () => openSolverAccounts(),
     'new-workspace': () => workspaceForm(), 'edit-workspace': () => workspaceForm(true),
+    'import-workspace-transfer': () => showTransferImport('workspace'),
+    'export-workspace-transfer': () => showTransferExport('workspace'),
+    'import-challenge-transfer': () => showTransferImport('challenge',currentWorkspace?.id),
+    'export-challenge-transfer': () => showTransferExport('challenge'),
+    'receive-workspace-direct': () => showDirectInvitation('workspace'),
+    'receive-challenge-direct': () => showDirectInvitation('challenge',currentWorkspace?.id),
+    'send-workspace-direct': () => showDirectSend('workspace'),
+    'send-challenge-direct': () => showDirectSend('challenge'),
+    'create-direct-invitation': () => createDirectInvitation(),
+    'revoke-direct-invitation': () => revokeDirectInvitation(),
+    'copy-direct-url': async () => { const value = directInviteState?.url; if (!value) return; const result = await copyText(value); copyToast(result,value); },
+    'copy-direct-token': async () => { const value = directInviteState?.token; if (!value) return; const result = await copyText(value); copyToast(result,value); },
+    'open-direct-result': () => openDirectResult(),
+    'start-direct-send': () => startDirectSend(),
+    'download-transfer': () => downloadTransfer(),
+    'start-transfer-upload': () => startTransferUpload(),
+    'pause-transfer-upload': () => { if (transferState?.running) { transferState.paused = true; transferState.controller?.abort(); } },
+    'cancel-transfer-upload': () => cancelTransferUpload(),
+    'confirm-transfer-import': () => confirmTransferImport(),
+    'workspace-ctfd-connection': () => {
+      if (formDirty()) throw new Error('작업공간 변경사항을 먼저 저장하세요.');
+      return ctfdSubmitSettings();
+    },
     'new-challenge': () => challengeForm(), 'edit-challenge': async () => { const c = currentChallenge; await saveNotes(true); if (currentChallenge === c && currentWorkspace?.id === c.workspace_id) challengeForm(true); },
     'clone-challenge': () => cloneChallenge(),
     'add-relation': () => changeRelation(),
@@ -3166,12 +4135,24 @@ document.addEventListener('click', event => {
     'refresh-release-update': () => refreshReleaseUpdatePanel(true),
     'remove-relation': () => changeRelation(button.dataset.id),
     'open-related-challenge': () => openChallenge(button.dataset.id),
+    'edit-related-evidence': () => editRelatedEvidence(button.dataset.id),
+    'stop-related-evidence': async () => {
+      const form = modal.querySelector('#related-evidence-form');
+      const target = currentChallenge;
+      if (!form || !target || target.id !== form.dataset.challengeId || target.workspace_id !== form.dataset.workspaceId) throw new Error('문제를 다시 선택하세요.');
+      const result = await api(`${path(target.id,target.workspace_id)}/relations/${form.dataset.relatedId}/evidence`,{method:'DELETE'});
+      target.related_challenges = result.related_challenges || [];
+      modal.close();
+      const area = detail.querySelector('#challenge-relations');
+      if (area) area.innerHTML = relatedChallengeMarkup(target);
+      toast('공유 자료를 해제했습니다.');
+    },
     'remove-challenge-file': () => {
       const form = activeChallengeUploadForm(), index = Number(button.dataset.index);
       if (!form || !Number.isInteger(index)) return;
       selectedChallengeFiles(form).splice(index,1); renderChallengeFiles(form);
     },
-    'close-modal': () => { if (busyForms.has(modal.querySelector('form'))) return; if (formDirty() && !confirm('작성 중인 변경 내용을 버리고 닫을까요?')) return; ++modalRendering; modal.close(); importPreview = null; },
+    'close-modal': () => { if (busyForms.has(modal.querySelector('form')) || transferState?.importing || directSendBusy) return; if (formDirty() && !confirm('작성 중인 변경 내용을 버리고 닫을까요?')) return; ++modalRendering; modal.close(); importPreview = null; },
     'close-detail': () => {
       if (detailBusy) return;
       if (notesDirty() && !confirm('저장하지 않은 노트가 있습니다. 닫을까요?')) return;
@@ -3191,6 +4172,10 @@ document.addEventListener('click', event => {
     'copy-notes': async () => { const notes = document.querySelector('#notes-editor').value; const result = await copyText(notes); copyToast(result, notes); },
     'copy-flag': async () => { const flag = currentChallenge.flag || ''; const result = await copyText(flag); copyToast(result, flag); },
     'start-solver': () => startSolver(),
+    'confirm-solver-retry-settings': () => {
+      clearSolverRetryWarning();
+      repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
+    },
     'approve-ultra-escalation': () => approveUltraEscalation(),
     'cancel-solver': () => cancelSolver(),
     'reject-solver-flag': () => rejectSolverFlag(),
@@ -3207,9 +4192,15 @@ document.addEventListener('click', event => {
     'delete-challenge': async () => { const c = currentChallenge; if (!confirm(`“${c.name}” 문제와 첨부파일, 노트를 삭제할까요? 되돌릴 수 없습니다.`)) return; await api(path(c.id,c.workspace_id),{method:'DELETE'}); noteDrafts.delete(noteKey(c)); if (currentChallenge === c) { stopSolverPolling(); detail.close(); } await refreshChallenges(); toast('문제를 삭제했습니다.'); },
     'delete-workspace': async () => { const w = currentWorkspace; if (!confirm(`“${w.name}” 작업공간의 모든 문제와 자료를 삭제할까요? 되돌릴 수 없습니다.`)) return; await api(`/api/workspaces/${w.id}`,{method:'DELETE'}); if (currentWorkspace?.id === w.id) { modal.close(); location.hash = ''; } toast('작업공간을 삭제했습니다.'); },
     'delete-attachment': async () => { const c = currentChallenge; if (!confirm('첨부파일을 삭제할까요?')) return; await saveNotes(true); await api(`${path(c.id,c.workspace_id)}/attachments/${button.dataset.id}`,{method:'DELETE'}); if (currentChallenge === c) await openChallenge(c.id); },
-    'ctfd-import': () => { ctfdRetryId = null; importForm(); },
+    'ctfd-import': () => { ctfdRetryId = null; return importForm(); },
+    'refresh-ctfd-jobs': () => pollCTFdJobs(currentWorkspace?.id),
     'ctfd-sync': () => previewCTFdSync(),
     'ctfd-sync-retry': () => previewCTFdSync(),
+    'open-ctfd-source-challenge': async () => {
+      if (currentWorkspace?.id !== button.dataset.workspaceId) throw new Error('작업공간을 다시 확인하세요.');
+      if (modal.open) modal.close();
+      await openChallenge(button.dataset.id);
+    },
     'refresh-ctfd-challenge': () => refreshCTFdChallenge(),
     'ctfd-refresh-auth': () => ctfdRefreshAuthForm(),
     'ctfd-submit-settings': () => ctfdSubmitSettings(),
@@ -3243,7 +4234,7 @@ document.addEventListener('submit', event => {
     return;
   }
   if (!form.id) return;
-  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-guidance-form','solver-console-guidance-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-auth-form','ctfd-submit-connection-form'];
+  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-guidance-form','solver-console-guidance-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-preview-form','ctfd-refresh-auth-form','ctfd-submit-connection-form','related-evidence-form'];
   if (!known.includes(form.id)) return;
   event.preventDefault();
   const challengeFiles = form.id === 'new-challenge-form' ? [...selectedChallengeFiles(form)] : [];
@@ -3254,9 +4245,19 @@ document.addEventListener('submit', event => {
     if (form.id === 'setup-form') {
       if (body.password !== body.confirmation) throw new Error('비밀번호 확인이 일치하지 않습니다.');
       const result = await api('/api/auth/setup',{method:'POST',body:{username:body.username,password:body.password}});
-      csrf = result.csrf_token; sessionUser = result.user; form.reset(); await render();
+      csrf = result.csrf_token; sessionUser = result.user; sessionPersistent = false; form.reset(); await render();
     } else if (form.id === 'login-form') {
-      const result = await api('/api/auth/login',{method:'POST',body:{username:body.username,password:body.password}}); csrf = result.csrf_token; if (sessionUser && sessionUser.id !== result.user.id) { noteDrafts.clear(); clearAccountsReturnTarget(); } sessionUser = result.user; form.reset(); await render();
+      const result = await api('/api/auth/login',{method:'POST',body:{username:body.username,password:body.password,remember:data.has('remember')}}); csrf = result.csrf_token; if (sessionUser && sessionUser.id !== result.user.id) { noteDrafts.clear(); clearAccountsReturnTarget(); } sessionUser = result.user; sessionPersistent = result.session_persistent === true; form.reset(); await render();
+    } else if (form.id === 'related-evidence-form') {
+      const target = currentChallenge;
+      if (!target || target.id !== form.dataset.challengeId || target.workspace_id !== form.dataset.workspaceId) throw new Error('문제를 다시 선택하세요.');
+      const result = await api(`${path(target.id,target.workspace_id)}/relations/${form.dataset.relatedId}/evidence`,
+        {method:'PUT',body:{observation:body.observation || '',include_flag:data.has('include_flag')}});
+      target.related_challenges = result.related_challenges || [];
+      modal.close();
+      const area = detail.querySelector('#challenge-relations');
+      if (area) area.innerHTML = relatedChallengeMarkup(target);
+      toast('검증 자료를 공유했습니다.');
     } else if (form.id === 'new-workspace-form' || form.id === 'edit-workspace-form') {
       const edit = form.id === 'edit-workspace-form';
       body.open_challenge_after_create = data.has('open_challenge_after_create');
@@ -3289,8 +4290,15 @@ document.addEventListener('submit', event => {
     else if (form.id === 'solver-guidance-form') { await sendSolverGuidance(body.message); }
     else if (form.id === 'solver-console-guidance-form') { await sendSolverGuidance(body.message,body.requested_delivery || 'next_turn'); }
     else if (form.id === 'ctfd-preview-form') {
-      if (!body.token) delete body.token;
-      body.url = body.url.trim(); if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(body.url)) body.url = `https://${body.url}`;
+      const saved = body.connection_mode === 'saved';
+      delete body.connection_mode;
+      if (saved) {
+        for (const key of ['url','auth_type','token','username','password']) delete body[key];
+        body.use_saved_connection = true;
+      } else {
+        if (!body.token) delete body.token;
+        body.url = body.url.trim(); if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(body.url)) body.url = `https://${body.url}`;
+      }
       const result = await api(`/api/workspaces/${currentWorkspace.id}/ctfd/preview`,{method:'POST',body}); form.reset(); showImportPreview(result,body);
     } else if (form.id === 'ctfd-import-form') {
       const ids = data.getAll('challenge').map(Number); if (!ids.length) throw new Error('가져올 문제를 선택하세요.');
@@ -3298,10 +4306,22 @@ document.addEventListener('submit', event => {
       const endpoint = ctfdRetryId ? `/api/workspaces/${workspaceId}/ctfd/jobs/${ctfdRetryId}/retry` : `/api/workspaces/${workspaceId}/ctfd/import`;
       const payload = importPreview.result.preview_id ? {preview_id:importPreview.result.preview_id,challenge_ids:ids} : {...importPreview.credentials,challenge_ids:ids};
       await api(endpoint,{method:'POST',body:payload});
-      importPreview = null; ctfdRetryId = null; modal.close(); await refreshChallenges(); await pollCTFdJobs(workspaceId); toast('CTFd 가져오기를 시작했습니다.');
+      importPreview = null; ctfdRetryId = null; showCTFdImportProgress(workspaceId); await refreshChallenges(); await pollCTFdJobs(workspaceId); toast('CTFd 가져오기를 시작했습니다.');
     } else if (form.id === 'ctfd-sync-form') {
       const ids = data.getAll('challenge').map(Number).filter(id => Number.isInteger(id) && id > 0);
       await startCTFdSync(form,ids);
+    } else if (form.id === 'ctfd-refresh-preview-form') {
+      const preview = importPreview;
+      if (!preview || preview.mode !== 'refresh' || !preview.result?.preview_id ||
+          preview.workspaceId !== form.dataset.workspaceId || preview.challengeId !== form.dataset.challengeId ||
+          currentWorkspace?.id !== preview.workspaceId || currentChallenge?.id !== preview.challengeId) {
+        throw new Error('CTFd 변경 미리보기가 만료되었습니다. 다시 확인하세요.');
+      }
+      await launchCTFdChallengeRefresh({
+        preview_id:preview.result.preview_id,
+        selected_fields:data.getAll('field'),
+      });
+      if (modal.open && modal.dataset.kind === 'ctfd-refresh-preview') modal.close();
     } else if (form.id === 'ctfd-refresh-auth-form') {
       await startAuthenticatedCTFdRefresh(form,body);
     }
@@ -3310,6 +4330,15 @@ document.addEventListener('submit', event => {
 
 document.addEventListener('change', event => {
   const input = event.target;
+  if (input.id === 'transfer-archive' && transferState?.kind === 'import') {
+    const state = transferState;
+    if (state.running || state.importing) return;
+    state.file = input.files?.[0] || null;
+    state.uploadId = ''; state.storageKey = ''; state.offset = 0; state.preview = null; state.paused = false;
+    const area = modal.querySelector('#transfer-preview');
+    if (area) { area.innerHTML = ''; area.hidden = true; }
+    transferUploadStatus(state,state.file ? `${state.file.name} · ${size(state.file.size)} · ${i18n.t('업로드할 준비가 됐습니다.')}` : i18n.t('ZIP 파일을 선택하세요.'));
+  }
   if (input.id === 'challenge-files') {
     addChallengeFiles(input.closest('form'),input.files);
     input.value = '';
@@ -3340,6 +4369,7 @@ document.addEventListener('change', event => {
     ));
   }
   if (input.id === 'solver-model-select') {
+    clearSolverRetryWarning();
     solverModel = input.value;
     const chosen = solverSelectedModel();
     const efforts = Array.isArray(chosen?.supportedReasoningEfforts)
@@ -3353,17 +4383,24 @@ document.addEventListener('change', event => {
     repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
   }
   if (input.id === 'solver-reasoning-select') {
+    clearSolverRetryWarning();
     solverReasoning = input.value;
     repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
   }
   if (input.id === 'solver-fast-toggle') {
+    clearSolverRetryWarning();
     solverServiceTier = input.checked ? 'fast' : null;
+    repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
   }
   if (input.id === 'solver-ultracode-toggle') {
+    clearSolverRetryWarning();
     solverUltracode = input.checked;
+    repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
   }
   if (input.id === 'solver-ultra-escalation') {
+    clearSolverRetryWarning();
     solverUltraEscalationMode = ['ask','auto','off'].includes(input.value) ? input.value : 'ask';
+    repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
   }
   if (input.id === 'category-filter') run(async () => { selectedCategory = input.value; await refreshChallenges(); });
   if (input.id === 'sort-order') run(async () => { selectedSort = input.value; await refreshChallenges(); });
@@ -3374,6 +4411,7 @@ document.addEventListener('change', event => {
       fields.querySelectorAll('input').forEach(node => { node.disabled = !enabled; node.required = enabled; if (!enabled) node.value = ''; });
     }
   }
+  if (input.id === 'ctfd-import-source') syncCTFdImportSource(input.closest('form'));
   if (input.id === 'ctfd-refresh-auth-type') {
     for (const [id,type] of [['ctfd-refresh-token-fields','token'],['ctfd-refresh-password-fields','password']]) {
       const fields = document.getElementById(id), enabled = input.value === type;
@@ -3441,6 +4479,16 @@ document.addEventListener('change', event => {
   },input);
 });
 
+document.addEventListener('focusout', event => {
+  if (!event.target.closest?.('#solver-panel .solver-configuration')) return;
+  const workspaceId = currentWorkspace?.id, challengeId = currentChallenge?.id, generation = solverRendering;
+  setTimeout(() => {
+    if (solverContext(workspaceId,challengeId,generation)) {
+      repaintSolverConfiguration(workspaceId,challengeId,generation);
+    }
+  },0);
+});
+
 document.addEventListener('input', event => {
   if (event.target.id === 'notes-editor') { rememberNotes(); const state = document.querySelector('#notes-save-state'); if (state) { state.classList?.remove('hidden'); state.textContent = '저장하지 않은 변경 사항'; } }
   if (event.target.id === 'writeup-refine-instruction') writeupRefineInstruction = event.target.value;
@@ -3479,10 +4527,21 @@ detail.addEventListener('cancel', event => {
   else { rememberNotes(); stopSolverPolling(); ++challengeRendering; }
 });
 detail.addEventListener('close', () => { if (!detail.open) stopSolverPolling(); });
-modal.addEventListener('cancel', event => { if (busyForms.has(modal.querySelector('form')) || (formDirty() && !confirm('작성 중인 변경 내용을 버리고 닫을까요?'))) event.preventDefault(); else ++modalRendering; });
-modal.addEventListener('close', () => { resetChallengeFileDrag(); if (!modal.open) { ++modalRendering; modal.removeAttribute('aria-busy'); modal.dataset.kind = ''; } importPreview = null; });
+modal.addEventListener('cancel', event => { if (busyForms.has(modal.querySelector('form')) || transferState?.importing || directSendBusy || (formDirty() && !confirm('작성 중인 변경 내용을 버리고 닫을까요?'))) event.preventDefault(); else ++modalRendering; });
+modal.addEventListener('close', () => {
+  resetChallengeFileDrag();
+  if (!modal.open) {
+    if (transferState?.running) { transferState.paused = true; transferState.controller?.abort(); }
+    transferState = null;
+    transferExportController?.abort(); transferExportController = null;
+    if (directInviteTimer !== null) clearTimeout(directInviteTimer);
+    directInviteTimer = null; directInviteState = null;
+    ++modalRendering; modal.removeAttribute('aria-busy'); modal.dataset.kind = '';
+  }
+  importPreview = null;
+});
 window.addEventListener('hashchange', event => {
-  if ((formDirty() || notesDirty() || detailBusy || (modal.open && busyForms.has(modal.querySelector('form')))) && !confirm('저장하지 않은 내용이나 진행 중인 요청이 있습니다. 다른 화면으로 이동할까요?')) { if (accountsReturnPending) clearAccountsReturnTarget(); history.replaceState(null,'',event.oldURL); return; }
+  if ((formDirty() || notesDirty() || detailBusy || transferState?.running || transferState?.importing || directSendBusy || (modal.open && busyForms.has(modal.querySelector('form')))) && !confirm('저장하지 않은 내용이나 진행 중인 요청이 있습니다. 다른 화면으로 이동할까요?')) { if (accountsReturnPending) clearAccountsReturnTarget(); history.replaceState(null,'',event.oldURL); return; }
   accountsReturnPending = false;
   const returnRoute = accountsReturnRoute();
   if (returnRoute && location.hash === `#${returnRoute}`) clearAccountsReturnTarget();
@@ -3495,5 +4554,5 @@ document.addEventListener('visibilitychange', () => {
     if (document.querySelector('#challenge-area')) startChallengeListPolling(currentWorkspace.id);
   }
 });
-window.addEventListener('beforeunload', event => { if (notesDirty() || formDirty() || [...activeUploads.values()].some(upload => upload.running)) { event.preventDefault(); event.returnValue = ''; } });
-run(async () => { const state = await api('/api/auth/state'); if (typeof window.setInterval === 'function') window.setInterval(updateSolverElapsedLabels,1000); await i18n.init(); authMode = state.auth_mode || 'password'; if (state.authenticated) { csrf = state.csrf_token; sessionUser = state.user; await render(); } else if (authMode === 'password') showLogin(false,state.configured,state.setup_available); else app.innerHTML = '<main class="login-shell"><div class="login-card"><h1>서비스 연결 오류</h1></div></main>'; });
+window.addEventListener('beforeunload', event => { if (notesDirty() || formDirty() || transferState?.running || transferState?.importing || directSendBusy || [...activeUploads.values()].some(upload => upload.running)) { event.preventDefault(); event.returnValue = ''; } });
+run(async () => { const state = await api('/api/auth/state'); if (typeof window.setInterval === 'function') window.setInterval(updateSolverElapsedLabels,1000); await i18n.init(); authMode = state.auth_mode || 'password'; if (state.authenticated) { csrf = state.csrf_token; sessionUser = state.user; sessionPersistent = state.session_persistent === true; await render(); } else if (authMode === 'password') showLogin(false,state.configured,state.setup_available); else app.innerHTML = '<main class="login-shell"><div class="login-card"><h1>서비스 연결 오류</h1></div></main>'; });

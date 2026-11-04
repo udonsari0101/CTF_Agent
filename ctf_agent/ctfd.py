@@ -584,8 +584,41 @@ class CTFdClient:
         if not isinstance(current, dict):
             raise CTFdError("The site returned an unsupported CTFd account response.")
 
+    def submission_readiness(self) -> tuple[bool, str]:
+        """Check read access and submission credentials without posting a flag.
+
+        A successful import does not prove that a password session has the
+        post-login CSRF nonce required by the CTFd attempt API. This check is
+        deliberately read-only; challenge-specific limits remain unknown.
+        """
+
+        self.validate()
+        try:
+            listing = self._json(self.url + "/api/v1/challenges")
+        except CTFdError:
+            return False, "challenge_access_unavailable"
+        if not isinstance(listing, list):
+            return False, "challenge_access_unavailable"
+        if self.auth_type == "password" and not self.csrf_nonce:
+            # CTFd often renders its rotated session nonce on the challenge
+            # page rather than in the redirected login response. Never reuse
+            # the pre-login form nonce as a submission credential.
+            try:
+                page = self._get(self.url + "/challenges", self.limits.json_bytes)
+            except CTFdError:
+                return False, "csrf_unavailable"
+            self.csrf_nonce = session_csrf_nonce(page.decode("utf-8", errors="replace"))
+        if self.auth_type == "password" and not self.csrf_nonce:
+            return False, "csrf_unavailable"
+        return True, ""
+
     def challenge_solved_by_me(self, challenge_id: int) -> bool:
         """Return CTFd's authenticated solve state without mutating the event."""
+
+        return self.challenge_submission_state(challenge_id)["solved_by_me"]
+
+    def challenge_submission_state(self, challenge_id: int) -> dict:
+        """Read per-challenge solve and attempt limits before a POST."""
 
         if type(challenge_id) is not int or challenge_id < 1:
             raise CTFdError("The CTFd challenge ID is invalid.")
@@ -599,7 +632,50 @@ class CTFdClient:
             raise CTFdError(
                 "The CTFd challenge detail did not include a trustworthy solve state."
             )
-        return challenge["solved_by_me"]
+        maximum = challenge.get("max_attempts")
+        attempts = challenge.get("attempts")
+        return {
+            "solved_by_me": challenge["solved_by_me"],
+            "attempt_limit_reached": (
+                type(maximum) is int and maximum > 0
+                and type(attempts) is int and attempts >= maximum
+            ),
+        }
+
+    def submission_status_for_flag(self, challenge_id: int, flag: str) -> str | None:
+        """Read optional CTFd self-submissions without exposing the flag.
+
+        Many CTFd sites disable this endpoint. None means it offered no
+        trustworthy evidence; an empty string means the history was available
+        but did not contain this exact submission.
+        """
+
+        if type(challenge_id) is not int or challenge_id < 1 or not isinstance(flag, str):
+            raise CTFdError("The CTFd submission lookup is invalid.")
+        self.authenticate()
+        query = urlencode({"challenge_id": challenge_id})
+        try:
+            response, _ = self._request(
+                f"{self.url}/api/v1/users/me/submissions?{query}",
+                self.limits.json_bytes, api=True, same_origin=True,
+                allow_error_status=True,
+            )
+            if response.status != 200:
+                return None
+            payload = json.loads(response.content)
+        except (CTFdError, ValueError, UnicodeError):
+            return None
+        rows = payload.get("data") if isinstance(payload, dict) and payload.get("success") is True else None
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if (isinstance(row, dict) and row.get("challenge_id") == challenge_id
+                    and row.get("provided") == flag):
+                kind = row.get("type")
+                if kind in {"correct", "incorrect", "partial"}:
+                    return kind
+                return "submitted"
+        return ""
 
     def submit(self, challenge_id: int, submission: str) -> dict:
         """Submit one flag through CTFd's documented attempt API.
@@ -672,6 +748,10 @@ class CTFdClient:
         excluded = exclude_ids or set()
         challenges, errors = [], []
         seen = set()
+        # Keep the source listing separate from importable rows. Existing
+        # challenges may disappear or become hidden without their local notes,
+        # files, or solve state being removed.
+        listing_states = {}
         for row in listing:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise CTFdError("Import cancelled.")
@@ -679,10 +759,26 @@ class CTFdClient:
                 errors.append({"challenge_id": None, "message": "Skipped a challenge with an invalid ID."})
                 continue
             challenge_id = row["id"]
+            state = row.get("state") if isinstance(row.get("state"), str) else ""
+            if row.get("type") == "hidden" or state in {"hidden", "private"}:
+                listing_states[challenge_id] = "hidden"
+            elif row.get("locked") is True or state == "locked":
+                listing_states[challenge_id] = "locked"
+            else:
+                listing_states[challenge_id] = "visible"
             if (
                 challenge_id in seen or challenge_id in excluded
                 or (chosen is not None and challenge_id not in chosen)
             ):
+                continue
+            # A hidden challenge may still be present in a CTFd listing.
+            # Do not advertise it as importable in a metadata-only sync preview
+            # when the detail fetch would reject that same challenge later.
+            if listing_states[challenge_id] in {"hidden", "locked"}:
+                if chosen is not None:
+                    seen.add(challenge_id)
+                    errors.append({"challenge_id": challenge_id,
+                                   "message": "The challenge is locked or hidden on the source site."})
                 continue
             if len(seen) >= self.limits.challenges:
                 errors.append({"challenge_id": None, "message": f"At most {self.limits.challenges} challenges can be imported at once."})
@@ -730,6 +826,7 @@ class CTFdClient:
         result = {"source_url": self.url, "challenges": challenges, "errors": errors}
         if metadata_only:
             result["details_pending"] = True
+            result["_listing_states"] = listing_states
         return result
 
     def download(self, url: str) -> bytes:
@@ -836,35 +933,57 @@ class CTFdClient:
                     raise CTFdError("The data volume has insufficient free space for this attachment.")
                 report()
 
-            last_report = [time.monotonic()]
+            # The transport yields 64 KiB at a time. A reservation is consumed
+            # only after its corresponding bytes are fsynced, so batching the
+            # writer also batches the reservation transaction. Keep the
+            # pending data in memory until a bounded size or time is reached;
+            # a failed download can then resume from its durable file prefix.
+            pending = bytearray()
+            last_sync = [time.monotonic()]
+            last_report = [last_sync[0]]
+
+            def persist_pending():
+                if not pending:
+                    return
+                payload = bytes(pending)
+
+                def durable_write():
+                    output.write(payload)
+                    output.flush()
+                    os.fsync(output.fileno())
+
+                try:
+                    if state["total"] is None:
+                        storage_budget.write_unreserved(len(payload), durable_write)
+                    else:
+                        storage_budget.commit_reserved_write(
+                            reservation_key, len(payload), durable_write
+                        )
+                except StorageBudgetError as exc:
+                    raise CTFdError(str(exc), received_bytes=state["bytes"] - offset) from None
+                except OSError as exc:
+                    raise CTFdError(
+                        "데이터 저장 공간에 첨부파일을 기록할 수 없습니다.",
+                        received_bytes=state["bytes"] - offset,
+                    ) from exc
+                digest.update(payload)
+                state["bytes"] += len(payload)
+                pending.clear()
+                last_sync[0] = time.monotonic()
+
             def receive(chunk):
                 if cancel is not None and cancel.is_set():
                     raise CTFdError("Import cancelled.")
-                def durable_write():
-                    output.write(chunk)
-                    output.flush()
-                    os.fsync(output.fileno())
                 if storage_budget is not None:
-                    try:
-                        if state["total"] is None:
-                            storage_budget.write_unreserved(len(chunk), durable_write)
-                        else:
-                            storage_budget.commit_reserved_write(
-                                reservation_key, len(chunk), durable_write
-                            )
-                    except StorageBudgetError as exc:
-                        raise CTFdError(str(exc), received_bytes=state["bytes"] - offset) from None
-                    except OSError as exc:
-                        raise CTFdError(
-                            "데이터 저장 공간에 첨부파일을 기록할 수 없습니다.",
-                            received_bytes=state["bytes"] - offset,
-                        ) from exc
+                    pending.extend(chunk)
+                    if len(pending) >= 4 * 1024 * 1024 or time.monotonic() - last_sync[0] >= 1.0:
+                        persist_pending()
                 else:
                     if shutil.disk_usage(partial.parent).free < len(chunk) + 1024 * 1024:
                         raise CTFdError("The data volume has insufficient free space.")
                     output.write(chunk)
-                digest.update(chunk)
-                state["bytes"] += len(chunk)
+                    digest.update(chunk)
+                    state["bytes"] += len(chunk)
                 if time.monotonic() - last_report[0] >= .25:
                     report()
                     last_report[0] = time.monotonic()
@@ -880,10 +999,13 @@ class CTFdClient:
                     offset = 0
                     validator = ""
                     self._request(url, self.limits.file_bytes, sink=receive, on_headers=receive_headers, cancel=cancel)
+                if storage_budget is not None:
+                    persist_pending()
                 if state["total"] is not None and state["bytes"] != state["total"]:
                     raise CTFdError("The downloaded attachment is incomplete.")
-                output.flush()
-                os.fsync(output.fileno())
+                if storage_budget is None:
+                    output.flush()
+                    os.fsync(output.fileno())
             finally:
                 report()
         return {**state, "sha256": digest.hexdigest()}
@@ -894,6 +1016,7 @@ CREATE TABLE IF NOT EXISTS ctfd_jobs (
  id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
  source_url TEXT NOT NULL, auth_type TEXT NOT NULL, selected_ids TEXT,
+ selected_fields TEXT,
  mode TEXT NOT NULL DEFAULT 'import', target_challenge_id TEXT,
  status TEXT NOT NULL, imported INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0,
  refreshed INTEGER NOT NULL DEFAULT 0,
@@ -925,6 +1048,13 @@ CREATE TABLE IF NOT EXISTS ctfd_managed_attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_ctfd_managed_challenge
  ON ctfd_managed_attachments(workspace_id,challenge_id,source_url,remote_id);
+CREATE TABLE IF NOT EXISTS ctfd_imported_fields (
+ challenge_id TEXT PRIMARY KEY REFERENCES challenges(id) ON DELETE CASCADE,
+ workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+ source_url TEXT NOT NULL, remote_id INTEGER NOT NULL,
+ name TEXT NOT NULL, category TEXT NOT NULL, description TEXT NOT NULL,
+ remote TEXT NOT NULL, remote_mode TEXT NOT NULL
+);
 """
 
 
@@ -989,6 +1119,8 @@ class ImportJobs:
                 )
             if "target_challenge_id" not in columns:
                 db.execute("ALTER TABLE ctfd_jobs ADD COLUMN target_challenge_id TEXT")
+            if "selected_fields" not in columns:
+                db.execute("ALTER TABLE ctfd_jobs ADD COLUMN selected_fields TEXT")
             if "refreshed" not in columns:
                 db.execute(
                     "ALTER TABLE ctfd_jobs ADD COLUMN refreshed INTEGER NOT NULL DEFAULT 0"
@@ -1212,6 +1344,7 @@ class ImportJobs:
         result["current_file_total"] = result["total_bytes"]
         result["total_bytes"] = result["downloaded_bytes"] if result["status"] == "completed" else None
         result.pop("selected_ids")
+        result.pop("selected_fields", None)
         result.pop("owner_user_id")
         return result
 
@@ -1278,6 +1411,14 @@ class ImportJobs:
     def request_client(self, workspace_id, user, body, *, allow_saved=False):
         if body.get("preview_id"):
             raise CTFdError("A preview client must be consumed through its preview ID.")
+        if "use_saved_connection" in body:
+            if body["use_saved_connection"] is not True or any(
+                key in body for key in ("url", "auth_type", "token", "username", "password")
+            ):
+                raise CTFdError("Choose either the saved CTFd connection or new connection details.")
+            if not allow_saved:
+                raise CTFdError("The saved CTFd connection is not available for this request.")
+            return self.saved_client(workspace_id, user)
         if body.get("url") is not None:
             return self.client(body)
         if allow_saved:
@@ -1291,6 +1432,65 @@ class ImportJobs:
                                   any(type(item) is not int or item <= 0 for item in value)):
             raise CTFdError("Select between 1 and 100 valid challenge IDs, or omit the selection.")
         return list(dict.fromkeys(value)) if value is not None else None
+
+    @staticmethod
+    def selected_refresh_fields(body):
+        fields = body.get("selected_fields")
+        allowed = {"name", "category", "description", "remote"}
+        if fields is None:
+            return None  # Older clients retain the existing safe merge policy.
+        if not isinstance(fields, list) or any(
+            not isinstance(field, str) or field not in allowed for field in fields
+        ):
+            raise CTFdError("Select valid CTFd fields to refresh.")
+        return list(dict.fromkeys(fields))
+
+    @staticmethod
+    def refresh_field_diff(db, workspace_id, challenge_id, source, remote):
+        current = db.execute(
+            """SELECT name,category,description,remote,remote_mode,ctfd_id,ctfd_url
+                 FROM challenges WHERE id=? AND workspace_id=?""",
+            (challenge_id, workspace_id),
+        ).fetchone()
+        if not current or current["ctfd_id"] != remote["id"] or normalize_url(
+            current["ctfd_url"], site=True
+        ) != source:
+            raise CTFdError("The challenge CTFd source mapping changed during preview.")
+        baseline = db.execute(
+            "SELECT * FROM ctfd_imported_fields WHERE challenge_id=?",
+            (challenge_id,),
+        ).fetchone()
+        if baseline is not None and (
+            baseline["workspace_id"] != workspace_id
+            or baseline["source_url"] != source
+            or baseline["remote_id"] != remote["id"]
+        ):
+            baseline = None
+        incoming = {field: remote[field] for field in ("name", "category", "description")}
+        incoming["remote"] = remote.get("remote") or ""
+        result = []
+        for field in ("name", "category", "description", "remote"):
+            current_value = current[field]
+            incoming_value = incoming[field]
+            if field == "remote":
+                incoming_mode = "endpoint" if incoming_value else "none"
+                overridden = baseline is None or (
+                    current_value != baseline["remote"]
+                    or current["remote_mode"] != baseline["remote_mode"]
+                )
+                changed = current_value != incoming_value or current["remote_mode"] != incoming_mode
+            else:
+                overridden = baseline is None or current_value != baseline[field]
+                changed = current_value != incoming_value
+            result.append({
+                "field": field,
+                "current": current_value,
+                "incoming": incoming_value,
+                "changed": changed,
+                "local_override": changed and overridden,
+                "selectable": changed and not overridden,
+            })
+        return result
 
     def bound_challenges(self, workspace_id, source):
         """Return the local remote-id mapping for one canonical CTFd source."""
@@ -1344,13 +1544,18 @@ class ImportJobs:
                 item["client"].clear_credentials()
                 del self.previews[key]
 
-    def preview(self, workspace_id, user, body, mode="import"):
+    def preview(self, workspace_id, user, body, mode="import", target_challenge_id=None):
         self.check_owner(workspace_id, user)
-        if mode not in {"import", "new"}:
+        if mode not in {"import", "new", "refresh"}:
             raise CTFdError("Unsupported CTFd preview mode.")
         selected = self.selected(body)
         if mode == "new" and selected is not None:
             raise CTFdError("Select new challenges after the sync preview is ready.")
+        target = self.refresh_target(workspace_id, target_challenge_id) if mode == "refresh" else None
+        if mode == "refresh":
+            if selected is not None and selected != [target["ctfd_id"]]:
+                raise CTFdError("The refresh preview does not match this CTFd challenge.")
+            selected = [target["ctfd_id"]]
         client = None
         with self.preview_slot(user["id"], workspace_id) as cancellation:
             # The service allowance comes before the workspace lifecycle lock.
@@ -1362,17 +1567,28 @@ class ImportJobs:
                     # therefore before DNS, login, or any remote request.
                     self.check_active(workspace_id, user["id"])
                     client = self.request_client(
-                        workspace_id, user, body, allow_saved=mode == "new"
+                        workspace_id, user, body,
+                        allow_saved=mode in {"new", "refresh"} or body.get("use_saved_connection") is True,
                     )
                     client.cancel_event = cancellation
                     if cancellation.is_set():
                         raise CTFdError("The workspace or user is no longer available.")
                     if mode == "new":
                         existing = self.require_bound_source(workspace_id, client.url)
+                    if mode == "refresh" and client.url != target["source_url"]:
+                        raise CTFdError("The CTFd connection does not match this challenge's source site.")
                     preview = client.preview(
-                        selected, metadata_only=True,
+                        selected, metadata_only=mode != "refresh",
                         exclude_ids=set(existing) if mode == "new" else None,
                     )
+                    if mode == "refresh":
+                        if len(preview["challenges"]) != 1:
+                            raise CTFdError("The challenge is no longer visible on CTFd.")
+                        with self.db() as db:
+                            field_diff = self.refresh_field_diff(
+                                db, workspace_id, target["id"], client.url,
+                                preview["challenges"][0],
+                            )
                     if mode == "new":
                         preview = {
                             **preview,
@@ -1381,6 +1597,27 @@ class ImportJobs:
                                 if challenge["id"] not in existing
                             ],
                         }
+                        listing_states = preview.pop("_listing_states", {})
+                        with self.db() as db:
+                            local_names = {
+                                row["id"]: row["name"]
+                                for row in db.execute(
+                                    "SELECT id,name FROM challenges WHERE workspace_id=?",
+                                    (workspace_id,),
+                                )
+                            }
+                        preview["source_statuses"] = [
+                            {
+                                "challenge_id": local_id,
+                                "remote_id": remote_id,
+                                "name": local_names.get(local_id, ""),
+                                # Absence from an authenticated listing cannot
+                                # distinguish deletion from privacy or a site
+                                # plugin. Never modify the local challenge.
+                                "state": listing_states.get(remote_id, "unlisted"),
+                            }
+                            for remote_id, local_id in sorted(existing.items())
+                        ]
                 except BaseException:
                     if client is not None:
                         client.clear_credentials()
@@ -1405,6 +1642,7 @@ class ImportJobs:
                     self.previews[preview_id] = {
                         "owner": user["id"], "workspace": workspace_id,
                         "client": client, "preview": preview, "mode": mode,
+                        "target_challenge_id": target_challenge_id,
                         "connection_generation": self.saved_connection_generation(client),
                         "expires": time.monotonic() + 900,
                     }
@@ -1413,9 +1651,11 @@ class ImportJobs:
                                        for challenge in preview["challenges"]]}
                 if mode == "new":
                     result.update(existing_count=len(existing), new_count=len(preview["challenges"]))
+                if mode == "refresh":
+                    result["field_diff"] = field_diff
                 return result
 
-    def consume(self, workspace_id, user, body, *, mode="import"):
+    def consume(self, workspace_id, user, body, *, mode="import", target_challenge_id=None):
         from fastapi import HTTPException
         if body.get("preview_id"):
             with self.lock:
@@ -1425,6 +1665,8 @@ class ImportJobs:
                     raise HTTPException(404, "Preview expired or not found. Preview the site again to authenticate.")
                 if item.get("mode", "import") != mode:
                     raise HTTPException(404, "Preview expired or not found. Preview the site again to authenticate.")
+                if mode == "refresh" and item.get("target_challenge_id") != target_challenge_id:
+                    raise HTTPException(404, "Preview does not belong to this CTFd challenge.")
                 self.previews.pop(body["preview_id"])
             client = item["client"]
             generation = item.get("connection_generation")
@@ -1436,7 +1678,8 @@ class ImportJobs:
                 )
             return client, item["preview"], generation
         client = self.request_client(
-            workspace_id, user, body, allow_saved=mode in {"new", "refresh"}
+            workspace_id, user, body,
+            allow_saved=mode in {"new", "refresh"} or body.get("use_saved_connection") is True,
         )
         return client, None, self.saved_connection_generation(client)
 
@@ -1459,6 +1702,9 @@ class ImportJobs:
                 )
         if mode not in {"import", "new", "refresh"}:
             raise CTFdError("Unsupported CTFd import mode.")
+        if mode != "refresh" and "selected_fields" in body:
+            raise CTFdError("Field selection is only available for a CTFd challenge refresh.")
+        selected_fields = self.selected_refresh_fields(body) if mode == "refresh" else None
         target = None
         if mode == "refresh":
             if not target_challenge_id:
@@ -1481,7 +1727,8 @@ class ImportJobs:
                 if mode == "import":
                     body = {**body, "url": previous["source_url"], "auth_type": "none"}
             client, preview, connection_generation = self.consume(
-                workspace_id, user, body, mode=mode
+                workspace_id, user, body, mode=mode,
+                target_challenge_id=target_challenge_id,
             )
             if mode == "new":
                 try:
@@ -1590,7 +1837,7 @@ class ImportJobs:
                         )
                     if previous:
                         stored = db.execute(
-                            """SELECT selected_ids,status,mode,target_challenge_id,refreshed
+                            """SELECT selected_ids,selected_fields,status,mode,target_challenge_id,refreshed
                                  FROM ctfd_jobs
                                WHERE id=? AND workspace_id=? AND owner_user_id=?""",
                             (job_id, workspace_id, user["id"]),
@@ -1604,6 +1851,9 @@ class ImportJobs:
                                 409,
                                 "This refresh was already published. Start a new refresh to fetch later changes.",
                             )
+                        previous_fields = json.loads(stored["selected_fields"]) if stored["selected_fields"] is not None else None
+                        if "selected_fields" in body and selected_fields != previous_fields:
+                            raise CTFdError("Retry must keep the original CTFd field selection.")
                         selected = json.loads(stored[0]) if stored[0] else None
                         changed = db.execute(
                             """UPDATE ctfd_jobs SET status='queued',cancel_requested=0,
@@ -1618,12 +1868,13 @@ class ImportJobs:
                         db.execute(
                             """INSERT INTO ctfd_jobs
                                (id,owner_user_id,workspace_id,source_url,auth_type,
-                                selected_ids,mode,target_challenge_id,status,created_at,updated_at)
-                               VALUES(?,?,?,?,?,?,?,?,'queued',?,?)""",
+                                selected_ids,selected_fields,mode,target_challenge_id,status,created_at,updated_at)
+                               VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)""",
                             (
                                 job_id, user["id"], workspace_id, client.url,
                                 client.auth_type,
                                 json.dumps(selected) if selected is not None else None,
+                                json.dumps(selected_fields) if selected_fields is not None else None,
                                 mode, target_challenge_id, _now(), _now(),
                             ),
                         )
@@ -1681,6 +1932,90 @@ class ImportJobs:
             cancel.set()
             raise CTFdError("The workspace or user is no longer available.")
 
+    @staticmethod
+    def merge_remote_fields(db, workspace_id, challenge_id, source, remote,
+                            connection, remote_mode, *, refresh_metadata,
+                            selected_fields=None):
+        """Three-way merge CTFd fields without overwriting local edits.
+
+        The last imported values are the base. Legacy rows have no trustworthy
+        base, so their existing fields stay intact on the first refresh. The
+        upstream snapshot is then recorded for later comparisons.
+        """
+        current = db.execute(
+            """SELECT name,category,description,remote,remote_mode,ctfd_id,ctfd_url
+                 FROM challenges WHERE id=? AND workspace_id=?""",
+            (challenge_id, workspace_id),
+        ).fetchone()
+        try:
+            bound = current is not None and normalize_url(current["ctfd_url"], site=True) == source
+        except CTFdError:
+            bound = False
+        if not bound or current["ctfd_id"] != remote["id"]:
+            raise CTFdError("The challenge CTFd source mapping changed during refresh.")
+
+        incoming = {
+            "name": remote["name"], "category": remote["category"],
+            "description": remote["description"], "remote": connection,
+            "remote_mode": remote_mode,
+        }
+        baseline = db.execute(
+            "SELECT * FROM ctfd_imported_fields WHERE challenge_id=?",
+            (challenge_id,),
+        ).fetchone()
+        if baseline is not None and (
+            baseline["workspace_id"] != workspace_id
+            or baseline["source_url"] != source
+            or baseline["remote_id"] != remote["id"]
+        ):
+            baseline = None
+        previous = dict(baseline) if baseline is not None else None
+        values = dict(current)
+        selected = set(selected_fields) if selected_fields is not None else {
+            "name", "category", "description", "remote"
+        }
+        allowed = (
+            tuple(field for field in ("name", "category", "description") if field in selected)
+            if refresh_metadata else ()
+        )
+        for field in allowed:
+            if previous is not None and current[field] == previous[field]:
+                values[field] = incoming[field]
+        # Endpoint and its mode are one value: a local change to either part
+        # must preserve both parts. Import retries may still rotate an unedited
+        # CTFd endpoint without silently replacing user-provided addresses.
+        if "remote" in selected and previous is not None and all(
+            current[field] == previous[field] for field in ("remote", "remote_mode")
+        ):
+            values["remote"], values["remote_mode"] = connection, remote_mode
+        if any(values[field] != current[field] for field in incoming):
+            db.execute(
+                """UPDATE challenges SET name=?,category=?,description=?,remote=?,remote_mode=?,updated_at=?
+                     WHERE id=? AND workspace_id=?""",
+                (*(values[field] for field in incoming), _now(), challenge_id, workspace_id),
+            )
+
+        snapshot = {}
+        for field in incoming:
+            selected_field = "remote" if field == "remote_mode" else field
+            if (selected_field in selected and
+                    (refresh_metadata or selected_field == "remote")):
+                snapshot[field] = incoming[field]
+            else:
+                snapshot[field] = previous[field] if previous is not None else incoming[field]
+        db.execute(
+            """INSERT INTO ctfd_imported_fields
+                 (challenge_id,workspace_id,source_url,remote_id,name,category,description,remote,remote_mode)
+                 VALUES(?,?,?,?,?,?,?,?,?)
+                 ON CONFLICT(challenge_id) DO UPDATE SET
+                 workspace_id=excluded.workspace_id,source_url=excluded.source_url,
+                 remote_id=excluded.remote_id,name=excluded.name,category=excluded.category,
+                 description=excluded.description,remote=excluded.remote,
+                 remote_mode=excluded.remote_mode""",
+            (challenge_id, workspace_id, source, remote["id"],
+             *(snapshot[field] for field in incoming)),
+        )
+
     def challenge(self, job_id, workspace_id, owner, source, remote, *, mode="import",
                   target_challenge_id=None):
         connection = remote.get("remote") or ""
@@ -1720,13 +2055,12 @@ class ImportJobs:
                 ):
                     raise CTFdError("The saved import mapping is invalid.")
                 if mode != "refresh":
-                    # A resumed partial import fetched fresh challenge detail
-                    # before reaching this durable mapping. Refresh only the
-                    # CTFd-owned endpoint; local challenge text and solve state
-                    # stay intact.
-                    db.execute(
-                        "UPDATE challenges SET remote=?,remote_mode=?,updated_at=? WHERE id=? AND workspace_id=?",
-                        (connection, remote_mode, _now(), mapped["challenge_id"], workspace_id),
+                    # A resumed import may see a rotated upstream endpoint.
+                    # Update it only when the operator has not overridden the
+                    # previously imported address; preserve solve state.
+                    self.merge_remote_fields(
+                        db, workspace_id, mapped["challenge_id"], source,
+                        remote, connection, remote_mode, refresh_metadata=False,
                     )
                 return mapped["challenge_id"], (
                     False if mode == "refresh" else bool(mapped["skipped"])
@@ -1752,13 +2086,17 @@ class ImportJobs:
                 )
                 db.execute("INSERT INTO challenges(id,workspace_id,name,category,description,remote,remote_mode,ctfd_id,ctfd_url,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                            (challenge_id, workspace_id, remote["name"], remote["category"], remote["description"], connection, remote_mode, remote["id"], source, _now(), _now()))
+                self.merge_remote_fields(
+                    db, workspace_id, challenge_id, source, remote,
+                    connection, remote_mode, refresh_metadata=True,
+                )
             else:
-                # Dynamic challenge targets can rotate between imports.  The
-                # CTFd-owned field therefore refreshes even when the new value
-                # is empty; all user-owned solve state remains untouched.
-                db.execute(
-                    "UPDATE challenges SET remote=?,remote_mode=?,updated_at=? WHERE id=?",
-                    (connection, remote_mode, _now(), challenge_id),
+                # Dynamic targets can rotate between imports. Merge the
+                # endpoint against its last imported value, including an
+                # upstream change to an empty (offline) connection.
+                self.merge_remote_fields(
+                    db, workspace_id, challenge_id, source, remote,
+                    connection, remote_mode, refresh_metadata=False,
                 )
             db.execute("INSERT INTO ctfd_job_challenges VALUES(?,?,?,?)", (job_id, remote["id"], challenge_id, int(bool(existing))))
             db.execute(
@@ -2081,6 +2419,11 @@ class ImportJobs:
                     (job_id, challenge_id, remote["id"]),
                 )
             ]
+            job = db.execute(
+                "SELECT selected_fields FROM ctfd_jobs WHERE id=? AND workspace_id=?",
+                (job_id, workspace_id),
+            ).fetchone()
+            selected_fields = json.loads(job["selected_fields"]) if job and job["selected_fields"] is not None else None
         if len(staged) != len(remote["files"]) or any(
             row["status"] != "done" for row in staged
         ):
@@ -2250,14 +2593,10 @@ class ImportJobs:
             # Removing only rows carrying importer provenance keeps manual
             # uploads intact. The whole transaction rolls back if a new row
             # cannot be published.
-                db.execute(
-                    """UPDATE challenges
-                          SET name=?,category=?,description=?,remote=?,remote_mode=?,updated_at=?
-                        WHERE id=? AND workspace_id=?""",
-                    (
-                        remote["name"], remote["category"], remote["description"],
-                        connection, remote_mode, _now(), challenge_id, workspace_id,
-                    ),
+                self.merge_remote_fields(
+                    db, workspace_id, challenge_id, source, remote,
+                    connection, remote_mode, refresh_metadata=True,
+                    selected_fields=selected_fields,
                 )
                 db.executemany(
                     "DELETE FROM attachments WHERE id=? AND workspace_id=? AND challenge_id=?",
@@ -2743,6 +3082,13 @@ def register_ctfd(app, require_auth, settings):
         """List only challenges not yet mapped from the saved source."""
 
         return call(jobs.preview, workspace_id, user, body, "new")
+
+    @app.post("/api/workspaces/{workspace_id}/challenges/{challenge_id}/ctfd/refresh/preview")
+    def preview_refresh_ctfd(
+        workspace_id: str, challenge_id: str, body: dict,
+        user=Depends(require_auth),
+    ):
+        return call(jobs.preview, workspace_id, user, body, "refresh", challenge_id)
 
     @app.post("/api/workspaces/{workspace_id}/ctfd/import", status_code=202)
     def import_ctfd(workspace_id: str, body: dict, user=Depends(require_auth)):

@@ -17,9 +17,10 @@ jobs:
   deploy:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (vars.CTF_AGENT_AUTO_DEPLOY != 'false' &&
+      (vars.CTF_AGENT_AUTO_DEPLOY == 'true' &&
        github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main')
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     concurrency:
@@ -36,6 +37,10 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$REQUESTED_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            current_main="$(git ls-remote origin refs/heads/main | cut -f1)"
+            test "$REQUESTED_REVISION" = "$current_main"
+          fi
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ctf-agent-public"
           digest="$(docker manifest inspect --verbose "$image:$REQUESTED_REVISION" | jq -er '.Descriptor.digest')"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]

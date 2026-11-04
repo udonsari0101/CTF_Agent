@@ -692,9 +692,11 @@ class StorageLayout:
             workspace_id, challenge_id, attachment_id, create_parent=False
         )
         if _is_regular(canonical):
-            for entry in os.scandir(parent):
-                target = Path(entry.path)
-                if entry.is_file(follow_symlinks=False) and _same_file(canonical, target):
+            with os.scandir(parent) as entries:
+                for entry in entries:
+                    target = Path(entry.path)
+                    if not entry.is_file(follow_symlinks=False) or not _same_file(canonical, target):
+                        continue
                     owner = db.execute(
                         """SELECT entity_id FROM readable_storage_paths
                              WHERE kind='attachment' AND parent_id=?

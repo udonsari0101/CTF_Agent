@@ -147,6 +147,10 @@ class TelegramToggle(BaseModel):
     enabled: bool
 
 
+class TelegramInstanceName(BaseModel):
+    name: str
+
+
 class TelegramBotInput(BaseModel):
     token: str
 
@@ -451,6 +455,7 @@ class TelegramService:
         linked = bool(configured and row and row["chat_id"] is not None)
         return {
             "configured": configured,
+            "instance_name": row["instance_name"] if row else "",
             "bot_username": bot["bot_username"] if bot else (self.bot_username if self.configured else None),
             "configuration_error": self.configuration_error if not bot else None,
             "linked": linked,
@@ -460,6 +465,18 @@ class TelegramService:
             "last_failure_at": row["last_failure_at"] if row else None,
             "last_failure_code": row["last_failure_code"] if row else None,
         }
+
+    def set_instance_name(self, user_id: str, name: str) -> dict[str, Any]:
+        value = name.strip()
+        if len(value) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise HTTPException(422, "설치 이름은 줄바꿈 없이 80자 이하로 입력하세요.")
+        with self.database() as db:
+            db.execute(
+                """INSERT INTO telegram_settings(user_id,instance_name) VALUES(?,?)
+                   ON CONFLICT(user_id) DO UPDATE SET instance_name=excluded.instance_name""",
+                (user_id, value),
+            )
+        return self.settings_for(user_id)
 
     def admin_summary(self, user_id: str) -> dict[str, Any]:
         """Return status metadata without exposing the Telegram chat identifier."""
@@ -1101,7 +1118,7 @@ class TelegramService:
             )
             while True:
                 row = db.execute(
-                    """SELECT o.*,s.chat_id,s.enabled,u.active,w.name AS workspace_name,
+                    """SELECT o.*,s.chat_id,s.enabled,s.instance_name,u.active,w.name AS workspace_name,
                               c.name AS challenge_name,c.flag,
                               cw.markdown AS writeup_markdown
                        FROM notification_outbox o
@@ -1167,6 +1184,8 @@ class TelegramService:
         )
 
     def _notification(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        name = row.get("instance_name") or ""
+        instance = f"📍 <b>{html.escape(telegram_text(name))}</b>\n" if name else ""
         origin = self.settings.public_origin.rstrip("/") if self.settings.public_origin else ""
         problem_url = f"{origin}/#w/{row['workspace_id']}/c/{row['challenge_id']}" if origin else ""
         writeup_download_url = (
@@ -1180,7 +1199,7 @@ class TelegramService:
             clean_flag = telegram_text(flag)
             display_flag = clean_flag if len(clean_flag) <= 3200 else clean_flag[:3200] + "…\n(전체 Flag는 웹에서 확인하세요.)"
             text = (
-                f"🚩 <b>Flag 발견</b>\n작업공간: {html.escape(telegram_text(row['workspace_name']))}\n"
+                f"{instance}🚩 <b>Flag 발견</b>\n작업공간: {html.escape(telegram_text(row['workspace_name']))}\n"
                 f"문제: {html.escape(telegram_text(row['challenge_name']))}\n발견: {html.escape(telegram_text(row['created_at']))}"
                 f"{context}\n\n"
                 f"<code>{html.escape(display_flag)}</code>"
@@ -1200,7 +1219,7 @@ class TelegramService:
                 and len(markdown) <= _COPY_TEXT_MAX_CHARACTERS
             )
             text = (
-                f"📝 <b>Write-up 완성</b>\n작업공간: {html.escape(telegram_text(row['workspace_name']))}\n"
+                f"{instance}📝 <b>Write-up 완성</b>\n작업공간: {html.escape(telegram_text(row['workspace_name']))}\n"
                 f"문제: {html.escape(telegram_text(row['challenge_name']))}\n완성: {html.escape(telegram_text(row['created_at']))}"
                 f"{context}"
             )
@@ -1232,7 +1251,7 @@ class TelegramService:
             if code == "ultra_escalation_requested" and row.get("solver_ultra_mode") == "auto":
                 reason = "기록된 분석을 보존하고 Codex Ultra 자동 전환을 시도합니다. 시작되지 않으면 문제 화면에서 직접 승인하세요."
             text = (
-                f"⚠️ <b>{title}</b>\n작업공간: {html.escape(telegram_text(row['workspace_name']))}\n"
+                f"{instance}⚠️ <b>{title}</b>\n작업공간: {html.escape(telegram_text(row['workspace_name']))}\n"
                 f"문제: {html.escape(telegram_text(row['challenge_name']))}\n"
                 f"안내: {html.escape(reason)}"
                 f"{context}"
@@ -1286,7 +1305,7 @@ class TelegramService:
         """Reload the claim immediately before sending while settings are locked."""
         with self.database() as db:
             current = db.execute(
-                """SELECT o.*,s.chat_id,s.enabled,u.active,w.name AS workspace_name,
+                """SELECT o.*,s.chat_id,s.enabled,s.instance_name,u.active,w.name AS workspace_name,
                           c.name AS challenge_name,c.flag,
                           cw.markdown AS writeup_markdown
                    FROM notification_outbox o
@@ -1407,6 +1426,10 @@ def register_telegram(app, require_auth, settings, database):
                    INSERT INTO telegram_settings SELECT * FROM telegram_settings_legacy;
                    DROP TABLE telegram_settings_legacy;"""
             )
+        if "instance_name" not in {
+            row["name"] for row in db.execute("PRAGMA table_info(telegram_settings)")
+        }:
+            db.execute("ALTER TABLE telegram_settings ADD COLUMN instance_name TEXT NOT NULL DEFAULT ''")
         _ensure_notification_outbox(db)
         # This deployment boundary prevents the newly introduced scanner from
         # replaying historical failures.  A job that terminates after the
@@ -1471,6 +1494,10 @@ def register_telegram(app, require_auth, settings, database):
     @app.get("/api/telegram", dependencies=[Depends(require_auth)])
     def telegram_settings(request: Request):
         return service.settings_for(request.state.user["id"])
+
+    @app.put("/api/telegram/instance-name", dependencies=[Depends(require_auth)])
+    def save_telegram_instance_name(payload: TelegramInstanceName, request: Request):
+        return service.set_instance_name(request.state.user["id"], payload.name)
 
     @app.put("/api/telegram/bot", dependencies=[Depends(require_auth)])
     async def save_telegram_bot(payload: TelegramBotInput, request: Request):

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
+from .writeup_publication import contains_internal_operation, public_solution_notes
 
 
 _OPAQUE_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -1034,7 +1035,7 @@ Challenge description follows between fixed delimiters.
 
 def _writeup_prompt(request: SolveRequest, discovery: DiscoveryResult) -> EphemeralPrompt:
     text = f"""Write a concise Markdown solution for the authorized CTF challenge below.
-Use a natural technical voice suitable for direct paste into Notion. State the observations, decisive steps, reproducible commands or code, and the verified flag. Do not mention being an AI, hidden reasoning, system prompts, or provider policy. Do not invent steps.
+Use a natural technical voice suitable for direct paste into Notion. State the observations, decisive steps, reproducible commands or code, and the verified flag. Do not mention being an AI, hidden reasoning, system prompts, or provider policy. Do not invent steps. Exclude service-only handoff commands (submit-flag, request-remote, connect-remote), CTFd auto-submission, and CTF Agent internals from prose and code.
 
 Challenge: {request.challenge_name.strip()}
 Description:
@@ -1044,7 +1045,7 @@ Verified flag:
 {discovery.flag}
 
 Private solution notes (use as facts; do not mention this label):
-{discovery.private_notes}
+{public_solution_notes(discovery.private_notes)}
 """
     return EphemeralPrompt(text)
 
@@ -1067,6 +1068,8 @@ def _validate_writeup(markdown: str, limits: SolverLimits, challenge_root: Path)
     markdown = markdown.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not markdown or len(markdown) > limits.max_writeup_chars or _CONTROL.search(markdown):
         raise ValueError("adapter returned an invalid write-up")
+    if contains_internal_operation(markdown):
+        raise ValueError("adapter returned a write-up with an internal operation")
     # Physical paths have no value in the exported write-up.  Replace both
     # separator styles without inspecting or logging anything else.
     physical = str(challenge_root)

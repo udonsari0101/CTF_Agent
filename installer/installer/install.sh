@@ -420,7 +420,24 @@ if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", diges
 print(digest)
 ')"
 image_ref="$image_repository@$image_digest"
+# Preserve a 5 GiB data/DB floor after estimated Docker pull and overlay work.
+# A cold image needs more headroom than a digest already present locally.
+image_cache_state=cold
+if docker image inspect "$image_ref" >/dev/null 2>&1; then
+    image_cache_state=cached
+fi
+python3 "$bundle_root/installer/storage_preflight.py" before-pull \
+    "$home_dir" "$database_fs_path" "$image_cache_state"
 public_docker pull "$image_ref"
+if ! python3 "$bundle_root/installer/storage_preflight.py" after-pull \
+    "$home_dir" "$database_fs_path" "$image_cache_state"; then
+    # The new digest was not present before this attempt. Remove only that
+    # reference so a larger-than-estimated pull does not consume the reserve.
+    if [[ "$image_cache_state" == cold ]]; then
+        public_docker image rm "$image_ref" >/dev/null 2>&1 || true
+    fi
+    exit 1
+fi
 image_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_ref")"
 image_source="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$image_ref")"
 if [[ "$image_revision" != "$revision" || "$image_source" != "https://github.com/udonsari0101/CTF_Agent" ]]; then
@@ -434,6 +451,8 @@ if [[ "$(id -u)" == 0 ]]; then
 fi
 mv -f -- "$image_ref_temp" "$target/.image-ref"
 export CTF_LOCAL_RUNTIME_IMAGE="$(python3 deploy/local_runtime.py build)"
+python3 "$bundle_root/installer/storage_preflight.py" after-pull \
+    "$home_dir" "$database_fs_path" "$image_cache_state"
 # Verify that Docker sees the live installed database before draining work or
 # stopping the existing service. Docker Desktop can retain a stale bind after
 # WSL remounts an external VHD, even when its Mount.Source string is correct.
@@ -537,10 +556,11 @@ PY
     if ! wait_service_healthy "$previous_image" 180; then return 1; fi
     echo "Previous CTF Agent release $previous_version restored and ready." >&2
 }
-# Drain old claims first, then stop the old coordinators before removing this
-# install's marker and starting the new stack.
+# Drain old claims first, then stop every local writer before Compose checks a
+# stopped web container. Leaving idle solver containers up made both the new
+# rollout and its rollback refuse the database-bind repair.
 rollout_started=true
-docker compose -f compose.local.yaml stop web solver-autoscaler
+python3 deploy/local-compose.py quiesce
 if [[ -n "$database_mount" && "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
     update_control="$home_dir/ctf_agent_data/update-control"
     # Web is now stopped, so no new request can be queued. A pending or

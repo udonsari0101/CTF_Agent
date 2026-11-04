@@ -9,6 +9,7 @@ leave an overly conservative reservation, never an unaccounted durable write.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import stat
@@ -44,7 +45,35 @@ ON storage_reservations(kind, owner_user_id, workspace_id, challenge_id);
 
 
 class StorageBudgetError(RuntimeError):
-    """A safe, user-displayable storage accounting error."""
+    """A safe public message with non-secret, machine-readable diagnostics."""
+
+    def __init__(self, message: str, *, code: str = "state_changed",
+                 diagnostics: Mapping[str, int | None] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.diagnostics = dict(diagnostics or {})
+
+
+def storage_http_status(error: StorageBudgetError) -> int:
+    """Map capacity, contention and state errors to distinct API statuses."""
+
+    if error.code in {"insufficient_space", "write_enospc"}:
+        return 507
+    if error.code in {"reservation_missing", "reservation_mismatch", "reservation_changed", "state_changed"}:
+        return 409
+    if error.code in {"lock_unavailable", "free_check_failed", "write_permission"}:
+        return 503
+    return 500
+
+
+def storage_io_http_response(error: OSError) -> tuple[int, str]:
+    """Classify filesystem errors without exposing paths or claiming false ENOSPC."""
+
+    if error.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+        return 507, "저장 공간이 부족합니다. 공간을 확보한 뒤 다시 시도해 주세요."
+    if error.errno in {errno.EACCES, errno.EPERM}:
+        return 503, "저장 경로에 접근할 권한이 없습니다."
+    return 503, "저장 경로에 접근하지 못했습니다. 마운트와 파일 상태를 확인하세요."
 
 
 _LOCKS_GUARD = threading.Lock()
@@ -105,13 +134,26 @@ class StorageBudget:
             try:
                 descriptor = os.open(self.lock_path, flags, 0o600)
             except OSError as exc:
-                raise StorageBudgetError("저장 공간 잠금 파일을 열 수 없습니다.") from exc
+                raise StorageBudgetError(
+                    "저장 공간 잠금 파일을 열 수 없습니다.", code="lock_unavailable",
+                    diagnostics={"errno": exc.errno, "mount_device": self._mount_device()},
+                ) from exc
             try:
-                info = os.fstat(descriptor)
-                if not stat.S_ISREG(info.st_mode):
-                    raise StorageBudgetError("저장 공간 잠금 경로가 올바르지 않습니다.")
-                if fcntl is not None:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                try:
+                    info = os.fstat(descriptor)
+                    if not stat.S_ISREG(info.st_mode):
+                        raise StorageBudgetError(
+                            "저장 공간 잠금 경로가 올바르지 않습니다.",
+                            code="lock_unavailable",
+                            diagnostics={"mount_device": self._mount_device()},
+                        )
+                    if fcntl is not None:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX)
+                except OSError as exc:
+                    raise StorageBudgetError(
+                        "저장 공간 잠금을 사용할 수 없습니다.", code="lock_unavailable",
+                        diagnostics={"errno": exc.errno, "mount_device": self._mount_device()},
+                    ) from exc
                 yield
             finally:
                 if fcntl is not None:
@@ -138,7 +180,52 @@ class StorageBudget:
         try:
             return int(shutil.disk_usage(self.data_dir).free)
         except OSError as exc:
-            raise StorageBudgetError("저장 공간 상태를 확인할 수 없습니다.") from exc
+            raise StorageBudgetError(
+                "저장 공간 상태를 확인할 수 없습니다.", code="free_check_failed",
+                diagnostics={"errno": exc.errno, "mount_device": self._mount_device()},
+            ) from exc
+
+    def _mount_device(self) -> int | None:
+        """Identify the data mount without recording its path or contents."""
+        try:
+            return int(os.stat(self.data_dir).st_dev)
+        except OSError:
+            return None
+
+    def _capacity_snapshot(self, *, reserved_bytes: int, requested_bytes: int,
+                           projected_reserved_bytes: int) -> dict[str, int | None]:
+        """Sample physical free space once while the caller holds the volume lock."""
+        details: dict[str, int | None] = {
+            "observed_at_ns": time.time_ns(),
+            "mount_device": self._mount_device(),
+            "reserved_bytes": reserved_bytes,
+            "requested_bytes": requested_bytes,
+            "projected_reserved_bytes": projected_reserved_bytes,
+            "minimum_free_bytes": self.minimum_free_bytes,
+        }
+        try:
+            details["free_bytes"] = self._free()
+        except StorageBudgetError as exc:
+            raise StorageBudgetError(
+                str(exc), code=exc.code,
+                diagnostics={**details, **exc.diagnostics},
+            ) from exc
+        return details
+
+    @staticmethod
+    def _write_error(exc: OSError, details: Mapping[str, int | None]) -> StorageBudgetError:
+        if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+            code = "write_enospc"
+            message = "저장 공간에 기록할 수 없습니다. 공간을 확인한 뒤 다시 시도해 주세요."
+        elif exc.errno in {errno.EACCES, errno.EPERM}:
+            code = "write_permission"
+            message = "저장 공간에 기록할 권한이 없습니다."
+        else:
+            code = "write_failed"
+            message = "저장 공간에 기록하지 못했습니다."
+        return StorageBudgetError(
+            message, code=code, diagnostics={**details, "errno": exc.errno},
+        )
 
     @staticmethod
     def _validate(key: str, kind: str, owner: str, workspace: str,
@@ -178,14 +265,27 @@ class StorageBudget:
                 "SELECT * FROM storage_reservations WHERE reservation_key=?", (key,)
             ).fetchone()
             if current and not self._matching(current, kind, owner, workspace, challenge):
-                raise StorageBudgetError("저장 공간 예약 범위가 일치하지 않습니다.")
+                raise StorageBudgetError(
+                    "저장 공간 예약 범위가 일치하지 않습니다.", code="reservation_mismatch",
+                    diagnostics={"requested_bytes": remaining},
+                )
             total = self._total(connection)
             previous = int(current["remaining_bytes"]) if current else 0
             projected = total - previous + remaining
-            if self._free() - projected < self.minimum_free_bytes:
-                raise StorageBudgetError("저장 공간이 부족합니다. 공간을 확보한 뒤 다시 시도해 주세요.")
+            details = self._capacity_snapshot(
+                reserved_bytes=total, requested_bytes=remaining,
+                projected_reserved_bytes=projected,
+            )
+            if details["free_bytes"] - projected < self.minimum_free_bytes:
+                raise StorageBudgetError(
+                    "저장 공간이 부족합니다. 공간을 확보한 뒤 다시 시도해 주세요.",
+                    code="insufficient_space", diagnostics=details,
+                )
             if prepare is not None:
-                prepare()
+                try:
+                    prepare()
+                except OSError as exc:
+                    raise self._write_error(exc, details) from exc
             now = int(time.time())
             if remaining:
                 connection.execute(
@@ -227,25 +327,44 @@ class StorageBudget:
                 if precheck is not None and precheck(connection) is False:
                     return False
                 if not row or int(row[0]) < amount:
-                    raise StorageBudgetError("저장 공간 예약이 없거나 부족합니다. 업로드를 다시 시작해 주세요.")
+                    raise StorageBudgetError(
+                        "저장 공간 예약이 없거나 부족합니다. 업로드를 다시 시작해 주세요.",
+                        code="reservation_missing", diagnostics={"requested_bytes": amount},
+                    )
                 total = self._total(connection)
             finally:
                 connection.close()
             # The current reservation already includes amount.  This condition
             # guarantees that physical free space remains above the floor after
             # this write and every other outstanding reservation is consumed.
-            if self._free() < self.minimum_free_bytes + total:
-                raise StorageBudgetError("저장 공간이 부족합니다. 공간을 확보한 뒤 이어서 시도해 주세요.")
-            writer()
+            details = self._capacity_snapshot(
+                reserved_bytes=total, requested_bytes=amount,
+                projected_reserved_bytes=total,
+            )
+            if details["free_bytes"] < self.minimum_free_bytes + total:
+                raise StorageBudgetError(
+                    "저장 공간이 부족합니다. 공간을 확보한 뒤 이어서 시도해 주세요.",
+                    code="insufficient_space", diagnostics=details,
+                )
+            try:
+                writer()
+            except OSError as exc:
+                raise self._write_error(exc, details) from exc
             with self._transaction() as connection:
                 row = connection.execute(
                     "SELECT remaining_bytes FROM storage_reservations WHERE reservation_key=?",
                     (key,),
                 ).fetchone()
                 if not row or int(row[0]) < amount:
-                    raise StorageBudgetError("저장 공간 예약 상태가 변경되었습니다.")
+                    raise StorageBudgetError(
+                        "저장 공간 예약 상태가 변경되었습니다.",
+                        code="reservation_changed", diagnostics=details,
+                    )
                 if precheck is not None and precheck(connection) is False:
-                    raise StorageBudgetError("저장 작업 상태가 쓰기 중 변경되었습니다.")
+                    raise StorageBudgetError(
+                        "저장 작업 상태가 쓰기 중 변경되었습니다.",
+                        code="state_changed", diagnostics=details,
+                    )
                 if db_update is not None:
                     db_update(connection)
                 remaining = int(row[0]) - amount
@@ -270,9 +389,19 @@ class StorageBudget:
                 total = self._total(connection)
             finally:
                 connection.close()
-            if self._free() - amount - total < self.minimum_free_bytes:
-                raise StorageBudgetError("저장 공간이 부족합니다. 공간을 확보한 뒤 이어서 시도해 주세요.")
-            writer()
+            details = self._capacity_snapshot(
+                reserved_bytes=total, requested_bytes=amount,
+                projected_reserved_bytes=total + amount,
+            )
+            if details["free_bytes"] - amount - total < self.minimum_free_bytes:
+                raise StorageBudgetError(
+                    "저장 공간이 부족합니다. 공간을 확보한 뒤 이어서 시도해 주세요.",
+                    code="insufficient_space", diagnostics=details,
+                )
+            try:
+                writer()
+            except OSError as exc:
+                raise self._write_error(exc, details) from exc
 
     def release(self, key: str, db_update: Callable | None = None,
                 cleanup: Callable | None = None,
@@ -289,7 +418,9 @@ class StorageBudget:
                 cleanup()
             with self._transaction() as connection:
                 if precheck is not None and precheck(connection) is False:
-                    raise StorageBudgetError("저장 정리 상태가 처리 중 변경되었습니다.")
+                    raise StorageBudgetError(
+                        "저장 정리 상태가 처리 중 변경되었습니다.", code="state_changed",
+                    )
                 connection.execute("DELETE FROM storage_reservations WHERE reservation_key=?", (key,))
                 if db_update is not None:
                     db_update(connection)

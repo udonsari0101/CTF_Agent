@@ -1,6 +1,6 @@
 # Skill Module: blockchain (smart contract)
 
-Field manual for EVM/Solidity (and Vyper — same bytecode) CTF. Working files, by role: **contract mechanics & state layout → `notes/ANALYSIS.md`**; **the vuln + verbatim `isSolved()` win-condition + storage-slot map → `notes/VULN.md`**; **dead-ends, remote tx hashes, next moves → `notes/NEXT.md`**; **the exploit → `solver.py`** (a Foundry `forge script`, or a thin runner shelling `forge`/`cast`; `web3.py` is the fallback). Scratch → `tmp/`.
+Field manual for EVM/Solidity (and Vyper — same bytecode) CTF. Working files, by role: **contract mechanics & state layout → `notes/ANALYSIS.md`**; **the vuln + verbatim `isSolved()` win-condition + storage-slot map → `notes/VULN.md`**; **dead-ends, remote tx hashes, next moves → `notes/NEXT.md`**; **the exploit → `solver.py`**. Foundry (`forge`/`cast`/`anvil`) and Python `web3` are optional, not preinstalled; check availability and acquire a pinned job-local tool if transaction signing or a fork is required. Installed `curl` and Python `requests` can make read-only JSON-RPC calls immediately. Scratch → `tmp/`.
 
 ## Canonical shape — the win is on-chain state, not a crash
 
@@ -15,7 +15,7 @@ Your job: read `isSolved()`, work backward to the state it checks, find the one 
 
 ### First moves
 ```bash
-cast --version || curl -L https://foundry.paradigm.xyz | bash   # forge/cast/anvil
+command -v cast || true     # Foundry is optional; do not assume it is installed
 ls                        # *.sol under src/? out/ artifacts? foundry.toml?
 ```
 Record RPC/CHAIN_ID/PK/SETUP/flag endpoint in `notes/ANALYSIS.md`. Put the **verbatim `isSolved()` body** in `notes/VULN.md` — it is your spec. Pull only `isSolved()` and the target's state-mutating functions — never whole contracts.
@@ -35,11 +35,11 @@ Record RPC/CHAIN_ID/PK/SETUP/flag endpoint in `notes/ANALYSIS.md`. Put the **ver
 cast code $TARGET --rpc-url $RPC > bytecode.hex
 cast selectors $(cat bytecode.hex)     # selectors present  |  cast 4byte 0xSEL → signature
 ```
-Then reach for: **`heimdall`/`panoramix`/`evmole`** to decompile, **`slither`** for static findings, **`medusa`/`echidna`** to fuzz an invariant mirroring `isSolved()`, **`halmos`** to prove reachability symbolically. `cast storage <addr> <slot>` reads raw state when there's no getter.
+If Foundry is available, `cast storage <addr> <slot>` reads raw state when there's no getter. Otherwise use `curl` with JSON-RPC `eth_getCode`/`eth_getStorageAt` for read-only triage. `heimdall`/`panoramix`/`evmole` (decompile), `slither` (static analysis), `medusa`/`echidna` (fuzz) and `halmos` (symbolic reachability) are optional extras.
 
 ## Rehearse-then-fire — the core loop (→ `solver.py`)
 
-Remote nonces/gas are real and many challenges rate-limit or give one shot. Prove the win on a local fork first, then repoint the **same** script at the live node.
+Remote nonces/gas are real and many challenges rate-limit or give one shot. If Foundry is installed, prove the win on a local fork first, then repoint the **same** script at the live node. If it is absent, do not run the following block as-is: install a pinned job-local EVM toolchain when signing/forking is needed, and verify the RPC/client before sending a live transaction.
 ```bash
 anvil --fork-url $RPC --fork-chain-id $CHAIN_ID &            # 1. mirror remote on :8545
 forge script src/Exploit.s.sol --rpc-url localhost:8545 \
@@ -70,7 +70,7 @@ cast wallet address --private-key $PK ; cast balance $(cast wallet address --pri
 cast storage $PROXY 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc --rpc-url $RPC  # impl
 cast storage $PROXY 0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103 --rpc-url $RPC  # admin
 ```
-`web3.py` is the fallback for custom signing, raw calldata, or a bespoke flag protocol.
+`web3.py` is an optional fallback for custom signing, raw calldata or a bespoke flag protocol; it is not in the base image. For read-only calls, installed `curl` can call JSON-RPC directly.
 
 ## Vulnerability classes — match the smell, confirm by reading (→ `notes/VULN.md`)
 

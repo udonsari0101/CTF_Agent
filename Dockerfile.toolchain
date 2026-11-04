@@ -1,8 +1,6 @@
 FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS node
 
 FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
-ARG CODEX_VERSION=0.164.0
-ARG CLAUDE_VERSION=2.1.310
 ARG RADARE2_VERSION=6.2.2
 ARG RADARE2_SHA256=09234e4139bf8dfcbb7fc1fdb2519859ad516e63c19d3c27d92aaecdf463b1ad
 ARG FFUF_VERSION=2.2.1
@@ -63,19 +61,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
-    && npm install --global --no-audit --no-fund "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
-    && native_host='' \
-    && for candidate in \
-        /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host \
-        /usr/local/lib/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host; do \
-        [ -f "$candidate" ] || continue; \
-        [ ! -L "$candidate" ] && [ -z "$native_host" ] || exit 1; \
-        native_host="$candidate"; \
-    done \
-    && [ -n "$native_host" ] \
-    && chown root:root "$native_host" \
-    && chmod 0555 "$native_host" \
-    && npm cache clean --force \
     && install -d -o root -g root -m 0755 /usr/local/libexec/ctf-command \
     && cp --dereference "$(command -v python)" /usr/local/libexec/ctf-agent-codex-launcher \
     && cp --dereference "$(command -v python)" /usr/local/libexec/ctf-agent-claude-launcher \
@@ -122,6 +107,25 @@ COPY --chown=0:0 --chmod=0444 deploy/DecompileAll.java deploy/DecompileFn.java /
 WORKDIR /app
 COPY requirements.txt requirements-ctf.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-ctf.txt
+
+# Keep model CLIs last: changing them must not invalidate the large system,
+# Ghidra/JDK/JADX or Python dependency layers.
+ARG CODEX_VERSION=0.166.0
+ARG CLAUDE_VERSION=2.1.311
+RUN npm install --global --no-audit --no-fund \
+        "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
+    && native_host='' \
+    && for candidate in \
+        /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host \
+        /usr/local/lib/node_modules/@openai/codex-linux-*/vendor/*/bin/codex-code-mode-host; do \
+        [ -f "$candidate" ] || continue; \
+        [ ! -L "$candidate" ] && [ -z "$native_host" ] || exit 1; \
+        native_host="$candidate"; \
+    done \
+    && [ -n "$native_host" ] \
+    && chown root:root "$native_host" \
+    && chmod 0555 "$native_host" \
+    && npm cache clean --force
 
 ENV CTF_IMAGE_CODEX_VERSION=$CODEX_VERSION \
     CTF_IMAGE_CLAUDE_VERSION=$CLAUDE_VERSION

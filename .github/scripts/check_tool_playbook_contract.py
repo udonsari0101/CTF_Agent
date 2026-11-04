@@ -1,0 +1,108 @@
+"""Offline contract for the core-image tool claims in category playbooks.
+
+The image smoke verifies executable behavior after a build. This test catches
+prompt regressions before a multi-GB image has to be built.
+"""
+
+from __future__ import annotations
+
+import unittest
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+PROMPTS = ROOT / "ctf_agent" / "agent_assets" / "prompts"
+
+
+def asset(name: str) -> str:
+    return (PROMPTS / name).read_text(encoding="utf-8")
+
+
+class ToolPlaybookContract(unittest.TestCase):
+    def test_installed_fallbacks_match_build_and_smoke(self) -> None:
+        dockerfile = (ROOT / "Dockerfile.toolchain").read_text(encoding="utf-8")
+        dependencies = (ROOT / "requirements-ctf.txt").read_text(encoding="utf-8")
+        smoke = (ROOT / "deploy" / "image-smoke.py").read_text(encoding="utf-8")
+        for executable in ("ffuf", "gp", "qemu-x86_64", "ghidra_headless", "jadx", "stegseek"):
+            self.assertIn(executable, dockerfile + smoke)
+            self.assertIn(executable, smoke, f"{executable} needs image smoke coverage")
+        for package in ("fpylll", "owiener", "pwntools", "sympy", "z3-solver", "pillow"):
+            self.assertIn(package, dependencies.lower())
+        self.assertIn("The image includes", asset("skill_forensics.md"))
+        self.assertIn("The image includes", asset("skill_crypto.md"))
+
+    def test_absent_tool_first_steps_are_guarded_or_optional(self) -> None:
+        web = asset("skill_web.md")
+        self.assertNotIn("/usr/share/wordlists/dirb/common.txt", web)
+        self.assertIn("tmp/paths.txt", web)
+        self.assertIn("tmp/params.txt", web)
+        self.assertIn("No \u0060rockyou.txt\u0060 wordlist is bundled", asset("skill_forensics.md"))
+
+        crypto = asset("skill_crypto.md")
+        self.assertNotIn("**First move:** \u0060RsaCtfTool", crypto)
+        self.assertIn("SageMath is optional, not preinstalled", crypto)
+        self.assertIn("RsaCtfTool\u0060 and \u0060roca-detect\u0060 are optional", crypto)
+
+        pwn = asset("skill_pwn.md")
+        self.assertNotIn("qemu-x86_64-static -g", pwn)
+        self.assertIn("seccomp-tools dump\u0060 is an optional helper", pwn)
+        self.assertIn("qemu-x86_64 -g 1234", pwn)
+
+        forensics = asset("skill_forensics.md")
+        self.assertIn("command -v zsteg", forensics)
+        self.assertIn("optional \u0060bkcrack\u0060", forensics)
+
+        reverse = asset("skill_rev.md")
+        self.assertIn("no ILSpy/\u0060ilspycmd\u0060", reverse)
+        blockchain = asset("skill_blockchain.md")
+        self.assertNotIn("curl -L https://foundry.paradigm.xyz | bash", blockchain)
+        self.assertIn("Foundry (\u0060forge\u0060/\u0060cast\u0060/\u0060anvil\u0060) and Python \u0060web3\u0060 are optional", blockchain)
+        ai = asset("skill_ai-ml.md")
+        self.assertIn("does not pin PyTorch", ai)
+        self.assertIn("pickletools.dis", ai)
+
+    def test_flag_and_patch_language_is_conditional(self) -> None:
+        base = asset("base.md")
+        unknown = asset("skill_unknown.md")
+        self.assertNotIn("The real flag is on the remote", base)
+        self.assertNotIn("the changed lines are the planted bug", base)
+        self.assertNotIn("the changed lines ARE the planted bug", unknown)
+        self.assertIn("A genuine Flag can come from a supplied artifact", base)
+        self.assertIn("does not expose a Docker daemon/socket", base)
+        self.assertIn("confirm reachability and behavior", unknown)
+
+    def test_unknown_category_allows_cheap_remote_first_contact(self) -> None:
+        unknown = asset("skill_unknown.md")
+        remote_only = asset("remote_only.md")
+        self.assertNotIn("hit the remote until one category wins", unknown)
+        self.assertNotIn("When two independent signals agree", unknown)
+        self.assertIn("one protocol-appropriate, non-destructive first contact", unknown)
+        self.assertIn("Save the response under `tmp/`", unknown)
+        self.assertIn("For a target with no files, follow `../../skills/remote_only.md`", unknown)
+        self.assertIn("A category label from the platform is a hint, not a gate", unknown)
+        self.assertIn("first contact is one gentle touch", remote_only)
+
+    def test_assembled_unknown_manual_respects_remote_mode(self) -> None:
+        from ctf_agent.agent_workspace import assemble_manual
+
+        with_remote = assemble_manual(
+            ("unknown",), challenge_name="Unclassified",
+            remote="https://example.invalid/", remote_mode="endpoint",
+            remote_only=True, remote_access=True,
+        )
+        self.assertIn("one bounded banner or protocol probe", with_remote)
+        self.assertIn("first contact is one gentle touch", with_remote)
+        self.assertNotIn("hit the remote until one category wins", with_remote)
+
+        without_remote = assemble_manual(
+            ("unknown",), challenge_name="Local artifact", remote_mode="none",
+            remote_only=False, remote_access=False,
+        )
+        self.assertIn("Remote: **none (configured)**", without_remote)
+        self.assertNotIn("first contact is one gentle touch", without_remote)
+
+
+if __name__ == "__main__":
+    unittest.main()

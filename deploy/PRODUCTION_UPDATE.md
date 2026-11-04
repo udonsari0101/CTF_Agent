@@ -2,6 +2,8 @@
 
 The site Update button can upgrade an existing registry based server installation. The controller uses the public GitHub release tag and the public GHCR image built from that tagged commit. The Docker host only pulls an immutable image digest and starts it with `docker compose up -d --no-build`; it does not build an image.
 
+Publishing a new image does not automatically restart an installed server. The separate GitHub Actions deployment workflow runs automatically only when the repository variable `CTF_AGENT_AUTO_DEPLOY` is explicitly set to `true`; an operator can also dispatch it for a specific verified revision. Otherwise, installed servers update through their own Update button.
+
 ## Existing server layout
 
 This integration is for an installation that already has:
@@ -18,7 +20,7 @@ sh app/deploy/bootstrap-production-update.sh \
   /absolute/data/root/releases \
   github-owner/repository \
   ghcr.io/github-owner/image \
-  v0.4.2
+  <current-installed-version>
 ```
 
 Set the final argument to the current installed version. This one-time migration records the running SHA and version. Subsequent updates verify the latest published release tag, resolve that tag to its commit SHA, and verify the SHA tagged registry manifest before invoking the existing rollout. After a healthy deployment, the controller refreshes its own files from the running image and restarts via systemd.

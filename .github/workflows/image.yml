@@ -1,11 +1,13 @@
 name: Publish container image
 
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   packages: write
 
@@ -15,12 +17,30 @@ concurrency:
 
 jobs:
   publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      BUILD_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_sha }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          ref: ${{ env.BUILD_SHA }}
+      - name: Confirm successful CI for manual build
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          passed="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$BUILD_SHA&status=success&per_page=20" --jq '.workflow_runs | length')"
+          test "$passed" -gt 0
       - name: Build, smoke test, and publish immutable images
         env:
           GHCR_TOKEN: ${{ github.token }}
@@ -32,8 +52,8 @@ jobs:
           app="ghcr.io/$owner/ctf-agent-public"
           toolchain="ghcr.io/$owner/ctf-agent-public-toolchain"
           fingerprint="$(sha256sum Dockerfile.toolchain toolchain.lock requirements.txt requirements-ctf.txt deploy/DecompileAll.java deploy/DecompileFn.java | sha256sum | cut -d' ' -f1)"
-          toolchain_tag="$toolchain:toolchain-2-$fingerprint"
-          app_tag="$app:$GITHUB_SHA"
+          toolchain_tag="$toolchain:toolchain-3-$fingerprint"
+          app_tag="$app:$BUILD_SHA"
 
           retry_once() {
             if "$@"; then return 0; fi
@@ -53,10 +73,10 @@ jobs:
           if docker manifest inspect "$app_tag" >/dev/null 2>&1; then
             docker pull "$app_tag" >/dev/null
           else
-            retry_once docker build --file Dockerfile --build-arg "TOOLCHAIN_IMAGE=$toolchain_ref" --build-arg "RELEASE_SHA=$GITHUB_SHA" --tag "$app_tag" .
+            retry_once docker build --file Dockerfile --build-arg "TOOLCHAIN_IMAGE=$toolchain_ref" --build-arg "RELEASE_SHA=$BUILD_SHA" --tag "$app_tag" .
           fi
           revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$app_tag")"
-          test "$revision" = "$GITHUB_SHA"
+          test "$revision" = "$BUILD_SHA"
           # Keep stdin attached so Python executes the smoke script. Provide
           # the same writable home/scratch paths the solver has in Compose.
           docker run --rm -i --network none \
@@ -66,7 +86,13 @@ jobs:
           if ! docker manifest inspect "$app_tag" >/dev/null 2>&1; then
             docker push "$app_tag"
           fi
-          docker tag "$app_tag" "$app:production"
-          docker push "$app:production"
+          current_main="$(git ls-remote origin refs/heads/main | cut -f1)"
+          [[ "$current_main" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$BUILD_SHA" = "$current_main" ]; then
+            docker tag "$app_tag" "$app:production"
+            docker push "$app:production"
+          else
+            echo 'A newer main commit exists; keeping the current production tag.' >> "$GITHUB_STEP_SUMMARY"
+          fi
           digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$app_tag")"
           printf 'Published %s\nToolchain %s\n' "$digest" "$toolchain_ref" >> "$GITHUB_STEP_SUMMARY"

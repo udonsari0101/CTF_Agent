@@ -2,9 +2,9 @@
 
 The production image carries the default Python and system toolchain from the
 original `ctf_agent.zip` `setup.sh`, including radare2, and a pinned subset of
-the original `--full` tools that the restored category playbooks call
-directly. Keeping these programs in the image makes the playbooks executable
-instead of leaving their commands as documentation only.
+the original `--full` tools. The category playbooks distinguish image tools
+from optional tools, so a solve can choose an installed path before deciding
+whether a challenge needs a job-local extra.
 
 Debian 12 (bookworm) packages provide:
 
@@ -97,11 +97,27 @@ sockets, Docker control and privileged mode are not mounted into a solver:
 each would give the challenge workload access to shared host resources and
 therefore cannot satisfy the requirement that the server remain unaffected.
 
-Bubblewrap is excluded because solver commands already run inside the enforced
-host AppArmor execution domain with `no-new-privileges`. A nested user-namespace
-sandbox cannot be relied on at that deployment boundary.
+A separate `bwrap` executable is not installed in the solver image. On the
+server, the dedicated AppArmor command profile and `no-new-privileges` form
+the external execution boundary, so Codex uses its external-sandbox policy.
+The Docker Desktop local profile instead permits the unprivileged namespace
+operations needed by Codex's workspace-write path; see
+[local solver namespace profile](../../deploy/local-seccomp.README.md).
 
-The remaining best-effort extras stay outside the core image: SageMath,
-Foundry, REA, Ruby gem tools such as one_gadget, seccomp-tools and zsteg,
-and format-specific packages such as Il2CppDumper and Blutter. Add them when a
-matching input calls for them and a pinned build can pass the image smoke.
+The playbooks' installed first paths are: ffuf/curl/Python httpx for web;
+PARI/GP, fpylll, gmpy2, SymPy, Z3, PyCryptodome and owiener for crypto;
+pwntools, ROPgadget, ropper, GDB/pwndbg, QEMU user/system and Ghidra for
+pwn/reverse; and Binwalk, ExifTool, pngcheck, Pillow, StegSeek, Steghide,
+Sleuth Kit, TShark, Volatility 3 and John for forensics. The image does not
+bundle a web or password wordlist. The playbooks construct small,
+challenge-derived lists before using ffuf or a password cracker.
+
+Optional extras outside the core image include SageMath, RsaCtfTool,
+roca-detect, cvc5, Foundry, Python web3, REA, ILSpy/ilspycmd, GoReSym,
+Il2CppDumper, Blutter, AFL++, one_gadget, seccomp-tools, bkcrack, zsteg,
+hashcat, outguess, ImageMagick, Aircrack-ng, specialized web scanners,
+and deep-learning frameworks such as PyTorch/Transformers. Their absence
+does not imply the corresponding category is unsupported: each playbook now
+starts with installed inspection tools and identifies where a specialized
+dependency would be needed. This is a source/image contract; run the image
+smoke against a built release digest to verify a specific deployment.

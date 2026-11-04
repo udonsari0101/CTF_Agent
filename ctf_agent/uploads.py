@@ -14,7 +14,9 @@ from fastapi import Body, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .process_lock import ProcessFileLock
-from .storage_budget import StorageBudgetError, get_storage_budget
+from .storage_budget import (
+    StorageBudgetError, get_storage_budget, storage_http_status, storage_io_http_response,
+)
 
 CHUNK_BYTES = 8 * 1024 * 1024
 EXPIRY_SECONDS = 7 * 24 * 3600
@@ -299,13 +301,14 @@ class UploadManager:
             )
         except StorageBudgetError as exc:
             target.unlink(missing_ok=True)
-            raise HTTPException(507, str(exc)) from None
+            raise HTTPException(storage_http_status(exc), str(exc)) from None
         except HTTPException:
             target.unlink(missing_ok=True)
             raise
-        except OSError:
+        except OSError as exc:
             target.unlink(missing_ok=True)
-            raise HTTPException(507, "업로드 임시 파일을 만들 수 없습니다.") from None
+            status, message = storage_io_http_response(exc)
+            raise HTTPException(status, message) from None
         row = self.row(upload_id, user)
         return self.result(row)
 
@@ -381,9 +384,10 @@ class UploadManager:
                     precheck=precheck, db_update=commit,
                 )
             except StorageBudgetError as exc:
-                raise HTTPException(507, str(exc)) from None
-            except OSError:
-                raise HTTPException(507, "청크를 저장하지 못했습니다. 공간을 확인하고 이어서 올려 주세요.") from None
+                raise HTTPException(storage_http_status(exc), str(exc)) from None
+            except OSError as exc:
+                status, message = storage_io_http_response(exc)
+                raise HTTPException(status, message) from None
             return self.result(self.row(upload_id, user))
 
     def finalize(self, upload_id, user):

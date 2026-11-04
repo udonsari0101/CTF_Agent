@@ -25,9 +25,10 @@ from pathlib import Path
 from functools import wraps
 from logging.handlers import RotatingFileHandler
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
@@ -151,7 +152,12 @@ class BodySizeLimit:
             return await self.app(scope, receive, send)
         headers = dict(scope.get("headers", []))
         declared = headers.get(b"content-length", b"")
-        chunk_request = scope.get("path", "").startswith("/api/uploads/") and scope.get("path", "").endswith("/chunks")
+        chunk_path = scope.get("path", "")
+        chunk_request = chunk_path.endswith("/chunks") and (
+            chunk_path.startswith("/api/uploads/")
+            or chunk_path.startswith("/api/transfers/uploads/")
+            or chunk_path.startswith("/api/transfers/direct/invitations/")
+        )
         max_bytes = self.chunk_bytes if chunk_request else self.max_bytes
 
         async def reject(status=413, detail="요청 본문이 너무 큽니다."):
@@ -305,6 +311,15 @@ class WorkspaceInput(BaseModel):
         return normalize_flag_format(value)
 
 
+class TransferUploadInput(BaseModel):
+    size: int = Field(ge=1, le=2**63 - 1)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class TransferImportInput(BaseModel):
+    workspace_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+
 class ChallengeInput(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     category: str = Field(default="", max_length=100)
@@ -402,6 +417,19 @@ class ChallengeRelationInput(BaseModel):
         validation_alias=AliasChoices("related_id", "prerequisite_id"),
         pattern=r"^[0-9a-f]{32}$",
     )
+
+
+class RelatedEvidenceInput(BaseModel):
+    observation: str = Field(default="", max_length=1200)
+    include_flag: bool = False
+
+    @field_validator("observation")
+    @classmethod
+    def safe_observation(cls, value: str) -> str:
+        value = value.strip()
+        if any(ord(char) < 32 and char not in "\n\t" for char in value):
+            raise ValueError("공유할 내용에 허용되지 않는 문자가 있습니다.")
+        return value
 
 
 def normalize_remote_pair(mode: str | None, remote: str) -> tuple[str, str]:
@@ -544,16 +572,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return result
 
     def challenge_relations(db, workspace_id: str, challenge_id: str) -> list[dict]:
-        return [dict(row) for row in db.execute(
-            """SELECT c.id,c.name,c.category,c.status,c.ctfd_id,c.ctfd_url
+        rows = db.execute(
+            """SELECT c.id,c.name,c.category,c.status,c.ctfd_id,c.ctfd_url,
+                      s.observation AS evidence_observation,
+                      s.include_flag AS evidence_include_flag,
+                      s.verified_at AS evidence_verified_at,
+                      s.reapproval_required AS evidence_reapproval_required,
+                      CASE WHEN s.source_challenge_id IS NOT NULL
+                           AND c.status='solved' AND c.updated_at=s.source_updated_at
+                           AND s.reapproval_required=0
+                           THEN 1 ELSE 0 END AS evidence_active,
+                      CASE WHEN s.source_challenge_id IS NOT NULL
+                           AND (c.status<>'solved' OR c.updated_at<>s.source_updated_at)
+                           THEN 1 ELSE 0 END AS evidence_stale,
+                      CASE WHEN c.completion_source='agent' AND c.flag IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM solver_jobs j
+                                WHERE j.workspace_id=c.workspace_id AND j.challenge_id=c.id
+                                  AND j.owner_user_id=? AND j.job_mode='solve'
+                                  AND j.released_ingested=1 AND j.flag_rejected_at IS NULL
+                                  AND j.flag=c.flag
+                           ) THEN 1 ELSE 0 END AS evidence_can_share_flag
                  FROM challenge_relations r
                  JOIN challenges c ON c.id=CASE WHEN r.prerequisite_id=?
                      THEN r.dependent_id ELSE r.prerequisite_id END
                      AND c.workspace_id=r.workspace_id
+                 LEFT JOIN challenge_evidence_shares s
+                   ON s.workspace_id=r.workspace_id
+                  AND s.target_challenge_id=? AND s.source_challenge_id=c.id
                 WHERE r.workspace_id=? AND (r.prerequisite_id=? OR r.dependent_id=?)
                 ORDER BY r.created_at,c.id""",
-            (challenge_id, workspace_id, challenge_id, challenge_id),
-        )]
+            (owner_id(), challenge_id, challenge_id, workspace_id, challenge_id, challenge_id),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def latest_solver_summary(db, workspace_id: str, challenge_id: str) -> dict | None:
         """Return the current owner's newest safe run metadata for list cards."""
@@ -579,10 +630,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ).fetchone()
         if not row:
             return None
+        input_request_kind = None
+        if row["status"] == "needs_input":
+            try:
+                error = json.loads(row["error_json"] or "{}")
+            except (TypeError, ValueError):
+                error = {}
+            code = error.get("code") if isinstance(error, dict) else None
+            input_request_kind = {
+                "ultra_escalation_requested": "ultra_escalation",
+                "remote_input_required": "remote_input",
+            }.get(code, "other")
         result = {
             "account_label": row["account_label"],
             "status": row["status"],
             "created_at": row["created_at"],
+            # Only a fixed classification is needed on list cards. Never copy
+            # the provider's error text or requested connection details here.
+            "input_request_kind": input_request_kind,
             "input_ready_to_retry": remote_input_ready_to_retry(db, row),
             "configuration": {
                 "provider": row["provider"],
@@ -744,7 +809,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
         raw_length = request.headers.get("content-length", "")
-        chunk_request = request.url.path.startswith("/api/uploads/") and request.url.path.endswith("/chunks")
+        chunk_request = request.url.path.endswith("/chunks") and (
+            request.url.path.startswith("/api/uploads/")
+            or request.url.path.startswith("/api/transfers/uploads/")
+            or request.url.path.startswith("/api/transfers/direct/invitations/")
+        )
         request_limit = 8 * 1024 * 1024 if chunk_request else 4 * 1024 * 1024
         if (not _legacy_attachment_post(request.scope)
                 and raw_length.isdigit() and int(raw_length) > request_limit):
@@ -1116,7 +1185,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def clone_challenge(workspace_id: str, challenge_id: str):
         """Create an unsolved, storage-independent copy of one challenge."""
 
-        from .storage_budget import MAX_SQLITE_INTEGER, StorageBudgetError
+        from .storage_budget import (
+            MAX_SQLITE_INTEGER, StorageBudgetError, storage_http_status, storage_io_http_response,
+        )
 
         clone_id, timestamp = uuid.uuid4().hex, now()
         reservation_key = f"challenge-clone:{clone_id}"
@@ -1296,12 +1367,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "복제 중 원본 첨부파일이 변경되었습니다. 다시 시도하세요.",
                 ) from None
             if isinstance(exc, StorageBudgetError):
-                raise HTTPException(507, str(exc)) from None
+                raise HTTPException(storage_http_status(exc), str(exc)) from None
             if isinstance(exc, OSError):
-                raise HTTPException(
-                    507,
-                    "첨부파일 복사에 실패했습니다. 저장 공간과 파일 상태를 확인하세요.",
-                ) from None
+                status, message = storage_io_http_response(exc)
+                raise HTTPException(status, message) from None
             raise
 
         with database() as db:
@@ -1375,6 +1444,64 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             related = challenge_relations(db, workspace_id, challenge_id)
             return {"related_challenges": related, "prerequisites": related}
 
+    @app.put("/api/workspaces/{workspace_id}/challenges/{challenge_id}/relations/{related_id}/evidence", dependencies=[Depends(require_auth)])
+    def share_related_evidence(workspace_id: str, challenge_id: str,
+                               related_id: str, payload: RelatedEvidenceInput):
+        if not payload.observation and not payload.include_flag:
+            raise HTTPException(422, "확인한 관찰 또는 Flag를 선택하세요.")
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            challenge_row(db, workspace_id, challenge_id)
+            source = challenge_row(db, workspace_id, related_id)
+            linked = db.execute(
+                """SELECT 1 FROM challenge_relations WHERE workspace_id=?
+                   AND ((prerequisite_id=? AND dependent_id=?) OR
+                        (prerequisite_id=? AND dependent_id=?)) LIMIT 1""",
+                (workspace_id, challenge_id, related_id, related_id, challenge_id),
+            ).fetchone()
+            if not linked:
+                raise HTTPException(409, "먼저 문제를 연결하세요.")
+            if source["status"] != "solved":
+                raise HTTPException(409, "완료한 문제의 검증된 관찰만 공유할 수 있습니다.")
+            if payload.include_flag:
+                accepted = source["completion_source"] == "agent" and source["flag"] and db.execute(
+                    """SELECT 1 FROM solver_jobs WHERE owner_user_id=? AND workspace_id=?
+                         AND challenge_id=? AND job_mode='solve' AND released_ingested=1
+                         AND flag_rejected_at IS NULL AND flag=? LIMIT 1""",
+                    (owner_id(), workspace_id, related_id, source["flag"]),
+                ).fetchone()
+                if not accepted:
+                    raise HTTPException(409, "검증된 에이전트 풀이 Flag만 공유할 수 있습니다.")
+            db.execute(
+                """INSERT INTO challenge_evidence_shares
+                   (workspace_id,target_challenge_id,source_challenge_id,observation,
+                    include_flag,source_updated_at,verified_by_user_id,verified_at,
+                    reapproval_required)
+                   VALUES(?,?,?,?,?,?,?,?,0)
+                   ON CONFLICT(workspace_id,target_challenge_id,source_challenge_id)
+                   DO UPDATE SET observation=excluded.observation,
+                     include_flag=excluded.include_flag,
+                     source_updated_at=excluded.source_updated_at,
+                     verified_by_user_id=excluded.verified_by_user_id,
+                     verified_at=excluded.verified_at,
+                     reapproval_required=0""",
+                (workspace_id, challenge_id, related_id, payload.observation,
+                 int(payload.include_flag), source["updated_at"], owner_id(), now()),
+            )
+            return {"related_challenges": challenge_relations(db, workspace_id, challenge_id)}
+
+    @app.delete("/api/workspaces/{workspace_id}/challenges/{challenge_id}/relations/{related_id}/evidence", dependencies=[Depends(require_auth)])
+    def stop_related_evidence(workspace_id: str, challenge_id: str, related_id: str):
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            challenge_row(db, workspace_id, challenge_id)
+            db.execute(
+                """DELETE FROM challenge_evidence_shares WHERE workspace_id=?
+                     AND target_challenge_id=? AND source_challenge_id=?""",
+                (workspace_id, challenge_id, related_id),
+            )
+            return {"related_challenges": challenge_relations(db, workspace_id, challenge_id)}
+
     @app.delete("/api/workspaces/{workspace_id}/challenges/{challenge_id}/relations/{prerequisite_id}", dependencies=[Depends(require_auth)])
     @app.delete("/api/workspaces/{workspace_id}/challenges/{challenge_id}/prerequisites/{prerequisite_id}", dependencies=[Depends(require_auth)])
     def remove_relation(workspace_id: str, challenge_id: str, prerequisite_id: str):
@@ -1389,6 +1516,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             if result.rowcount == 0:
                 raise HTTPException(404, "연관 문제를 찾을 수 없습니다.")
+            db.execute(
+                """DELETE FROM challenge_evidence_shares WHERE workspace_id=?
+                     AND ((target_challenge_id=? AND source_challenge_id=?) OR
+                          (target_challenge_id=? AND source_challenge_id=?))""",
+                (workspace_id, challenge_id, prerequisite_id, prerequisite_id, challenge_id),
+            )
             related = challenge_relations(db, workspace_id, challenge_id)
             return {"related_challenges": related, "prerequisites": related}
 
@@ -1661,6 +1794,166 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from .uploads import register_uploads
     register_uploads(app, require_auth, settings, validate_filename, now)
+    from .transfer_uploads import TransferUploadError, TransferUploadManager
+    from .workspace_transfer import (
+        TransferError, export_challenge, export_workspace, import_challenge,
+        import_workspace, lookup_import, preview_bundle,
+    )
+
+    transfer_uploads = TransferUploadManager(settings)
+    app.state.transfer_uploads = transfer_uploads
+    transfer_export_root = settings.data_dir / "workspaces" / ".transfers" / "exports"
+    transfer_export_root.mkdir(parents=True, exist_ok=True)
+
+    @app.exception_handler(TransferUploadError)
+    async def transfer_upload_error(_request: Request, exc: TransferUploadError):
+        status = {
+            "not_found": 404, "owner_inactive": 403, "low_space": 507,
+            "busy": 409, "owner_limit": 429, "wrong_state": 409,
+            "incomplete": 409, "missing_data": 409,
+            "changed_file": 409, "chunk_conflict": 409,
+        }.get(exc.code, 400)
+        return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=status)
+
+    def transfer_error(error: TransferError) -> HTTPException:
+        return HTTPException(422, str(error))
+
+    def transfer_export_file(workspace_id: str, challenge_id: str | None,
+                             include_remote: bool):
+        with app.state.uploads.try_workspace_lock(workspace_id):
+            with database() as db:
+                workspace = workspace_row(db, workspace_id)
+                challenge = challenge_row(db, workspace_id, challenge_id) if challenge_id else None
+            destination = transfer_export_root / f"{uuid.uuid4().hex}.zip"
+            try:
+                if challenge is None:
+                    export_workspace(
+                        settings, app.state.storage_layout, owner_id(),
+                        workspace_id, destination, include_remote=include_remote,
+                    )
+                    name = workspace["name"]
+                else:
+                    export_challenge(
+                        settings, app.state.storage_layout, owner_id(),
+                        workspace_id, challenge_id, destination,
+                        include_remote=include_remote,
+                    )
+                    name = challenge["name"]
+            except TransferError as exc:
+                destination.unlink(missing_ok=True)
+                raise transfer_error(exc) from None
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")[:90] or "ctf-agent"
+        return FileResponse(
+            destination, filename=f"{safe_name}-transfer.zip", media_type="application/zip",
+            background=BackgroundTask(destination.unlink, missing_ok=True),
+        )
+
+    @app.get("/api/workspaces/{workspace_id}/transfer", dependencies=[Depends(require_auth)])
+    def download_workspace_transfer(workspace_id: str, include_remote: bool = False):
+        return transfer_export_file(workspace_id, None, include_remote)
+
+    @app.get("/api/workspaces/{workspace_id}/challenges/{challenge_id}/transfer",
+             dependencies=[Depends(require_auth)])
+    def download_challenge_transfer(workspace_id: str, challenge_id: str,
+                                    include_remote: bool = False):
+        return transfer_export_file(workspace_id, challenge_id, include_remote)
+
+    @app.post("/api/transfers/uploads", status_code=201,
+              dependencies=[Depends(require_auth)])
+    def create_transfer_upload(payload: TransferUploadInput):
+        return transfer_uploads.create(owner_id(), payload.size, payload.sha256)
+
+    @app.get("/api/transfers/uploads/{upload_id}", dependencies=[Depends(require_auth)])
+    def get_transfer_upload(upload_id: str):
+        return transfer_uploads.status(owner_id(), upload_id)
+
+    @app.put("/api/transfers/uploads/{upload_id}/chunks",
+             dependencies=[Depends(require_auth)])
+    def put_transfer_chunk(upload_id: str, offset: int,
+                           content: bytes = Body(media_type="application/octet-stream"),
+                           chunk_sha256: str | None = Header(default=None, alias="X-Chunk-SHA256")):
+        return transfer_uploads.append(owner_id(), upload_id, offset, content, chunk_sha256)
+
+    @app.post("/api/transfers/uploads/{upload_id}/finalize",
+              dependencies=[Depends(require_auth)])
+    def finalize_transfer_upload(upload_id: str):
+        return transfer_uploads.finalize(owner_id(), upload_id)
+
+    @app.get("/api/transfers/uploads/{upload_id}/preview",
+             dependencies=[Depends(require_auth)])
+    def preview_transfer_upload(upload_id: str, workspace_id: str | None = None):
+        archive = transfer_uploads.ready_path(owner_id(), upload_id)
+        try:
+            result = preview_bundle(
+                archive, settings=settings, owner_user_id=owner_id(),
+                destination_workspace_id=workspace_id,
+            )
+        except TransferError as exc:
+            raise transfer_error(exc) from None
+        if result["scope"] == "challenge" and not workspace_id:
+            raise HTTPException(422, "문제를 가져올 작업공간을 선택하세요.")
+        if result["scope"] == "workspace" and workspace_id:
+            raise HTTPException(422, "작업공간 묶음은 새 작업공간으로 가져오세요.")
+        return result
+
+    @app.post("/api/transfers/uploads/{upload_id}/import",
+              dependencies=[Depends(require_auth)])
+    def import_transfer_upload(upload_id: str, payload: TransferImportInput):
+        try:
+            scope = "challenge" if payload.workspace_id else "workspace"
+            previous = lookup_import(
+                settings, owner_id(), upload_id, scope=scope,
+                destination_workspace_id=payload.workspace_id,
+            )
+            if previous is not None:
+                return previous
+            with transfer_uploads.import_slot(owner_id(), upload_id) as archive:
+                preview = preview_bundle(
+                    archive, settings=settings, owner_user_id=owner_id(),
+                    destination_workspace_id=payload.workspace_id,
+                )
+                if preview["sufficient_space"] is False:
+                    raise HTTPException(507, "가져올 파일을 저장할 공간이 부족합니다.")
+                if preview["scope"] == "challenge":
+                    if not payload.workspace_id:
+                        raise HTTPException(422, "문제를 가져올 작업공간을 선택하세요.")
+                    with app.state.uploads.try_workspace_lock(payload.workspace_id):
+                        result = import_challenge(
+                            settings, app.state.storage_layout, owner_id(),
+                            payload.workspace_id, archive, source_upload_id=upload_id,
+                        )
+                else:
+                    if payload.workspace_id:
+                        raise HTTPException(422, "작업공간 묶음은 새 작업공간으로 가져오세요.")
+                    result = import_workspace(
+                        settings, app.state.storage_layout, owner_id(), archive,
+                        source_upload_id=upload_id,
+                    )
+                return result
+        except TransferUploadError as exc:
+            if exc.code in {"busy", "wrong_state", "not_found"}:
+                previous = lookup_import(
+                    settings, owner_id(), upload_id, scope=scope,
+                    destination_workspace_id=payload.workspace_id,
+                )
+                if previous is not None:
+                    return previous
+            raise
+        except TransferError as exc:
+            raise transfer_error(exc) from None
+
+    @app.delete("/api/transfers/uploads/{upload_id}",
+                dependencies=[Depends(require_auth)])
+    def cancel_transfer_upload(upload_id: str):
+        transfer_uploads.cancel(owner_id(), upload_id)
+        return {"ok": True}
+
+    from .direct_transfer import register_direct_transfer
+    register_direct_transfer(app, require_auth, settings, owner_id, require_workspace_owner)
+
     from .telegram import register_telegram
     register_telegram(app, require_auth, settings, database)
     from .ctfd_submit import register_ctfd_submit

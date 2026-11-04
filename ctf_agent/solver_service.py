@@ -401,13 +401,54 @@ class SolverService:
         pids_warning = bool(
             self.web_pids_limit and estimated_web_pids >= self.web_pids_limit
         )
-        resource_warning = demand > self.recommended_concurrent
-        warning = resource_warning or pids_warning
+        baseline_warning = demand > self.recommended_concurrent
+
+        # These are observations of the host/WSL system, not per-solver peak
+        # measurements. A failed or absent monitor must remain visibly unknown.
+        monitor = getattr(getattr(self.app, "state", None), "resource_monitor", None)
+        try:
+            sample = monitor.snapshot() if callable(getattr(monitor, "snapshot", None)) else {}
+        except Exception:
+            sample = {}
+        if not isinstance(sample, dict):
+            sample = {}
+        cpu = sample.get("cpu_percent")
+        if isinstance(cpu, bool) or not isinstance(cpu, (int, float)) or not 0 <= cpu <= 100:
+            cpu = None
+        used = sample.get("memory_used_bytes")
+        total = sample.get("memory_total_bytes")
+        if (
+            isinstance(used, bool) or not isinstance(used, int)
+            or isinstance(total, bool) or not isinstance(total, int)
+            or total <= 0 or used < 0 or used > total
+        ):
+            memory_available = None
+        else:
+            memory_available = total - used
+        pressure_warning = bool(
+            (cpu is not None and cpu >= 90)
+            or (memory_available is not None and memory_available < 6 * 1024**3)
+        )
+        warning = baseline_warning or pids_warning or pressure_warning
         limited = bool(
             capacity["hard_max"]
             and max(self.baseline_concurrent, capacity["open_jobs"])
             > capacity["hard_max"]
         )
+        messages = []
+        if baseline_warning:
+            messages.append(
+                f"현재 풀의 수요가 권장 동시 실행 {self.recommended_concurrent}개를 넘었습니다. "
+                f"약 {demand * 2}개 논리 CPU와 {demand * 6} GiB 메모리를 기준으로 확장합니다."
+            )
+        if pids_warning:
+            messages.append(f"웹 PID 제한 {self.web_pids_limit}개에 근접하여 확장이 실패할 수 있습니다.")
+        if cpu is not None and cpu >= 90:
+            messages.append(f"시스템 CPU 사용률이 {cpu:.0f}%입니다.")
+        if memory_available is not None and memory_available < 6 * 1024**3:
+            messages.append(
+                f"시스템 가용 메모리가 {memory_available / 1024**3:.1f} GiB입니다."
+            )
         return {
             **capacity,
             "recommended": self.recommended_concurrent,
@@ -418,27 +459,14 @@ class SolverService:
             "estimated_web_pids": estimated_web_pids,
             "web_pids_limit": self.web_pids_limit,
             "web_pids_warning": pids_warning,
+            "resource_measurement": "measured" if cpu is not None or memory_available is not None else "unmeasured",
+            "resource_scope": "system",
+            "resource_cpu_percent": cpu,
+            "resource_memory_available_bytes": memory_available,
+            "resource_pressure_warning": pressure_warning,
             "warning": warning,
             "limited": limited,
-            "warning_message": (
-                " ".join(
-                    part
-                    for part in (
-                        (
-                            f"현재 풀이 수요는 권장 동시 실행 {self.recommended_concurrent}개를 넘습니다. "
-                            f"약 {demand * 2}개 논리 CPU와 {demand * 6} GiB 메모리를 기준으로 확장합니다."
-                            if resource_warning
-                            else ""
-                        ),
-                        (
-                            f"웹 PID 제한 {self.web_pids_limit}개에 근접해 확장이 실패할 수 있습니다."
-                            if pids_warning
-                            else ""
-                        ),
-                    )
-                    if part
-                )
-            ),
+            "warning_message": " ".join(messages),
         }
 
     def _autoscaler_snapshot(self) -> dict[str, Any]:
@@ -509,8 +537,12 @@ class SolverService:
             if telegram(*telegram_args) is False:
                 return False
         submit = getattr(self.app.state, "ctfd_auto_submit_flag", None)
-        if callable(submit) and submit(owner, workspace, challenge, flag, "agent") is False:
-            return False
+        if callable(submit):
+            submit_args = (owner, workspace, challenge, flag, "agent")
+            if job_id is not None:
+                submit_args += (job_id,)
+            if submit(*submit_args) is False:
+                return False
         return True
 
     def _writeup_committed(

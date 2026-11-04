@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $installer = Join-Path $PSScriptRoot 'installer\install.sh'
 $stateFile = Join-Path $env:LOCALAPPDATA 'CTF Agent\install.json'
-$minimumFreeBytes = 15GB
+$minimumFreeBytes = 5GB
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw 'Release archive is incomplete.' }
 $databaseDiskHelper = Join-Path $PSScriptRoot 'DatabaseDisk.ps1'
 if (-not (Test-Path -LiteralPath $databaseDiskHelper -PathType Leaf)) { throw 'Release archive is incomplete.' }
@@ -9,6 +9,9 @@ if (-not (Test-Path -LiteralPath $databaseDiskHelper -PathType Leaf)) { throw 'R
 $dockerDesktopHelper = Join-Path $PSScriptRoot 'DockerDesktop.ps1'
 if (-not (Test-Path -LiteralPath $dockerDesktopHelper -PathType Leaf)) { throw 'Release archive is incomplete: DockerDesktop.ps1 is missing.' }
 . $dockerDesktopHelper
+$dockerDiskHelper = Join-Path $PSScriptRoot 'DockerDisk.ps1'
+if (-not (Test-Path -LiteralPath $dockerDiskHelper -PathType Leaf)) { throw 'Release archive is incomplete: DockerDisk.ps1 is missing.' }
+. $dockerDiskHelper
 
 function Ask-YesNo([string]$question, [bool]$default = $true) {
     $hint = if ($default) { 'Y/n' } else { 'y/N' }
@@ -251,7 +254,7 @@ function Select-DatabaseVhd([string]$savedPath, [string]$requestedPath = '') {
         throw 'Existing VHDX was left untouched. Choose a new file to create a new database.'
     }
     if ((Get-HostVolumeFree $full) -lt $minimumFreeBytes) {
-        throw 'The database drive needs at least 15 GB free before installation.'
+        throw 'The database drive needs at least 5 GiB free before installation.'
     }
     return $full
 }
@@ -409,7 +412,7 @@ function Get-WslCandidateInfo([string]$name, [hashtable]$versions) {
 
 function Get-WslInfo([string]$name, [hashtable]$versions) {
     $probe = @'
-import json,os,shutil,sys
+import json,os,pathlib,shutil,sys
 data={}
 try:
     for line in open('/etc/os-release',encoding='utf-8'):
@@ -418,9 +421,17 @@ try:
             data[key]=value.strip('"')
 except OSError:
     pass
+native_docker=False
+for process in pathlib.Path('/proc').glob('[0-9]*/comm'):
+    try:
+        if process.read_text(encoding='ascii').strip()=='dockerd':
+            native_docker=True
+            break
+    except (OSError,UnicodeError):
+        pass
 print(json.dumps({'id':data.get('ID',''),'version':data.get('VERSION_ID',''),
                   'home':os.path.expanduser('~'),'python':list(sys.version_info[:2]),
-                  'bash':bool(shutil.which('bash'))}))
+                  'bash':bool(shutil.which('bash')),'native_docker':native_docker}))
 '@
     $probeResult = Invoke-WslPython $name $probe
     $result = $null
@@ -445,11 +456,13 @@ print(json.dumps({'id':data.get('ID',''),'version':data.get('VERSION_ID',''),
             $score = if ($ubuntuVersion -ge [version]'24.04') { 100 } else { 90 }
         }
         elseif ($result.id -eq 'debian') { $score = 80 }
+        if ($result.native_docker) { $score = 0 }
     }
     $reason = if ($version -eq 0) { 'WSL version could not be verified' }
         elseif ($version -ne 2) { 'WSL 2 required' }
         elseif (-not $result) { "Python probe failed (exit $($probeResult.ExitCode)); try Install.cmd as administrator under this same Windows account" }
         elseif (-not $result.bash) { 'bash unavailable' }
+        elseif ($result.native_docker) { 'A native Docker Engine is running here. Use a separate WSL distro (choose N); existing containers will be left running.' }
         elseif ($score -eq 0) { 'Python 3.10+ required' }
         else { 'recommended' }
     return [pscustomobject]@{Name=$name;Version=$version;Score=$score;Reason=$reason;
@@ -467,6 +480,7 @@ function Get-OnlineUbuntu {
 
 function Install-WslDistribution([string]$name) {
     Write-Host "Installing WSL distribution: $name"
+    Write-Host 'A Linux window may open for first-run account setup. After creating the account, type exit in that Linux window to continue this installer.'
     $process = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wsl.exe') `
         -ArgumentList @('--install', '--distribution', $name) -Verb RunAs -Wait -PassThru
     if ($process.ExitCode -ne 0) {
@@ -540,7 +554,8 @@ function Get-HostVolumeFree([string]$path) {
     return [int64](Get-PSDrive -Name $root.Substring(0, 1) -ErrorAction Stop).Free
 }
 
-function Assert-StorageCapacity([string]$distro, [string]$linuxHome) {
+function Assert-StorageCapacity([string]$distro, [string]$linuxHome,
+    [int64]$estimatedWriteBytes = 0) {
     $diskProbe = @'
 import json,os,shutil,sys
 p=sys.argv[1]
@@ -562,12 +577,30 @@ print(json.dumps({'free':shutil.disk_usage(p).free,'existing':p}))
     }
     $hostFree = Get-HostVolumeFree ([string]$registered[0].BasePath)
     Write-Host ('WSL free: {0:N1} GB; Windows backing volume free: {1:N1} GB' -f ($wslFree / 1GB), ($hostFree / 1GB))
-    if ($wslFree -lt $minimumFreeBytes -or $hostFree -lt $minimumFreeBytes) {
-        throw 'At least 15 GB free space is required both inside WSL and on its Windows backing volume.'
+    $required = $minimumFreeBytes + $estimatedWriteBytes
+    if ($wslFree -lt $required -or $hostFree -lt $required) {
+        throw ('At least {0:g} GiB free is required inside WSL and on its Windows backing volume to leave 5 GiB after estimated installation writes.' -f ($required / 1GB))
     }
     if ((Get-HostVolumeFree $env:SystemDrive) -lt $minimumFreeBytes) {
-        Write-Warning 'The Windows system drive has less than 15 GB free. Docker Desktop may need more space there.'
+        Write-Warning 'The Windows system drive has less than 5 GiB free. Docker Desktop may need more space there.'
     }
+}
+
+function Get-EstimatedImageWorkBytes {
+    # An already installed copy of this exact release has cached toolchain
+    # layers. Otherwise leave room for a cold pull and extracted layers.
+    $revisionFile = Join-Path $PSScriptRoot 'COMMIT'
+    if (-not (Test-Path -LiteralPath $revisionFile -PathType Leaf)) { return [int64]10GB }
+    $revision = (Get-Content -LiteralPath $revisionFile -Raw).Trim()
+    if ($revision -notmatch '^[0-9a-f]{40}$') { return [int64]10GB }
+    $docker = Get-DesktopDockerCli
+    $result = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
+        'image', 'inspect', 'ctf-agent-local:latest',
+        '--format={{index .Config.Labels "org.opencontainers.image.revision"}}') 8
+    if ($result.ExitCode -eq 0 -and $result.Stdout.Trim() -eq $revision) {
+        return [int64]2GB
+    }
+    return [int64]10GB
 }
 
 function Get-DockerDesktopExecutable {
@@ -702,7 +735,7 @@ if ($separateDatabase) {
     if (-not $saved.db_vhd) { Assert-FreshDatabaseHome $distro $linuxHome }
     $dbVhd = Select-DatabaseVhd ([string]$saved.db_vhd) $requestedDatabaseVhd
     if ((Get-HostVolumeFree $dbVhd) -lt $minimumFreeBytes) {
-        throw 'The database drive needs at least 15 GB free before installation.'
+        throw 'The database drive needs at least 5 GiB free before installation.'
     }
     $databaseMount = Get-DatabaseMountPath
     $databasePath = "$databaseMount/Database/CTF_Agent"
@@ -721,6 +754,11 @@ $loginDefault = -not ($saved -and $saved.authMode -eq 'nologin')
 $requireLogin = Ask-YesNo 'Require account login on this computer?' $loginDefault
 $authMode = if ($requireLogin) { 'password' } else { 'nologin' }
 Ensure-DockerDesktop $distro
+# This second check includes pull and temporary layer headroom; the earlier
+# check only establishes that choosing a location is feasible.
+$imageWorkBytes = Get-EstimatedImageWorkBytes
+Assert-StorageCapacity $distro $linuxHome $imageWorkBytes
+Assert-DockerDesktopImageCapacity $imageWorkBytes
 if ($separateDatabase) {
     $dbUuid = Initialize-DatabaseVhd $distro $dbVhd $dbUuid
     Write-Host "Database filesystem: $dbVhd -> $databasePath"
@@ -776,7 +814,7 @@ $installResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
 if ($installResult.ExitCode -ne 0) { throw "Local installation failed (exit code $($installResult.ExitCode))." }
 $stateDir = Split-Path -Parent $stateFile
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
-foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1', 'DatabaseDisk.ps1', 'DockerDesktop.ps1')) {
+foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1', 'DatabaseDisk.ps1', 'DockerDesktop.ps1', 'DockerDisk.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $stateDir $name) -Force
 }
 $state = @{distro=$distro;home=$linuxHome;autoStart=$autoStart;

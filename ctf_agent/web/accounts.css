@@ -7,9 +7,12 @@
 .account-management .notice:empty, .account-management .notice[hidden] { display: none; margin: 0; padding: 0; border: 0; }
 .account-list .model-help { color: var(--muted); font-size: .85rem; }
 .account-list .model-help p { margin: .35rem 0; }
-.account-list .quota-limited { border-color: #6f3038; box-shadow: inset 2px 0 #ff7382; }
+.account-list .quota-limited, .account-list .quota-exhausted { border-color: #6f3038; box-shadow: inset 2px 0 #ff7382; }
+.account-list .quota-stale { border-color: #6b5933; box-shadow: inset 2px 0 #e7ba6f; }
 .account-list .quota-alert, .account-list .quota-reason { color: #ff9da7; }
-.account-list .quota-bucket.quota-limited { border-color: #71343d; background: #100609; }
+.account-list .auth-refresh-warning { color: #f3c38e; font-size: .85rem; }
+.account-list .quota-bucket.quota-limited, .account-list .quota-bucket.quota-exhausted { border-color: #71343d; background: #100609; }
+.account-list .quota-bucket.quota-stale { border-color: #6b5933; background: #110e08; }
 .account-list .quota-window-exhausted { color: #ff9da7; }
 .account-list progress.quota-window-exhausted { accent-color: #ff7382; }
 .account-list progress.quota-window-exhausted::-webkit-progress-value { background: #ff7382; }
@@ -19,6 +22,8 @@
 .account-list .model-fields select { width: 100%; margin: .25rem 0 0; }
 .account-list .auth-upload { padding-top: .8rem; border-top: 1px solid var(--border); margin-top: .8rem; }
 .account-list .auth-upload label { flex: 1 1 210px; }
+.account-list form.auth-upload { align-items: flex-end; }
+.account-list form.auth-upload button { align-self: flex-end; flex: 0 0 auto; min-height: 42px; }
 .account-list .claude-login-guide { margin: .8rem 0; padding: .8rem 1rem; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
 .account-list .claude-login-guide p { margin: .35rem 0; }
 .account-list .claude-login-link { display: flex; align-items: center; flex-wrap: wrap; gap: .6rem; min-width: 0; }
