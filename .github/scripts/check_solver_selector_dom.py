@@ -110,12 +110,22 @@ document.querySelector('#result').textContent=initial&&poll&&staleBlocked&&align
         page = root / "index.html"
         page.write_text(fixture, encoding="utf-8")
         cmd = [browser, "--headless=new", "--disable-gpu", "--no-first-run",
-               "--disable-extensions", f"--user-data-dir={root / 'profile'}",
-               "--virtual-time-budget=1000", "--dump-dom", page.as_uri()]
+               "--disable-extensions", "--disable-dev-shm-usage",
+               "--virtual-time-budget=1000", "--dump-dom"]
         if sys.platform != "win32":
             cmd.append("--no-sandbox")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                                encoding="utf-8", errors="replace")
+        for attempt in range(2):
+            try:
+                result = subprocess.run(
+                    [*cmd, f"--user-data-dir={root / f'profile-{attempt}'}", page.as_uri()],
+                    capture_output=True, text=True, timeout=45,
+                    encoding="utf-8", errors="replace",
+                )
+                break
+            except subprocess.TimeoutExpired:
+                if attempt:
+                    print("Chrome did not finish the selector fixture after one retry")
+                    return 1
         if result.returncode != 0 or '<pre id="result">PASS</pre>' not in result.stdout:
             print(result.stdout[-3000:])
             print(result.stderr[-1000:])
