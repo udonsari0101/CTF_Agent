@@ -21,6 +21,9 @@ deploy/*
 !.github/scripts/
 .github/scripts/*
 !.github/scripts/remote-rollout.sh
+!scripts/
+scripts/*
+!scripts/repair_historical_writeups.py
 !ctf_agent/
 !ctf_agent/**
 **/__pycache__/

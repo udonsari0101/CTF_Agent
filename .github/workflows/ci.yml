@@ -181,6 +181,10 @@ jobs:
         run: python .github/scripts/check_writeup_ingest_guard.py
       - name: Check existing write-up audit
         run: python .github/scripts/check_existing_writeup_audit.py
+      - name: Check one-way write-up migration
+        run: python .github/scripts/check_writeup_migration.py
+      - name: Check historical write-up maintenance
+        run: python .github/scripts/check_repair_historical_writeups.py
       - name: Check storage diagnostics and error mapping
         run: python .github/scripts/check_storage_budget_diagnostics.py
       - name: Check solver selector DOM stability
@@ -342,6 +346,7 @@ jobs:
           required = {
               "DockerDesktop.ps1", "DockerDisk.ps1", "installer/storage_control.py",
               "app/Dockerfile.local-runtime", "app/deploy/local_runtime.py",
+              "app/scripts/repair_historical_writeups.py",
               "app/deploy/local-seccomp.json", "app/deploy/local-seccomp.README.md",
               "app/deploy/moby-profiles-LICENSE",
           }

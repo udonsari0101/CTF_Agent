@@ -169,9 +169,11 @@ class WriteupStore:
         if not required.issubset(columns):
             return
 
-        # Keep the most recent durable result for each challenge.  Existing
-        # notes are deliberately left untouched because an older release may
-        # have stored either user text or a generated write-up there.
+        # Backfill only missing canonical write-ups from the most recent
+        # durable job. A later edit or cleanup of a canonical write-up must
+        # never be replaced by an older solver result on application restart.
+        # Existing notes are deliberately left untouched because an older
+        # release may have stored either user text or a generated write-up there.
         db.execute(
             """WITH ranked AS (
                    SELECT challenge_id,workspace_id,writeup_markdown,
@@ -192,10 +194,7 @@ class WriteupStore:
                             AND r.challenge_id=c.id
                             AND r.position=1
                WHERE c.status='solved' AND c.completion_source='agent'
-               ON CONFLICT(challenge_id) DO UPDATE SET
-                   markdown=excluded.markdown,
-                   updated_at=excluded.updated_at
-               WHERE challenge_writeups.markdown<>excluded.markdown"""
+               ON CONFLICT(challenge_id) DO NOTHING"""
         )
 
     def fields(

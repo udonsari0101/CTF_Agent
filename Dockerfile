@@ -25,6 +25,7 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Seoul
 WORKDIR /app
 COPY ctf_agent ./ctf_agent
+COPY --chown=0:0 --chmod=0444 scripts/repair_historical_writeups.py /app/scripts/repair_historical_writeups.py
 COPY --chown=0:0 --chmod=0444 deploy/production-update.py /app/deploy/production-update.py
 COPY --chown=0:0 --chmod=0444 .github/scripts/remote-rollout.sh /app/deploy/remote-rollout.sh
 USER 10001:10001

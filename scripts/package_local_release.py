@@ -35,6 +35,7 @@ FIXED_APP_FILES = {
     "deploy/production-update.py",
     "deploy/bootstrap-production-update.sh",
     "deploy/PRODUCTION_UPDATE.md",
+    "scripts/repair_historical_writeups.py",
     ".github/scripts/remote-rollout.sh",
 }
 INSTALLER_FILES = {
