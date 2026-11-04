@@ -26,17 +26,32 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     # The CI container uses disposable tmpfs mounts for the solver's writable
     # paths. Ghidra resolves the image user's home from passwd, not $HOME.
     Path("/data/config/home").mkdir(parents=True, mode=0o700, exist_ok=True)
+    data_root = root / "data"
+    # Production's /data mount is root-owned and not writable at its top level
+    # by the web UID. Seed only the writable directories created by storage
+    # initialization, then make the root itself non-writable during app boot.
+    for subdir in (
+        "config", "workspaces", "workspace_files", "runtime",
+        "claude-runtime", "solver-exchange", "solver-scratch",
+    ):
+        (data_root / subdir).mkdir(parents=True, exist_ok=True)
+    (data_root / ".storage-budget.lock").touch()
     password = secrets.token_urlsafe(24)
     os.environ.update({
-        "CTF_DATA_DIR": str(root / "data"),
+        "CTF_DATA_DIR": str(data_root),
         "CTF_DB_DIR": str(root / "database"),
-        "CTF_CONFIG_DIR": str(root / "config"),
+        "CTF_CONFIG_DIR": str(data_root / "config"),
         "CTF_LOG_DIR": str(root / "logs"),
         "CTF_BOOTSTRAP_PASSWORD": password,
         "CTF_PUBLIC_ORIGIN": "https://testserver",
         "CTF_COOKIE_SECURE": "true",
     })
-    with TestClient(create_app(), base_url="https://testserver") as client:
+    data_root.chmod(0o500)
+    try:
+        app = create_app()
+    finally:
+        data_root.chmod(0o700)
+    with TestClient(app, base_url="https://testserver") as client:
         # The disposable web-only smoke container has no solver worker. A
         # release must therefore refuse readiness while ordinary authenticated
         # routes remain testable; Compose readiness becomes 200 only after the

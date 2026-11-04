@@ -42,6 +42,26 @@ class BundleUploadTests(unittest.TestCase):
             warnings.simplefilter("ignore", ResourceWarning)
             gc.collect()
 
+    def test_staging_avoids_nonwritable_data_root(self):
+        self.assertEqual(
+            self.manager.root,
+            self.settings.data_dir / "workspaces" / ".transfers" / "uploads",
+        )
+        self.assertFalse((self.settings.data_dir / ".transfer_uploads").exists())
+
+    def test_existing_staging_directory_is_preserved_for_resume(self):
+        legacy_root = self.settings.data_dir / ".transfer_uploads"
+        legacy_root.mkdir()
+        first = TransferUploadManager(self.settings)
+        self.assertEqual(first.root, legacy_root)
+        upload_id = first.create(self.owner, 6)["upload_id"]
+        first.append(self.owner, upload_id, 0, b"abc")
+        restarted = TransferUploadManager(self.settings)
+        self.assertEqual(restarted.root, legacy_root)
+        self.assertEqual(restarted.status(self.owner, upload_id)["offset"], 3)
+        restarted.append(self.owner, upload_id, 3, b"def")
+        self.assertEqual(restarted.finalize(self.owner, upload_id)["offset"], 6)
+
     def test_resume_finalize_and_import_slot(self):
         payload = b"abcdef"
         digest = hashlib.sha256(payload).hexdigest()

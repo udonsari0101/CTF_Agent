@@ -82,6 +82,7 @@ git clone https://github.com/udonsari0101/CTF_Agent.git ~/CTF_Agent && cd ~/CTF_
 - **도구 사용과 실패 분석:** [EnIGMA](https://proceedings.mlr.press/v267/abramovich25a.html)(대화형 도구와 실제 출력), [PwnAgent](https://link.springer.com/article/10.1186/s42400-026-00649-5)(디버거 피드백), [Reveree](https://arxiv.org/html/2609.01185)(리버싱 단계별 진척), [A Second Look](https://arxiv.org/html/2605.21497)(조정 구조의 시간·비용 균형).
 - **평가 설계:** [Baselines Before Architecture](https://arxiv.org/html/2607.13085)([재현 자료](https://github.com/krodalabs/coding-agent-research-artifact))는 같은 모델·예산의 기본 CLI 대조군 필요성을 보여줍니다. 과거 XBOW 웹 실험 수치를 일반 CTF 성능으로 보지 않습니다. [CTFusion](https://github.com/kaist-hacking/CTFusion)은 격리된 실전 대회 비교를, [CTF-ABACUS](https://arxiv.org/html/2608.26237)는 Flag 출처 감사를 참고하게 합니다.
 - **공개 평가 자료:** [NYU CTF Bench](https://github.com/NYU-LLM-CTF/NYU_CTF_Bench)는 공개 개발/시험 분할, [Cybench](https://github.com/andyzorigin/cybench)는 부분 과제, [CTFTiny](https://github.com/NYU-LLM-CTF/CTFTiny)는 작은 회귀 확인에 쓸 수 있습니다. [CTF-Dojo](https://proceedings.mlr.press/v306/zhuo26c.html)의 보고 개선치는 모델 학습 결과이지 실행 하네스 효과가 아닙니다. 공개 정답은 학습이나 검색으로 알려졌을 수 있으므로 향후 실전 결과는 별도로 보고해야 합니다.
+
 ## 출처와 반영 항목
 
 아래 표는 실제 탑재한 도구·프로토콜 연동과 설계 비교를 구분합니다. CTF Agent의 작업 조정·평가 코드는 독립적으로 구현했으며, 인용한 외부 에이전트의 코드를 복사하지 않았습니다. 평가 도구가 준비된 것과 모델 벤치마크가 끝난 것은 다릅니다.

@@ -52,7 +52,16 @@ def _directory(path: Path) -> None:
 class TransferUploadManager:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.root = Path(settings.data_dir) / ".transfer_uploads"
+        # Production mounts /data root-owned (0750) so the web UID cannot
+        # create new entries directly beneath it. StorageLayout initializes
+        # the writable workspaces directory before this manager is constructed.
+        # Keep an existing v0.4.30 staging tree in place so interrupted uploads
+        # can still be resumed after upgrading.
+        legacy_root = Path(settings.data_dir) / ".transfer_uploads"
+        self.root = (
+            legacy_root if legacy_root.exists() or legacy_root.is_symlink()
+            else Path(settings.data_dir) / "workspaces" / ".transfers" / "uploads"
+        )
         self.lock_root = Path(settings.config_dir) / ".locks" / "transfer_uploads"
         _directory(self.root)
         _directory(self.lock_root)
