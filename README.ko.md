@@ -82,3 +82,16 @@ git clone https://github.com/udonsari0101/CTF_Agent.git ~/CTF_Agent && cd ~/CTF_
 - **도구 사용과 실패 분석:** [EnIGMA](https://proceedings.mlr.press/v267/abramovich25a.html)(대화형 도구와 실제 출력), [PwnAgent](https://link.springer.com/article/10.1186/s42400-026-00649-5)(디버거 피드백), [Reveree](https://arxiv.org/html/2609.01185)(리버싱 단계별 진척), [A Second Look](https://arxiv.org/html/2605.21497)(조정 구조의 시간·비용 균형).
 - **평가 설계:** [Baselines Before Architecture](https://arxiv.org/html/2607.13085)([재현 자료](https://github.com/krodalabs/coding-agent-research-artifact))는 같은 모델·예산의 기본 CLI 대조군 필요성을 보여줍니다. 과거 XBOW 웹 실험 수치를 일반 CTF 성능으로 보지 않습니다. [CTFusion](https://github.com/kaist-hacking/CTFusion)은 격리된 실전 대회 비교를, [CTF-ABACUS](https://arxiv.org/html/2608.26237)는 Flag 출처 감사를 참고하게 합니다.
 - **공개 평가 자료:** [NYU CTF Bench](https://github.com/NYU-LLM-CTF/NYU_CTF_Bench)는 공개 개발/시험 분할, [Cybench](https://github.com/andyzorigin/cybench)는 부분 과제, [CTFTiny](https://github.com/NYU-LLM-CTF/CTFTiny)는 작은 회귀 확인에 쓸 수 있습니다. [CTF-Dojo](https://proceedings.mlr.press/v306/zhuo26c.html)의 보고 개선치는 모델 학습 결과이지 실행 하네스 효과가 아닙니다. 공개 정답은 학습이나 검색으로 알려졌을 수 있으므로 향후 실전 결과는 별도로 보고해야 합니다.
+## 출처와 반영 항목
+
+아래 표는 실제 탑재한 도구·프로토콜 연동과 설계 비교를 구분합니다. CTF Agent의 작업 조정·평가 코드는 독립적으로 구현했으며, 인용한 외부 에이전트의 코드를 복사하지 않았습니다. 평가 도구가 준비된 것과 모델 벤치마크가 끝난 것은 다릅니다.
+
+| 출처 | 반영·비교한 내용 | 이 저장소의 위치 |
+| --- | --- | --- |
+| [CTFd](https://github.com/CTFd/CTFd) | CTFd 호환 API로 문제·첨부파일을 가져오고 나중에 동기화하며, 선택적으로 Flag를 제출합니다. | [CTFd 클라이언트](ctf_agent/ctfd.py)와 [제출 작업자](ctf_agent/ctfd_submit.py). 프로토콜 직접 연동이며 자동 제출은 기본적으로 꺼져 있습니다. |
+| [Ghidra](https://github.com/NationalSecurityAgency/ghidra)·[JADX](https://github.com/skylot/jadx) | solver 이미지에 네이티브 및 Android/DEX용 헤드리스 디컴파일 명령을 제공합니다. | [도구 이미지](Dockerfile.toolchain)와 [이미지 작동 검사](deploy/image-smoke.py). 상위 도구를 설치했으며 에이전트 구현을 가져오지는 않았습니다. |
+| [Pwndbg](https://github.com/pwndbg/pwndbg) | Pwn 문제에서 GDB 기반 바이너리 분석을 지원합니다. | [도구 이미지](Dockerfile.toolchain)와 [이미지 작동 검사](deploy/image-smoke.py). 상위 도구를 설치했습니다. |
+| [ctfsolver](https://github.com/hongyime/ctfsolver) | CTFd 문제를 도구가 준비된 격리 에이전트 컨테이너에 전달하는 흐름을 비교했습니다. | [CTFd 클라이언트](ctf_agent/ctfd.py)와 [풀이 작업자](ctf_agent/solver_worker.py). 독립적인 작업 흐름이며 상위 에이전트 코드를 가져오지 않았습니다. |
+| [CTFusion](https://github.com/kaist-hacking/CTFusion) | 독립 시도와 로컬 Flag 발견·공식 CTFd 제출의 분리를 평가 기준에 반영했습니다. | [벤치마크 절차](docs/benchmarking/protocol.md)와 [제출 작업자](ctf_agent/ctfd_submit.py). 설계 참고이며 실전 벤치마크 결과를 주장하지 않습니다. |
+| [Baselines Before Architecture](https://arxiv.org/html/2607.13085) ([재현 자료](https://github.com/krodalabs/coding-agent-research-artifact)) | 같은 모델·예산의 기본 공급자 CLI를 하네스 비교의 대조군으로 둡니다. | [벤치마크 절차](docs/benchmarking/protocol.md), [계획 검사기](scripts/benchmark_plan.py), [결과 검사기](scripts/benchmark_report.py). 평가 방법만 준비됐고 실제 시행은 남아 있습니다. |
+| [NYU CTF Bench](https://github.com/NYU-LLM-CTF/NYU_CTF_Bench)·[Cybench](https://github.com/andyzorigin/cybench) | 재현 가능한 문제 입력, 별도 정답 판정, 분야별 결과 기록을 벤치마크 매니페스트에 참고했습니다. | [벤치마크 절차](docs/benchmarking/protocol.md)와 [사전 감사](docs/benchmarking/preflight-audit.md). 해당 문제셋은 이 저장소에 포함하지 않습니다. |
