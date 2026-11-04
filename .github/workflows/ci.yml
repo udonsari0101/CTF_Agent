@@ -191,6 +191,8 @@ jobs:
         run: python .github/scripts/check_solver_selector_dom.py
       - name: Check account quota and auth upload layout
         run: python .github/scripts/check_account_quota_ui.py
+      - name: Check mobile language picker
+        run: python .github/scripts/check_mobile_language_picker.py
       - name: Check persistent login session preference
         run: python .github/scripts/check_auth_remember_session.py
       - name: Check admin runtime version lookup
