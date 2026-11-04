@@ -15,6 +15,7 @@ import logging
 import re
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import closing, contextmanager, nullcontext
@@ -31,6 +32,7 @@ from .direct_transfer_client import (
     MAX_BUNDLE_BYTES, DirectTransferClient, DirectTransferClientError,
 )
 from .direct_transfer_outbox import DirectOutboxError, DirectTransferOutbox
+from .direct_transfer_jobs import DirectSendJobError, DirectSendJobs
 from .process_lock import ProcessFileLock
 from .storage_layout import StorageLayout
 from .transfer_uploads import CHUNK_BYTES, TransferUploadError, TransferUploadManager
@@ -370,24 +372,40 @@ class DirectInvitationManager:
                     raise DirectTransferError("not_found", "Invitation was not found.")
                 if row["status"] == "completed":
                     return self._public_status(row)
-                db.execute(
-                    "UPDATE direct_transfer_invitations SET status='revoked',updated_at=? WHERE id=?",
-                    (int(time.time()), invitation_id),
-                )
-            if row["upload_id"]:
-                try:
-                    self.uploads.cancel(owner, row["upload_id"])
-                except TransferUploadError as exc:
-                    if exc.code not in {"wrong_state", "not_found"}:
-                        raise
+                if row["status"] != "revoked":
+                    db.execute(
+                        "UPDATE direct_transfer_invitations SET status='revoked',updated_at=? WHERE id=?",
+                        (int(time.time()), invitation_id),
+                    )
+            self._reclaim_upload(row)
             return self.status(owner, invitation_id)
+
+    def _reclaim_upload(self, row: sqlite3.Row) -> bool:
+        """Retry terminal invitation cleanup after a concurrent chunk releases its lock."""
+        if not row["upload_id"]:
+            return True
+        try:
+            self.uploads.cancel(row["owner_user_id"], row["upload_id"])
+        except TransferUploadError as exc:
+            if exc.code == "busy":
+                return False
+            if exc.code not in {"wrong_state", "not_found"}:
+                raise
+        with closing(connect(self.settings)) as db, db:
+            db.execute(
+                """UPDATE direct_transfer_invitations SET upload_id=NULL,updated_at=?
+                   WHERE id=? AND upload_id=? AND status IN ('revoked','expired')""",
+                (int(time.time()), row["id"], row["upload_id"]),
+            )
+        return True
 
     def cleanup_expired(self) -> int:
         """Revoke expired capabilities and reclaim their staged bundles."""
         with closing(connect(self.settings)) as db:
             ids = [row[0] for row in db.execute(
                 """SELECT id FROM direct_transfer_invitations
-                   WHERE status IN ('issued','uploading') AND expires_at<=?
+                   WHERE (status IN ('issued','uploading') AND expires_at<=?)
+                      OR (status IN ('revoked','expired') AND upload_id IS NOT NULL)
                    LIMIT 100""",
                 (int(time.time()),),
             ).fetchall()]
@@ -398,20 +416,18 @@ class DirectInvitationManager:
                     with closing(connect(self.settings)) as db, db:
                         db.execute("BEGIN IMMEDIATE")
                         row = self._row(db, invitation_id)
-                        if row["status"] not in {"issued", "uploading"} or row["expires_at"] > int(time.time()):
+                        if row["status"] in {"issued", "uploading"}:
+                            if row["expires_at"] > int(time.time()):
+                                continue
+                            db.execute(
+                                """UPDATE direct_transfer_invitations
+                                   SET status='expired',updated_at=? WHERE id=?""",
+                                (int(time.time()), invitation_id),
+                            )
+                            cleaned += 1
+                        elif row["status"] not in {"revoked", "expired"}:
                             continue
-                        db.execute(
-                            """UPDATE direct_transfer_invitations
-                               SET status='expired',updated_at=? WHERE id=?""",
-                            (int(time.time()), invitation_id),
-                        )
-                    if row["upload_id"]:
-                        try:
-                            self.uploads.cancel(row["owner_user_id"], row["upload_id"])
-                        except TransferUploadError as exc:
-                            if exc.code not in {"wrong_state", "not_found"}:
-                                raise
-                    cleaned += 1
+                    self._reclaim_upload(row)
             except DirectTransferError as exc:
                 if exc.code != "busy":
                     raise
@@ -464,6 +480,8 @@ def register_direct_transfer(app: FastAPI, require_auth, settings: Settings,
     client = DirectTransferClient()
     outbox = DirectTransferOutbox(settings)
     app.state.direct_transfer_outbox = outbox
+    send_jobs = DirectSendJobs(settings)
+    app.state.direct_send_jobs = send_jobs
 
     def cleanup_stale():
         # Maintenance is bounded and best effort; a stale cleanup problem must
@@ -471,6 +489,7 @@ def register_direct_transfer(app: FastAPI, require_auth, settings: Settings,
         try:
             manager.cleanup_expired()
             outbox.cleanup_stale()
+            send_jobs.cleanup_stale()
         except Exception:
             logging.warning("Direct transfer stale cleanup deferred")
 
@@ -501,6 +520,11 @@ def register_direct_transfer(app: FastAPI, require_auth, settings: Settings,
             "owner_inactive": 403, "expired": 410,
             "missing_snapshot": 409, "changed_snapshot": 409,
         }.get(exc.code, 400)
+        return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=status)
+
+    @app.exception_handler(DirectSendJobError)
+    async def direct_send_job_error(_request: Request, exc: DirectSendJobError):
+        status = {"not_found": 404, "busy": 409, "owner_limit": 429}.get(exc.code, 400)
         return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=status)
 
     @app.post("/api/transfers/direct/invitations", status_code=201,
@@ -535,45 +559,104 @@ def register_direct_transfer(app: FastAPI, require_auth, settings: Settings,
     def complete_invitation(invitation_id: str, request: Request):
         return manager.complete(invitation_id, _bearer(request))
 
+    def run_send(job_id: str, lock: ProcessFileLock, owner: str,
+                 workspace_id: str, challenge_id: str | None,
+                 invitation_url: str, token: str, include_remote: bool) -> None:
+        try:
+            if send_jobs.cancelled(job_id):
+                raise DirectTransferClientError("cancelled", "Direct transfer was cancelled.")
+            with outbox.slot(owner, workspace_id, challenge_id,
+                             invitation_url, token, include_remote) as (outbox_id, archive, new_export):
+                if new_export:
+                    send_jobs.update(job_id, "exporting")
+                    with app.state.uploads.try_workspace_lock(workspace_id):
+                        if challenge_id is None:
+                            export_workspace(
+                                settings, app.state.storage_layout, owner, workspace_id,
+                                archive, include_remote=include_remote,
+                            )
+                        else:
+                            export_challenge(
+                                settings, app.state.storage_layout, owner,
+                                workspace_id, challenge_id, archive,
+                                include_remote=include_remote,
+                            )
+                    outbox.publish(outbox_id, archive)
+                if send_jobs.cancelled(job_id):
+                    raise DirectTransferClientError("cancelled", "Direct transfer was cancelled.")
+                send_jobs.update(job_id, "sending", size=archive.stat().st_size)
+                result = client.send_bundle(
+                    invitation_url, token, archive,
+                    scope="workspace" if challenge_id is None else "challenge",
+                    progress=lambda offset, size: send_jobs.update(
+                        job_id, "sending", offset=offset, size=size,
+                    ),
+                    should_cancel=lambda: send_jobs.cancelled(job_id),
+                )
+                outbox.complete(outbox_id, archive)
+                send_jobs.finish(job_id, result)
+        except (DirectTransferClientError, DirectOutboxError,
+                TransferError, TransferUploadError) as exc:
+            code = getattr(exc, "code", "transfer_error")
+            try:
+                send_jobs.fail(job_id, code, str(exc))
+            except Exception:
+                logging.warning("Direct transfer job status update failed")
+        except Exception:
+            # Never log the token, remote body, or exported challenge content.
+            logging.warning("Direct transfer worker failed")
+            try:
+                send_jobs.fail(job_id, "internal_error", "Direct transfer failed; retry with the same invitation.")
+            except Exception:
+                logging.warning("Direct transfer job status update failed")
+        finally:
+            lock.release()
+
     def send(workspace_id: str, challenge_id: str | None, payload: SendInput,
              request: Request):
         user = request.state.user
         require_workspace_owner(workspace_id, user)
         client.validate_invitation(payload.invitation_url, payload.token)
         cleanup_stale()
+        owner = owner_id()
+        key = send_jobs.key(owner, workspace_id, challenge_id,
+                            payload.invitation_url, payload.token,
+                            payload.include_remote)
+        job, lock = send_jobs.start(owner, key)
+        if lock is None:
+            return job
+        thread = threading.Thread(
+            target=run_send,
+            args=(job["job_id"], lock, owner, workspace_id, challenge_id,
+                  payload.invitation_url, payload.token, payload.include_remote),
+            daemon=True,
+            name="direct-transfer-send",
+        )
         try:
-            with outbox.slot(owner_id(), workspace_id, challenge_id,
-                             payload.invitation_url, payload.token,
-                             payload.include_remote) as (outbox_id, archive, new_export):
-                if new_export:
-                    with app.state.uploads.try_workspace_lock(workspace_id):
-                        if challenge_id is None:
-                            export_workspace(
-                                settings, app.state.storage_layout, owner_id(), workspace_id,
-                                archive, include_remote=payload.include_remote,
-                            )
-                        else:
-                            export_challenge(
-                                settings, app.state.storage_layout, owner_id(), workspace_id,
-                                challenge_id, archive, include_remote=payload.include_remote,
-                            )
-                    outbox.publish(outbox_id, archive)
-                result = client.send_bundle(
-                    payload.invitation_url, payload.token, archive,
-                    scope="workspace" if challenge_id is None else "challenge",
-                )
-                outbox.complete(outbox_id, archive)
-                return result
-        except TransferError as exc:
-            raise HTTPException(422, str(exc)) from None
+            thread.start()
+        except Exception:
+            lock.release()
+            send_jobs.fail(job["job_id"], "worker_start_failed", "Transfer worker could not start.")
+            raise DirectTransferError("worker_start_failed", "Transfer worker could not start.") from None
+        return job
+
+    @app.get("/api/transfers/direct/sends/{job_id}",
+             dependencies=[Depends(require_auth)])
+    def source_send_status(job_id: str):
+        return send_jobs.status(owner_id(), job_id)
+
+    @app.delete("/api/transfers/direct/sends/{job_id}",
+                dependencies=[Depends(require_auth)])
+    def source_send_cancel(job_id: str):
+        return send_jobs.cancel(owner_id(), job_id)
 
     @app.post("/api/workspaces/{workspace_id}/transfer/direct",
-              dependencies=[Depends(require_auth)])
+              status_code=202, dependencies=[Depends(require_auth)])
     def send_workspace(workspace_id: str, payload: SendInput, request: Request):
         return send(workspace_id, None, payload, request)
 
     @app.post("/api/workspaces/{workspace_id}/challenges/{challenge_id}/transfer/direct",
-              dependencies=[Depends(require_auth)])
+              status_code=202, dependencies=[Depends(require_auth)])
     def send_challenge(workspace_id: str, challenge_id: str,
                        payload: SendInput, request: Request):
         return send(workspace_id, challenge_id, payload, request)

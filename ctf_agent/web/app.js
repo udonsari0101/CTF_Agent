@@ -38,7 +38,8 @@ let modalRendering = 0, ctfdSubmitRendering = 0;
 let challengeFileDragDepth = 0;
 let transferState = null;
 let transferExportController = null;
-let directInviteState = null, directInviteTimer = null, directSendBusy = false;
+let directInviteState = null, directInviteTimer = null;
+let directSendState = null, directSendTimer = null, directSendBusy = false;
 const TRANSFER_CHUNK_BYTES = 8 * 1024 * 1024;
 let solverRendering = 0, solverPollTimer = null, currentSolverJob = null;
 let resourcePollTimer = null, resourceRequestGeneration = 0;
@@ -1967,6 +1968,8 @@ function openModal(title, subtitle, body, footer, formId) {
   transferExportController?.abort(); transferExportController = null;
   if (directInviteTimer !== null) clearTimeout(directInviteTimer);
   directInviteTimer = null; directInviteState = null;
+  if (directSendTimer !== null) clearTimeout(directSendTimer);
+  directSendTimer = null; directSendState = null;
   ++modalRendering;
   resetChallengeFileDrag();
   modal.removeAttribute('aria-busy');
@@ -2356,43 +2359,171 @@ function openDirectResult() {
   location.hash = route;
 }
 
+function directSendStorageKey(state) {
+  return ['ctf-direct-send',sessionUser?.id || 'local',state.scope,state.workspaceId,state.challengeId || ''].join(':');
+}
+
+function directSendStatusLabel(status) {
+  return i18n.t({queued:'대기 중',exporting:'ZIP 생성 중',sending:'서버 간 전송 중',completed:'전송 완료',failed:'전송 실패',cancelled:'전송 취소',interrupted:'전송 중단'}[status] || '전송 상태 확인 중');
+}
+
+function directSendActive(state) {
+  return ['queued','exporting','sending'].includes(state.status);
+}
+
+function paintDirectSend(state) {
+  if (directSendState !== state || modal.dataset.kind !== 'direct-send') return;
+  const status = modal.querySelector('#direct-send-status');
+  const progress = modal.querySelector('#direct-send-progress');
+  const progressText = modal.querySelector('#direct-send-progress-text');
+  const start = modal.querySelector('[data-action="start-direct-send"]');
+  const cancel = modal.querySelector('[data-action="cancel-direct-send"]');
+  const active = directSendActive(state);
+  if (status) {
+    status.textContent = state.error || (state.jobId || state.status !== 'idle'
+      ? directSendStatusLabel(state.status) + (state.cancelRequested && active ? ' · ' + i18n.t('취소 요청 중') : '')
+        + (state.status === 'completed' && state.result?.workspace_id ? ' · ' + i18n.t('대상 작업공간 ID') + ': ' + state.result.workspace_id : '')
+      : i18n.t('초대 URL과 토큰을 입력한 뒤 전송을 시작하세요.'));
+    status.classList.toggle('error-text',Boolean(state.error) || ['failed','interrupted'].includes(state.status));
+  }
+  const total = Number(state.size);
+  if (progress) {
+    progress.hidden = !(Number.isSafeInteger(total) && total > 0);
+    if (!progress.hidden) { progress.max = total; progress.value = Math.min(total,Math.max(0,Number(state.offset) || 0)); }
+  }
+  if (progressText) {
+    progressText.hidden = progress?.hidden !== false;
+    if (!progressText.hidden) progressText.textContent = size(Math.max(0,Number(state.offset) || 0)) + ' / ' + size(total);
+  }
+  if (start) {
+    start.hidden = active || state.status === 'completed';
+    start.disabled = state.busy;
+    start.textContent = i18n.t(['failed','interrupted','cancelled'].includes(state.status) ? '다시 시도' : '전송 시작');
+  }
+  if (cancel) { cancel.hidden = !active; cancel.disabled = state.busy || state.cancelRequested; }
+  if (state.status === 'completed') {
+    const tokenInput = modal.querySelector('#direct-send-token');
+    if (tokenInput) tokenInput.value = '';
+  }
+}
+
+async function pollDirectSend(state) {
+  if (!state.jobId || directSendState !== state) return;
+  if (directSendTimer !== null) clearTimeout(directSendTimer);
+  directSendTimer = null;
+  try {
+    const result = await api('/api/transfers/direct/sends/' + encodeURIComponent(state.jobId));
+    if (directSendState !== state || modal.dataset.kind !== 'direct-send') return;
+    state.status = result.status || state.status;
+    state.offset = result.offset || 0;
+    state.size = result.size;
+    state.result = result.result || null;
+    state.error = result.error || '';
+    if (!directSendActive(state)) {
+      try { if (state.status !== 'completed') localStorage.removeItem(directSendStorageKey(state)); } catch {}
+      state.cancelRequested = false;
+    }
+    paintDirectSend(state);
+  } catch (error) {
+    if (directSendState !== state) return;
+    if (error.status === 404) {
+      try { localStorage.removeItem(directSendStorageKey(state)); } catch {}
+      state.jobId = '';
+      state.status = 'interrupted';
+      state.error = i18n.t('전송 작업을 찾을 수 없습니다. 같은 초대 URL과 토큰으로 다시 시도하세요.');
+    } else state.error = error.message;
+    paintDirectSend(state);
+  }
+  if (directSendState === state && state.jobId && directSendActive(state)) {
+    directSendTimer = setTimeout(() => pollDirectSend(state),2500);
+  }
+}
+
 function showDirectSend(scope) {
   const workspace = currentWorkspace, challenge = scope === 'challenge' ? currentChallenge : null;
   if (!workspace || (scope === 'challenge' && (!challenge || challenge.workspace_id !== workspace.id))) throw new Error(i18n.t('보낼 자료를 다시 선택하세요.'));
   openModal(i18n.t(scope === 'challenge' ? '문제 직접 보내기' : '작업공간 직접 보내기'),challenge?.name || workspace.name,
-    `<div class="direct-transfer"><p>${tr('받는 설치에서 직접 받기 초대를 발급하고, 아래에 URL과 토큰을 입력하세요. 파일은 서버 간에 직접 전송됩니다.')}</p><label>${tr('초대 URL')}<input id="direct-send-url" type="url" placeholder="https://…" autocomplete="off" spellcheck="false"></label><label>${tr('초대 토큰')}<input id="direct-send-token" type="password" autocomplete="off" spellcheck="false"></label><label class="transfer-remote-option"><input id="direct-include-remote" type="checkbox"><span><strong>${tr('원격 접속 정보 포함')}</strong><small>${tr('서버 주소, URL, 접속 명령을 전송합니다. 필요한 경우에만 선택하세요.')}</small></span></label><p class="form-hint">${tr('설명과 노트의 자유 입력 내용은 그대로 전송될 수 있습니다.')}</p><div id="direct-send-status" class="direct-status" role="status" aria-live="polite"></div></div>`,
-    `<button type="button" data-action="close-modal">${tr('닫기')}</button><button type="button" class="primary" data-action="start-direct-send">${tr('전송 시작')}</button>`);
+    '<div class="direct-transfer"><p>' + tr('받는 설치에서 직접 받기 초대를 발급하고, 아래에 URL과 토큰을 입력하세요. 파일은 서버 간에 직접 전송됩니다.') + '</p>' +
+    '<label>' + tr('초대 URL') + '<input id="direct-send-url" type="url" placeholder="https://" autocomplete="off" spellcheck="false"></label>' +
+    '<label>' + tr('초대 토큰') + '<input id="direct-send-token" type="password" autocomplete="off" spellcheck="false"></label>' +
+    '<label class="transfer-remote-option"><input id="direct-include-remote" type="checkbox"><span><strong>' + tr('원격 접속 정보 포함') + '</strong><small>' + tr('서버 주소, URL, 접속 명령도 전송합니다. 필요한 경우에만 선택하세요.') + '</small></span></label>' +
+    '<p class="form-hint">' + tr('설명과 힌트의 자유 입력 내용은 그대로 전송될 수 있습니다.') + '</p>' +
+    '<div id="direct-send-status" class="direct-status" role="status" aria-live="polite"></div>' +
+    '<progress id="direct-send-progress" hidden></progress><small id="direct-send-progress-text" class="form-hint" hidden></small></div>',
+    '<button type="button" data-action="close-modal">' + tr('닫기') + '</button>' +
+    '<button type="button" class="danger ghost" data-action="cancel-direct-send" hidden>' + tr('전송 취소') + '</button>' +
+    '<button type="button" class="primary" data-action="start-direct-send">' + tr('전송 시작') + '</button>');
   modal.dataset.kind = 'direct-send'; modal.dataset.transferScope = scope;
   modal.dataset.workspaceId = workspace.id; modal.dataset.challengeId = challenge?.id || '';
+  const state = {scope,workspaceId:workspace.id,challengeId:challenge?.id || '',jobId:'',status:'idle',offset:0,size:null,result:null,error:'',busy:false,cancelRequested:false};
+  directSendState = state;
+  try { state.jobId = localStorage.getItem(directSendStorageKey(state)) || ''; } catch {}
+  paintDirectSend(state);
+  if (state.jobId) pollDirectSend(state);
 }
 
 async function startDirectSend() {
-  if (modal.dataset.kind !== 'direct-send' || directSendBusy) return;
+  const state = directSendState;
+  if (!state || modal.dataset.kind !== 'direct-send' || state.busy || directSendActive(state)) return;
   const invitationUrl = modal.querySelector('#direct-send-url')?.value.trim() || '';
   const token = modal.querySelector('#direct-send-token')?.value.trim() || '';
   let url;
   try { url = new URL(invitationUrl); } catch { throw new Error(i18n.t('올바른 HTTPS 초대 URL을 입력하세요.')); }
   if (url.protocol !== 'https:') throw new Error(i18n.t('올바른 HTTPS 초대 URL을 입력하세요.'));
   if (!token) throw new Error(i18n.t('초대 토큰을 입력하세요.'));
-  const scope = modal.dataset.transferScope, workspaceId = modal.dataset.workspaceId, challengeId = modal.dataset.challengeId;
-  const endpoint = scope === 'challenge' ? `${path(challengeId,workspaceId)}/transfer/direct` : `/api/workspaces/${workspaceId}/transfer/direct`;
-  const status = modal.querySelector('#direct-send-status');
-  directSendBusy = true;
-  if (status) { status.textContent = i18n.t('서버 간 전송 중… 창을 닫지 마세요.'); status.classList.remove('error-text'); }
+  const endpoint = state.scope === 'challenge'
+    ? path(state.challengeId,state.workspaceId) + '/transfer/direct'
+    : '/api/workspaces/' + state.workspaceId + '/transfer/direct';
+  state.busy = true; directSendBusy = true; state.error = i18n.t('전송 작업을 시작하는 중입니다.');
+  paintDirectSend(state);
   try {
     const result = await api(endpoint,{method:'POST',body:{invitation_url:invitationUrl,token,include_remote:modal.querySelector('#direct-include-remote')?.checked === true}});
-    if (modal.dataset.kind !== 'direct-send') return;
-    const tokenInput = modal.querySelector('#direct-send-token');
-    if (tokenInput) tokenInput.value = '';
-    if (status) status.textContent = `${i18n.t('전송을 마쳤습니다.')} ${i18n.t('대상 작업공간 ID')}: ${result.workspace_id || '—'}`;
-    const start = modal.querySelector('[data-action="start-direct-send"]');
-    if (start) start.hidden = true;
-    toast(i18n.t('직접 전송을 마쳤습니다.'));
+    if (directSendState !== state) return;
+    state.error = '';
+    if (result.job_id) {
+      state.jobId = result.job_id;
+      state.status = result.status || 'queued';
+      state.offset = result.offset || 0;
+      state.size = result.size;
+      state.result = result.result || null;
+      state.cancelRequested = false;
+      try { localStorage.setItem(directSendStorageKey(state),state.jobId); } catch {}
+      paintDirectSend(state);
+      directSendTimer = setTimeout(() => pollDirectSend(state),1000);
+    } else {
+      state.status = 'completed';
+      state.result = result;
+      paintDirectSend(state);
+      toast(i18n.t('직접 전송을 마쳤습니다.'));
+    }
   } catch (error) {
-    if (status?.isConnected) { status.textContent = `${i18n.t('전송 실패')}: ${error.message}`; status.classList.add('error-text'); }
+    if (directSendState === state) {
+      state.status = 'failed';
+      state.error = i18n.t('전송 실패') + ': ' + error.message;
+      paintDirectSend(state);
+    }
     throw error;
   } finally {
-    directSendBusy = false;
+    state.busy = false; directSendBusy = false;
+    if (directSendState === state) paintDirectSend(state);
+  }
+}
+
+async function cancelDirectSend() {
+  const state = directSendState;
+  if (!state?.jobId || !directSendActive(state) || state.busy) return;
+  state.busy = true; state.cancelRequested = true; paintDirectSend(state);
+  try {
+    const result = await api('/api/transfers/direct/sends/' + encodeURIComponent(state.jobId),{method:'DELETE'});
+    if (directSendState !== state) return;
+    state.status = result.status || state.status;
+    state.error = result.error || '';
+    paintDirectSend(state);
+    if (directSendTimer !== null) clearTimeout(directSendTimer);
+    directSendTimer = setTimeout(() => pollDirectSend(state),1000);
+  } finally {
+    state.busy = false;
+    if (directSendState === state) paintDirectSend(state);
   }
 }
 
@@ -4119,6 +4250,7 @@ document.addEventListener('click', event => {
     'copy-direct-token': async () => { const value = directInviteState?.token; if (!value) return; const result = await copyText(value); copyToast(result,value); },
     'open-direct-result': () => openDirectResult(),
     'start-direct-send': () => startDirectSend(),
+    'cancel-direct-send': () => cancelDirectSend(),
     'download-transfer': () => downloadTransfer(),
     'start-transfer-upload': () => startTransferUpload(),
     'pause-transfer-upload': () => { if (transferState?.running) { transferState.paused = true; transferState.controller?.abort(); } },
@@ -4536,6 +4668,10 @@ modal.addEventListener('close', () => {
     transferExportController?.abort(); transferExportController = null;
     if (directInviteTimer !== null) clearTimeout(directInviteTimer);
     directInviteTimer = null; directInviteState = null;
+    if (directSendTimer !== null) clearTimeout(directSendTimer);
+    directSendTimer = null; directSendState = null;
+    const directToken = modal.querySelector('#direct-send-token');
+    if (directToken) directToken.value = '';
     ++modalRendering; modal.removeAttribute('aria-busy'); modal.dataset.kind = '';
   }
   importPreview = null;

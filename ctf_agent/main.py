@@ -28,7 +28,6 @@ from logging.handlers import RotatingFileHandler
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
@@ -1795,6 +1794,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from .uploads import register_uploads
     register_uploads(app, require_auth, settings, validate_filename, now)
     from .transfer_uploads import TransferUploadError, TransferUploadManager
+    from .transfer_export_cleanup import TransferExportManager, TransferExportResponse
     from .workspace_transfer import (
         TransferError, export_challenge, export_workspace, import_challenge,
         import_workspace, lookup_import, preview_bundle,
@@ -1802,8 +1802,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     transfer_uploads = TransferUploadManager(settings)
     app.state.transfer_uploads = transfer_uploads
-    transfer_export_root = settings.data_dir / "workspaces" / ".transfers" / "exports"
-    transfer_export_root.mkdir(parents=True, exist_ok=True)
+    transfer_exports = TransferExportManager(settings)
+    app.state.transfer_exports = transfer_exports
+    try:
+        transfer_exports.cleanup_stale()
+    except Exception:
+        logging.warning("Transfer export stale cleanup deferred")
 
     @app.exception_handler(TransferUploadError)
     async def transfer_upload_error(_request: Request, exc: TransferUploadError):
@@ -1824,7 +1828,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with database() as db:
                 workspace = workspace_row(db, workspace_id)
                 challenge = challenge_row(db, workspace_id, challenge_id) if challenge_id else None
-            destination = transfer_export_root / f"{uuid.uuid4().hex}.zip"
+            destination, export_lock = transfer_exports.reserve()
             try:
                 if challenge is None:
                     export_workspace(
@@ -1840,16 +1844,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                     name = challenge["name"]
             except TransferError as exc:
-                destination.unlink(missing_ok=True)
+                transfer_exports.discard(destination, export_lock)
                 raise transfer_error(exc) from None
             except BaseException:
-                destination.unlink(missing_ok=True)
+                transfer_exports.discard(destination, export_lock)
                 raise
         safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")[:90] or "ctf-agent"
-        return FileResponse(
-            destination, filename=f"{safe_name}-transfer.zip", media_type="application/zip",
-            background=BackgroundTask(destination.unlink, missing_ok=True),
-        )
+        try:
+            return TransferExportResponse(
+                destination, export_lock,
+                filename=f"{safe_name}-transfer.zip", media_type="application/zip",
+            )
+        except BaseException:
+            transfer_exports.discard(destination, export_lock)
+            raise
 
     @app.get("/api/workspaces/{workspace_id}/transfer", dependencies=[Depends(require_auth)])
     def download_workspace_transfer(workspace_id: str, include_remote: bool = False):

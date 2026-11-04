@@ -17,7 +17,7 @@ c1 = "c" * 32
 c2 = "d" * 32
 workspace = {"id": w1, "name": "Demo workspace", "description": "", "flag_format": "", "challenge_count": 0, "solved_count": 0, "running_count": 0}
 challenge = {"id": c1, "workspace_id": w1, "name": "Demo challenge", "category": "Web", "description": "", "remote_mode": "unknown", "remote": "", "status": "pending", "attachments": [], "notes": "", "flag": "", "related_challenges": [{"id":"e" * 32,"name":"Related","status":"solved","evidence_reapproval_required":True}]}
-state = {"size": 0, "offset": 0, "status": "uploading", "puts": [], "chunk_lengths": [], "fail_second": True, "previews": 0, "creates": 0, "deletes": 0, "exports": [], "origin_error": True, "invite_creates": 0, "invite_requests": [], "invite_status": "issued", "direct_posts": []}
+state = {"size": 0, "offset": 0, "status": "uploading", "puts": [], "chunk_lengths": [], "fail_second": True, "previews": 0, "creates": 0, "deletes": 0, "exports": [], "origin_error": True, "invite_creates": 0, "invite_requests": [], "invite_status": "issued", "direct_posts": [], "direct_job_polls": {}, "direct_cancelled": set()}
 
 class QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, *_args):
@@ -70,7 +70,22 @@ def api(route):
         return fulfill(route, {"revoked":True})
     if path.endswith("/transfer/direct") and method == "POST":
         state["direct_posts"].append(request.post_data_json)
-        return fulfill(route, {"workspace_id":w2,"challenge_ids":[c2]})
+        job_id = "send" + str(len(state["direct_posts"]))
+        return fulfill(route, {"job_id":job_id,"status":"queued","offset":0,"size":None,"result":None,"error":None}, 202)
+    if path.startswith("/api/transfers/direct/sends/"):
+        job_id = path.rsplit("/", 1)[-1]
+        if method == "DELETE":
+            state["direct_cancelled"].add(job_id)
+            return fulfill(route, {"job_id":job_id,"status":"sending","cancel_requested":True})
+        state["direct_job_polls"][job_id] = state["direct_job_polls"].get(job_id, 0) + 1
+        polls = state["direct_job_polls"][job_id]
+        status = ("cancelled" if job_id in state["direct_cancelled"] else
+                  "failed" if job_id == "send1" and polls >= 2 else
+                  "completed" if job_id in {"send2", "send4"} and polls >= 2 else "sending")
+        result = {"workspace_id":w2,"challenge_ids":[c2]} if status == "completed" else None
+        error = "Temporary destination error" if status == "failed" else None
+        return fulfill(route, {"job_id":job_id,"status":status,"offset":5 if status == "sending" else 10,
+                               "size":10,"result":result,"error":error})
     if path.startswith("/api/transfers/uploads"):
         parts = path.split("/")
         if path == "/api/transfers/uploads" and method == "POST":
@@ -188,8 +203,17 @@ def run_dom_check():
                 page.locator("#direct-send-token").fill("one-time-secret")
                 page.locator("#direct-include-remote").check()
                 page.locator('[data-action="start-direct-send"]').click()
-                page.get_by_text("전송을 마쳤습니다.", exact=False).first.wait_for()
+                page.locator("#direct-send-status").get_by_text("Temporary destination error").wait_for(timeout=12000)
                 assert state["direct_posts"][-1] == {"invitation_url":"https://destination.example/api/transfers/direct/invitations/invite1","token":"one-time-secret","include_remote":True}
+                assert page.locator("#direct-send-token").input_value() == "one-time-secret"
+                page.locator('[data-action="start-direct-send"]').click()
+                page.locator("#direct-send-progress").wait_for(state="visible", timeout=12000)
+                assert "send2" in page.evaluate("JSON.stringify(localStorage)")
+                page.locator('#modal [data-action="close-modal"]').last.click()
+                page.locator('[data-action="send-workspace-direct"]').click()
+                page.locator("#direct-send-status").get_by_text("전송 완료", exact=False).wait_for(timeout=12000)
+                assert page.locator("#direct-send-token").input_value() == ""
+                assert "one-time-secret" not in page.evaluate("JSON.stringify(localStorage)")
                 page.locator('#modal [data-action="close-modal"]').last.click()
 
                 page.locator('[data-action="receive-workspace-direct"]').click()
@@ -235,8 +259,13 @@ def run_dom_check():
                 page.locator("#direct-send-url").fill("https://destination.example/api/transfers/direct/invitations/invite1")
                 page.locator("#direct-send-token").fill("one-time-secret")
                 page.locator('[data-action="start-direct-send"]').click()
-                page.get_by_text("전송을 마쳤습니다.", exact=False).first.wait_for()
+                page.locator("#direct-send-progress").wait_for(state="visible", timeout=12000)
+                page.locator('[data-action="cancel-direct-send"]').click()
+                page.locator("#direct-send-status").get_by_text("전송 취소", exact=False).wait_for(timeout=12000)
+                assert "send3" in state["direct_cancelled"]
                 assert state["direct_posts"][-1]["include_remote"] is False
+                page.locator('[data-action="start-direct-send"]').click()
+                page.locator("#direct-send-status").get_by_text("전송 완료", exact=False).wait_for(timeout=12000)
                 page.locator('#modal [data-action="close-modal"]').last.click()
 
                 page.locator('#detail [data-action="import-challenge-transfer"]').click()
@@ -276,7 +305,3 @@ def run_dom_check():
 
 if __name__ == "__main__":
     run_dom_check()
-
-
-
-\n

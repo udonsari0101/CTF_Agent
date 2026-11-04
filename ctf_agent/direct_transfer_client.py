@@ -19,6 +19,7 @@ import stat
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
 
 from .transfer_uploads import CHUNK_BYTES
@@ -27,6 +28,7 @@ from .transfer_uploads import CHUNK_BYTES
 MAX_BUNDLE_BYTES = 20 * 1024**3
 MAX_RESPONSE_BYTES = 64 * 1024
 REQUEST_TIMEOUT_SECONDS = 45
+DNS_TIMEOUT_SECONDS = 10
 TRANSFER_DEADLINE_SECONDS = 24 * 3600
 INVITATION_PATH = re.compile(r"/api/transfers/direct/invitations/[0-9a-f]{32}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{40,128}\Z")
@@ -36,9 +38,10 @@ _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 class DirectTransferClientError(ValueError):
     """Safe error without a destination URL, token, or remote response body."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, status_code: int | None = None):
         super().__init__(message)
         self.code = code
+        self.status_code = status_code
 
 
 def _public_address(value: str) -> bool:
@@ -129,10 +132,27 @@ class DirectTransferClient:
         )
 
     def _address(self, host: str, port: int) -> str:
+        resolved = threading.Event()
+        outcome: dict = {}
+
+        def resolve():
+            try:
+                outcome["records"] = self.resolver(host, port, type=socket.SOCK_STREAM)
+            except Exception as exc:
+                outcome["error"] = exc
+            finally:
+                resolved.set()
+
+        threading.Thread(target=resolve, daemon=True).start()
+        if not resolved.wait(DNS_TIMEOUT_SECONDS):
+            raise DirectTransferClientError("dns_failed", "Invitation host resolution timed out.")
+        if "error" in outcome:
+            raise DirectTransferClientError(
+                "dns_failed", "Invitation host could not be resolved.",
+            ) from outcome["error"]
         try:
-            records = self.resolver(host, port, type=socket.SOCK_STREAM)
-            addresses = list(dict.fromkeys(record[4][0] for record in records))
-        except (OSError, UnicodeError) as exc:
+            addresses = list(dict.fromkeys(record[4][0] for record in outcome["records"]))
+        except (KeyError, IndexError, TypeError) as exc:
             raise DirectTransferClientError("dns_failed", "Invitation host could not be resolved.") from exc
         if not addresses or not all(_public_address(address) for address in addresses):
             raise DirectTransferClientError("blocked_address", "Invitation host resolves to a blocked address.")
@@ -183,7 +203,10 @@ class DirectTransferClient:
             if not 200 <= response.status < 300:
                 # Never surface response bodies. Even redirect Location could
                 # carry a token, and redirects are never followed.
-                raise DirectTransferClientError("receiver_rejected", f"Receiver rejected transfer ({response.status}).")
+                raise DirectTransferClientError(
+                    "receiver_rejected", f"Receiver rejected transfer ({response.status}).",
+                    status_code=response.status,
+                )
             try:
                 decoded = json.loads(content)
             except (UnicodeError, ValueError) as exc:
@@ -200,7 +223,9 @@ class DirectTransferClient:
             connection.close()
 
     def send_bundle(self, invitation_url: str, token: str, archive: Path,
-                    *, scope: str) -> dict:
+                    *, scope: str,
+                    progress: Callable[[int, int], None] | None = None,
+                    should_cancel: Callable[[], bool] | None = None) -> dict:
         if scope not in {"workspace", "challenge"}:
             raise DirectTransferClientError("invalid_scope", "Transfer scope is invalid.")
         host, port, path = self.validate_invitation(invitation_url, token)
@@ -220,15 +245,24 @@ class DirectTransferClient:
         payload = json.dumps({"scope": scope, "size": details.st_size,
                               "sha256": digest.hexdigest()}, separators=(",", ":")).encode()
         started = time.monotonic()
+        if should_cancel is not None and should_cancel():
+            raise DirectTransferClientError("cancelled", "Direct transfer was cancelled.")
         prepared = self._request(host, port, path, token, "POST", "/prepare", payload)
         if prepared.get("status") == "completed":
-            return self._request(host, port, path, token, "POST", "/complete", b"{}")
+            if progress is not None:
+                progress(details.st_size, details.st_size)
+            return self._complete(host, port, path, token, payload, details.st_size,
+                                  started, should_cancel)
         offset = prepared.get("offset")
         if type(offset) is not int or not 0 <= offset <= details.st_size:
             raise DirectTransferClientError("invalid_response", "Receiver upload offset is invalid.")
+        if progress is not None:
+            progress(offset, details.st_size)
         with archive.open("rb") as source:
             source.seek(offset)
             while offset < details.st_size:
+                if should_cancel is not None and should_cancel():
+                    raise DirectTransferClientError("cancelled", "Direct transfer was cancelled.")
                 if time.monotonic() - started > TRANSFER_DEADLINE_SECONDS:
                     raise DirectTransferClientError("deadline", "Direct transfer time limit was reached.")
                 chunk = source.read(min(CHUNK_BYTES, details.st_size - offset))
@@ -243,6 +277,50 @@ class DirectTransferClient:
                     raise DirectTransferClientError("invalid_response", "Receiver upload offset is invalid.")
                 offset = next_offset
                 source.seek(offset)
+                if progress is not None:
+                    progress(offset, details.st_size)
         if archive.stat().st_size != details.st_size:
             raise DirectTransferClientError("changed_bundle", "Bundle changed during transfer.")
-        return self._request(host, port, path, token, "POST", "/complete", b"{}")
+        if should_cancel is not None and should_cancel():
+            raise DirectTransferClientError("cancelled", "Direct transfer was cancelled.")
+        return self._complete(host, port, path, token, payload, details.st_size,
+                              started, should_cancel)
+
+    @staticmethod
+    def _recoverable_complete_error(exc: DirectTransferClientError) -> bool:
+        return exc.code == "network_error" or (
+            exc.code == "receiver_rejected" and exc.status_code == 409
+        )
+
+    def _complete(self, host: str, port: int, path: str, token: str,
+                  prepare_payload: bytes, size: int, started: float,
+                  should_cancel: Callable[[], bool] | None) -> dict:
+        """Resolve a lost/slow import response against the invitation's durable state."""
+        while True:
+            if should_cancel is not None and should_cancel():
+                raise DirectTransferClientError("cancelled", "Direct transfer was cancelled.")
+            if time.monotonic() - started > TRANSFER_DEADLINE_SECONDS:
+                raise DirectTransferClientError("deadline", "Direct transfer time limit was reached.")
+            try:
+                return self._request(host, port, path, token, "POST", "/complete", b"{}")
+            except DirectTransferClientError as exc:
+                if not self._recoverable_complete_error(exc):
+                    raise
+            # An import may still hold the receiver lock after our request
+            # timed out. Prepare reports the durable offset or completed state.
+            time.sleep(2)
+            try:
+                status = self._request(host, port, path, token,
+                                       "POST", "/prepare", prepare_payload)
+            except DirectTransferClientError as exc:
+                if self._recoverable_complete_error(exc):
+                    continue
+                raise
+            if status.get("status") == "completed":
+                continue
+            if (status.get("status") in {"uploading", "ready", "consumed"}
+                    and status.get("offset") == size):
+                continue
+            raise DirectTransferClientError(
+                "invalid_response", "Receiver completion state is inconsistent.",
+            )

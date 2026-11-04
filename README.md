@@ -13,13 +13,18 @@ The screenshots use synthetic challenges and account data.
 ## Features
 
 - Keep each CTF in a separate workspace. Save a CTFd site and API token or username/password in workspace settings, then reuse that connection for import and optional flag submission; imports can also use new credentials for a single session. Add challenges manually or import selected challenges from CTFd; sync new or changed challenges later. Link related challenges by ID, including challenges with duplicate names.
-- Connect Codex and Claude Code through account sign-in or an API key. Choose the account, model, and reasoning level per challenge; see remaining account quota, live solve time, session activity, and child agents.
+- Connect Codex and Claude Code through account sign-in or an API key. Choose the account, model, and reasoning level per challenge; see remaining quota when supported by the account connection, live solve time, session activity, and child agents.
 - Send instructions during a solve. On retry, a compatible provider session can resume directly. Switching between Codex and Claude Code carries available work files and bounded analysis notes into a new session; if a run stops before it writes notes, a bounded summary of its recorded activity supplies the retry context.
 - Upload multiple files, including large binaries with resumable transfers. Challenge files and the database use separate data directories.
 - See status and flags update while a solve runs, without refreshing the page. Review, copy, and download Markdown write-ups in the selected interface language; request a revised write-up when needed.
 - Each user can register a Telegram bot token in **Personal settings**, connect a chat through a one-time link, and receive flag, write-up, error, and input-request notifications. No bot token is bundled or required during installation. CTFd flag submission is off by default.
 - Use the first-run administrator setup for a multi-user installation. A separate no-login mode is available for explicitly configured single-user instances.
 - Switch the web interface between English and Korean. Interface translations live in [language packs](docs/guides/localization.md) so more languages can be added.
+
+Move a workspace or challenge between installations with a manual ZIP or an
+optional HTTPS direct transfer. The [transfer guide](docs/guides/workspace-transfer.md)
+explains the public HTTPS requirement, retries, and the manual ZIP route for
+local-only or Cloudflare Access protected destinations.
 
 ## Screenshots
 

@@ -216,6 +216,8 @@ input:focus, textarea:focus, select:focus {
 .direct-transfer > label { min-width: 0; }
 .direct-status { border: 1px solid var(--border); border-radius: 9px; padding: 11px 13px; color: #c9dadf; background: #030d12; font-size: 12px; overflow-wrap: anywhere; }
 .direct-status.error-text { border-color: #693743; }
+.direct-transfer > progress { width: 100%; margin: 0; }
+.direct-transfer > #direct-send-progress-text { margin-top: -10px; font: 10px ui-monospace, "Cascadia Code", Consolas, monospace; }
 .direct-credentials { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: end; gap: 10px; border: 1px solid #275042; border-radius: 9px; padding: 13px; background: #061811; }
 .direct-credentials[hidden],.direct-result[hidden],.direct-transfer [hidden] { display: none; }
 .direct-credentials label { min-width: 0; }

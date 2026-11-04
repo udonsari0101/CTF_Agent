@@ -5,8 +5,11 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 import warnings
@@ -14,6 +17,8 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+warnings.filterwarnings("ignore", category=ResourceWarning, message=r"unclosed database.*")
 
 from fastapi.testclient import TestClient
 
@@ -27,12 +32,17 @@ from ctf_agent.direct_transfer import (  # noqa: E402
 from ctf_agent.direct_transfer_client import (  # noqa: E402
     DirectTransferClient, DirectTransferClientError, _normalize_invitation_url,
 )
+from ctf_agent.direct_transfer_jobs import DirectSendJobs  # noqa: E402
+from ctf_agent.direct_transfer_outbox import DirectTransferOutbox  # noqa: E402
 from ctf_agent.storage_layout import StorageLayout  # noqa: E402
 from ctf_agent.transfer_uploads import (  # noqa: E402
     MIN_FREE_BYTES, TransferUploadError, TransferUploadManager,
 )
 from ctf_agent.workspace_transfer import export_challenge, export_workspace  # noqa: E402
 from ctf_agent.main import create_app  # noqa: E402
+from ctf_agent.transfer_export_cleanup import (  # noqa: E402
+    EXPORT_TTL_SECONDS, TransferExportManager,
+)
 
 
 class DirectTransferTests(unittest.TestCase):
@@ -191,6 +201,46 @@ class DirectTransferTests(unittest.TestCase):
             self.manager.prepare(revoked["invitation_id"], revoked["token"],
                                  "workspace", len(data), digest)
 
+    def test_terminal_invitation_retries_busy_upload_cleanup(self):
+        for ending in ("revoked", "expired"):
+            with self.subTest(ending=ending):
+                invite, data, digest = self._offer(self.workspace_bundle, "workspace")
+                invitation_id = invite["invitation_id"]
+                self.manager.prepare(invitation_id, invite["token"],
+                                     "workspace", len(data), digest)
+                self.manager.append(invitation_id, invite["token"], 0,
+                                    data[:30], hashlib.sha256(data[:30]).hexdigest())
+                with closing(connect(self.target[0])) as db:
+                    upload_id = db.execute(
+                        "SELECT upload_id FROM direct_transfer_invitations WHERE id=?",
+                        (invitation_id,),
+                    ).fetchone()[0]
+                stage = self.uploads._stage(self.target[1], upload_id)
+                self.assertTrue(stage.exists())
+                if ending == "expired":
+                    with closing(connect(self.target[0])) as db, db:
+                        db.execute(
+                            "UPDATE direct_transfer_invitations SET expires_at=1 WHERE id=?",
+                            (invitation_id,),
+                        )
+                with self.uploads._exclusive(upload_id):
+                    if ending == "revoked":
+                        self.manager.revoke(self.target[1], invitation_id)
+                    else:
+                        self.assertEqual(self.manager.cleanup_expired(), 1)
+                    self.assertTrue(stage.exists())
+                    self.assertEqual(self.manager.status(self.target[1], invitation_id)["status"],
+                                     ending)
+                self.assertEqual(self.manager.cleanup_expired(), 0)
+                self.assertFalse(stage.exists())
+                self.assertEqual(self.uploads.status(self.target[1], upload_id)["status"],
+                                 "cancelled")
+                with closing(connect(self.target[0])) as db:
+                    self.assertIsNone(db.execute(
+                        "SELECT upload_id FROM direct_transfer_invitations WHERE id=?",
+                        (invitation_id,),
+                    ).fetchone()[0])
+
     def test_ready_bundle_rechecks_owner_and_disk_floor(self):
         invite, data, digest = self._offer(self.workspace_bundle, "workspace")
         invitation_id, token = invite["invitation_id"], invite["token"]
@@ -259,6 +309,51 @@ class DirectTransferTests(unittest.TestCase):
         self.assertEqual(calls[1][2], b"def")
         self.assertEqual(calls[1][3]["chunk_digest"], hashlib.sha256(b"def").hexdigest())
 
+    def test_complete_lost_response_busy_retry_and_dns_timeout(self):
+        invitation_id = "a" * 32
+        url = f"https://receiver.example/api/transfers/direct/invitations/{invitation_id}"
+        archive = Path(self.temp.name) / "retry.zip"
+        archive.write_bytes(b"abcdef")
+        client = DirectTransferClient()
+        for first_error in (
+            DirectTransferClientError("network_error", "Secure connection failed."),
+            DirectTransferClientError("receiver_rejected", "Receiver is busy.", status_code=409),
+        ):
+            with self.subTest(code=first_error.code):
+                calls = []
+
+                def fake_request(_host, _port, _path, _token, method, suffix, _body, **_kwargs):
+                    calls.append(suffix)
+                    if suffix == "/prepare":
+                        return {"status": "uploading" if len(calls) == 1 else "completed",
+                                "offset": len(archive.read_bytes()) if len(calls) > 1 else 0}
+                    if suffix.startswith("/chunks"):
+                        return {"status": "uploading", "offset": len(archive.read_bytes())}
+                    if calls.count("/complete") == 1:
+                        raise first_error
+                    return {"workspace_id": "imported"}
+
+                with patch.object(client, "_request", side_effect=fake_request), \
+                     patch("ctf_agent.direct_transfer_client.time.sleep"):
+                    self.assertEqual(client.send_bundle(url, "a" * 43, archive,
+                                                        scope="workspace"),
+                                     {"workspace_id": "imported"})
+                self.assertEqual(calls.count("/complete"), 2)
+                self.assertEqual(calls.count("/prepare"), 2)
+
+        release = threading.Event()
+
+        def stalled_dns(_host, _port, **_kwargs):
+            release.wait(1)
+            return [(None, None, None, None, ("8.8.8.8", 443))]
+
+        with patch("ctf_agent.direct_transfer_client.DNS_TIMEOUT_SECONDS", 0.01):
+            try:
+                with self.assertRaisesRegex(DirectTransferClientError, "timed out"):
+                    DirectTransferClient(resolver=stalled_dns)._address("receiver.example", 443)
+            finally:
+                release.set()
+
     def test_authenticated_source_to_bearer_receiver_api(self):
         root = Path(self.temp.name)
         source_settings = Settings(
@@ -318,6 +413,7 @@ class DirectTransferTests(unittest.TestCase):
             def route_request(_client, _host, _port, path, token, method, suffix,
                               body, **kwargs):
                 headers = {"authorization": f"Bearer {token}",
+                           "x-csrf-token": "",
                            "content-type": "application/octet-stream" if method == "PUT"
                            else "application/json"}
                 if kwargs.get("chunk_digest"):
@@ -333,20 +429,101 @@ class DirectTransferTests(unittest.TestCase):
                     f"/api/workspaces/{source_workspace}/transfer/direct",
                     json={"invitation_url": invite["url"], "token": invite["token"]},
                 )
-            self.assertEqual(sent.status_code, 200, sent.text)
-            imported_workspace = sent.json()["workspace_id"]
+                self.assertEqual(sent.status_code, 202, sent.text)
+                job_id = sent.json()["job_id"]
+                for _ in range(100):
+                    source_status = source_client.get(
+                        f"/api/transfers/direct/sends/{job_id}"
+                    ).json()
+                    if source_status["status"] in {"completed", "failed", "cancelled", "interrupted"}:
+                        break
+                    time.sleep(0.05)
+            self.assertEqual(source_status["status"], "completed", source_status)
+            imported_workspace = source_status["result"]["workspace_id"]
             self.assertNotEqual(imported_workspace, source_workspace)
             final_status = target_client.get(
                 f"/api/transfers/direct/invitations/{invite['invitation_id']}"
             ).json()
             self.assertEqual(final_status["status"], "completed")
-            self.assertEqual(final_status["result"], sent.json())
+            self.assertEqual(final_status["result"], source_status["result"])
             imported_challenges = target_client.get(
                 f"/api/workspaces/{imported_workspace}/challenges"
             ).json()["challenges"]
             self.assertEqual(len(imported_challenges), 1)
             export_root = source_settings.data_dir / "workspaces" / ".transfers" / "exports"
             self.assertEqual(list(export_root.iterdir()), [])
+
+            # Lose the HTTP response after a chunk was durably accepted. The
+            # next source job must use its retained ZIP, and target prepare
+            # must report the already stored offset for that exact checksum.
+            second_invite = target_client.post(
+                "/api/transfers/direct/invitations",
+                json={"scope": "workspace", "max_size": 1024 * 1024},
+            ).json()
+            lost_once = [False]
+            resumed_offsets = []
+
+            def unreliable_request(client_obj, host, port, path, token,
+                                   method, suffix, body, **kwargs):
+                reply = route_request(client_obj, host, port, path, token,
+                                      method, suffix, body, **kwargs)
+                if suffix == "/prepare":
+                    resumed_offsets.append(reply["offset"])
+                if suffix.startswith("/chunks") and not lost_once[0]:
+                    lost_once[0] = True
+                    raise DirectTransferClientError(
+                        "network_error", "Secure connection to receiver failed.",
+                    )
+                return reply
+
+            send_body = {"invitation_url": second_invite["url"],
+                         "token": second_invite["token"]}
+            with patch.object(DirectTransferClient, "_request", unreliable_request):
+                first_try = source_client.post(
+                    f"/api/workspaces/{source_workspace}/transfer/direct",
+                    json=send_body,
+                )
+                self.assertEqual(first_try.status_code, 202, first_try.text)
+                for _ in range(100):
+                    first_status = source_client.get(
+                        f"/api/transfers/direct/sends/{first_try.json()['job_id']}"
+                    ).json()
+                    if first_status["status"] in {"completed", "failed", "cancelled", "interrupted"}:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(first_status["status"], "failed", first_status)
+                outbox_root = source_settings.data_dir / "workspaces" / ".transfers" / "outbox"
+                snapshots = list(outbox_root.glob("*/*.zip"))
+                self.assertEqual(len(snapshots), 1)
+                retained_digest = hashlib.sha256(snapshots[0].read_bytes()).hexdigest()
+                with source_client.app.state.direct_transfer_outbox.slot(
+                    source_client.get("/api/auth/state").json()["user"]["id"],
+                    source_workspace, None, second_invite["url"],
+                    "z" * 43, False,
+                ) as (_other_id, _other_archive, new_export):
+                    self.assertTrue(new_export)
+                retry = source_client.post(
+                    f"/api/workspaces/{source_workspace}/transfer/direct",
+                    json=send_body,
+                )
+                self.assertEqual(retry.status_code, 202, retry.text)
+                for _ in range(100):
+                    retry_status = source_client.get(
+                        f"/api/transfers/direct/sends/{retry.json()['job_id']}"
+                    ).json()
+                    if retry_status["status"] in {"completed", "failed", "cancelled", "interrupted"}:
+                        break
+                    time.sleep(0.05)
+            self.assertEqual(retry_status["status"], "completed", retry_status)
+            self.assertGreater(resumed_offsets[-1], 0)
+            with closing(connect(target_settings)) as db:
+                received_digest = db.execute(
+                    "SELECT sha256 FROM direct_transfer_invitations WHERE id=?",
+                    (second_invite["invitation_id"],),
+                ).fetchone()[0]
+            self.assertEqual(received_digest, retained_digest)
+            self.assertEqual(list(outbox_root.glob("*/*.zip")), [])
+
             invalid_send = source_client.post(
                 f"/api/workspaces/{source_workspace}/transfer/direct",
                 json={"invitation_url": "http://127.0.0.1/api/transfers/direct/invitations/"
@@ -405,6 +582,76 @@ class DirectTransferTests(unittest.TestCase):
         self.assertEqual(headers["Authorization"], "Bearer " + "s" * 43)
         self.assertNotIn("Cookie", headers)
         self.assertNotIn("Proxy-Authorization", headers)
+
+    def test_stale_manual_export_cleanup_skips_active_download(self):
+        exports = TransferExportManager(self.target[0])
+        archive, lock = exports.reserve()
+        archive.write_bytes(b"private export")
+        old = time.time() - EXPORT_TTL_SECONDS - 10
+        os.utime(archive, (old, old))
+        try:
+            self.assertEqual(exports.cleanup_stale(), 0)
+            self.assertTrue(archive.exists())
+        finally:
+            lock.release()
+        self.assertEqual(exports.cleanup_stale(), 1)
+        self.assertFalse(archive.exists())
+
+    def test_outbox_lock_hash_and_worker_restart(self):
+        settings, owner, _layout = self.source
+        outbox = DirectTransferOutbox(settings)
+        invitation_url = "https://receiver.example/api/transfers/direct/invitations/" + "a" * 32
+        token = "s" * 43
+        with outbox.slot(owner, self.source_workspace, None,
+                         invitation_url, token, False) as (outbox_id, archive, fresh):
+            self.assertTrue(fresh)
+            archive.write_bytes(self.workspace_bundle.read_bytes())
+            outbox.publish(outbox_id, archive)
+            with closing(connect(settings)) as db, db:
+                row = db.execute(
+                    "SELECT token_hash FROM direct_transfer_outbox WHERE id=?",
+                    (outbox_id,),
+                ).fetchone()
+                self.assertEqual(row["token_hash"], hashlib.sha256(token.encode()).hexdigest())
+                self.assertNotEqual(row["token_hash"], token)
+                db.execute("UPDATE direct_transfer_outbox SET updated_at=1 WHERE id=?",
+                           (outbox_id,))
+            self.assertEqual(outbox.cleanup_stale(), 0)
+            self.assertTrue(archive.exists())
+            with closing(connect(settings)) as db, db:
+                db.execute("UPDATE direct_transfer_outbox SET updated_at=? WHERE id=?",
+                           (int(time.time()), outbox_id))
+        with outbox.slot(owner, self.source_workspace, None,
+                         invitation_url, token, False) as (same_id, same_archive, fresh):
+            self.assertEqual(same_id, outbox_id)
+            self.assertFalse(fresh)
+            self.assertEqual(same_archive.read_bytes(), self.workspace_bundle.read_bytes())
+        with outbox.slot(owner, self.source_workspace, None,
+                         invitation_url, "z" * 43, False) as (other_id, _archive, fresh):
+            self.assertNotEqual(other_id, outbox_id)
+            self.assertTrue(fresh)
+        with closing(connect(settings)) as db, db:
+            db.execute("UPDATE direct_transfer_outbox SET updated_at=1 WHERE id=?",
+                       (outbox_id,))
+        self.assertEqual(outbox.cleanup_stale(), 1)
+        self.assertFalse(archive.exists())
+
+        jobs = DirectSendJobs(settings)
+        key = jobs.key(owner, self.source_workspace, None, invitation_url, token, False)
+        job, lock = jobs.start(owner, key)
+        self.assertEqual(job["status"], "queued")
+        lock.release()  # The process died before its worker completed.
+        restarted = DirectSendJobs(settings)
+        self.assertEqual(restarted.status(owner, job["job_id"])["status"], "interrupted")
+        retry, retry_lock = restarted.start(owner, key)
+        try:
+            self.assertNotEqual(retry["job_id"], job["job_id"])
+            self.assertEqual(retry["status"], "queued")
+            self.assertTrue(restarted.cancel(owner, retry["job_id"])["cancel_requested"])
+            restarted.fail(retry["job_id"], "cancelled", "Direct transfer was cancelled.")
+            self.assertEqual(restarted.status(owner, retry["job_id"])["status"], "cancelled")
+        finally:
+            retry_lock.release()
 
 
 if __name__ == "__main__":

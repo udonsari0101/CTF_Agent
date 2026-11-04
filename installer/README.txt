@@ -11,7 +11,8 @@ CTF Agent - Windows local installation
    D:\CTF-Agent\data\ctf-agent-db.vhdx and leaves challenge files
    at the usual WSL path. Existing databases are not migrated automatically.
    Choose whether to start the service at Windows sign-in and require login.
-3. Open http://127.0.0.1:5050 and create the first administrator account.
+3. Open http://127.0.0.1:5050. If you chose password login, create the first
+   administrator account. The no-login mode skips this step.
 4. Connect a Codex or Claude Code account in Agents.
 
 Requirements: x64 Windows, WSL 2, Docker Desktop with its WSL 2 engine and
