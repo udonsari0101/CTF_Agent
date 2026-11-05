@@ -20,7 +20,7 @@ spec.loader.exec_module(helper)
 with tempfile.TemporaryDirectory() as temporary:
     control = Path(temporary)
     marker = control / "current-version.json"
-    payload = {"tag": "v0.4.40", "revision": "a" * 40, "repository": "owner/project"}
+    payload = {"tag": "v1.2.3", "revision": "a" * 40, "repository": "owner/project"}
 
     original_umask = os.umask(0o077)
     try:
