@@ -228,6 +228,8 @@ jobs:
         run: python .github/scripts/check_activity_provenance.py
       - name: Check solver sandbox canary inventory
         run: python .github/scripts/check_solver_canary_inventory.py
+      - name: Check solver failure diagnostics
+        run: python .github/scripts/check_solver_failure_diagnostics.py
       - name: Check solver context usage provenance
         run: python .github/scripts/check_solver_context_usage.py
       - name: Check provider-scoped session resume

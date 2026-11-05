@@ -3325,12 +3325,15 @@ class CodexAppServer:
         finally:
             for future in self.pending.values():
                 if not future.done():
-                    future.set_exception(AppServerFailure({"code": "provider_unavailable"}))
+                    # The app-server reader ended without answering this
+                    # request. Preserve that protocol failure instead of
+                    # conflating it with an upstream overload response.
+                    future.set_exception(AppServerFailure({"code": self.reader_failure_code}))
             self.reader_stopped.set()
 
     async def request(self, method: str, params: dict[str, Any] | None = None, *, timeout: int = 30) -> dict[str, Any]:
         if not self.process or self.process.returncode is not None:
-            raise AppServerFailure({"code": "provider_unavailable"})
+            raise AppServerFailure({"code": "provider_stream_closed"})
         self.sequence += 1
         request_id = self.sequence
         future = asyncio.get_running_loop().create_future()
@@ -6923,6 +6926,7 @@ class SolverWorker:
     async def attest_runtime(self) -> PlatformAttestation:
         """Prove the pinned CLI sandbox before advertising worker readiness."""
 
+        self.startup_diagnostic = None
         for name in self.provider_runtime_checks:
             self.provider_runtime_checks[name] = False
         if not self.attestation or not self.attestation.ready:
@@ -7053,8 +7057,19 @@ class SolverWorker:
             self.startup_diagnostic = getattr(driver, "safe_startup_stderr", None)
             failure = f"app_server_{attestation_stage}_failed:{protocol_code}{exit_detail}{stderr_detail}"
             self.runtime_ready = self.sandbox_attested = False
-        except Exception:
+        except Exception as exc:
             failure = "sandbox_canary_failed"
+            # The status file is observable by the coordinator. Record only
+            # a bounded class and the fixed canary stage, never exception
+            # text, paths, provider output, or authentication material.
+            error_kind = type(exc).__name__
+            if error_kind not in {
+                "AssertionError", "FileNotFoundError", "OSError",
+                "PermissionError", "RuntimeError", "TimeoutError",
+                "TypeError", "ValueError",
+            }:
+                error_kind = "UnexpectedError"
+            self.startup_diagnostic = f"canary:{attestation_stage}:{error_kind}"
             self.runtime_ready = self.sandbox_attested = False
         finally:
             if driver is not None:
