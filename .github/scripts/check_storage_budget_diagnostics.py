@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
-from contextlib import closing, nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,7 +22,8 @@ from ctf_agent.storage_budget import (  # noqa: E402
     StorageBudget, StorageBudgetError, storage_http_status, storage_io_http_response,
 )
 from ctf_agent.solver_exchange import (  # noqa: E402
-    SolverExchangeCoordinator, _stage_budget_error, _stage_io_error,
+    ExchangeError, SolverExchangeCoordinator, _stage_budget_error, _stage_io_error,
+    _write_json_file,
 )
 
 
@@ -68,6 +72,32 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
         self.assertIsInstance(error.diagnostics["observed_at_ns"], int)
         self.assertEqual([row["reservation_key"] for row in self.budget.snapshot()], ["one"])
         self.assertEqual(original.read_bytes(), b"original")
+
+    def test_parallel_staging_writes_keep_reservations_consistent(self):
+        original = self.data / "existing.bin"
+        original.write_bytes(b"preserved")
+        start = threading.Barrier(8)
+
+        def stage(index):
+            key = f"solver:{index}"
+            path = self.data / f"stage-{index}.bin"
+            start.wait(timeout=10)
+            self.budget.reserve(key, "solver", "owner", "workspace", str(index), 1024 * 1024)
+
+            def write():
+                with path.open("xb") as output:
+                    output.write(bytes([index]) * (1024 * 1024))
+                    output.flush()
+                    os.fsync(output.fileno())
+
+            self.budget.commit_reserved_write(key, 1024 * 1024, write)
+            return path.stat().st_size
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            sizes = list(pool.map(stage, range(8)))
+        self.assertEqual(sizes, [1024 * 1024] * 8)
+        self.assertEqual(original.read_bytes(), b"preserved")
+        self.assertFalse(self.budget.snapshot())
 
     def test_replacing_reservation_counts_only_projected_total(self):
         with patch.object(self.budget, "_free", return_value=1000):
@@ -233,6 +263,124 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
                 result = coordinator._tick_slot(job, self.data / "absent-stage")
             self.assertFalse(result)
             self.assertEqual(coordinator.last_block["code"], "solver_storage_write_enospc")
+
+    def _live_attachment_fixture(self):
+        owner = "a" * 32
+        workspace = "b" * 32
+        challenge = "c" * 32
+        attachment = "d" * 32
+        source = (self.data / "workspaces" / workspace / "challenges" /
+                  challenge / "attachments" / attachment)
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"saved attachment contents")
+        active = self.data / "solver-exchange" / "active"
+        (active / "challenge" / "attachments").mkdir(parents=True)
+        index = active / "attachment-index.json"
+        index.write_text('{"ids": []}', encoding="utf-8")
+        with closing(sqlite3.connect(self.database)) as db:
+            with db:
+                db.execute(
+                    "CREATE TABLE attachments (id TEXT,workspace_id TEXT,challenge_id TEXT,"
+                    "original_name TEXT,stored_name TEXT,size INTEGER,created_at TEXT)"
+                )
+                db.execute(
+                    "INSERT INTO attachments VALUES (?,?,?,?,?,?,?)",
+                    (attachment, workspace, challenge, "proof.bin", attachment,
+                     source.stat().st_size, "2026-11-05T00:00:00Z"),
+                )
+
+        @contextmanager
+        def connect():
+            db = sqlite3.connect(self.database)
+            db.row_factory = sqlite3.Row
+            try:
+                yield db
+            finally:
+                db.close()
+
+        coordinator = object.__new__(SolverExchangeCoordinator)
+        coordinator.data_dir = self.data
+        coordinator.database_path = self.database
+        coordinator.storage_budget = self.budget
+        coordinator.stop_requested = threading.Event()
+        coordinator._is_cancelled = lambda _job_id: False
+        coordinator._connect = connect
+        job = {"id": "job", "owner_user_id": owner,
+               "workspace_id": workspace, "challenge_id": challenge}
+        target = active / "challenge" / "attachments" / f"live-{attachment}_proof.bin"
+        return coordinator, job, active, source, target, index
+
+    def test_live_attachment_partial_enospc_cleans_up_and_retries(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+
+        def fail_after_partial(_source, destination, **_kwargs):
+            destination.write_bytes(b"partial")
+            raise OSError(errno.ENOSPC, "simulated write failure")
+
+        with patch("ctf_agent.solver_exchange._copy_regular_file", side_effect=fail_after_partial):
+            with self.assertLogs("ctf_agent.solver_exchange", level="WARNING"):
+                with self.assertRaises(ExchangeError) as caught:
+                    coordinator._sync_live_attachments(job, active)
+        self.assertEqual(caught.exception.code, "solver_storage_write_enospc")
+        self.assertFalse(target.exists())
+        self.assertFalse((target.parent / ("." + target.name + ".partial")).exists())
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": []})
+        self.assertEqual(source.read_bytes(), b"saved attachment contents")
+        self.assertFalse(self.budget.snapshot())
+
+        self.assertTrue(coordinator._sync_live_attachments(job, active))
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": ["d" * 32]})
+        self.assertFalse(coordinator._sync_live_attachments(job, active))
+
+    def test_live_attachment_recovers_leftover_partial_after_restart(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+        partial = target.parent / ("." + target.name + ".partial")
+        partial.write_bytes(b"interrupted copy")
+        self.assertTrue(coordinator._sync_live_attachments(job, active))
+        self.assertFalse(partial.exists())
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": ["d" * 32]})
+
+    def test_live_attachment_drain_leaves_job_retryable(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+        coordinator.stop_requested.set()
+        self.assertFalse(coordinator._sync_live_attachments(job, active))
+        self.assertFalse(target.exists())
+        self.assertFalse((target.parent / ("." + target.name + ".partial")).exists())
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": []})
+        coordinator.stop_requested.clear()
+        self.assertTrue(coordinator._sync_live_attachments(job, active))
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+
+    def test_live_attachment_index_failure_rechecks_existing_content(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+
+        def fail_index(path, payload):
+            if path == index:
+                raise OSError(errno.EIO, "simulated index failure")
+            return _write_json_file(path, payload)
+
+        with patch("ctf_agent.solver_exchange._write_json_file", side_effect=fail_index):
+            with self.assertLogs("ctf_agent.solver_exchange", level="WARNING"):
+                with self.assertRaises(ExchangeError) as caught:
+                    coordinator._sync_live_attachments(job, active)
+        self.assertEqual(caught.exception.code, "stage_storage_failed")
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": []})
+
+        changed = b"X" * source.stat().st_size
+        target.write_bytes(changed)
+        with self.assertRaises(ExchangeError) as caught:
+            coordinator._sync_live_attachments(job, active)
+        self.assertEqual(caught.exception.code, "invalid_attachment_path")
+        self.assertEqual(target.read_bytes(), changed)
+        self.assertEqual(source.read_bytes(), b"saved attachment contents")
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": []})
+
+        target.write_bytes(source.read_bytes())
+        self.assertTrue(coordinator._sync_live_attachments(job, active))
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": ["d" * 32]})
 
 
 if __name__ == "__main__":

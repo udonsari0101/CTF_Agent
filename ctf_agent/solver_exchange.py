@@ -2921,7 +2921,23 @@ class SolverExchangeCoordinator:
         return changed
 
     def _sync_live_attachments(self, job: Mapping[str, Any], active: Path) -> bool:
-        """Expose newly uploaded challenge files to a running solve."""
+        """Expose newly uploaded files without disguising transient storage errors."""
+
+        try:
+            return self._sync_live_attachments_unchecked(job, active)
+        except _StageCancelled:
+            # A drain or owner cancellation may interrupt a live copy. The
+            # isolated job remains intact; a later tick handles the control.
+            return False
+        except StorageBudgetError as exc:
+            _log_stage_storage_failure(exc, self.data_dir, self.database_path)
+            raise _stage_budget_error(exc) from exc
+        except (OSError, sqlite3.Error) as exc:
+            _log_stage_storage_failure(exc, self.data_dir, self.database_path)
+            raise _stage_io_error(exc) from exc
+
+    def _sync_live_attachments_unchecked(self, job: Mapping[str, Any], active: Path) -> bool:
+        """Publish each copy only after its file is complete and durable."""
 
         index_path = active / "attachment-index.json"
         if not index_path.exists():
@@ -2960,18 +2976,50 @@ class SolverExchangeCoordinator:
                 raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
             name = "live-" + attachment_id + "_" + _stage_filename(0, row["original_name"])[5:]
             target = destination / name
+            partial = destination / ("." + name + ".partial")
+            if partial.exists() or partial.is_symlink():
+                partial_info = partial.lstat()
+                if not stat.S_ISREG(partial_info.st_mode) or partial_info.st_nlink != 1:
+                    raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+                partial.unlink()
+                _fsync(destination)
             if target.exists() or target.is_symlink():
                 info = target.lstat()
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != row["size"]:
                     raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+                if not _regular_files_match(
+                    source_root / stored, target, expected_size=row["size"],
+                    source_root=self.data_dir, target_root=destination,
+                ):
+                    raise ExchangeError("invalid_attachment_path", "Live attachment content does not match the saved file.", category="safety")
+                _fsync(destination)
             else:
-                _copy_regular_file(
-                    source_root / stored, target,
-                    expected_size=row["size"],
-                    cancelled=lambda: self.stop_requested.is_set() or self._is_cancelled(job["id"]),
-                    source_root=self.data_dir,
-                    allow_hardlinks=True,
-                )
+                def copy_one() -> None:
+                    try:
+                        _copy_regular_file(
+                            source_root / stored, partial,
+                            expected_size=row["size"],
+                            cancelled=lambda: self.stop_requested.is_set() or self._is_cancelled(job["id"]),
+                            source_root=self.data_dir,
+                            allow_hardlinks=True,
+                            space_reserved=True,
+                        )
+                        if target.exists() or target.is_symlink():
+                            raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+                        os.replace(partial, target)
+                        _fsync(destination)
+                    finally:
+                        if partial.exists() or partial.is_symlink():
+                            info = partial.lstat()
+                            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                                raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+                            partial.unlink()
+                            _fsync(destination)
+
+                if row["size"]:
+                    self.storage_budget.write_unreserved(row["size"], copy_one)
+                else:
+                    copy_one()
             known.append(attachment_id)
             known_set.add(attachment_id)
             _write_json_file(index_path, {"ids": known})
@@ -6769,6 +6817,52 @@ def _content_snapshot(details: os.stat_result) -> tuple[int, int, int, int, int]
         int(details.st_mtime_ns),
         int(details.st_ctime_ns),
     )
+
+
+def _regular_files_match(
+    source: Path, target: Path, *, expected_size: int,
+    source_root: Path, target_root: Path,
+) -> bool:
+    """Verify an already-published copy before repairing its missing index."""
+
+    source_fd = target_fd = None
+    try:
+        source_fd = _open_readonly_beneath(source, source_root)
+        target_fd = _open_readonly_beneath(target, target_root)
+        source_info, target_info = os.fstat(source_fd), os.fstat(target_fd)
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or not stat.S_ISREG(target_info.st_mode)
+            or target_info.st_nlink != 1
+            or source_info.st_size != expected_size
+            or target_info.st_size != expected_size
+        ):
+            return False
+        source_snapshot = _content_snapshot(source_info)
+        target_snapshot = _content_snapshot(target_info)
+
+        def digest(descriptor: int) -> bytes:
+            value = hashlib.sha256()
+            while chunk := os.read(descriptor, 4 * 1024 * 1024):
+                value.update(chunk)
+            return value.digest()
+
+        source_digest, target_digest = digest(source_fd), digest(target_fd)
+        if (
+            _content_snapshot(os.fstat(source_fd)) != source_snapshot
+            or _content_snapshot(os.fstat(target_fd)) != target_snapshot
+        ):
+            raise ExchangeError(
+                "attachment_changed_during_staging",
+                "Live attachment changed while verifying the interrupted copy.",
+                category="storage", retryable=True,
+            )
+        return secrets.compare_digest(source_digest, target_digest)
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if target_fd is not None:
+            os.close(target_fd)
 
 
 def _copy_regular_file(
