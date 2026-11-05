@@ -22,6 +22,7 @@ x-solver-common: &solver-common
   restart: ${CTF_LOCAL_RESTART_POLICY:-no}
   user: "${CTF_LOCAL_UID:-1000}:${CTF_LOCAL_GID:-1000}"
   command: [python, -m, ctf_agent.solver_worker]
+  networks: [solver_egress]
   environment:
     TZ: Asia/Seoul
     HOME: /solver-scratch/worker-home
@@ -308,3 +309,7 @@ services:
         condition: service_started
       solver:
         condition: service_started
+
+networks:
+  solver_egress:
+    driver: bridge

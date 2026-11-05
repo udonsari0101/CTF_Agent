@@ -91,6 +91,10 @@ if ($dbVhd) {
 $launch = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
     "CTF_LOCAL_HOME=$linuxHome", "CTF_LOCAL_DATABASE=$dockerDatabasePath",
     "CTF_LOCAL_FS_DATABASE=$databasePath", "CTF_LOCAL_DB_MOUNT=$databaseMount",
+    'CTF_LOCAL_BROWSER_FROM_WINDOWS=true',
     'bash', $linuxPath) -Visible
 if ($launch.ExitCode -ne 0) { throw "CTF Agent start failed (exit code $($launch.ExitCode))." }
 Wait-CtfAgentReady $distro $linuxHome
+if ([string]$saved.authMode -eq 'nologin') {
+    Open-CtfAgentLocalBrowser $distro $linuxHome
+}

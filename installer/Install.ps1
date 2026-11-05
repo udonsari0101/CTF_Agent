@@ -837,10 +837,13 @@ if ($autoStart) {
     $shortcut.Save()
 }
 Wait-CtfAgentReady $distro $linuxHome
+if (-not $requireLogin) {
+    Open-CtfAgentLocalBrowser $distro $linuxHome
+}
 Write-Host "Start: $(Join-Path $stateDir 'Start.cmd')"
 Write-Host "Uninstall: $(Join-Path $stateDir 'Uninstall.cmd')"
 if ($requireLogin) { Write-Host 'Open http://127.0.0.1:5050 to create the first administrator account.' }
-else { Write-Host 'Open http://127.0.0.1:5050.' }
+else { Write-Host 'The local site was opened in your browser. Run Start.cmd to connect another browser later.' }
 Write-Host "Files in Explorer: \\wsl.localhost\$distro\$($linuxHome.TrimStart('/') -replace '/', '\')\ctf_agent_data\workspace_files"
 if ($dbVhd) {
     Write-Host "Database VHDX on Windows: $dbVhd"

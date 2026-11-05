@@ -19,6 +19,10 @@ from fastapi import Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from .local_access import COOKIE_NAME as LOCAL_COOKIE, COOKIE_SECONDS as LOCAL_COOKIE_SECONDS
+from .local_access import ensure_key as ensure_local_access_key
+from .local_access import issue_cookie as issue_local_cookie
+from .local_access import valid_cookie as valid_local_cookie
 from .password_policy import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH
 
 COOKIE = "ctf_session"
@@ -50,6 +54,14 @@ class Login(BaseModel):
     password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
     remember: bool = False
     _username = field_validator("username")(username_value)
+
+
+class LocalBootstrap(BaseModel):
+    ticket: str = Field(min_length=32, max_length=32)
+
+
+class LocalTicketRequest(BaseModel):
+    token: str = Field(min_length=64, max_length=64)
 
 
 class SessionPreference(BaseModel):
@@ -98,7 +110,11 @@ class UserPassword(BaseModel):
 def register_auth(app, settings, database, make_hash, verify_hash, user_context):
     credential_work_gate = threading.BoundedSemaphore(2)
     automatic_session = None
+    local_access_key = None
+    local_tickets: dict[str, float] = {}
+    local_tickets_lock = threading.Lock()
     if settings.auth_mode == "nologin":
+        local_access_key = ensure_local_access_key(settings.config_dir)
         with database() as db:
             local_id = db.execute(
                 "SELECT value FROM meta WHERE key='legacy_owner_id'"
@@ -126,6 +142,13 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
             "csrf_token": secrets.token_urlsafe(32),
             "token_hash": "",
         }
+
+    def local_session_for(request: Request):
+        if automatic_session is None or local_access_key is None:
+            return None
+        return automatic_session if valid_local_cookie(
+            local_access_key, request.cookies.get(LOCAL_COOKIE, "")
+        ) else None
 
     def password_api_disabled(path: str) -> bool:
         return settings.auth_mode == "nologin" and (
@@ -181,7 +204,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
     def require_auth(request: Request) -> dict:
         if getattr(request.state, "user", None):
             return request.state.user
-        session = automatic_session or session_for(request)
+        session = local_session_for(request) if automatic_session else session_for(request)
         if not session:
             raise HTTPException(401, "로그인이 필요합니다.")
         if request.method not in ("GET", "HEAD", "OPTIONS"):
@@ -236,6 +259,8 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
         # occupy the bounded request-body gates.
         if password_api_disabled(scope.get("path", "")):
             return 404, "이 인증 모드에서는 사용할 수 없습니다."
+        if scope.get("path") in {"/api/auth/local/ticket", "/api/auth/local/bootstrap"}:
+            return None if settings.auth_mode == "nologin" else (404, "Local browser access is unavailable")
         if scope.get("path") == "/api/auth/login":
             return None
         if scope.get("path") == "/api/auth/setup":
@@ -262,7 +287,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
             if request.url.path == "/api/auth/setup" and not settings.allow_web_bootstrap:
                 return JSONResponse({"detail": "초기 설정을 사용할 수 없습니다."}, status_code=404)
             if (request.url.path.startswith("/api/")
-                    and request.url.path not in ("/api/auth/state", "/api/auth/login", "/api/auth/setup")
+                    and request.url.path not in ("/api/auth/state", "/api/auth/login", "/api/auth/setup", "/api/auth/local/ticket", "/api/auth/local/bootstrap")
                     and not direct_bearer_request(request.scope)):
                 try:
                     user_context.set(require_auth(request))
@@ -278,7 +303,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
 
     @app.get("/api/auth/state")
     def state(request: Request):
-        session = automatic_session or session_for(request)
+        session = local_session_for(request) if automatic_session else session_for(request)
         if automatic_session:
             configured = True
         else:
@@ -295,6 +320,44 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
             "username": session["username"] if session else None,
             "session_persistent": bool(session["persistent"]) if session and not automatic_session else False,
         }
+
+    @app.post("/api/auth/local/ticket")
+    def local_ticket(payload: LocalTicketRequest, request: Request, response: Response):
+        if automatic_session is None or local_access_key is None:
+            raise HTTPException(404)
+        origin_check(request)
+        if not hmac.compare_digest(payload.token.encode("ascii"), local_access_key):
+            raise HTTPException(403, "Local access link is invalid")
+        now = time.monotonic()
+        ticket = secrets.token_urlsafe(24)
+        with local_tickets_lock:
+            for candidate, expiry in list(local_tickets.items()):
+                if expiry <= now:
+                    del local_tickets[candidate]
+            if len(local_tickets) >= 16:
+                oldest = next(iter(local_tickets))
+                del local_tickets[oldest]
+            local_tickets[ticket] = now + 90
+        response.headers["Cache-Control"] = "no-store"
+        return {"ticket": ticket}
+
+    @app.post("/api/auth/local/bootstrap")
+    def local_bootstrap(payload: LocalBootstrap, request: Request, response: Response):
+        if automatic_session is None or local_access_key is None:
+            raise HTTPException(404)
+        origin_check(request)
+        with local_tickets_lock:
+            expiry = local_tickets.pop(payload.ticket, 0)
+        if expiry <= time.monotonic():
+            raise HTTPException(403, "Local access link is invalid or expired")
+        response.set_cookie(
+            LOCAL_COOKIE, issue_local_cookie(local_access_key),
+            max_age=LOCAL_COOKIE_SECONDS, httponly=True,
+            secure=settings.cookie_secure, samesite="strict", path="/",
+        )
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return {"ok": True}
 
     @app.post("/api/auth/setup")
     def setup(payload: FirstAdmin, request: Request, response: Response):

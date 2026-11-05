@@ -263,3 +263,25 @@ print(json.dumps({'ready':d.get('ready'), 'reason':d.get('reason')}))
     }
     throw 'CTF Agent is configured but /readyz did not return HTTP 200 within the readiness deadline. Installation settings and the database were preserved.'
 }
+
+function Open-CtfAgentLocalBrowser([string]$distro, [string]$linuxHome) {
+    # The installation key stays in the POST body. Only a one-use, short-lived
+    # ticket appears in the URL fragment, which app.js immediately removes.
+    $path = "$linuxHome/ctf_agent_data/config/local-access.key"
+    $probe = Invoke-DesktopNative 'wsl.exe' @('--distribution', $distro, '--exec',
+        'cat', $path) 10
+    if ($probe.ExitCode -ne 0 -or $probe.Stdout -notmatch '^[A-Za-z0-9_-]{64}$') {
+        throw 'Local browser access is unavailable. Run Install.cmd from this release to repair the installation.'
+    }
+    try {
+        $body = @{ token = $probe.Stdout.Trim() } | ConvertTo-Json -Compress
+        $ticketResponse = Invoke-RestMethod -Uri 'http://127.0.0.1:5050/api/auth/local/ticket' `
+            -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 10
+    } catch {
+        throw 'Local browser access could not be prepared. Retry Start.cmd after the service is ready.'
+    }
+    $ticket = [string]$ticketResponse.ticket
+    if ($ticket -notmatch '^[A-Za-z0-9_-]{32}$') { throw 'Local browser access returned an invalid ticket.' }
+    $url = 'http://127.0.0.1:5050/#/local-access/' + $ticket
+    Start-Process -FilePath $url
+}

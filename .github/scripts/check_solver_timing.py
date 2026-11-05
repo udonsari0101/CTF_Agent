@@ -14,7 +14,7 @@ if not (ROOT / "ctf_agent").is_dir():
     ROOT = Path.cwd()
 sys.path.insert(0, str(ROOT))
 
-from fastapi.testclient import TestClient
+from local_test_client import TestClient
 
 from ctf_agent.db import Settings
 from ctf_agent.main import create_app

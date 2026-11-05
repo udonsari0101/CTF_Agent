@@ -13,7 +13,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi.testclient import TestClient
+from local_test_client import TestClient
 
 
 ROOT = Path(__file__).resolve().parents[2]

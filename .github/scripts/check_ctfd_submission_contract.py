@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from fastapi.testclient import TestClient
+from local_test_client import TestClient
 
 from ctf_agent.ctfd import CTFdClient, CTFdError, Response
 from ctf_agent.db import Settings

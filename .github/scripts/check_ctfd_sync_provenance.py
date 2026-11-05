@@ -10,7 +10,7 @@ from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
-from fastapi.testclient import TestClient
+from local_test_client import TestClient
 
 ROOT = Path(__file__).resolve().parents[2] if ".github" in Path(__file__).parts else Path.cwd()
 sys.path.insert(0, str(ROOT))

@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 warnings.filterwarnings("ignore", category=ResourceWarning, message=r"unclosed database.*")
 
-from fastapi.testclient import TestClient
+from local_test_client import TestClient
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))

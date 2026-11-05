@@ -196,3 +196,65 @@ elif docker image inspect ctf-agent-updater:local >/dev/null 2>&1; then
     docker start ctf_agent_local_updater >/dev/null 2>&1 || true
 fi
 printf 'CTF Agent %s services requested; solver readiness requires /readyz HTTP 200.\n' "$version"
+if [[ "${options[0]}" == nologin && "${CTF_LOCAL_BROWSER_FROM_WINDOWS:-}" != true ]]; then
+    # An in-app update refreshes this WSL launcher but cannot replace an old
+    # Windows Start.ps1. That older launcher still calls this script. Pair its
+    # browser using a short-lived ticket, keeping the installation key out of
+    # command lines, URLs, browser history, and solver mounts.
+    python3 - "$home_dir/ctf_agent_data/config/local-access.key" <<'PY'
+import base64
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+key_path = pathlib.Path(sys.argv[1])
+if key_path.is_symlink() or not key_path.is_file():
+    raise SystemExit("Local browser access is unavailable; run Install.cmd from the current release.")
+key = key_path.read_text(encoding="ascii").strip()
+if not re.fullmatch(r"[A-Za-z0-9_-]{64}", key):
+    raise SystemExit("Local browser access is invalid; run Install.cmd from the current release.")
+windows_shell = shutil.which("cmd.exe") or "/mnt/c/Windows/System32/cmd.exe"
+powershell = (shutil.which("powershell.exe")
+              or "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+if not pathlib.Path(windows_shell).is_file() or not pathlib.Path(powershell).is_file():
+    raise SystemExit("Windows browser integration is unavailable; run Install.cmd from the current release.")
+script = r'''
+$ErrorActionPreference = 'Stop'
+$key = [Console]::In.ReadToEnd().Trim()
+if ($key -notmatch '^[A-Za-z0-9_-]{64}$') { exit 2 }
+$ready = $false
+for ($i = 0; $i -lt 30; $i++) {
+    try {
+        $response = Invoke-WebRequest -Uri 'http://127.0.0.1:5050/readyz' -UseBasicParsing -TimeoutSec 3
+        if ([int]$response.StatusCode -eq 200) { $ready = $true; break }
+    } catch { }
+    Start-Sleep -Seconds 2
+}
+if (-not $ready) { exit 3 }
+$body = @{ token = $key } | ConvertTo-Json -Compress
+$response = Invoke-RestMethod -Uri 'http://127.0.0.1:5050/api/auth/local/ticket' -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 10
+if ([string]$response.ticket -notmatch '^[A-Za-z0-9_-]{32}$') { exit 4 }
+[Console]::Out.Write([string]$response.ticket)
+'''
+encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+try:
+    result = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        input=key, text=True, encoding="utf-8", errors="replace",
+        capture_output=True, timeout=120,
+    )
+except (OSError, subprocess.TimeoutExpired) as exc:
+    raise SystemExit("Local browser access could not be prepared. Retry Start.cmd.") from exc
+ticket = result.stdout.strip()
+if result.returncode or not re.fullmatch(r"[A-Za-z0-9_-]{32}", ticket):
+    raise SystemExit("Local browser access could not be prepared. Retry Start.cmd.")
+url = "http://127.0.0.1:5050/#/local-access/" + ticket
+try:
+    subprocess.run([windows_shell, "/c", "start", "", url], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+    raise SystemExit("Could not open the Windows browser. Run Install.cmd from the current release.") from exc
+PY
+fi
