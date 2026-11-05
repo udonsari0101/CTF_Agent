@@ -159,6 +159,8 @@ jobs:
           PY
       - name: Check workspace transfer archive contract
         run: python .github/scripts/check_workspace_transfer.py
+      - name: Check read-only solver history transfer
+        run: python .github/scripts/check_solver_history_transfer.py
       - name: Check resumable transfer upload contract
         run: python .github/scripts/check_transfer_uploads.py
       - name: Check workspace transfer HTTP contract

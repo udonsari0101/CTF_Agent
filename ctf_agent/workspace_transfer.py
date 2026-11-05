@@ -1,10 +1,10 @@
-"""Versioned, credential-free transfer of one workspace and its source files.
+"""Versioned, credential-free transfer of workspace data and solver history.
 
-This is a data transfer, not a solver-session backup. The bundle never reads
-provider accounts, CTFd connection secrets, notification settings, sessions,
-or worker state. Challenge text, notes, flags and attachments are user content
-and may themselves contain sensitive material; callers must treat the bundle
-as private. Remote endpoints are omitted unless explicitly requested.
+The bundle never reads provider accounts, CTFd connection secrets,
+notification settings, live sessions, or worker state. Imported solver jobs
+are read-only history, not resumable provider sessions. User text, flags,
+attachments and logs may themselves be sensitive; treat the bundle as private.
+Remote endpoints are omitted unless explicitly requested.
 """
 
 from __future__ import annotations
@@ -25,11 +25,16 @@ from pathlib import Path
 from typing import Any
 
 from .db import Settings, connect
+from .solver_history_transfer import (
+    ARCHIVE_PATH as HISTORY_ARCHIVE_PATH,
+    HistoryError, export_history, history_digest, import_history,
+    validate_descriptor as validate_history_descriptor,
+)
 from .storage_layout import StorageLayout
 
 
 FORMAT = "ctf-agent-workspace"
-VERSION = 1
+VERSION = 2
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_ENTRIES = 50_000
 CHUNK = 1024 * 1024
@@ -321,6 +326,11 @@ def export_workspace(
                     bundle, source, item["archive_path"], item["size"],
                     layout.legacy_root,
                 )
+            try:
+                with closing(connect(settings)) as db:
+                    history = export_history(db, bundle, owner_user_id, workspace_id, challenge_id)
+            except HistoryError as exc:
+                raise TransferError(str(exc)) from exc
             manifest = {
                 "format": FORMAT,
                 "version": VERSION,
@@ -329,8 +339,10 @@ def export_workspace(
                 "included_remote": bool(include_remote),
                 "excluded": [
                     "users", "sessions", "provider_accounts", "ctfd_credentials",
-                    "telegram_settings", "solver_jobs", "upload_sessions",
+                    "telegram_settings", "native_provider_sessions", "worker_state",
+                    "retry_checkpoints", "upload_sessions",
                 ],
+                "solver_history": history,
                 **bundle_metadata,
             }
             encoded = json.dumps(manifest, ensure_ascii=False,
@@ -351,6 +363,12 @@ def export_workspace(
             current["evidence_shares"] = []
         if current != snapshot:
             raise TransferError("The workspace changed during export; retry.")
+        try:
+            with closing(connect(settings)) as db:
+                if history_digest(db, owner_user_id, workspace_id, challenge_id) != history:
+                    raise TransferError("Solver history changed during export; retry.")
+        except HistoryError as exc:
+            raise TransferError(str(exc)) from exc
         with staging.open("r+b") as source:
             os.fsync(source.fileno())
         # Hard-link publishing never replaces an existing user-selected file.
@@ -362,6 +380,8 @@ def export_workspace(
             "challenge_count": len(snapshot["challenges"]),
             "attachment_count": len(snapshot["attachments"]),
             "evidence_share_count": len(snapshot["evidence_shares"]),
+            "solver_job_count": history["job_count"],
+            "solver_event_count": history["event_count"],
             "size": destination.stat().st_size,
         }
     finally:
@@ -394,7 +414,7 @@ def _identifier(value: Any, label: str) -> str:
 
 def _validate(bundle: zipfile.ZipFile) -> dict:
     entries = bundle.infolist()
-    if len(entries) > MAX_ENTRIES + 1 or len({item.filename for item in entries}) != len(entries):
+    if len(entries) > MAX_ENTRIES + 2 or len({item.filename for item in entries}) != len(entries):
         raise TransferError("Bundle has duplicate or too many entries.")
     names = {item.filename for item in entries}
     if "manifest.json" not in names:
@@ -407,15 +427,22 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
     except (json.JSONDecodeError, UnicodeDecodeError, RuntimeError,
             zipfile.BadZipFile) as exc:
         raise TransferError("Bundle manifest is not valid JSON.") from exc
-    if not isinstance(manifest, dict) or manifest.get("format") != FORMAT or manifest.get("version") != VERSION:
+    if (not isinstance(manifest, dict) or manifest.get("format") != FORMAT
+            or manifest.get("version") not in (1, VERSION)):
         raise TransferError("Unsupported workspace bundle version.")
     mandatory = {
         "format", "version", "scope", "exported_at", "included_remote",
         "excluded", "workspace", "challenges", "relations", "attachments",
     }
-    if set(manifest) not in (mandatory, mandatory | {"evidence_shares"}):
+    extra = {"solver_history"} if manifest["version"] == VERSION else set()
+    if set(manifest) not in (mandatory | extra, mandatory | extra | {"evidence_shares"}):
         raise TransferError("Bundle manifest contains unknown metadata fields.")
     manifest.setdefault("evidence_shares", [])
+    if manifest["version"] == VERSION:
+        try:
+            validate_history_descriptor(bundle, manifest["solver_history"])
+        except HistoryError as exc:
+            raise TransferError(str(exc)) from exc
     if manifest.get("scope", "workspace") not in {"workspace", "challenge"}:
         raise TransferError("Unsupported bundle scope.")
     if not isinstance(manifest["included_remote"], bool):
@@ -466,6 +493,8 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
         if item.get("completion_source") not in (None, "manual", "agent"):
             raise TransferError("Invalid completion source in bundle.")
     expected = {"manifest.json"}
+    if manifest["version"] == VERSION:
+        expected.add(HISTORY_ARCHIVE_PATH)
     attachment_ids: set[str] = set()
     for item in attachments:
         if not isinstance(item, dict):
@@ -561,10 +590,16 @@ def preview_bundle(archive: Path, *, settings: Settings | None = None,
     total = sum(item["size"] for item in manifest["attachments"])
     collisions: list[str] = []
     free_bytes = None
+    database_free_bytes = None
     sufficient_space = None
     if settings is not None:
         free_bytes = shutil.disk_usage(settings.data_dir).free
-        sufficient_space = free_bytes - total >= settings.storage_min_free_bytes
+        database_free_bytes = shutil.disk_usage(settings.db_dir).free
+        history_size = (manifest.get("solver_history") or {}).get("size", 0)
+        sufficient_space = (
+            free_bytes - total >= settings.storage_min_free_bytes
+            and database_free_bytes - history_size * 3 >= settings.storage_min_free_bytes
+        )
         if owner_user_id:
             with closing(connect(settings)) as db:
                 if destination_workspace_id:
@@ -591,18 +626,22 @@ def preview_bundle(archive: Path, *, settings: Settings | None = None,
                     collisions = [manifest["workspace"]["name"]]
     return {
         "scope": manifest.get("scope", "workspace"),
-        "version": VERSION,
+        "version": manifest["version"],
         "name": manifest["workspace"]["name"] if manifest.get("scope") != "challenge"
                 else manifest["challenges"][0]["name"],
         "challenge_count": len(manifest["challenges"]),
         "attachment_count": len(manifest["attachments"]),
         "evidence_share_count": len(shares),
+        "solver_job_count": (manifest.get("solver_history") or {}).get("job_count", 0),
+        "solver_event_count": (manifest.get("solver_history") or {}).get("event_count", 0),
+        "solver_guidance_count": (manifest.get("solver_history") or {}).get("guidance_count", 0),
         "flag_share_count": sum(1 for share in shares if share["include_flag"]),
         "flag_shares_require_reapproval": any(share["include_flag"] for share in shares),
         "observations_require_reapproval": any(share["observation"] for share in shares),
         "attachment_bytes": total,
         "archive_bytes": archive.stat().st_size,
         "free_bytes": free_bytes,
+        "database_free_bytes": database_free_bytes,
         "sufficient_space": sufficient_space,
         "name_collisions": collisions,
         "remote_endpoints_included": manifest["included_remote"],
@@ -643,6 +682,17 @@ def _copy_from_bundle(bundle: zipfile.ZipFile, item: dict, target: Path) -> None
         raise TransferError("Attachment checksum does not match the manifest.")
 
 
+def _check_history_storage(settings: Settings, manifest: dict) -> None:
+    history = manifest.get("solver_history")
+    if not history:
+        return
+    # SQLite indexes, WAL pages and UTF-8 JSON can take more space than the
+    # uncompressed archive. Reserve three times the serialized history size.
+    needed = history["size"] * 3
+    if shutil.disk_usage(settings.db_dir).free - needed < settings.storage_min_free_bytes:
+        raise TransferError("Insufficient database space to import solver history.")
+
+
 def import_workspace(settings: Settings, layout: StorageLayout, owner_user_id: str,
                      archive: Path, *, source_upload_id: str | None = None) -> dict[str, Any]:
     """Import a checked bundle as a new workspace with new IDs.
@@ -672,6 +722,7 @@ def import_workspace(settings: Settings, layout: StorageLayout, owner_user_id: s
         manifest = _validate(bundle)
         if manifest.get("scope", "workspace") != "workspace":
             raise TransferError("Import this challenge bundle into an existing workspace.")
+        _check_history_storage(settings, manifest)
         total = sum(item["size"] for item in manifest["attachments"])
         free = shutil.disk_usage(settings.data_dir).free
         if free - total < settings.storage_min_free_bytes:
@@ -779,6 +830,13 @@ def import_workspace(settings: Settings, layout: StorageLayout, owner_user_id: s
                          item["observation"], 0, item["source_updated_at"],
                          owner_user_id, item["verified_at"]),
                     )
+                try:
+                    historical_jobs = import_history(
+                        db, bundle, manifest.get("solver_history"), owner_user_id,
+                        workspace_id, challenge_ids,
+                    )
+                except HistoryError as exc:
+                    raise TransferError(str(exc)) from exc
                 for new_id in challenge_ids.values():
                     layout.sync_challenge(db, workspace_id, new_id)
                 result = {
@@ -790,6 +848,7 @@ def import_workspace(settings: Settings, layout: StorageLayout, owner_user_id: s
                         bool(item["observation"])
                         for item in manifest["evidence_shares"]
                     ),
+                    "solver_job_count": historical_jobs,
                 }
                 if source_upload_id is not None:
                     db.execute(
@@ -850,6 +909,7 @@ def import_challenge(settings: Settings, layout: StorageLayout, owner_user_id: s
         manifest = _validate(bundle)
         if manifest.get("scope") != "challenge":
             raise TransferError("A workspace bundle cannot be added as one challenge.")
+        _check_history_storage(settings, manifest)
         item = manifest["challenges"][0]
         files = manifest["attachments"]
         total = sum(file["size"] for file in files)
@@ -924,6 +984,13 @@ def import_challenge(settings: Settings, layout: StorageLayout, owner_user_id: s
                          file["original_name"], file_ids[file["id"]],
                          file["size"], file["created_at"]),
                     )
+                try:
+                    historical_jobs = import_history(
+                        db, bundle, manifest.get("solver_history"), owner_user_id,
+                        workspace_id, {item["id"]: new_id},
+                    )
+                except HistoryError as exc:
+                    raise TransferError(str(exc)) from exc
                 db.execute("UPDATE workspaces SET updated_at=? WHERE id=?",
                            (stamp, workspace_id))
                 layout.reserve_workspace(db, workspace_id, owned["name"])
@@ -937,6 +1004,7 @@ def import_challenge(settings: Settings, layout: StorageLayout, owner_user_id: s
                     "challenge_id": new_id,
                     "source_challenge_id": item["id"],
                     "attachment_count": len(files),
+                    "solver_job_count": historical_jobs,
                 }
                 if source_upload_id is not None:
                     db.execute(

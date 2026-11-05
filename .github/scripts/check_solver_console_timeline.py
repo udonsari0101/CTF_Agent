@@ -70,16 +70,23 @@ try {
   const initial=!!first&&first.querySelector('pre')?.textContent.includes('python solver.py')
     &&first.querySelector('.solver-console-field:last-child pre')?.textContent.includes('Flag found')
     &&stream.querySelectorAll('.solver-console-card').length===36
+    &&first.matches('details')&&!first.open
+    &&stream.querySelectorAll('details.solver-console-card').length===1
     &&solverConsoleDialog.querySelector('[name="requested_delivery"]').disabled;
-  first.open=false;
+  first.open=true;
   first.dispatchEvent(new Event('toggle'));
   currentSolverEvents.push({kind:'progress',sequence:38,code:'step',created_at:38});
+  paintSolverConsole();
+  const openRetained=first.open&&stream.querySelector('.solver-console-card')===first;
+  first.open=false;
+  first.dispatchEvent(new Event('toggle'));
+  currentSolverEvents.push({kind:'progress',sequence:39,code:'step',created_at:39});
   paintSolverConsole();
   const stableCard=stream.querySelector('.solver-console-card');
   const retained=stableCard===first&&stableCard.open===false;
   stream.scrollTop=0;
   stream.dispatchEvent(new Event('scroll'));
-  currentSolverEvents.push({kind:'progress',sequence:39,code:'step',created_at:39});
+  currentSolverEvents.push({kind:'progress',sequence:40,code:'step',created_at:40});
   paintSolverConsole();
   const retainedNode=stream.querySelector('.solver-console-card')===stableCard;
   const paused=!solverConsoleFollowLatest&&stream.scrollTop===0
@@ -97,6 +104,11 @@ try {
   reconcileSolverConsoleTimeline(separate,source);
   const backfill=separate.querySelector('.solver-console-card')?.dataset.logKey==='event:9'
     &&separate.querySelector('[data-log-key="event:10"]')===oldCard;
+  const pending=document.createElement('div');
+  pending.className='solver-console-stream'; document.body.append(pending);
+  reconcileSolverConsoleTimeline(pending,[{kind:'activity',sequence:60,activity_id:'b'.repeat(32),
+    phase:'started',tool:'shell',summary:'Working',command:'echo pending',message:'still running',created_at:60}]);
+  const noEmptyExpand=pending.querySelectorAll('details').length===0;
   const compact=document.createElement('details');
   const compactEvents=[{kind:'progress',sequence:50,code:'step',created_at:50},
     {kind:'progress',sequence:51,code:'step',created_at:51}];
@@ -115,8 +127,8 @@ try {
   const changed=solverConsoleDialog.querySelector('.solver-console-head small').textContent==='job-2'
     &&!solverConsoleDialog.querySelector('[name="requested_delivery"]').disabled
     &&!solverConsoleDialog.querySelector('.solver-console-card');
-  document.querySelector('#result').textContent=initial&&retained&&retainedNode&&paused&&resumed&&backfill&&compactIncremental&&changed?'PASS'
-    :'FAIL '+JSON.stringify({initial,retained,retainedNode,paused,resumed,backfill,compactIncremental,changed,count:stream.querySelectorAll('.solver-console-card').length});
+  document.querySelector('#result').textContent=initial&&openRetained&&retained&&retainedNode&&paused&&resumed&&backfill&&noEmptyExpand&&compactIncremental&&changed?'PASS'
+    :'FAIL '+JSON.stringify({initial,openRetained,retained,retainedNode,paused,resumed,backfill,noEmptyExpand,compactIncremental,changed,count:stream.querySelectorAll('.solver-console-card').length});
 } catch(error) { document.querySelector('#result').textContent='ERROR '+error.stack; }
 </script></body></html>"""
     with tempfile.TemporaryDirectory(prefix="ctf-agent-solver-console-") as temp:

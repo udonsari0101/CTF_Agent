@@ -156,7 +156,8 @@ class WorkspaceTransferTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as bundle:
             manifest = json.loads(bundle.read("manifest.json"))
             self.assertEqual(set(bundle.namelist()),
-                             {"manifest.json", f"attachments/{self.attachment}"})
+                             {"manifest.json", "solver-history.jsonl",
+                              f"attachments/{self.attachment}"})
             self.assertEqual(manifest["challenges"][0]["remote"], "")
             self.assertEqual(manifest["challenges"][0]["remote_mode"], "unknown")
             self.assertNotIn("DO_NOT_EXPORT_THIS_CREDENTIAL", json.dumps(manifest))
@@ -272,9 +273,11 @@ class WorkspaceTransferTests(unittest.TestCase):
         self.export()
         with zipfile.ZipFile(self.archive) as source:
             manifest = source.read("manifest.json")
+            history = source.read("solver-history.jsonl")
         invalid = self.archive.with_name("invalid.zip")
         with zipfile.ZipFile(invalid, "w") as target:
             target.writestr(f"attachments/{self.attachment}", b"BADBAD")
+            target.writestr("solver-history.jsonl", history)
             target.writestr("manifest.json", manifest)
         with self.assertRaisesRegex(TransferError, "checksum"):
             import_workspace(self.settings, self.layout, self.owner, invalid)
@@ -283,6 +286,7 @@ class WorkspaceTransferTests(unittest.TestCase):
         extra = self.archive.with_name("extra.zip")
         with zipfile.ZipFile(extra, "w") as target:
             target.writestr(f"attachments/{self.attachment}", b"\x00\xffcode")
+            target.writestr("solver-history.jsonl", history)
             target.writestr("manifest.json", manifest)
             target.writestr("../outside", b"no")
         with self.assertRaisesRegex(TransferError, "unexpected"):

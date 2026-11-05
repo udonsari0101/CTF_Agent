@@ -173,6 +173,7 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     agents_json TEXT NOT NULL DEFAULT '[]',
     context_usage_json TEXT NOT NULL DEFAULT '{}',
     released_ingested INTEGER NOT NULL DEFAULT 0 CHECK(released_ingested IN (0,1)),
+    imported_historical INTEGER NOT NULL DEFAULT 0 CHECK(imported_historical IN (0,1)),
     flag TEXT,
     writeup_markdown TEXT,
     private_notes TEXT,
@@ -820,6 +821,8 @@ class SolverExchangeCoordinator:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN agents_json TEXT NOT NULL DEFAULT '[]'")
             if "context_usage_json" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN context_usage_json TEXT NOT NULL DEFAULT '{}'")
+            if "imported_historical" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN imported_historical INTEGER NOT NULL DEFAULT 0 CHECK(imported_historical IN (0,1))")
             if "ultra_escalation_mode" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN ultra_escalation_mode TEXT NOT NULL DEFAULT 'off' CHECK(ultra_escalation_mode IN ('off','ask','auto'))")
             if "ultra_source_job_id" not in columns:
@@ -1844,7 +1847,7 @@ class SolverExchangeCoordinator:
             input_ready_to_retry = remote_input_ready_to_retry(db, row)
         result = _public_job(row, events, position, guidance=guidance)
         result["event_cursor"] = event_cursor
-        result["input_ready_to_retry"] = input_ready_to_retry
+        result["input_ready_to_retry"] = input_ready_to_retry and not bool(row["imported_historical"])
         if elapsed_origin is not None:
             result["continuation_started_at"] = elapsed_origin[0]
             result["continuation_started_running"] = elapsed_origin[1]
@@ -6057,7 +6060,8 @@ def _public_job(
         *_agent_nodes(row["agents_json"]),
     ]
     ultra_eligible = bool(
-        row["job_mode"] == "solve"
+        not row["imported_historical"]
+        and row["job_mode"] == "solve"
         and row["status"] == "needs_input"
         and row["released_ingested"]
         and row["ultra_escalation_mode"] in {"ask", "auto"}
@@ -6078,6 +6082,7 @@ def _public_job(
         "challenge_id": row["challenge_id"],
         "account_id": row["account_id"],
         "account_label": row["account_label"],
+        "read_only_history": bool(row["imported_historical"]),
         "status": row["status"],
         "continuation_mode": row["continuation_mode"],
         "continuation_source_job_id": row["continuation_source_job_id"],
@@ -6110,7 +6115,8 @@ def _public_job(
         ),
         "has_custom_instruction": bool(row["writeup_instruction"]),
         "guidance_allowed": bool(
-            row["job_mode"] == "solve" and row["status"] in _GUIDANCE_OPEN_STATUSES
+            not row["imported_historical"] and row["job_mode"] == "solve"
+            and row["status"] in _GUIDANCE_OPEN_STATUSES
         ),
         "source_solver_job_id": (
             row["source_solver_job_id"] if row["job_mode"] == "writeup_refine" else None

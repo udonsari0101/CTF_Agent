@@ -22,7 +22,9 @@ The screenshots use synthetic challenges and account data.
 - Switch the web interface between English and Korean. Interface translations live in [language packs](docs/guides/localization.md) so more languages can be added.
 
 Move a workspace or challenge between installations with a manual ZIP or an
-optional HTTPS direct transfer. The [transfer guide](docs/guides/workspace-transfer.md)
+optional HTTPS direct transfer. The bundle carries read-only solver session
+logs alongside challenge data; credentials and resumable provider sessions stay
+on the source installation. The [transfer guide](docs/guides/workspace-transfer.md)
 explains the public HTTPS requirement, retries, and the manual ZIP route for
 local-only or Cloudflare Access protected destinations.
 

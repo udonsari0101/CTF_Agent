@@ -644,22 +644,25 @@ function solverConsoleEntryMarkup(entry, agentLabels) {
   const durationText = Number.isInteger(duration) ? duration >= 1000 ? `${(duration / 1000).toFixed(1)}s` : `${duration}ms` : '';
   const exitCode = events.findLast?.(event => Number.isInteger(event.exit_code))?.exit_code;
   const meta = [agentLabel && !agent ? agentLabel : '',durationText,Number.isInteger(exitCode) ? `exit ${exitCode}` : ''].filter(Boolean);
-  const preferredOpen = solverConsoleCardStates.has(entry.key) ? solverConsoleCardStates.get(entry.key) : running;
   const command = events.find(event => solverConsoleText(event.command));
   const output = [...events].reverse().find(event => solverConsoleText(event.output));
-  const messages = events.map(event => solverConsoleText(event.message)).filter(Boolean);
+  const messages = events.filter(event => event.phase === 'completed')
+    .map(event => solverConsoleText(event.message)).filter(Boolean);
   const distinctMessages = [...new Set(messages)];
+  const detail = !activity && !agent && ['error','flag','writeup','guidance'].includes(latest.kind)
+    ? solverConsoleText(solverEventDetail(latest)) : '';
+  const expandable = activity ? Boolean(output || distinctMessages.length) : Boolean(detail);
   const body = activity
     ? `${solverConsoleField(first.tool === 'web_search' ? '검색어' : '명령',command?.command,events.some(event => event.command_truncated))}
        ${solverConsoleField('결과',output?.output,events.some(event => event.output_truncated))}
        ${distinctMessages.map(message => solverConsoleField('내용',message)).join('')}`
-    : agent
-      ? `<div class="solver-console-agent-meta">${[latest.provider,latest.model,latest.parent_id ? `상위 ${latest.parent_id}` : ''].filter(Boolean).map(esc).join(' · ')}</div>
-         <ol class="solver-console-agent-states">${events.map(event => `<li>${esc(solverEventLabel(event))}<small>${esc(solverEventTime(event))}</small></li>`).join('')}</ol>`
-      : `${solverConsoleField('내용',solverEventDetail(latest))}`;
-  return `<details class="solver-console-card${running ? ' running' : ''}${failed ? ' failed' : ''}" data-log-key="${esc(entry.key)}" data-log-revision="${esc(solverConsoleEntryRevision(entry,agentLabels))}" ${preferredOpen ? 'open' : ''}>
-    <summary><span class="solver-console-card-icon" aria-hidden="true">${running ? '◌' : failed ? '×' : '✓'}</span><span class="solver-console-card-title"><strong>${esc(title)}</strong><small>${esc([toolLabel,...meta].join(' · '))}</small></span><span class="solver-console-card-state">${esc(state)}</span><time>${esc(solverEventTime(latest))}</time></summary>
-    <div class="solver-console-card-body">${body || '<p class="solver-console-no-detail">자세한 기록이 없습니다.</p>'}</div>
+    : solverConsoleField('내용',detail);
+  const classes = `solver-console-card${running ? ' running' : ''}${failed ? ' failed' : ''}${expandable ? '' : ' static'}`;
+  const attributes = `class="${classes}" data-log-key="${esc(entry.key)}" data-log-revision="${esc(solverConsoleEntryRevision(entry,agentLabels))}"`;
+  const heading = `<span class="solver-console-card-icon" aria-hidden="true">${running ? '◌' : failed ? '×' : '✓'}</span><span class="solver-console-card-title"><strong>${esc(title)}</strong><small>${esc([toolLabel,...meta].join(' · '))}</small></span><span class="solver-console-card-state">${esc(state)}</span><time>${esc(solverEventTime(latest))}</time>`;
+  if (!expandable) return `<div ${attributes}><div class="solver-console-card-summary">${heading}</div></div>`;
+  return `<details ${attributes}${solverConsoleCardStates.get(entry.key) === true ? ' open' : ''}>
+    <summary>${heading}</summary><div class="solver-console-card-body">${body}</div>
   </details>`;
 }
 
@@ -700,8 +703,8 @@ function reconcileSolverConsoleTimeline(stream, events, job = null) {
       const replacement = template.content.firstElementChild;
       replacement.dataset.logRevision = revision;
       if (card) {
-        solverConsoleCardStates.set(entry.key,card.open);
-        replacement.open = card.open;
+        if (card.matches('details')) solverConsoleCardStates.set(entry.key,card.open);
+        if (replacement.matches('details')) replacement.open = solverConsoleCardStates.get(entry.key) === true;
         card.replaceWith(replacement);
       }
       card = replacement;
@@ -823,7 +826,7 @@ function toggleSolverLogSize(button) {
     });
     solverConsoleDialog.addEventListener('toggle', event => {
       const card = event.target;
-      if (card?.matches?.('.solver-console-card') && card.dataset.logKey) {
+      if (card?.matches?.('details.solver-console-card') && card.dataset.logKey) {
         solverConsoleCardStates.set(card.dataset.logKey,card.open);
       }
     }, true);
@@ -831,7 +834,7 @@ function toggleSolverLogSize(button) {
   const provider = currentSolverJob.provider || currentSolverJob.configuration?.provider;
   const active = solverIsActive(currentSolverJob) && currentSolverJob.guidance_allowed !== false;
   const agentTree = solverAgentTreeMarkup(currentSolverJob,currentSolverEvents);
-  solverConsoleDialog.innerHTML = `<header class="solver-console-head"><div><strong>${esc(currentChallenge?.name || '세션 로그')}</strong><small>${esc(solverJobId(currentSolverJob))}</small>${solverContextUsageMarkup(currentSolverJob)}</div><div class="solver-console-head-actions"><button type="button" class="small ghost solver-console-bottom hidden" data-action="solver-console-bottom" aria-label="맨 아래로 이동">↓ 맨 아래</button><button type="button" class="small ghost" data-action="close-solver-console" aria-label="세션 로그 닫기">닫기</button></div></header>
+  solverConsoleDialog.innerHTML = `<header class="solver-console-head"><div><strong>${esc(currentChallenge?.name || '세션 로그')}</strong><small>${esc(solverJobId(currentSolverJob))}${currentSolverJob.read_only_history ? ` · ${tr('가져온 기록 · 읽기 전용')}` : ''}</small>${solverContextUsageMarkup(currentSolverJob)}</div><div class="solver-console-head-actions"><button type="button" class="small ghost solver-console-bottom hidden" data-action="solver-console-bottom" aria-label="맨 아래로 이동">↓ 맨 아래</button><button type="button" class="small ghost" data-action="close-solver-console" aria-label="세션 로그 닫기">닫기</button></div></header>
     <div class="solver-console-body"><aside class="solver-agent-tree${agentTree ? '' : ' hidden'}" aria-label="에이전트 활동">${agentTree}</aside><div class="solver-console-stream" role="log" aria-live="polite">${solverConsoleTimelineMarkup(solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null)}</div></div>
     <div class="solver-console-controls"><form id="solver-console-guidance-form" class="solver-console-guidance${active ? '' : ' hidden'}">
       <label for="solver-console-message">메인 세션 추가 명령</label><textarea id="solver-console-message" name="message" maxlength="16384" rows="3" placeholder="풀이 방향이나 확인할 내용을 입력" required>${esc(solverGuidanceDraft)}</textarea>
@@ -922,7 +925,7 @@ function paintSolverConsole() {
     .find(card => card.getBoundingClientRect().bottom > streamTop);
   const anchorKey = anchor?.dataset.logKey;
   const anchorOffset = anchor ? anchor.getBoundingClientRect().top - streamTop : 0;
-  for (const card of stream.querySelectorAll('.solver-console-card[data-log-key]')) {
+  for (const card of stream.querySelectorAll('details.solver-console-card[data-log-key]')) {
     solverConsoleCardStates.set(card.dataset.logKey,card.open);
   }
   reconcileSolverConsoleTimeline(stream,solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null);
@@ -1992,7 +1995,7 @@ function showTransferExport(scope) {
   if (!workspace || (scope === 'challenge' && (!challenge || challenge.workspace_id !== workspace.id))) throw new Error(i18n.t('내보낼 자료를 다시 선택하세요.'));
   const name = challenge?.name || workspace.name;
   openModal(i18n.t(scope === 'challenge' ? '문제 ZIP 내보내기' : '작업공간 ZIP 내보내기'), name,
-    `<div class="transfer-explainer"><p>${tr('문제 기록과 첨부파일을 ZIP으로 다운로드합니다. 계정, 로그인 정보, CTFd 연결, 풀이 세션은 포함되지 않습니다.')}</p><label class="transfer-remote-option"><input id="transfer-include-remote" type="checkbox"><span><strong>${tr('원격 접속 정보 포함')}</strong><small>${tr('서버 주소, URL, 접속 명령을 ZIP에 넣습니다. 필요한 경우에만 선택하세요.')}</small></span></label><p class="form-hint">${tr('설명과 노트의 자유 입력 내용은 그대로 포함될 수 있습니다. 공유 전에 확인하세요.')}</p><p id="transfer-export-status" class="form-hint" role="status"></p></div>`,
+    `<div class="transfer-explainer"><p>${tr('문제 기록, 첨부파일과 읽기 전용 풀이 세션 로그를 ZIP으로 다운로드합니다. 계정, 인증 정보, CTFd 연결과 실행 가능한 세션은 제외됩니다.')}</p><label class="transfer-remote-option"><input id="transfer-include-remote" type="checkbox"><span><strong>${tr('원격 접속 정보 포함')}</strong><small>${tr('서버 주소, URL, 접속 명령을 ZIP에 넣습니다. 필요한 경우에만 선택하세요.')}</small></span></label><p class="form-hint">${tr('설명, 노트와 로그에는 민감한 내용이 있을 수 있습니다. 공유 전에 확인하세요.')}</p><p id="transfer-export-status" class="form-hint" role="status"></p></div>`,
     `<button type="button" data-action="close-modal">${tr('취소')}</button><button type="button" class="primary" data-action="download-transfer">${tr('ZIP 다운로드')}</button>`);
   modal.dataset.kind = 'transfer-export';
   modal.dataset.transferScope = scope;
@@ -2100,11 +2103,11 @@ function transferPreviewMarkup(preview, scope) {
   const names = Array.isArray(preview.challenges) ? preview.challenges : [];
   const collisions = Array.isArray(preview.name_collisions) ? preview.name_collisions : [];
   return `<div class="section-head"><h3>${tr('가져오기 미리보기')}</h3><span class="tag ${scopeMismatch ? 'muted' : ''}">${tr(preview.scope === 'challenge' ? '문제' : '작업공간')}</span></div>
-    <dl class="transfer-preview-facts"><div><dt>${tr('이름')}</dt><dd>${esc(preview.name)}</dd></div><div><dt>${tr('문제')}</dt><dd>${esc(preview.challenge_count)}</dd></div><div><dt>${tr('첨부파일')}</dt><dd>${esc(preview.attachment_count)} · ${esc(size(Number(preview.attachment_bytes || 0)))}</dd></div><div><dt>${tr('원격 접속 정보')}</dt><dd>${tr(preview.remote_endpoints_included ? '포함됨' : '제외됨')}</dd></div></dl>
+    <dl class="transfer-preview-facts"><div><dt>${tr('이름')}</dt><dd>${esc(preview.name)}</dd></div><div><dt>${tr('문제')}</dt><dd>${esc(preview.challenge_count)}</dd></div><div><dt>${tr('첨부파일')}</dt><dd>${esc(preview.attachment_count)} · ${esc(size(Number(preview.attachment_bytes || 0)))}</dd></div><div><dt>${tr('세션 기록')}</dt><dd>${esc(preview.solver_job_count || 0)} · ${tr('이벤트')} ${esc(preview.solver_event_count || 0)}</dd></div><div><dt>${tr('원격 접속 정보')}</dt><dd>${tr(preview.remote_endpoints_included ? '포함됨' : '제외됨')}</dd></div></dl>
     ${scopeMismatch ? `<p class="notice error-notice">${tr(scope === 'challenge' ? '문제 ZIP을 선택하세요.' : '작업공간 ZIP을 선택하세요.')} ${tr(preview.scope === 'challenge' ? '이 파일은 문제 ZIP입니다.' : '이 파일은 작업공간 ZIP입니다.')}</p>` : ''}
     ${preview.sufficient_space === false ? `<p class="notice error-notice">${tr('저장 공간이 부족합니다. 공간을 확보한 뒤 다시 시도하세요.')}</p>` : ''}
     ${collisions.length ? `<p class="notice">${tr('같은 이름이 이미 있습니다:')} ${collisions.map(esc).join(', ')}. ${tr('가져온 항목은 새 ID로 추가됩니다.')}</p>` : ''}
-    <p class="form-hint">${tr('계정과 연결 인증 정보는 제외됩니다. 설명과 노트의 자유 입력 내용에는 민감한 정보가 있을 수 있습니다.')}</p>
+    <p class="form-hint">${tr('세션 기록은 읽기 전용 과거 이력으로 가져옵니다. 계정과 인증 정보는 제외됩니다. 설명·노트·로그에는 민감한 내용이 있을 수 있습니다.')}</p>
     ${names.length ? `<details><summary>${tr('문제 목록')} ${names.length}</summary><ul>${names.map(item => `<li>${esc(item.name)} <small>${esc(item.category || i18n.t('미분류'))} · ${tr('첨부')} ${esc(item.attachment_count || 0)}</small></li>`).join('')}</ul></details>` : ''}`;
 }
 

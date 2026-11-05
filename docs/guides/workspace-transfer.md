@@ -1,12 +1,18 @@
 # Move a workspace or challenge between installations
 
 Use **Export ZIP** on the source and **Import ZIP** on the destination for the
-portable path. The ZIP contains the workspace or one challenge, notes, flags,
-write-ups, and attachment files. It excludes account credentials, browser
-sessions, CTFd credentials, Telegram settings, and solver jobs. Challenge text
-and attachments can still contain secrets that you entered yourself, so handle
-the ZIP as private data. Challenge imports require an existing destination
-workspace; workspace imports create a new workspace.
+portable path. Version 2 ZIPs contain the workspace or one challenge, notes,
+flags, write-ups, attachment files, and solver job history (events, subagent
+records, context readings, elapsed times, and user guidance). Imported jobs
+are marked read-only; a running source job becomes a stopped historical job at
+the destination. The ZIP excludes account credentials, browser sessions, CTFd
+credentials, Telegram settings, live provider sessions, retry checkpoints,
+worker state, and notification delivery hooks. Version 1 ZIPs remain importable.
+Challenge text, attachments, notes, and solver logs can contain secrets that
+you entered or observed yourself, so handle the ZIP as private data. Challenge
+imports require an existing destination workspace; workspace imports create a
+new workspace. Retrying an import with the same upload ID returns the previous
+result without duplicating history.
 
 **Direct transfer** sends the same ZIP between two installations. On the
 destination, create an invitation for a new workspace or one challenge in a

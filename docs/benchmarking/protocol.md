@@ -1,12 +1,12 @@
 # CTF Agent benchmark protocol
 
-This document describes a paired comparison of the unmodified provider CLI (`baseline`) and the current CTF Agent harness (`harness`). The scripts validate a schedule and a report; they do **not** start solvers, submit flags, read credentials, or prove that a solver is better. Keep the private oracle and raw transcripts outside the public repository.
+This document describes a paired comparison of a minimal-prompt provider CLI arm (`baseline`) and the current CTF Agent harness (`harness`). The production Codex app-server transport, credential handoff, and external container isolation are shared plumbing; the baseline omits the CTF Agent solve prompt, skills, notes, checkpoint, flag watcher, write-up, retries, and interventions. It is therefore a minimal provider-app-server control, **not** a pristine standalone CLI installation. The public scripts validate a schedule and a report; they do **not** start solvers, submit flags, read credentials, or prove that a solver is better. Keep the private oracle and raw transcripts outside the public repository.
 
 The [2026-11-04 preflight audit](preflight-audit.md) inventories the prepared private static candidates, pending service fixtures, source-code comparisons, missing field coverage, and the concrete B0/B1 execution boundary. Prepared handouts and judge metadata are not actual model trials. In particular, the current planner/reporter are a **two-arm format**, not a runner or a three-arm candidate evaluator.
 
 ## Freeze the experiment before any run
 
-Use the same frozen problem statement, files, reachable endpoints, provider account, model, reasoning level, CLI version, image digest, network/tool policy, wall-time limit, and token budget in both arms of each pair. The baseline receives only the problem and files. The harness receives the same input plus its normal instructions and tools. Do not leak prior solves or expected flags into either arm.
+Use the same frozen problem statement, files, reachable endpoints, provider account, model, reasoning level, CLI version, image digest, network/tool policy, wall-time limit, and token budget in both arms of each pair. The baseline receives only the problem, files, and a neutral structured-answer request. The harness receives the same challenge input plus its normal instructions and tools. Do not leak prior solves or expected flags into either arm.
 
 Partition cases into `development`, `holdout`, and `live` before looking at results. Tune only on development cases. Keep categories exactly as supplied, including localized or unusual CTFd labels. For an unclassified case, assign a neutral label such as `unknown`; do not infer an oracle answer from the category. Keep a private, dated oracle record from the official checker, CTFd, or another independent judge. A candidate flag without a verdict is unverified.
 
