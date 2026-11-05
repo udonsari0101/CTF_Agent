@@ -194,6 +194,10 @@ def _write_json(directory: Path, name: str, payload: dict, mode: int = 0o644) ->
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            # os.open's mode is reduced by the process umask. The web service
+            # must be able to read the published version marker even when the
+            # host updater starts with a restrictive umask.
+            os.fchmod(output.fileno(), mode)
             json.dump(payload, output, ensure_ascii=False, separators=(",", ":"))
             output.write("\n")
             output.flush()
