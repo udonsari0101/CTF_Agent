@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext
@@ -23,8 +24,10 @@ from ctf_agent.storage_budget import (  # noqa: E402
 )
 from ctf_agent.solver_exchange import (  # noqa: E402
     ExchangeError, SolverExchangeCoordinator, _stage_budget_error, _stage_io_error,
-    _write_json_file,
+    _write_json_file, _write_live_attachment_chunk,
+    _publish_live_attachment_no_replace, _LIVE_ATTACHMENT_CHUNK_BYTES,
 )
+from ctf_agent.solver_worker import _install_live_attachments  # noqa: E402
 
 
 class StorageBudgetDiagnosticsTests(unittest.TestCase):
@@ -192,6 +195,36 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
         self.assertEqual(error.diagnostics["requested_bytes"], 100)
         self.assertFalse(self.budget.snapshot())
 
+    def test_durable_chunk_consumption_is_exact_and_short(self):
+        self.reserve(amount=100)
+        self.budget.consume_durable_reserved_write("one", 40)
+        self.assertEqual(self.budget.snapshot()[0]["remaining_bytes"], 60)
+        error = self.assert_error(
+            "reservation_missing",
+            lambda: self.budget.consume_durable_reserved_write("one", 61),
+        )
+        self.assertEqual(error.diagnostics["requested_bytes"], 61)
+        self.assertEqual(self.budget.snapshot()[0]["remaining_bytes"], 60)
+        self.budget.consume_durable_reserved_write("one", 60)
+        self.assertFalse(self.budget.snapshot())
+
+    def test_unacknowledged_durable_bytes_conservatively_reduce_headroom(self):
+        # The 40-byte write is already durable but has not yet had its short
+        # reservation-decrement transaction. This can briefly reject a new
+        # request near the floor; it must never admit an unsafe one.
+        with patch.object(self.budget, "_free", return_value=301):
+            self.reserve(amount=100)
+        with patch.object(self.budget, "_free", return_value=261):
+            self.assert_error(
+                "insufficient_space",
+                lambda: self.budget.reserve("next", "solver", "owner", "workspace", None, 1),
+            )
+        self.budget.consume_durable_reserved_write("one", 40)
+        with patch.object(self.budget, "_free", return_value=261):
+            self.budget.reserve("next", "solver", "owner", "workspace", None, 1)
+        self.budget.release("next")
+        self.budget.release("one")
+
     def test_commit_detects_metadata_state_changed_without_releasing_reservation(self):
         with patch.object(self.budget, "_free", return_value=1000):
             self.reserve()
@@ -317,7 +350,7 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
             destination.write_bytes(b"partial")
             raise OSError(errno.ENOSPC, "simulated write failure")
 
-        with patch("ctf_agent.solver_exchange._copy_regular_file", side_effect=fail_after_partial):
+        with patch("ctf_agent.solver_exchange._copy_regular_file_reserved_chunks", side_effect=fail_after_partial):
             with self.assertLogs("ctf_agent.solver_exchange", level="WARNING"):
                 with self.assertRaises(ExchangeError) as caught:
                     coordinator._sync_live_attachments(job, active)
@@ -380,6 +413,170 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
 
         target.write_bytes(source.read_bytes())
         self.assertTrue(coordinator._sync_live_attachments(job, active))
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": ["d" * 32]})
+
+    def _grow_live_attachment(self, source, size):
+        source.write_bytes(b"A" * size)
+        with closing(sqlite3.connect(self.database)) as db:
+            with db:
+                db.execute("UPDATE attachments SET size=?", (size,))
+
+    def test_live_attachment_second_chunk_failure_releases_reservation(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+        self._grow_live_attachment(source, _LIVE_ATTACHMENT_CHUNK_BYTES * 2 + 17)
+        original_write = _write_live_attachment_chunk
+        calls = 0
+
+        def fail_second(destination_fd, chunk):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                original_write(destination_fd, chunk)
+                raise OSError(errno.ENOSPC, "simulated second chunk fsync failure")
+            return original_write(destination_fd, chunk)
+
+        with patch("ctf_agent.solver_exchange._write_live_attachment_chunk", side_effect=fail_second):
+            with self.assertLogs("ctf_agent.solver_exchange", level="WARNING"):
+                with self.assertRaises(ExchangeError) as caught:
+                    coordinator._sync_live_attachments(job, active)
+        self.assertEqual(caught.exception.code, "solver_storage_write_enospc")
+        self.assertEqual(calls, 2)
+        self.assertFalse(target.exists())
+        self.assertFalse((target.parent / ("." + target.name + ".partial")).exists())
+        self.assertFalse(self.budget.snapshot())
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": []})
+        self.assertEqual(source.stat().st_size, _LIVE_ATTACHMENT_CHUNK_BYTES * 2 + 17)
+        self.assertTrue(coordinator._sync_live_attachments(job, active))
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertFalse(self.budget.snapshot())
+
+    def test_live_attachment_releases_global_lock_between_chunks(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+        self._grow_live_attachment(source, _LIVE_ATTACHMENT_CHUNK_BYTES * 2 + 17)
+        original_consume = self.budget.consume_durable_reserved_write
+        first_committed = threading.Event()
+        continue_copy = threading.Event()
+        calls = 0
+
+        def pause_between_chunks(key, amount):
+            nonlocal calls
+            result = original_consume(key, amount)
+            calls += 1
+            if calls == 1:
+                first_committed.set()
+                if not continue_copy.wait(timeout=10):
+                    raise TimeoutError("test did not resume the copy")
+            return result
+
+        with patch.object(self.budget, "consume_durable_reserved_write", side_effect=pause_between_chunks):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(coordinator._sync_live_attachments, job, active)
+                self.assertTrue(first_committed.wait(timeout=10))
+                try:
+                    start = time.monotonic()
+                    self.budget.reserve("unrelated", "solver", "other", "workspace", None, 1)
+                    elapsed = time.monotonic() - start
+                    self.assertLess(elapsed, 5)
+                    self.assertFalse(future.done())
+                finally:
+                    continue_copy.set()
+                self.assertTrue(future.result(timeout=30))
+        self.budget.release("unrelated")
+        self.assertEqual(calls, 3)
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": ["d" * 32]})
+        self.assertFalse(self.budget.snapshot())
+
+    def test_live_attachment_slow_write_does_not_hold_global_lock(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+        self._grow_live_attachment(source, _LIVE_ATTACHMENT_CHUNK_BYTES + 17)
+        entered_write = threading.Event()
+        resume_write = threading.Event()
+
+        def paused_write(destination_fd, chunk):
+            entered_write.set()
+            if not resume_write.wait(timeout=10):
+                raise TimeoutError("test did not resume the write")
+            return _write_live_attachment_chunk(destination_fd, chunk)
+
+        with patch("ctf_agent.solver_exchange._write_live_attachment_chunk", side_effect=paused_write):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(coordinator._sync_live_attachments, job, active)
+                self.assertTrue(entered_write.wait(timeout=10))
+                try:
+                    started = time.monotonic()
+                    self.budget.reserve("unrelated", "solver", "other", "workspace", None, 1)
+                    self.assertLess(time.monotonic() - started, 5)
+                    self.assertFalse(future.done())
+                finally:
+                    resume_write.set()
+                self.assertTrue(future.result(timeout=30))
+        self.budget.release("unrelated")
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": ["d" * 32]})
+        self.assertFalse(self.budget.snapshot())
+
+    def test_live_attachment_reservation_removed_during_copy_cleans_partial(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+        original_consume = self.budget.consume_durable_reserved_write
+
+        def remove_before_ack(key, amount):
+            self.budget.release(key)
+            original_consume(key, amount)
+
+        with patch.object(self.budget, "consume_durable_reserved_write", side_effect=remove_before_ack):
+            with self.assertLogs("ctf_agent.solver_exchange", level="WARNING"):
+                with self.assertRaises(ExchangeError) as caught:
+                    coordinator._sync_live_attachments(job, active)
+        self.assertEqual(caught.exception.code, "solver_storage_reservation_invalid")
+        self.assertFalse(target.exists())
+        self.assertFalse((target.parent / ("." + target.name + ".partial")).exists())
+        self.assertFalse(self.budget.snapshot())
+        self.assertEqual(source.read_bytes(), b"saved attachment contents")
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": []})
+        self.assertTrue(coordinator._sync_live_attachments(job, active))
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+
+    def test_live_attachment_publish_never_overwrites_racing_target(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+        original_publish = _publish_live_attachment_no_replace
+
+        def race_target_creation(partial, destination, **kwargs):
+            self.assertEqual(destination, target)
+            target.write_bytes(b"created by another writer")
+            return original_publish(partial, destination, **kwargs)
+
+        with patch("ctf_agent.solver_exchange._publish_live_attachment_no_replace", side_effect=race_target_creation):
+            with self.assertRaises(ExchangeError) as caught:
+                coordinator._sync_live_attachments(job, active)
+        self.assertEqual(caught.exception.code, "invalid_attachment_path")
+        self.assertEqual(target.read_bytes(), b"created by another writer")
+        self.assertEqual(source.read_bytes(), b"saved attachment contents")
+        self.assertFalse((target.parent / ("." + target.name + ".partial")).exists())
+        self.assertFalse(self.budget.snapshot())
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": []})
+        target.unlink()
+        self.assertTrue(coordinator._sync_live_attachments(job, active))
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+
+    def test_live_attachment_recovers_interrupted_hardlink_publication(self):
+        coordinator, job, active, source, target, index = self._live_attachment_fixture()
+        partial = target.parent / ("." + target.name + ".partial")
+        partial.write_bytes(source.read_bytes())
+        os.link(partial, target)
+        self.assertEqual(partial.stat().st_nlink, 2)
+
+        # On a fallback filesystem, a worker poll in the tiny link/unlink
+        # window sees nlink=2 and retries on its next 0.5-second poll.
+        worker_destination = self.data / "worker-visible-attachments"
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            _install_live_attachments(target.parent, worker_destination, None)
+
+        self.assertTrue(coordinator._sync_live_attachments(job, active))
+        self.assertFalse(partial.exists())
+        self.assertEqual(target.stat().st_nlink, 1)
+        self.assertEqual(_install_live_attachments(target.parent, worker_destination, None), 1)
+        self.assertEqual((worker_destination / target.name).read_bytes(), source.read_bytes())
         self.assertEqual(json.loads(index.read_text(encoding="utf-8")), {"ids": ["d" * 32]})
 
 

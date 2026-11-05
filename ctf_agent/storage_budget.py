@@ -379,6 +379,38 @@ class StorageBudget:
                     )
             return True
 
+    def consume_durable_reserved_write(self, key: str, amount: int) -> None:
+        """Consume bytes already written and fsynced from a full reservation.
+
+        The caller must reserve the entire known-size file before writing and
+        call this only after each chunk is durable. Keeping unacknowledged
+        bytes reserved is conservative while a write is in progress. This
+        short transaction lets other solvers use the volume lock during slow
+        writes and fsyncs without admitting over-reservation.
+        """
+        if type(amount) is not int or amount <= 0 or amount > MAX_SQLITE_INTEGER:
+            raise ValueError("invalid reserved write size")
+        with self.exclusive(), self._transaction() as connection:
+            row = connection.execute(
+                "SELECT remaining_bytes FROM storage_reservations WHERE reservation_key=?",
+                (key,),
+            ).fetchone()
+            if not row or int(row[0]) < amount:
+                raise StorageBudgetError(
+                    "Storage reservation disappeared or is smaller than a durable write.",
+                    code="reservation_missing", diagnostics={"requested_bytes": amount},
+                )
+            remaining = int(row[0]) - amount
+            if remaining:
+                connection.execute(
+                    "UPDATE storage_reservations SET remaining_bytes=?,updated_at=? WHERE reservation_key=?",
+                    (remaining, int(time.time()), key),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM storage_reservations WHERE reservation_key=?", (key,)
+                )
+
     def write_unreserved(self, amount: int, writer: Callable[[], None]) -> None:
         """Write one unknown-length chunk while holding the volume-wide lock."""
         if type(amount) is not int or amount <= 0 or amount > MAX_SQLITE_INTEGER:

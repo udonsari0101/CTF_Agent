@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import concurrent.futures
+import ctypes
 import errno
 import hashlib
 import inspect
@@ -97,6 +98,7 @@ _RESTORABLE_CHALLENGE_STATUSES = {
 _MAX_EVENT_BYTES = MAX_OUTPUT_TEXT + 256 * 1024
 _MIN_FREE_BYTES_AFTER_STAGE = 512 * 1024 * 1024
 _STAGE_CONTROL_RESERVE = 2 * 1024 * 1024
+_LIVE_ATTACHMENT_CHUNK_BYTES = 8 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 512 * 1024
 _MAX_CONTINUATION_BYTES = 512 * 1024 * 1024
 _MAX_OWNER_CONTINUATIONS_BYTES = 4 * 1024 * 1024 * 1024
@@ -2977,12 +2979,7 @@ class SolverExchangeCoordinator:
             name = "live-" + attachment_id + "_" + _stage_filename(0, row["original_name"])[5:]
             target = destination / name
             partial = destination / ("." + name + ".partial")
-            if partial.exists() or partial.is_symlink():
-                partial_info = partial.lstat()
-                if not stat.S_ISREG(partial_info.st_mode) or partial_info.st_nlink != 1:
-                    raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
-                partial.unlink()
-                _fsync(destination)
+            _remove_live_attachment_partial(partial, target, destination)
             if target.exists() or target.is_symlink():
                 info = target.lstat()
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != row["size"]:
@@ -2994,32 +2991,53 @@ class SolverExchangeCoordinator:
                     raise ExchangeError("invalid_attachment_path", "Live attachment content does not match the saved file.", category="safety")
                 _fsync(destination)
             else:
-                def copy_one() -> None:
-                    try:
-                        _copy_regular_file(
-                            source_root / stored, partial,
-                            expected_size=row["size"],
-                            cancelled=lambda: self.stop_requested.is_set() or self._is_cancelled(job["id"]),
-                            source_root=self.data_dir,
-                            allow_hardlinks=True,
-                            space_reserved=True,
-                        )
-                        if target.exists() or target.is_symlink():
-                            raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
-                        os.replace(partial, target)
-                        _fsync(destination)
-                    finally:
-                        if partial.exists() or partial.is_symlink():
-                            info = partial.lstat()
-                            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                                raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
-                            partial.unlink()
-                            _fsync(destination)
+                reservation = f"solver-live:{job['id']}:{attachment_id}"
+                size = row["size"]
+                if type(size) is not int or size < 0 or size > MAX_SQLITE_INTEGER:
+                    raise ExchangeError("invalid_attachment_path", "Live attachment size is invalid.", category="safety")
 
-                if row["size"]:
-                    self.storage_budget.write_unreserved(row["size"], copy_one)
-                else:
-                    copy_one()
+                def discard_partial() -> None:
+                    _remove_live_attachment_partial(partial, target, destination)
+
+                # A previous process may have stopped after consuming some
+                # chunks. Its partial file is gone above; replace its stale
+                # reservation before beginning a complete fresh copy.
+                if size:
+                    self.storage_budget.release(reservation)
+                    self.storage_budget.reserve(
+                        reservation, "solver", job["owner_user_id"],
+                        job["workspace_id"], job["challenge_id"], size,
+                    )
+                try:
+                    _copy_regular_file_reserved_chunks(
+                        source_root / stored, partial,
+                        expected_size=size,
+                        cancelled=lambda: self.stop_requested.is_set() or self._is_cancelled(job["id"]),
+                        source_root=self.data_dir,
+                        storage_budget=self.storage_budget,
+                        reservation_key=reservation if size else None,
+                    )
+                    if target.exists() or target.is_symlink():
+                        raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+                    try:
+                        _publish_live_attachment_no_replace(partial, target)
+                    except FileExistsError as exc:
+                        raise ExchangeError(
+                            "invalid_attachment_path", "Live attachment path is invalid.",
+                            category="safety",
+                        ) from exc
+                    _fsync(destination)
+                except BaseException:
+                    if size:
+                        try:
+                            self.storage_budget.release(reservation, cleanup=discard_partial)
+                        except (StorageBudgetError, ExchangeError, OSError, sqlite3.Error):
+                            # Keep an unproven reservation if cleanup failed.
+                            # The next tick retries the private partial path.
+                            pass
+                    else:
+                        discard_partial()
+                    raise
             known.append(attachment_id)
             known_set.add(attachment_id)
             _write_json_file(index_path, {"ids": known})
@@ -6863,6 +6881,129 @@ def _regular_files_match(
             os.close(source_fd)
         if target_fd is not None:
             os.close(target_fd)
+
+
+def _remove_live_attachment_partial(partial: Path, target: Path, directory: Path) -> None:
+    """Discard a stale copy, including an interrupted hard-link publication."""
+
+    if not (partial.exists() or partial.is_symlink()):
+        return
+    info = partial.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink not in {1, 2}:
+        raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+    if info.st_nlink == 2:
+        if not (target.exists() or target.is_symlink()):
+            raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+        target_info = target.lstat()
+        if (
+            not stat.S_ISREG(target_info.st_mode)
+            or target_info.st_nlink != 2
+            or target_info.st_dev != info.st_dev
+            or target_info.st_ino != info.st_ino
+        ):
+            raise ExchangeError("invalid_attachment_path", "Live attachment path is invalid.", category="safety")
+    partial.unlink()
+    _fsync(directory)
+
+
+def _publish_live_attachment_no_replace(partial: Path, target: Path) -> None:
+    """Atomically publish a complete copy without replacing an existing target."""
+
+    if os.name == "nt":
+        # Windows rename fails with FileExistsError if the destination exists.
+        os.rename(partial, target)
+        return
+    if platform.system() == "Linux":
+        # This avoids even a brief second hard link visible to the worker.
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = (
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                ctypes.c_char_p, ctypes.c_uint,
+            )
+            renameat2.restype = ctypes.c_int
+            if renameat2(-100, os.fsencode(partial), -100, os.fsencode(target), 1) == 0:
+                return
+            error = ctypes.get_errno()
+            if error not in {errno.ENOSYS, errno.EINVAL, getattr(errno, "EOPNOTSUPP", -1)}:
+                raise OSError(error, os.strerror(error), str(target))
+    # Older Unix filesystems can still publish without clobbering. A crash
+    # between link and unlink is recovered by _remove_live_attachment_partial.
+    os.link(partial, target, follow_symlinks=False)
+    partial.unlink()
+
+
+def _copy_regular_file_reserved_chunks(
+    source: Path, destination: Path, *, expected_size: int,
+    cancelled: Callable[[], bool], source_root: Path,
+    storage_budget: StorageBudget, reservation_key: str | None,
+) -> None:
+    """Consume a known-size reservation after each durable chunk.
+
+    The whole file is reserved before copying. Reads, writes, and fsyncs are
+    outside the volume-wide lock; only each reservation decrement takes it.
+    Unacknowledged bytes remain reserved, which may briefly make free-space
+    checks more conservative but never creates extra spendable capacity.
+    """
+
+    source_fd = destination_fd = None
+    copied = 0
+    try:
+        source_fd = _open_readonly_beneath(source, source_root)
+        source_info = os.fstat(source_fd)
+        if not stat.S_ISREG(source_info.st_mode) or source_info.st_size != expected_size:
+            raise ExchangeError("attachment_size_mismatch", "Live attachment size changed before copying.", category="storage", retryable=True)
+        initial_source = _content_snapshot(source_info)
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        while True:
+            if cancelled():
+                raise _StageCancelled
+            chunk = os.read(source_fd, _LIVE_ATTACHMENT_CHUNK_BYTES)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > expected_size:
+                raise ExchangeError("attachment_size_mismatch", "Live attachment size changed during copying.", category="storage", retryable=True)
+
+            if reservation_key is None:
+                raise ExchangeError("invalid_attachment_path", "Live attachment reservation is missing.", category="safety")
+            _write_live_attachment_chunk(destination_fd, chunk)
+            storage_budget.consume_durable_reserved_write(reservation_key, len(chunk))
+        if cancelled():
+            raise _StageCancelled
+        if copied != expected_size or _content_snapshot(os.fstat(source_fd)) != initial_source:
+            raise ExchangeError("attachment_changed_during_staging", "Live attachment changed while copying.", category="storage", retryable=True)
+        os.fsync(destination_fd)
+        destination_info = os.fstat(destination_fd)
+        if (
+            not stat.S_ISREG(destination_info.st_mode)
+            or destination_info.st_nlink != 1
+            or destination_info.st_size != expected_size
+        ):
+            raise ExchangeError("invalid_attachment_path", "Live attachment copy is incomplete.", category="safety")
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
+
+
+def _write_live_attachment_chunk(destination_fd: int, chunk: bytes) -> None:
+    """Write and fsync one bounded chunk before consuming its reservation."""
+
+    remaining = memoryview(chunk)
+    while remaining:
+        written = os.write(destination_fd, remaining)
+        if written <= 0:
+            raise OSError("short live attachment write")
+        remaining = remaining[written:]
+    os.fsync(destination_fd)
 
 
 def _copy_regular_file(
