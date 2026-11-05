@@ -52,9 +52,11 @@ jobs:
         run: |
           python - <<'PY'
           import json
+          import sys
           import tempfile
           from pathlib import Path
-          from fastapi.testclient import TestClient
+          sys.path.insert(0, str(Path('.github/scripts').resolve()))
+          from local_test_client import TestClient
           from ctf_agent.db import Settings
           from ctf_agent.main import create_app
 
@@ -82,8 +84,10 @@ jobs:
           python - <<'PY'
           import tempfile
           import time
+          import sys
           from pathlib import Path
-          from fastapi.testclient import TestClient
+          sys.path.insert(0, str(Path('.github/scripts').resolve()))
+          from local_test_client import TestClient
           from ctf_agent.db import Settings
           from ctf_agent.main import create_app
 
