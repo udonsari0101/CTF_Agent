@@ -201,7 +201,10 @@ class UltraCardStateTests(unittest.TestCase):
         start = source.index("function challengeRunSummary(challenge)")
         end = source.index("function challengeListParams()", start)
         implementation = source[start:end]
-        fixture = """<!doctype html><html><body><pre id="result">PENDING</pre><script>
+        css = "\n".join((ROOT / f"ctf_agent/web/{name}").read_text(encoding="utf-8")
+                        for name in ("style.css", "theme.css"))
+        self.assertNotIn("</style", css.lower())
+        fixture = """<!doctype html><html><head><meta charset="utf-8"><style>""" + css + """</style></head><body><pre id="result">PENDING</pre><script>
 const i18n={locale:'ko',t:value=>value};
 const statuses={stopped:'중단'},solverPhases={needs_input:'추가 입력 필요'};
 const solverTerminalPhases=new Set(['needs_input']);
@@ -227,6 +230,12 @@ const checks={
   unknownNoRemote:!other.querySelector('form.challenge-inline-input'),
   unknownDetail:!!other.querySelector('.challenge-inline-attention [data-action="open-challenge"]')
 };
+const narrow=document.createElement('div');narrow.style.width='260px';
+const longRemote=structuredClone(base);longRemote.latest_solver.input_request_kind='remote_input';
+longRemote.remote='nc '+'a'.repeat(240)+' 31337';
+narrow.innerHTML=challengeCardMarkup(longRemote,'workspace-1');document.body.append(narrow);
+const composer=narrow.querySelector('form.challenge-inline-input');
+checks.composerFits=!!composer&&composer.scrollWidth<=composer.clientWidth+1&&narrow.scrollWidth<=narrow.clientWidth+1;
 document.querySelector('#result').textContent=Object.values(checks).every(Boolean)?'PASS':'FAIL '+JSON.stringify(checks);
 </script></body></html>"""
         page = Path(self.temp.name) / "card.html"

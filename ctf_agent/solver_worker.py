@@ -137,6 +137,35 @@ MAX_LIVE_CONTEXT_EVENTS = 1_000
 MAX_LIVE_COMMAND_BYTES = 2_048
 MAX_LIVE_OUTPUT_BYTES = 8 * 1_024
 MAX_LIVE_MESSAGE_BYTES = 4 * 1_024
+
+# These timing lines are worker-local diagnostics, not exchange events.  The
+# coordinator's event schema must remain unchanged while an isolated worker is
+# starting.  A fresh random key groups phases without exposing account, job,
+# challenge, path, command, or RPC data in Docker logs.
+_STARTUP_TIMING_PHASES = frozenset({
+    "workspace_prepare", "credential_consume", "provider_start",
+    "app_server_spawn", "initialize_rpc", "canary_pre_login",
+    "account_login_rpc", "account_read_rpc", "rate_limits_rpc",
+    "provider_login", "canary_post_login", "startup_total",
+    "first_model_text_after_running", "first_tool_result_after_running",
+})
+
+
+def _record_startup_timing(phase: str, started_ns: int, run_key: str) -> None:
+    if phase not in _STARTUP_TIMING_PHASES:
+        return
+    try:
+        elapsed_ms = max(0, (time.perf_counter_ns() - started_ns) // 1_000_000)
+        sys.stderr.write(json.dumps({
+            "event": "solver_startup_timing", "run": run_key,
+            "phase": phase, "duration_ms": elapsed_ms,
+        }, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        # Diagnostic output cannot reject a solve or change its cleanup path.
+        pass
+
+
 _JOB_ID = re.compile(r"[A-Za-z0-9_-]{20,100}\Z")
 _VERSION = re.compile(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}\Z")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -1964,8 +1993,14 @@ async def _run_with_flag_watcher(
         await asyncio.gather(watcher_task, return_exceptions=True)
 
 
-def _write_json(path: Path, payload: Mapping[str, Any], *, mode: int = 0o600) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+def _write_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    mode: int = 0o600,
+    temporary_directory: Path | None = None,
+) -> None:
+    temporary = (temporary_directory or path.parent) / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
     data = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
@@ -2845,6 +2880,10 @@ class CodexAppServer:
         self.resume_thread_id: str | None = None
         self.restored_home = False
         self.continuation_event: Callable[[str], None] | None = None
+        self.startup_timing_reporter: Callable[[str, int], None] | None = None
+        self.first_model_text_reporter: Callable[[], None] | None = None
+        self.first_tool_result_reporter: Callable[[], None] | None = None
+        self._first_tool_started_ids: set[tuple[str, str]] = set()
         self.turn_id = None
         self._flag_interrupt_requested: tuple[str, str, str] | None = None
         self._flag_interrupt_ready = asyncio.Event()
@@ -2875,6 +2914,14 @@ class CodexAppServer:
         self._deferred_guidance_ids: set[str] = set()
         self.pid = -1
 
+    def _note_first_model_text(self, value: object, *, root: bool = True) -> None:
+        if not root or not isinstance(value, str) or not value.strip():
+            return
+        reporter = getattr(self, "first_model_text_reporter", None)
+        self.first_model_text_reporter = None
+        if reporter is not None:
+            reporter()
+
     async def _report_activity(
         self,
         phase: str,
@@ -2894,6 +2941,25 @@ class CodexAppServer:
             not isinstance(activity_agent_id, str) or activity_agent_id not in self.agent_nodes
         ):
             activity_agent_id = None
+        # This phase measures the first observable root tool result, not merely
+        # a provider's completed marker. A silent command still has its exit
+        # code; web/file completion markers without output do not qualify.
+        # Require the matching start in this solve as well, so an unrelated
+        # child event or unpaired completion cannot become the first result.
+        reporter = getattr(self, "first_tool_result_reporter", None)
+        if reporter is not None and activity_agent_id == "root" and isinstance(activity_id, str):
+            pending = getattr(self, "_first_tool_started_ids", None)
+            if pending is None:
+                pending = self._first_tool_started_ids = set()
+            key = (tool, activity_id)
+            if phase == "started" and tool in {"shell", "web_search", "file", "tool"}:
+                pending.add(key)
+            elif phase == "completed" and key in pending:
+                pending.discard(key)
+                if (isinstance(output, str) and bool(output)) or type(exit_code) is int:
+                    pending.clear()
+                    self.first_tool_result_reporter = None
+                    reporter()
         command_bytes = len(command.encode("utf-8", errors="replace")) if isinstance(command, str) else 0
         output_bytes = len(output.encode("utf-8", errors="replace")) if isinstance(output, str) else 0
         command_truncated = command_bytes > MAX_LIVE_COMMAND_BYTES
@@ -3104,6 +3170,7 @@ class CodexAppServer:
         command = self.command_arguments()
         if os.name == "posix":
             command = hardened_solver_exec_command(command)
+        spawn_started_ns = time.perf_counter_ns()
         try:
             self.process = await asyncio.create_subprocess_exec(
                 *command,
@@ -3116,9 +3183,12 @@ class CodexAppServer:
             )
         except OSError as exc:
             raise WorkerRefusal("codex_start_failed", "Codex app-server를 시작하지 못했습니다.") from exc
+        if self.startup_timing_reporter:
+            self.startup_timing_reporter("app_server_spawn", spawn_started_ns)
         self.pid = self.process.pid
         self.reader_task = asyncio.create_task(self._reader())
         self.stderr_task = asyncio.create_task(self._stderr_reader())
+        initialize_started_ns = time.perf_counter_ns()
         initialized = await self.request(
             "initialize",
             {
@@ -3126,6 +3196,8 @@ class CodexAppServer:
                 "capabilities": {"experimentalApi": True},
             },
         )
+        if self.startup_timing_reporter:
+            self.startup_timing_reporter("initialize_rpc", initialize_started_ns)
         user_agent = initialized.get("userAgent")
         expected = self.expected_version
         version = re.search(r"/(\d+\.\d+\.\d+)(?:\s|\Z)", user_agent) if isinstance(user_agent, str) else None
@@ -3748,7 +3820,10 @@ print(json.dumps(result,separators=(",",":")))
             else None
         )
         try:
+            login_started_ns = time.perf_counter_ns()
             result = await self.request("account/login/start", dict(credential.login))
+            if self.startup_timing_reporter:
+                self.startup_timing_reporter("account_login_rpc", login_started_ns)
             if result.get("type") != expected:
                 raise WorkerRefusal("external_auth_failed", "Codex 메모리 인증 응답을 확인할 수 없습니다.", category="auth")
             # API-key login writes auth.json in current Codex versions.  Remove
@@ -3758,7 +3833,10 @@ print(json.dumps(result,separators=(",",":")))
                     raise WorkerRefusal("auth_cleanup_failed", "Codex 임시 인증 경로를 확인할 수 없습니다.", category="auth")
                 candidate.unlink()
                 _fsync_directory(candidate.parent)
+            account_started_ns = time.perf_counter_ns()
             account = await self.request("account/read", {"refreshToken": False})
+            if self.startup_timing_reporter:
+                self.startup_timing_reporter("account_read_rpc", account_started_ns)
             if not isinstance(account.get("account"), dict):
                 raise WorkerRefusal("external_auth_failed", "Codex 메모리 인증을 확인할 수 없습니다.", category="auth")
             # Memory login and account/read are local operations.  For ChatGPT
@@ -3769,7 +3847,10 @@ print(json.dumps(result,separators=(",",":")))
             # first supported authenticated backend operation.
             self.rate_limit_context = None
             if expected == "chatgptAuthTokens":
+                limits_started_ns = time.perf_counter_ns()
                 limits = await self.request("account/rateLimits/read", timeout=30)
+                if self.startup_timing_reporter:
+                    self.startup_timing_reporter("rate_limits_rpc", limits_started_ns)
                 returned_account_id = limits.get("accountId") if isinstance(limits, Mapping) else None
                 expected_account_id = credential.login.get("chatgptAccountId")
                 if returned_account_id is not None and (
@@ -4372,6 +4453,10 @@ print(json.dumps(result,separators=(",",":")))
                 elif item_type == "reasoning" and method == "item/started":
                     await self._report_activity("started", "analysis", "분석 중")
                 elif item_type == "agentMessage" and method == "item/completed":
+                    self._note_first_model_text(
+                        item.get("text") if isinstance(item, Mapping) else None,
+                        root=source_agent_id == "root",
+                    )
                     await self._report_activity(
                         "completed",
                         "analysis",
@@ -5819,6 +5904,7 @@ class ClaudePrintDriver(CodexAppServer):
                                 activity_id=activity_id,
                             )
                     if text_parts:
+                        self._note_first_model_text("\n".join(text_parts))
                         await self._report_activity(
                             "completed",
                             "analysis",
@@ -6719,6 +6805,7 @@ class SolverWorker:
         self.restart_required = False
         self.restart_reason: str | None = None
         self.startup_diagnostic: str | None = None
+        self._canary_in_progress = False
 
     def _new_driver(
         self,
@@ -6756,25 +6843,25 @@ class SolverWorker:
         scratch: Path,
         challenge_source: Path,
     ) -> None:
-        """Repeat a transient canary failure; the full isolation check must pass."""
+        """Repeat only a transient command exit; inventory failures stay terminal."""
 
+        self._canary_in_progress = True
         try:
-            await driver.sandbox_canary(
-                os.getpid(), self.exchange, scratch, challenge_source
-            )
-        except WorkerRefusal as exc:
-            if exc.error.code != "sandbox_canary_failed" or tuple(exc.error.requirements) not in {
-                ("command_exit",),
-                # worker.json is atomically replaced through a short-lived
-                # top-level temporary file. A concurrent status publication
-                # can intersect the command sandbox's directory listing.
-                ("exchange_inventory_safe",),
-            }:
-                raise
-            await asyncio.sleep(0.2)
-            await driver.sandbox_canary(
-                os.getpid(), self.exchange, scratch, challenge_source
-            )
+            try:
+                await driver.sandbox_canary(
+                    os.getpid(), self.exchange, scratch, challenge_source
+                )
+            except WorkerRefusal as exc:
+                if exc.error.code != "sandbox_canary_failed" or tuple(exc.error.requirements) not in {
+                    ("command_exit",),
+                }:
+                    raise
+                await asyncio.sleep(0.2)
+                await driver.sandbox_canary(
+                    os.getpid(), self.exchange, scratch, challenge_source
+                )
+        finally:
+            self._canary_in_progress = False
 
     def _publish_worker(self, *, reason: str | None = None) -> None:
         base = self.attestation.public() if self.attestation else PlatformAttestation(False, {}, reason).public()
@@ -6797,7 +6884,16 @@ class SolverWorker:
                 "diagnostic": self.startup_diagnostic,
             }
         )
-        _write_json(self.exchange / "worker.json", base, mode=0o644)
+        temporary_directory = None
+        if getattr(self, "_canary_in_progress", False):
+            active = self.exchange / "active"
+            if active.is_symlink() or not active.is_dir() or active.resolve().parent != self.exchange.resolve():
+                raise WorkerRefusal("invalid_exchange_inventory", "solver 활성 디렉터리를 확인할 수 없습니다.")
+            # The command canary rejects every unknown top-level artifact. Keep
+            # atomic status publication and its one short-lived temporary file
+            # inside the already staged job while the canary inspects the root.
+            temporary_directory = active
+        _write_json(self.exchange / "worker.json", base, mode=0o644, temporary_directory=temporary_directory)
 
     def _require_restart(self, reason: str) -> None:
         """Fail readiness and leave the long-lived loop after unsafe cleanup."""
@@ -7003,6 +7099,7 @@ class SolverWorker:
             return False
         if active.is_symlink() or not active.is_dir() or active.resolve().parent != self.exchange.resolve():
             return False
+        startup_run_key = secrets.token_hex(8)
         manifest = None
         writer = None
         guidance_mailbox = None
@@ -7155,7 +7252,9 @@ class SolverWorker:
                 job_root = self.scratch_root / continuation_input.scratch_name
                 job_root.mkdir(mode=0o700)
             home = job_root / "home"
+            startup_started_ns = time.perf_counter_ns()
             writer.emit("progress", code="inspecting_files")
+            workspace_started_ns = time.perf_counter_ns()
             try:
                 # Archive parsing runs in a disposable child while the owner
                 # credential remains outside worker memory.  Offloading this
@@ -7248,6 +7347,8 @@ class SolverWorker:
                     "원본 agent 작업공간을 안전하게 준비하지 못했습니다.",
                     stage="writeup" if manifest.job_mode == "writeup_refine" else "solve",
                 ) from exc
+            _record_startup_timing("workspace_prepare", workspace_started_ns, startup_run_key)
+            credential_started_ns = time.perf_counter_ns()
             credential = (
                 consume_staged_claude_api_key(active, manifest.auth_sha256)
                 if manifest.configuration.provider == "claude" and manifest.auth_kind == "api_key"
@@ -7262,6 +7363,7 @@ class SolverWorker:
                 raise WorkerRefusal("invalid_auth_stage", "Codex 계정 인증 방식이 작업 설정과 다릅니다.", category="auth")
             (active / "credential-request.json").unlink(missing_ok=True)
             _fsync_directory(active)
+            _record_startup_timing("credential_consume", credential_started_ns, startup_run_key)
             scratch = prepared.workdir
             if manifest.job_mode == "solve":
                 attachment_watcher = asyncio.create_task(
@@ -7292,6 +7394,10 @@ class SolverWorker:
             )
             if isinstance(driver, (CodexAppServer, ClaudePrintDriver)):
                 driver.continuation_event = lambda code: writer.emit("progress", code=code)
+                if isinstance(driver, CodexAppServer):
+                    driver.startup_timing_reporter = lambda phase, started_ns: (
+                        _record_startup_timing(phase, started_ns, startup_run_key)
+                    )
                 if continuation_input is not None and continuation_input.mode == "session":
                     if isinstance(driver, ClaudePrintDriver):
                         driver.resume_session_id = continuation_input.session_id
@@ -7300,18 +7406,26 @@ class SolverWorker:
                         driver.resume_thread_id = continuation_input.session_id
                         driver.restored_home = True
             driver.guidance_mailbox = guidance_mailbox
+            provider_started_ns = time.perf_counter_ns()
             await driver.start()
+            _record_startup_timing("provider_start", provider_started_ns, startup_run_key)
+            canary_started_ns = time.perf_counter_ns()
             await self._verify_sandbox_canary(
                 driver, scratch, prepared.brief.parent
             )
+            _record_startup_timing("canary_pre_login", canary_started_ns, startup_run_key)
+            login_started_ns = time.perf_counter_ns()
             await driver.login_memory(credential)
             credential.erase()
             credential = None
+            _record_startup_timing("provider_login", login_started_ns, startup_run_key)
             # Repeat after login, when the access token exists only in protected
             # worker/app-server memory and any API-key auth file was removed.
+            canary_started_ns = time.perf_counter_ns()
             await self._verify_sandbox_canary(
                 driver, scratch, prepared.brief.parent
             )
+            _record_startup_timing("canary_post_login", canary_started_ns, startup_run_key)
             cancel_watcher = asyncio.create_task(_watch_cancel(active / "cancel", cancel_event))
 
             async def progress(code: str, **details: str):
@@ -7369,6 +7483,14 @@ class SolverWorker:
                     terminal=False,
                     private_notes=notes,
                     solver_artifact=solver_artifact_payload,
+                )
+                _record_startup_timing("startup_total", startup_started_ns, startup_run_key)
+                solve_started_ns = time.perf_counter_ns()
+                driver.first_model_text_reporter = lambda: _record_startup_timing(
+                    "first_model_text_after_running", solve_started_ns, startup_run_key
+                )
+                driver.first_tool_result_reporter = lambda: _record_startup_timing(
+                    "first_tool_result_after_running", solve_started_ns, startup_run_key
                 )
                 published_flag: str | None = None
 
@@ -7433,6 +7555,8 @@ class SolverWorker:
                         else None
                     ),
                 )
+                driver.first_model_text_reporter = None
+                driver.first_tool_result_reporter = None
                 if (
                     getattr(driver, "effective_reasoning_effort", None) == "max"
                     and manifest.max_reasoning_available

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -32,8 +33,49 @@ def browser_path() -> str | None:
     return None
 
 
+REQUIRED_ENGLISH = {
+    # Expanded session log and its steering composer.
+    "모델 응답": "Model response", "내용": "Content", "결과": "Result", "명령": "Command",
+    "일부만 표시": "Truncated", "↓ 맨 아래": "↓ Latest", "세션 로그 닫기": "Close session log",
+    "메인 세션 추가 명령": "Instruction for the main session",
+    "현재 턴에 개입": "Deliver in current turn", "다음 턴에 전달": "Deliver in next turn",
+    "풀이 방향이나 확인할 내용을 입력": "Enter a direction or detail to check",
+    # Account actions: the Korean and English labels must name the same action.
+    "auth.json 업로드": "Upload auth.json", "auth.json 가져오기": "Import auth.json",
+    "API 키 연결": "Connect API key", "모델 설정 저장": "Save model settings",
+    "URL 또는 nc host port": "URL or nc host port", "남음": "remaining",
+}
+
+
+def check_i18n() -> None:
+    duplicates: list[str] = []
+
+    def reject_duplicates(items: list[tuple[str, object]]) -> dict[str, object]:
+        seen: dict[str, object] = {}
+        for key, value in items:
+            if key in seen:
+                duplicates.append(key)
+            seen[key] = value
+        return seen
+
+    packs = {}
+    for locale in ("en", "ko"):
+        text = (ROOT / f"ctf_agent/web/i18n/{locale}.json").read_text(encoding="utf-8")
+        packs[locale] = json.loads(text, object_pairs_hook=reject_duplicates)
+        assert packs[locale]["locale"] == locale
+    # A duplicate key silently lets the later value win, so conflicting
+    # translations never reach the user as written.
+    assert not duplicates, f"duplicate i18n keys: {sorted(set(duplicates))}"
+    messages = packs["en"]["messages"]
+    wrong = {key: messages.get(key) for key, value in REQUIRED_ENGLISH.items() if messages.get(key) != value}
+    assert not wrong, f"missing or changed English labels: {wrong}"
+    assert all(isinstance(value, str) and value.strip() for value in messages.values())
+    assert all(isinstance(value, str) and value.strip() for value in packs["ko"]["messages"].values())
+
+
 def main() -> int:
     assert "${solverEventMarkup(events)}" in section("function solverSessionMarkup(", "function toggleSolverLogSize(")
+    check_i18n()
     browser = browser_path()
     if not browser:
         print("SKIP: Chrome/Chromium is not installed")
@@ -43,11 +85,14 @@ def main() -> int:
         section("function solverAgentNodes(", "function solverGuidanceHistoryMarkup("),
         section("function toggleSolverLogSize(", "function solverWriteup("),
     ))
+    english = json.loads((ROOT / "ctf_agent/web/i18n/en.json").read_text(encoding="utf-8"))["messages"]
+    translations = json.dumps(english, ensure_ascii=False).replace("</", "<\\/")
     fixture = """<!doctype html><html><head><meta charset="utf-8"><style>""" + CSS + """</style></head><body>
 <dialog id="detail" open><button class="solver-log-size-toggle"></button></dialog><pre id="result">PENDING</pre><script>
 const detail=document.querySelector('#detail');
 const esc=x=>String(x??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-const i18n={locale:'en',t:x=>x};
+const translations=""" + translations + """;
+const i18n={locale:'en',t:x=>translations[x]||x};
 const tr=value=>esc(i18n.t(value));
 const solverProgress={},solverPhases={};
 const solverEventSequence=e=>Number(e.sequence)||0;
@@ -94,6 +139,43 @@ try {
   solverConsoleBottom();
   const resumed=solverConsoleFollowLatest&&solverConsoleAtBottom(stream)
     &&solverConsoleDialog.querySelector('.solver-console-bottom').classList.contains('hidden');
+  const draftField=solverConsoleDialog.querySelector('#solver-console-message');
+  draftField.value='keep this draft';
+  currentSolverEvents.push({kind:'activity',sequence:70,phase:'completed',tool:'analysis',summary:'모델 응답',
+    message:'Readable answer\\nsecond line',created_at:70});
+  paintSolverConsole();
+  const replyCard=stream.querySelector('[data-log-key="event:70"]');
+  const reply=replyCard?.querySelector('.solver-console-reply');
+  const readable=!!replyCard&&replyCard.classList.contains('message')&&!replyCard.matches('details')
+    &&!replyCard.querySelector('details,pre')&&reply.textContent.includes('Readable answer')
+    &&reply.textContent.includes('second line')&&reply.getBoundingClientRect().height>0;
+  const englishLabels=replyCard.querySelector('.solver-console-card-title strong')?.textContent==='Model response'
+    &&solverConsoleDialog.querySelector('.solver-console-head .solver-console-bottom')?.textContent==='↓ Latest'
+    &&solverConsoleDialog.querySelector('#solver-console-guidance-form label')?.textContent==='Instruction for the main session'
+    &&solverConsoleDialog.querySelector('#solver-console-message')?.placeholder==='Enter a direction or detail to check'
+    &&first.querySelector('.solver-console-field-head strong')?.textContent==='Command';
+  const draftKept=solverConsoleDialog.querySelector('#solver-console-message')===draftField
+    &&draftField.value==='keep this draft';
+  const expandableCard=stream.querySelector('details.solver-console-card');
+  const plainCard=stream.querySelector('.solver-console-card.static:not(.message)');
+  const distinct=!!expandableCard&&!!plainCard
+    &&getComputedStyle(expandableCard.querySelector('summary'),'::after').content.includes('▸')
+    &&getComputedStyle(expandableCard).borderLeftWidth!=='0px'
+    &&getComputedStyle(plainCard).borderLeftWidth==='0px';
+  currentSolverJob.agents=[{id:'agent-a',parent_id:'root',label:'Worker',status:'running'}];
+  currentSolverEvents.push({kind:'activity',sequence:71,agent_id:'agent-a',phase:'completed',tool:'analysis',
+    summary:'모델 응답',message:'Worker answer',created_at:71});
+  paintSolverConsole();
+  selectSolverAgent({dataset:{agentId:'agent-a'}});
+  currentSolverEvents.push({kind:'activity',sequence:72,agent_id:'agent-a',phase:'completed',tool:'analysis',
+    summary:'모델 응답',message:'Second worker answer',created_at:72});
+  paintSolverConsole();
+  const agentKept=solverConsoleAgentId==='agent-a'
+    &&!!solverConsoleDialog.querySelector('.solver-agent-select.selected[data-agent-id="agent-a"]')
+    &&stream.querySelectorAll('.solver-console-card').length===2
+    &&solverConsoleDialog.querySelector('#solver-console-message')===draftField
+    &&draftField.value==='keep this draft';
+  solverConsoleAgentId='root'; paintSolverConsole();
   const separate=document.createElement('div');
   separate.className='solver-console-stream'; document.body.append(separate);
   const source=[{kind:'progress',sequence:10,code:'step',created_at:10},
@@ -127,8 +209,8 @@ try {
   const changed=solverConsoleDialog.querySelector('.solver-console-head small').textContent==='job-2'
     &&!solverConsoleDialog.querySelector('[name="requested_delivery"]').disabled
     &&!solverConsoleDialog.querySelector('.solver-console-card');
-  document.querySelector('#result').textContent=initial&&openRetained&&retained&&retainedNode&&paused&&resumed&&backfill&&noEmptyExpand&&compactIncremental&&changed?'PASS'
-    :'FAIL '+JSON.stringify({initial,openRetained,retained,retainedNode,paused,resumed,backfill,noEmptyExpand,compactIncremental,changed,count:stream.querySelectorAll('.solver-console-card').length});
+  document.querySelector('#result').textContent=initial&&openRetained&&retained&&retainedNode&&paused&&resumed&&readable&&englishLabels&&draftKept&&distinct&&agentKept&&backfill&&noEmptyExpand&&compactIncremental&&changed?'PASS'
+    :'FAIL '+JSON.stringify({initial,openRetained,retained,retainedNode,paused,resumed,readable,englishLabels,draftKept,distinct,agentKept,backfill,noEmptyExpand,compactIncremental,changed,count:stream.querySelectorAll('.solver-console-card').length});
 } catch(error) { document.querySelector('#result').textContent='ERROR '+error.stack; }
 </script></body></html>"""
     with tempfile.TemporaryDirectory(prefix="ctf-agent-solver-console-") as temp:
@@ -146,7 +228,8 @@ try {
             print(result.stdout[-3000:])
             print(result.stderr[-1000:])
             return 1
-    print("PASS: expanded timeline groups tool calls, retains cards and scroll; compact log unchanged")
+    print("PASS: expanded timeline shows model replies inline, marks only real details as expandable, "
+          "retains cards, drafts, subagent and scroll; compact log unchanged; i18n labels aligned")
     return 0
 
 

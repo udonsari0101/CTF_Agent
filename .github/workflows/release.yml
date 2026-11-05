@@ -34,11 +34,14 @@ jobs:
           fi
           git merge-base --is-ancestor "$revision" origin/main
           git checkout --detach "$revision"
+          test "$(git rev-parse HEAD)" = "$revision"
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ctf-agent-public"
-          digest="$(docker manifest inspect --verbose "$image:$revision" | jq -er '.Descriptor.digest')"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           python3 scripts/package_local_release.py --version "$RELEASE_TAG" --commit "$revision"
           (cd dist && sha256sum --check "CTF_Agent-${RELEASE_TAG}-local-windows.zip.sha256")
+          digest="$(python3 scripts/check_release_identity.py \
+            --tag "$RELEASE_TAG" --revision "$revision" \
+            --archive "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" --image "$image")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           python3 - <<'PY'
           import os
           from pathlib import Path

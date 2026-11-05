@@ -14,6 +14,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,7 +24,8 @@ from ctf_agent.storage_budget import (  # noqa: E402
     StorageBudget, StorageBudgetError, storage_http_status, storage_io_http_response,
 )
 from ctf_agent.solver_exchange import (  # noqa: E402
-    ExchangeError, SolverExchangeCoordinator, _stage_budget_error, _stage_io_error,
+    ExchangeError, SCHEMA as SOLVER_SCHEMA, SolverExchangeCoordinator,
+    _stage_budget_error, _stage_io_error,
     _log_stage_storage_failure,
     _write_json_file, _write_live_attachment_chunk,
     _publish_live_attachment_no_replace, _LIVE_ATTACHMENT_CHUNK_BYTES,
@@ -102,6 +104,69 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
         self.assertEqual(sizes, [1024 * 1024] * 8)
         self.assertEqual(original.read_bytes(), b"preserved")
         self.assertFalse(self.budget.snapshot())
+
+    def test_new_slot_keeps_other_claimed_stage_and_live_copy_reservations(self):
+        jobs = {
+            "a" * 32: "staging",
+            "b" * 32: "running",
+            "c" * 32: "cleanup_blocked",
+            "d" * 32: "failed",
+        }
+        with closing(sqlite3.connect(self.database)) as db:
+            with db:
+                db.executescript(SOLVER_SCHEMA)
+                for index, (job_id, status) in enumerate(jobs.items()):
+                    db.execute(
+                        """INSERT INTO solver_jobs
+                           (id,owner_user_id,workspace_id,challenge_id,account_id,
+                            provider,model,reasoning_effort,status,created_at,updated_at)
+                           VALUES (?,?,?,?,?,'codex','test-model','low',?,1,1)""",
+                        (job_id, "owner", "workspace", f"challenge-{index}", "account", status),
+                    )
+                    if status != "failed":
+                        db.execute("INSERT INTO solver_slots VALUES (?,?)", (f"slot-{index}", job_id))
+
+        stage_key = "solver:" + "a" * 32
+        live_key = "solver-live:" + "b" * 32 + ":" + "e" * 32
+        cleanup_key = "solver:" + "c" * 32
+        orphan_key = "solver:" + "d" * 32
+        for index, key in enumerate((stage_key, live_key, cleanup_key, orphan_key)):
+            self.budget.reserve(key, "solver", "owner", "workspace", f"challenge-{index}", 10)
+        other_runtime = "solver-runtime:other-slot:0.166.0:" + "f" * 32
+        own_runtime = "solver-runtime:new-slot:0.166.0:" + "e" * 32
+        legacy_runtime = "solver-runtime:0.166.0:" + "d" * 32
+        for key in (other_runtime, own_runtime, legacy_runtime):
+            self.budget.reserve(key, "solver_runtime", "system", "runtime", "0.166.0", 10)
+
+        original_reconcile = self.budget.reconcile_kind
+
+        def assert_locked_snapshot(kind, expected):
+            if kind in {"solver", "solver_runtime"}:
+                self.assertTrue(callable(expected))
+            return original_reconcile(kind, expected)
+
+        with patch.object(self.budget, "reconcile_kind", side_effect=assert_locked_snapshot):
+            SolverExchangeCoordinator(
+                self.database, self.data, self.data / "accounts",
+                self.data / "solver-exchange" / "slots" / "new-slot",
+                storage_budget=self.budget, slot_id="new-slot",
+                enforce_host_ownership=False,
+            )
+        self.assertEqual(
+            {row["reservation_key"] for row in self.budget.snapshot(kind="solver")},
+            {stage_key, live_key, cleanup_key},
+        )
+        self.assertEqual(
+            {row["reservation_key"] for row in self.budget.snapshot(kind="solver_runtime")},
+            {other_runtime, legacy_runtime},
+        )
+        self.budget.commit_reserved_write(stage_key, 10, lambda: None)
+        self.budget.consume_durable_reserved_write(live_key, 10)
+        self.budget.release(cleanup_key)
+        self.budget.release(other_runtime)
+        self.budget.release(legacy_runtime)
+        self.assertFalse(self.budget.snapshot(kind="solver"))
+        self.assertFalse(self.budget.snapshot(kind="solver_runtime"))
 
     def test_replacing_reservation_counts_only_projected_total(self):
         with patch.object(self.budget, "_free", return_value=1000):
@@ -307,6 +372,26 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
             _log_stage_storage_failure(sqlite_error, self.data, self.database)
         self.assertNotIn(secret, captured.output[0])
         self.assertNotIn("sqlite_errorname", captured.output[0])
+
+    def test_stage_log_records_inode_headroom_without_file_paths(self):
+        # shutil.disk_usage also calls os.statvfs on Linux. Mock its byte
+        # probe separately so this inode-only fixture does not replace the
+        # unrelated statvfs fields required by disk_usage.
+        with patch(
+            "ctf_agent.solver_exchange.shutil.disk_usage",
+            return_value=SimpleNamespace(free=4096, total=8192),
+        ), patch(
+            "ctf_agent.solver_exchange.os.statvfs", create=True,
+            return_value=SimpleNamespace(f_favail=0, f_files=1234),
+        ):
+            with self.assertLogs("ctf_agent.solver_exchange", level="WARNING") as captured:
+                _log_stage_storage_failure(OSError(errno.ENOSPC, "private path"), self.data, self.database)
+        entry = captured.output[0]
+        self.assertIn("'free_inodes': 0", entry)
+        self.assertIn("'total_inodes': 1234", entry)
+        self.assertNotIn(str(self.data), entry)
+        self.assertNotIn(str(self.database), entry)
+        self.assertNotIn("private path", entry)
 
     def test_existing_slot_stage_failure_is_not_reported_as_success(self):
         with closing(sqlite3.connect(":memory:")) as db:

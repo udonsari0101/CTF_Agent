@@ -336,11 +336,19 @@ def _volume_diagnostic(path: Path) -> dict[str, int | None]:
 
     try:
         usage = shutil.disk_usage(path)
-        return {
+        details = {
             "free_bytes": int(usage.free),
             "total_bytes": int(usage.total),
             "mount_device": int(path.stat().st_dev),
         }
+        if hasattr(os, "statvfs"):
+            try:
+                filesystem = os.statvfs(path)
+                details["free_inodes"] = int(filesystem.f_favail)
+                details["total_inodes"] = int(filesystem.f_files)
+            except OSError as exc:
+                details["inode_probe_errno"] = exc.errno
+        return details
     except OSError as exc:
         return {"probe_errno": exc.errno}
 
@@ -1027,10 +1035,18 @@ class SolverExchangeCoordinator:
                     if path.is_file() and not path.is_symlink() and path.resolve().parent == active.resolve():
                         path.unlink()
                 _fsync(active)
+            # A new autoscaled slot must not discard another slot's in-flight
+            # staging or live-attachment reservation. Compute the expected set
+            # under the volume lock so a concurrent reservation cannot appear
+            # between the snapshot and the reconciliation transaction.
             self.storage_budget.reconcile_kind(
-                "solver", self._cleanup_blocked_reservations()
+                "solver", self._active_solver_reservations
             )
-            self.storage_budget.reconcile_kind("solver_runtime", {})
+            # Runtime publication is also per slot. Reconcile only this slot's
+            # interrupted copy; another slot may still be publishing its CLI.
+            self.storage_budget.reconcile_kind(
+                "solver_runtime", self._other_slot_runtime_reservations
+            )
 
     def _prepare_exchange(self) -> None:
         if self.host_managed_exchange:
@@ -2463,23 +2479,72 @@ class SolverExchangeCoordinator:
                 ).fetchall()
         return {str(row["id"]) for row in rows}
 
-    def _cleanup_blocked_reservations(
+    def _active_solver_reservations(
         self,
     ) -> dict[str, tuple[str, str, str | None, int]]:
-        """Preserve conservative remaining-byte promises until cleanup succeeds."""
+        """Keep reservations for every claimed slot while removing orphaned rows.
 
-        blocked = self._cleanup_blocked_job_ids(own_slot=False)
+        The caller evaluates this under the shared storage lock. A different
+        solver can still be staging or copying a live attachment when this
+        coordinator starts, including when its status is not cleanup_blocked.
+        """
+
+        with self._connect() as db:
+            claimed = {
+                str(row["id"]): (
+                    str(row["owner_user_id"]),
+                    str(row["workspace_id"]),
+                    str(row["challenge_id"]),
+                )
+                for row in db.execute(
+                    """SELECT j.id,j.owner_user_id,j.workspace_id,j.challenge_id
+                         FROM solver_jobs j JOIN solver_slots s ON s.job_id=j.id"""
+                )
+            }
         expected: dict[str, tuple[str, str, str | None, int]] = {}
         for row in self.storage_budget.snapshot(kind="solver"):
             key = row.get("reservation_key")
-            if not isinstance(key, str) or not key.startswith("solver:"):
+            if not isinstance(key, str):
                 continue
-            if key.removeprefix("solver:") not in blocked:
+            if key.startswith("solver:"):
+                job_id = key.removeprefix("solver:")
+            elif key.startswith("solver-live:"):
+                job_id = key.removeprefix("solver-live:").split(":", 1)[0]
+            else:
+                continue
+            scope = claimed.get(job_id)
+            if scope is None or scope != (
+                row["owner_user_id"], row["workspace_id"], row["challenge_id"]
+            ):
                 continue
             expected[key] = (
                 str(row["owner_user_id"]),
                 str(row["workspace_id"]),
                 str(row["challenge_id"]) if row.get("challenge_id") is not None else None,
+                int(row["remaining_bytes"]),
+            )
+        return expected
+
+    def _other_slot_runtime_reservations(
+        self,
+    ) -> dict[str, tuple[str, str, str | None, int]]:
+        """Retain concurrent runtime copies while clearing this slot's stale copy.
+
+        Older reservation keys did not include a slot ID. Their ownership
+        cannot be proven, so retain them conservatively rather than deleting
+        another coordinator's in-flight reservation.
+        """
+
+        expected: dict[str, tuple[str, str, str | None, int]] = {}
+        for row in self.storage_budget.snapshot(kind="solver_runtime"):
+            key = row["reservation_key"]
+            components = key.split(":")
+            if len(components) == 4 and components[:2] == ["solver-runtime", self.slot_id]:
+                continue
+            expected[key] = (
+                str(row["owner_user_id"]),
+                str(row["workspace_id"]),
+                str(row["challenge_id"]) if row["challenge_id"] is not None else None,
                 int(row["remaining_bytes"]),
             )
         return expected
@@ -2593,7 +2658,7 @@ class SolverExchangeCoordinator:
                     retryable=True,
                 )
             staging = runtime_root / f".staging-{uuid.uuid4().hex}"
-            reservation = f"solver-runtime:{version}:{uuid.uuid4().hex}"
+            reservation = f"solver-runtime:{self.slot_id}:{version}:{uuid.uuid4().hex}"
             try:
                 self.storage_budget.reserve(
                     reservation,

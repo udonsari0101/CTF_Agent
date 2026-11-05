@@ -61,6 +61,7 @@ const items = [
 const api = async path => {
   if (path === '/api/accounts') return {accounts:items};
   if (path.endsWith('/refresh')) return {};
+  if (path.endsWith('/models')) return {status:'available',models:[{model:'gpt-6-sol',displayName:'GPT-6 Sol',supportedReasoningEfforts:[{reasoningEffort:'high'}]}]};
   if (path === '/api/providers/codex/runtime' || path === '/api/providers/claude/runtime')
     return {operation:{status:'idle'},can_manage:true,update_supported:true};
   throw new Error('Unexpected API route: '+path);
@@ -110,18 +111,48 @@ try {
   const button = form?.querySelector('button');
   const file = form?.querySelector('input[type="file"]');
   check(form && button && file, 'upload controls accessible');
-  const height = button.getBoundingClientRect().height;
-  check(height >= 42 && height <= 48, 'upload button compact height: '+height);
+  const actionButtons = label => [...codex.querySelectorAll('.actions button')]
+    .find(item => item.textContent === label);
+  actionButtons('API 키 연결').click();
+  const keyForm = codex.querySelector('form.account-api-key');
+  const keyInput = keyForm?.querySelector('input');
+  check(keyForm && keyInput, 'API key form opens from the action button');
+  actionButtons('모델·속도 설정').click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const modelSelect = codex.querySelector('.model-fields select');
+  check(modelSelect, 'model form opens from the action button');
+  modelSelect.value = 'gpt-6-sol';
+  modelSelect.dispatchEvent(new Event('change'));
+  const expectedHeight = parseFloat(getComputedStyle(document.querySelector('.account-management'))
+    .getPropertyValue('--account-control-height'));
+  check(expectedHeight >= 36, 'shared account control height is defined: '+expectedHeight);
+  const heights = [...codex.querySelectorAll('.actions button'), button,
+    keyForm.querySelector('button'), document.querySelector('.account-create button')]
+    .map(item => Math.round(item.getBoundingClientRect().height));
+  check(heights.every(item => item === expectedHeight), 'account buttons share one height: '+heights);
   button.focus();
   check(document.activeElement === button, 'upload button keyboard focus');
   document.querySelector('#root').style.width = '320px';
   await new Promise(resolve => requestAnimationFrame(resolve));
   const labelRect = form.querySelector('label').getBoundingClientRect();
   const buttonRect = button.getBoundingClientRect();
-  check(buttonRect.height >= 42 && buttonRect.height <= 48,
+  check(Math.round(buttonRect.height) === expectedHeight,
     'compact upload button on narrow view');
   check(buttonRect.top >= labelRect.bottom || buttonRect.left >= labelRect.right,
     'narrow upload controls must not overlap');
+  // A background usage refresh rebuilds the card, but open forms and their
+  // drafts must stay connected so typing and native pickers are not reset.
+  keyInput.value = 'draft-value-for-layout-test';
+  actionButtons('사용량 새로고침').click();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  check(card('codex-zero-week') === codex, 'refresh updates the account card in place');
+  check(codex.querySelector('form.account-api-key input') === keyInput
+    && keyInput.value === 'draft-value-for-layout-test', 'API key draft survives usage refresh');
+  check(codex.querySelector('form.auth-upload') === form, 'auth.json form survives usage refresh');
+  check(codex.querySelector('.model-fields select') === modelSelect
+    && modelSelect.value === 'gpt-6-sol', 'model dropdown and unsaved selection survive usage refresh');
+  check([...codex.querySelectorAll('.actions button')].every(item => item.isConnected)
+    && codex.querySelectorAll('.actions button').length >= 6, 'action buttons rebuilt after refresh');
   document.querySelector('#result').textContent='PASS';
 } catch (error) {
   document.querySelector('#result').textContent='FAIL '+error.message;
@@ -159,7 +190,7 @@ try {
             print("Browser result:", result_text.group(1) if result_text else "not rendered")
             print(result.stderr[-500:])
             return 1
-    print("PASS: quota windows, stale state, and compact auth.json upload")
+    print("PASS: quota windows, stale state, shared button height, and forms kept across refresh")
     return 0
 
 

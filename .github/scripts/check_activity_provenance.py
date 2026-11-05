@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path.cwd()
 sys.path.insert(0, str(ROOT))
@@ -23,6 +24,7 @@ from ctf_agent.solver_exchange import (  # noqa: E402
     _validate_event,
 )
 from ctf_agent.solver_worker import (  # noqa: E402
+    ClaudePrintDriver,
     CodexAppServer,
     EventWriter,
     MAX_LIVE_ACTIVITY_EVENTS,
@@ -213,6 +215,205 @@ class ActivityProvenanceTests(unittest.TestCase):
         self.assertEqual(seen[0]["activity_id"], activity_id)
         self.assertTrue(seen[0]["output_truncated"])
         self.assertLessEqual(len(seen[0]["output"].encode("utf-8")), MAX_LIVE_OUTPUT_BYTES)
+
+    def test_timing_observers_fire_once_without_changing_sampled_activity(self):
+        live = []
+        timings = []
+
+        async def record(**details):
+            live.append(details)
+
+        driver = make_driver(reporter=record, activity_count=MAX_LIVE_ACTIVITY_EVENTS)
+        driver.first_model_text_reporter = lambda: timings.append("model")
+        driver.first_tool_result_reporter = lambda: timings.append("tool")
+        driver._note_first_model_text("  ")
+        driver._note_first_model_text("child", root=False)
+        self.assertEqual(timings, [])
+        driver._note_first_model_text("root response")
+        driver._note_first_model_text("another response")
+
+        async def run():
+            await driver._report_activity(
+                "completed", "shell", "Unpaired", output="ignored",
+                activity_id="orphan",
+            )
+            await driver._report_activity(
+                "started", "shell", "Started", activity_id="root-tool",
+            )
+            await driver._report_activity(
+                "started", "web_search", "Search started", activity_id="root-search",
+            )
+            await driver._report_activity(
+                "completed", "web_search", "Search completed", activity_id="root-search",
+            )
+            driver.agent_nodes["child"] = {}
+            await driver._report_activity(
+                "completed", "shell", "Child result", output="ignored",
+                agent_id="child", activity_id="root-tool",
+            )
+            await driver._report_activity(
+                "completed", "shell", "Done", output="secret",
+                activity_id="root-tool",
+            )
+            await driver._report_activity(
+                "completed", "shell", "Done again", activity_id="root-tool",
+            )
+
+        asyncio.run(run())
+        self.assertEqual(timings, ["model", "tool"])
+        self.assertEqual(live, [])
+
+    def test_codex_notification_path_observes_only_root_paired_result(self):
+        timings = []
+
+        async def run():
+            driver = CodexAppServer(Path("."), Path("."), command_prefix=["codex"])
+            driver.first_model_text_reporter = lambda: timings.append("model")
+            driver.first_tool_result_reporter = lambda: timings.append("tool")
+            driver.thread_agents["child-thread"] = "child"
+            driver.agent_nodes["child"] = {}
+
+            async def thread(_manifest):
+                return "root-thread"
+
+            async def request(method, _params):
+                self.assertEqual(method, "turn/start")
+                return {"turn": {"id": "turn-1"}}
+
+            async def progress(_code):
+                pass
+
+            driver._thread = thread
+            driver.request = request
+            driver._sandbox_parameters = lambda *_args, **_kwargs: {}
+            for method, source, item in (
+                ("item/started", "child-thread", {"id": "child-tool", "type": "commandExecution", "command": "echo child"}),
+                ("item/completed", "child-thread", {"id": "child-tool", "type": "commandExecution", "aggregatedOutput": "child output"}),
+                ("item/completed", "root-thread", {"id": "orphan", "type": "commandExecution", "aggregatedOutput": "orphan output"}),
+                ("item/started", "root-thread", {"id": "root-search", "type": "webSearch", "query": "fixture"}),
+                ("item/completed", "root-thread", {"id": "root-search", "type": "webSearch", "query": "fixture"}),
+                ("item/completed", "root-thread", {"id": "root-text", "type": "agentMessage", "text": "root response"}),
+                ("item/started", "root-thread", {"id": "root-tool", "type": "commandExecution", "command": "echo root"}),
+                ("item/completed", "root-thread", {"id": "root-tool", "type": "commandExecution", "aggregatedOutput": "root output"}),
+            ):
+                driver.notifications.put_nowait({
+                    "method": method,
+                    "params": {"threadId": source, "item": item},
+                })
+            driver.notifications.put_nowait({
+                "method": "turn/completed",
+                "params": {"threadId": "root-thread", "turn": {"id": "turn-1", "status": "completed"}},
+            })
+            manifest = SimpleNamespace(
+                configuration=SimpleNamespace(
+                    model="gpt-6-sol", reasoning_effort="medium", service_tier=None,
+                ),
+                job_mode="solve", network_enabled=True,
+            )
+            self.assertEqual(
+                await driver._turn(manifest, "fixture prompt", None, asyncio.Event(), progress),
+                {},
+            )
+
+        asyncio.run(run())
+        self.assertEqual(timings, ["model", "tool"])
+
+    def test_claude_stream_path_observes_only_root_paired_result(self):
+        timings = []
+
+        async def run():
+            configuration = SimpleNamespace(
+                model="claude-sonnet-4-6", reasoning_effort="high", ultracode=False,
+            )
+            driver = ClaudePrintDriver(
+                Path("."), Path("."), configuration, command_prefix=["claude"],
+            )
+            driver.session_id = "session-root"
+            driver.tool_agents["parent-agent-tool"] = "child"
+            driver.agent_nodes["child"] = {"parent_id": "root", "label": "child"}
+            driver.first_model_text_reporter = lambda: timings.append("model")
+            driver.first_tool_result_reporter = lambda: timings.append("tool")
+            manifest = SimpleNamespace(
+                configuration=configuration,
+                job_mode="solve",
+            )
+            events = [
+                {
+                    "type": "system", "subtype": "init", "session_id": "session-root",
+                    "model": manifest.configuration.model, "effort": "high",
+                    "claude_code_version": driver.expected_version,
+                    "permissionMode": "dontAsk", "slash_commands": [],
+                    "tools": [*driver.ALLOWED_TOOLS, "StructuredOutput"], "mcp_servers": [],
+                },
+                {
+                    "type": "assistant", "session_id": "session-root",
+                    "parent_tool_use_id": "parent-agent-tool",
+                    "message": {"content": [{"type": "tool_use", "id": "child-tool",
+                                            "name": "Bash", "input": {"command": "echo child"}}]},
+                },
+                {
+                    "type": "user", "session_id": "session-root",
+                    "parent_tool_use_id": "parent-agent-tool",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": "child-tool",
+                                            "content": "child output"}]},
+                },
+                {
+                    "type": "user", "session_id": "session-root",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": "orphan",
+                                            "content": "orphan output"}]},
+                },
+                {
+                    "type": "assistant", "session_id": "session-root",
+                    "message": {"content": [{"type": "tool_use", "id": "root-read",
+                                            "name": "Read", "input": {}}]},
+                },
+                {
+                    "type": "user", "session_id": "session-root",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": "root-read",
+                                            "content": ""}]},
+                },
+                {
+                    "type": "assistant", "session_id": "session-root",
+                    "message": {"content": [{"type": "text", "text": "root response"}]},
+                },
+                {
+                    "type": "assistant", "session_id": "session-root",
+                    "message": {"content": [{"type": "tool_use", "id": "root-tool",
+                                            "name": "Bash", "input": {"command": "echo root"}}]},
+                },
+                {
+                    "type": "user", "session_id": "session-root",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": "root-tool",
+                                            "content": "root output"}]},
+                },
+                {
+                    "type": "result", "session_id": "session-root", "subtype": "success",
+                    "is_error": False, "result": "",
+                    "structured_output": {"flag": "test{fixture}", "private_notes": ""},
+                },
+            ]
+            reader = asyncio.StreamReader()
+            for event in events:
+                reader.feed_data((json.dumps(event) + "\n").encode("utf-8"))
+            reader.feed_eof()
+
+            class FakeProcess:
+                stdout = reader
+                returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            async def progress(_code):
+                pass
+
+            self.assertEqual(
+                (await driver._read_stream(FakeProcess(), manifest, progress))["flag"],
+                "test{fixture}",
+            )
+
+        asyncio.run(run())
+        self.assertEqual(timings, ["model", "tool"])
 
     def test_evidence_schema_rejects_leaks_and_invalid_metadata(self):
         valid = {

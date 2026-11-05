@@ -614,7 +614,7 @@ function solverConsoleText(value) {
 function solverConsoleField(label, value, truncated = false) {
   const content = solverConsoleText(value);
   if (!content) return '';
-  return `<div class="solver-console-field"><div class="solver-console-field-head"><strong>${esc(label)}</strong>${truncated ? '<small>일부만 표시</small>' : ''}</div><pre>${esc(content)}</pre></div>`;
+  return `<div class="solver-console-field"><div class="solver-console-field-head"><strong>${tr(label)}</strong>${truncated ? `<small>${tr('일부만 표시')}</small>` : ''}</div><pre>${esc(content)}</pre></div>`;
 }
 
 function solverConsoleEntryRevision(entry, agentLabels) {
@@ -651,15 +651,19 @@ function solverConsoleEntryMarkup(entry, agentLabels) {
   const distinctMessages = [...new Set(messages)];
   const detail = !activity && !agent && ['error','flag','writeup','guidance'].includes(latest.kind)
     ? solverConsoleText(solverEventDetail(latest)) : '';
-  const expandable = activity ? Boolean(output || distinctMessages.length) : Boolean(detail);
+  // A completed model response carries only text. Show it in the timeline
+  // instead of hiding it behind a disclosure that has nothing else to reveal.
+  const reply = activity && first.tool === 'analysis' && !command && !output && distinctMessages.length > 0;
+  const expandable = !reply && (activity ? Boolean(output || distinctMessages.length) : Boolean(detail));
   const body = activity
     ? `${solverConsoleField(first.tool === 'web_search' ? '검색어' : '명령',command?.command,events.some(event => event.command_truncated))}
        ${solverConsoleField('결과',output?.output,events.some(event => event.output_truncated))}
        ${distinctMessages.map(message => solverConsoleField('내용',message)).join('')}`
     : solverConsoleField('내용',detail);
-  const classes = `solver-console-card${running ? ' running' : ''}${failed ? ' failed' : ''}${expandable ? '' : ' static'}`;
+  const classes = `solver-console-card${running ? ' running' : ''}${failed ? ' failed' : ''}${expandable ? '' : ' static'}${reply ? ' message' : ''}`;
   const attributes = `class="${classes}" data-log-key="${esc(entry.key)}" data-log-revision="${esc(solverConsoleEntryRevision(entry,agentLabels))}"`;
-  const heading = `<span class="solver-console-card-icon" aria-hidden="true">${running ? '◌' : failed ? '×' : '✓'}</span><span class="solver-console-card-title"><strong>${esc(title)}</strong><small>${esc([toolLabel,...meta].join(' · '))}</small></span><span class="solver-console-card-state">${esc(state)}</span><time>${esc(solverEventTime(latest))}</time>`;
+  const heading = `<span class="solver-console-card-icon" aria-hidden="true">${reply ? '›' : running ? '◌' : failed ? '×' : '✓'}</span><span class="solver-console-card-title"><strong>${tr(title)}</strong><small>${esc([i18n.t(toolLabel),...meta].join(' · '))}</small></span><span class="solver-console-card-state">${reply ? '' : tr(state)}</span><time>${esc(solverEventTime(latest))}</time>`;
+  if (reply) return `<div ${attributes}><div class="solver-console-card-summary">${heading}</div><div class="solver-console-reply" data-i18n-ignore>${distinctMessages.map(message => `<p>${esc(message)}</p>`).join('')}</div></div>`;
   if (!expandable) return `<div ${attributes}><div class="solver-console-card-summary">${heading}</div></div>`;
   return `<details ${attributes}${solverConsoleCardStates.get(entry.key) === true ? ' open' : ''}>
     <summary>${heading}</summary><div class="solver-console-card-body">${body}</div>
@@ -667,7 +671,7 @@ function solverConsoleEntryMarkup(entry, agentLabels) {
 }
 
 function solverConsoleTimelineMarkup(events, job = null) {
-  if (!events.length) return '<p class="solver-log-empty">아직 기록이 없습니다.</p>';
+  if (!events.length) return `<p class="solver-log-empty">${tr('아직 기록이 없습니다.')}</p>`;
   const agentLabels = new Map((Array.isArray(job?.agents) ? job.agents : [])
     .filter(agent => agent && typeof agent.id === 'string')
     .map(agent => [agent.id,String(agent.label || agent.id)]));
@@ -677,7 +681,7 @@ function solverConsoleTimelineMarkup(events, job = null) {
 function reconcileSolverConsoleTimeline(stream, events, job = null) {
   const entries = solverConsoleEntries(events);
   if (!entries.length) {
-    if (!stream.querySelector('.solver-log-empty')) stream.innerHTML = '<p class="solver-log-empty">아직 기록이 없습니다.</p>';
+    if (!stream.querySelector('.solver-log-empty')) stream.innerHTML = `<p class="solver-log-empty">${tr('아직 기록이 없습니다.')}</p>`;
     return;
   }
   stream.querySelector('.solver-log-empty')?.remove();
@@ -769,16 +773,16 @@ function solverAgentTreeMarkup(job, events) {
     const status = typeof agent.status === 'string' ? agent.status : '';
     const safeStatus = ['queued','running','completed','failed','cancelled','stopped','interrupted'].includes(status) ? status : '';
     const statusLabel = {queued:'대기',running:'작업 중',completed:'완료',failed:'실패',cancelled:'취소',stopped:'중단',interrupted:'중단'}[status] || status;
-    const meta = [agent.provider,agent.model,statusLabel].filter(Boolean).map(esc).join(' · ');
+    const meta = [agent.provider,agent.model,i18n.t(statusLabel)].filter(Boolean).map(esc).join(' · ');
     const count = agent.id === 'root' ? events.length : counts.get(agent.id) || 0;
     return `<li class="solver-agent-node"><div class="solver-agent-row">${expandable
-      ? `<button type="button" class="solver-agent-expand" data-action="toggle-solver-agent-branch" data-agent-id="${esc(agent.id)}" aria-label="${esc(agent.label || agent.id)} ${collapsed ? '펼치기' : '접기'}" aria-expanded="${!collapsed}">${collapsed ? '▸' : '▾'}</button>`
+      ? `<button type="button" class="solver-agent-expand" data-action="toggle-solver-agent-branch" data-agent-id="${esc(agent.id)}" aria-label="${esc(agent.label || agent.id)} ${tr(collapsed ? '펼치기' : '접기')}" aria-expanded="${!collapsed}">${collapsed ? '▸' : '▾'}</button>`
       : '<span class="solver-agent-expand-spacer" aria-hidden="true"></span>'}
-      <button type="button" class="solver-agent-select${solverConsoleAgentId === agent.id ? ' selected' : ''}" data-action="select-solver-agent" data-agent-id="${esc(agent.id)}" aria-pressed="${solverConsoleAgentId === agent.id}"><span class="solver-agent-name">${esc(agent.id === 'root' ? '전체 세션' : agent.label || agent.id)}</span><span class="solver-agent-count">${count}</span>${safeStatus ? `<span class="solver-agent-status ${safeStatus}" title="${esc(status)}"></span>` : ''}${meta ? `<small>${meta}</small>` : ''}</button></div>${expandable ? `<ul class="solver-agent-children${collapsed ? ' hidden' : ''}">${descendants.map(branch).join('')}</ul>` : ''}</li>`;
+      <button type="button" class="solver-agent-select${solverConsoleAgentId === agent.id ? ' selected' : ''}" data-action="select-solver-agent" data-agent-id="${esc(agent.id)}" aria-pressed="${solverConsoleAgentId === agent.id}"><span class="solver-agent-name">${agent.id === 'root' ? tr('전체 세션') : esc(agent.label || agent.id)}</span><span class="solver-agent-count">${count}</span>${safeStatus ? `<span class="solver-agent-status ${safeStatus}" title="${esc(status)}"></span>` : ''}${meta ? `<small>${meta}</small>` : ''}</button></div>${expandable ? `<ul class="solver-agent-children${collapsed ? ' hidden' : ''}">${descendants.map(branch).join('')}</ul>` : ''}</li>`;
   }
   let content = branch(agents[0]);
   for (const agent of agents.slice(1)) if (!visited.has(agent.id)) content += branch(agent);
-  return `<h3>에이전트</h3><ul class="solver-agent-list">${content}</ul>`;
+  return `<h3>${tr('에이전트')}</h3><ul class="solver-agent-list">${content}</ul>`;
 }
 
 function solverGuidanceHistoryMarkup() {
@@ -834,12 +838,12 @@ function toggleSolverLogSize(button) {
   const provider = currentSolverJob.provider || currentSolverJob.configuration?.provider;
   const active = solverIsActive(currentSolverJob) && currentSolverJob.guidance_allowed !== false;
   const agentTree = solverAgentTreeMarkup(currentSolverJob,currentSolverEvents);
-  solverConsoleDialog.innerHTML = `<header class="solver-console-head"><div><strong>${esc(currentChallenge?.name || '세션 로그')}</strong><small>${esc(solverJobId(currentSolverJob))}${currentSolverJob.read_only_history ? ` · ${tr('가져온 기록 · 읽기 전용')}` : ''}</small>${solverContextUsageMarkup(currentSolverJob)}</div><div class="solver-console-head-actions"><button type="button" class="small ghost solver-console-bottom hidden" data-action="solver-console-bottom" aria-label="맨 아래로 이동">↓ 맨 아래</button><button type="button" class="small ghost" data-action="close-solver-console" aria-label="세션 로그 닫기">닫기</button></div></header>
-    <div class="solver-console-body"><aside class="solver-agent-tree${agentTree ? '' : ' hidden'}" aria-label="에이전트 활동">${agentTree}</aside><div class="solver-console-stream" role="log" aria-live="polite">${solverConsoleTimelineMarkup(solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null)}</div></div>
+  solverConsoleDialog.innerHTML = `<header class="solver-console-head"><div><strong>${esc(currentChallenge?.name || i18n.t('세션 로그'))}</strong><small>${esc(solverJobId(currentSolverJob))}${currentSolverJob.read_only_history ? ` · ${tr('가져온 기록 · 읽기 전용')}` : ''}</small>${solverContextUsageMarkup(currentSolverJob)}</div><div class="solver-console-head-actions"><button type="button" class="small ghost solver-console-bottom hidden" data-action="solver-console-bottom" aria-label="${tr('맨 아래로 이동')}">${tr('↓ 맨 아래')}</button><button type="button" class="small ghost" data-action="close-solver-console" aria-label="${tr('세션 로그 닫기')}">${tr('닫기')}</button></div></header>
+    <div class="solver-console-body"><aside class="solver-agent-tree${agentTree ? '' : ' hidden'}" aria-label="${tr('에이전트 활동')}">${agentTree}</aside><div class="solver-console-stream" role="log" aria-live="polite">${solverConsoleTimelineMarkup(solverConsoleEvents(currentSolverJob,currentSolverEvents),solverConsoleAgentId === 'root' ? currentSolverJob : null)}</div></div>
     <div class="solver-console-controls"><form id="solver-console-guidance-form" class="solver-console-guidance${active ? '' : ' hidden'}">
-      <label for="solver-console-message">메인 세션 추가 명령</label><textarea id="solver-console-message" name="message" maxlength="16384" rows="3" placeholder="풀이 방향이나 확인할 내용을 입력" required>${esc(solverGuidanceDraft)}</textarea>
-      <div class="solver-console-send"><select name="requested_delivery" aria-label="명령 전달 방식" ${provider === 'claude' ? 'disabled' : ''}><option value="same_turn">현재 턴에 개입</option><option value="next_turn" ${provider === 'claude' ? 'selected' : ''}>다음 턴에 전달</option></select><button type="submit" class="primary">전송</button></div>
-    </form><label class="solver-console-upload">문제 파일 추가<input id="solver-console-files" type="file" multiple></label><small>업로드가 끝난 파일은 진행 중인 풀이의 attachments/에 추가됩니다.</small></div>`;
+      <label for="solver-console-message">${tr('메인 세션 추가 명령')}</label><textarea id="solver-console-message" name="message" maxlength="16384" rows="3" placeholder="${tr('풀이 방향이나 확인할 내용을 입력')}" required>${esc(solverGuidanceDraft)}</textarea>
+      <div class="solver-console-send"><select name="requested_delivery" aria-label="${tr('명령 전달 방식')}" ${provider === 'claude' ? 'disabled' : ''}><option value="same_turn">${tr('현재 턴에 개입')}</option><option value="next_turn" ${provider === 'claude' ? 'selected' : ''}>${tr('다음 턴에 전달')}</option></select><button type="submit" class="primary">${tr('전송')}</button></div>
+    </form><label class="solver-console-upload">${tr('문제 파일 추가')}<input id="solver-console-files" type="file" multiple></label><small>${tr('업로드가 끝난 파일은 진행 중인 풀이의 attachments/에 추가됩니다.')}</small></div>`;
   solverConsoleDialog.showModal();
   solverLogExpanded = true;
   const toggle = detail.querySelector('.solver-log-size-toggle');
@@ -3542,7 +3546,7 @@ async function refreshReleaseUpdatePanel(force = false) {
     if (!area.isConnected || requestGeneration !== releaseUpdateRequestGeneration) return;
     const phase = info.status?.phase || 'idle';
     const active = ['queued','downloading','verifying','installing','health_check','rolling_back'].includes(phase);
-    const labels = {idle:'대기',queued:'대기 중',downloading:'다운로드 중',verifying:'검증 중',installing:'설치 중',health_check:'상태 확인 중',rolling_back:'이전 버전 복구 중',completed:'완료',failed:'실패'};
+    const labels = {idle:'대기',queued:'대기 중',downloading:'다운로드 중',verifying:'검증 중',installing:'설치 중',health_check:'서비스 상태 확인 중',rolling_back:'이전 버전 복구 중',completed:'완료',failed:'실패'};
     area.innerHTML = `<div class="release-update-head"><h2>서비스 업데이트</h2><button type="button" class="small ghost" data-action="refresh-release-update">새로고침</button></div><p>${i18n.locale === 'en' ? 'Current' : '현재'} ${esc(info.current)} · ${i18n.locale === 'en' ? 'Latest' : '최신'} ${esc(info.latest?.tag || i18n.t('조회 불가'))}</p>
       ${info.latest?.notes ? `<details><summary>업데이트 내역</summary><div class="release-notes markdown-preview" data-i18n-ignore>${safeMarkdown(info.latest.notes)}</div></details>` : ''}
       ${info.error ? `<p class="form-hint" role="status">${esc(info.error)}</p>` : ''}

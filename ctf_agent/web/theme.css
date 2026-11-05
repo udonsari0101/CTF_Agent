@@ -341,11 +341,13 @@ input:focus, textarea:focus, select:focus {
   background: linear-gradient(145deg,rgba(41,31,5,.72),rgba(8,8,4,.94));
   box-shadow: inset 2px 0 #e6b834;
 }
-.challenge-inline-input > div { grid-column: 1/-1; display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.challenge-inline-input { min-width: 0; overflow-wrap: anywhere; }
+.challenge-inline-input > div { grid-column: 1/-1; display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 3px 10px; min-width: 0; }
+.challenge-inline-input > div > * { min-width: 0; }
 .challenge-inline-input > div strong { color: #ffd968; font: 700 10px ui-monospace,"Cascadia Code",Consolas,monospace; text-transform: uppercase; }
 .challenge-inline-input > div small { color: #9b8d65; font-size: 9px; }
 .challenge-inline-input label { min-width: 0; }
-.challenge-inline-input select, .challenge-inline-input input { width: 100%; min-width: 0; height: 34px; padding: 6px 8px; font-size: 10px; }
+.challenge-inline-input select, .challenge-inline-input input { width: 100%; min-width: 0; height: 34px; padding: 6px 8px; font-size: 10px; text-overflow: ellipsis; }
 .challenge-inline-input button { min-height: 34px; padding-inline: 10px; white-space: nowrap; }
 .challenge-inline-input .is-disabled { opacity: .42; }
 .challenge-inline-attention {
@@ -785,6 +787,17 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, #20b88c, #65ffd
 .solver-console-card.running .solver-console-card-state { color:#69dfc0; }
 .solver-console-card.failed .solver-console-card-state { color:#f58a99; }
 .solver-console-card-body { display:grid; gap:10px; min-width:0; padding:6px 0 12px 29px; border-left:1px solid #245d6e; margin-left:9px; }
+.solver-console-timeline > details.solver-console-card { margin:4px 0; padding:0 10px; border:1px solid #17313c; border-radius:6px; background:#020b10; }
+.solver-console-timeline > details.solver-console-card:hover,.solver-console-timeline > details.solver-console-card[open] { border-color:#245d6e; }
+details.solver-console-card > summary { grid-template-columns:20px minmax(0,1fr) auto auto 12px; }
+details.solver-console-card > summary::after { content:'▸'; color:#729eac; font-size:10px; text-align:center; }
+details.solver-console-card[open] > summary::after { content:'▾'; }
+.solver-console-card.static .solver-console-card-title strong { color:#a9c4cd; font-weight:500; }
+.solver-console-timeline > .solver-console-card.message { margin:4px 0; padding-left:10px; border-left:2px solid #2d7c92; }
+.solver-console-card.message .solver-console-card-title strong { color:#8fd7ea; }
+.solver-console-reply { max-width:96ch; margin:0 0 10px 29px; color:#d4e8ee; font:13px/1.65 system-ui,-apple-system,"Segoe UI","Noto Sans KR",sans-serif; }
+.solver-console-reply p { margin:0; overflow-wrap:anywhere; white-space:pre-wrap; }
+.solver-console-reply p + p { margin-top:8px; }
 .solver-console-field { min-width:0; }
 .solver-console-field-head { display:flex; justify-content:space-between; gap:8px; margin-bottom:5px; color:#8cb4c0; font-size:10px; }
 .solver-console-field-head small { color:#e0b971; }
@@ -793,7 +806,7 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, #20b88c, #65ffd
 .solver-console-agent-states { display:grid; gap:6px; margin:0; padding-left:20px; color:#a8c7d0; font-size:11px; }
 .solver-console-agent-states li { padding:0; }
 .solver-console-agent-states small { margin-left:8px; color:#7a9ca7; }
-@media(max-width:580px) { .solver-console-card > summary,.solver-console-card-summary { grid-template-columns:18px minmax(0,1fr) auto; gap:5px; padding:8px 0; } .solver-console-card time { display:none; } .solver-console-card-body { padding-left:18px; } }
+@media(max-width:580px) { .solver-console-card > summary,.solver-console-card-summary { grid-template-columns:18px minmax(0,1fr) auto; gap:5px; padding:8px 0; } .solver-console-card time { display:none; } details.solver-console-card > summary { grid-template-columns:18px minmax(0,1fr) auto 12px; } .solver-console-card-body { padding-left:18px; } .solver-console-reply { margin-left:23px; } }
 .solver-console-controls { flex:0 0 auto; display:grid; gap:8px; max-height:38dvh; overflow-y:auto; padding:12px 18px 16px; border-top:1px solid #18333e; }
 .solver-console-guidance { display:grid; gap:7px; }
 .solver-console-guidance label,.solver-console-upload { font-size:12px; color:#c8d9df; }

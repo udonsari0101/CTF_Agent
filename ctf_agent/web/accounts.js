@@ -159,6 +159,7 @@ export async function renderAccounts(container, api, options = {}) {
   let runtimeLoadGeneration = 0;
   const loginGeneration = new WeakMap();
   const modelTargets = new Map();
+  const formTargets = new Map();
   const active = () => !stopped && container.contains(accounts);
   async function action(task) {
     setFeedback('');
@@ -293,7 +294,7 @@ export async function renderAccounts(container, api, options = {}) {
             target.replaceChildren(el('p', labels[result.status] || result.status));
             if (result.message) target.append(el('p', result.message));
             if (result.error) target.append(el('p', errorText(result.error), 'error-text'));
-            if (result.status === 'completed') { modelTargets.delete(account.id); await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }
+            if (result.status === 'completed') { modelTargets.delete(account.id); await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); target.replaceChildren(); }
           }
         } catch (error) {
           if (current()) {
@@ -307,6 +308,7 @@ export async function renderAccounts(container, api, options = {}) {
       modelTargets.delete(account.id);
       await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'});
       await load();
+      target.replaceChildren();
     }
   }
 
@@ -436,6 +438,7 @@ export async function renderAccounts(container, api, options = {}) {
     const pendingLogins = [];
     const liveAccountIds = new Set(data.accounts.map(account => account.id));
     for (const id of modelTargets.keys()) if (!liveAccountIds.has(id)) modelTargets.delete(id);
+    for (const id of formTargets.keys()) if (!liveAccountIds.has(id)) formTargets.delete(id);
     const existingCards = new Map([...accounts.children]
       .filter(child => child.dataset.accountId)
       .map(child => [child.dataset.accountId, child]));
@@ -502,48 +505,45 @@ export async function renderAccounts(container, api, options = {}) {
       const summary = el('p', modelSummary.join(' · '), 'account-model-summary');
       summary.setAttribute('aria-label', '기본 풀이 설정');
       card.append(summary);
-      const login = el('div');
+      const forms = formTargets.get(account.id) || {login: el('div'), upload: el('div'), apiKey: el('div')};
+      formTargets.set(account.id, forms);
+      const {login, upload, apiKey} = forms;
       const models = modelTargets.get(account.id) || el('div');
       modelTargets.set(account.id, models);
-      // Build the refreshed card without moving an open settings form. Removing
-      // even the same <select> for one render closes its native dropdown.
-      const modelSlot = el('div');
+      // Build the refreshed card without moving an open form. Removing even the
+      // same <select> for one render closes its native dropdown, and a rebuilt
+      // API-key or file field would drop what the user already entered.
+      const keep = [login, models, upload, apiKey];
+      const slots = keep.map(() => el('div'));
       const controls = el('div', undefined, 'actions');
-      const upload = el('div');
-      const apiKey = el('div');
       const select = button(account.selected ? '선택됨' : '이 계정 선택', async () => { await api(`/api/accounts/${account.id}/select`, {method: 'POST'}); await load(); });
       select.disabled = account.selected;
       controls.append(select, button('사용량 새로고침', async () => { await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }));
       if (account.auth_kind !== 'api_key') controls.append(button(snapshot.status === 'authenticated' ? '다시 로그인' : '로그인', () => showLogin(account, login, true)));
       controls.append(button('API 키 연결', () => showApiKey(account, apiKey)), button('모델·속도 설정', () => showModels(account, models)),
-        button('로그아웃', async () => { await api(`/api/accounts/${account.id}/logout`, {method: 'POST'}); modelTargets.delete(account.id); await load(); }),
+        button('로그아웃', async () => { await api(`/api/accounts/${account.id}/logout`, {method: 'POST'}); modelTargets.delete(account.id); login.replaceChildren(); await load(); }),
         button('계정 삭제', async () => {
           if (!window.confirm(`${account.label} 계정 등록과 서버에 저장된 로그인 정보를 삭제할까요?`)) return;
           await api(`/api/accounts/${account.id}`, {method: 'DELETE'});
           await load();
         }));
       if (account.provider === 'codex') controls.append(button('auth.json 업로드', () => authUpload(account, upload)));
-      card.append(controls, login, modelSlot, upload, apiKey);
+      card.append(controls, ...slots);
       const existing = existingCards.get(account.id);
       existingCards.delete(account.id);
-      if (existing?.contains(models)) {
-        // Update quotas and account metadata in place while the model form and
-        // its ancestors stay connected, preserving focus and unsaved choices.
+      if (existing && keep.every(node => existing.contains(node))) {
+        // Update quotas and account metadata in place while the form slots
+        // and their ancestors stay connected, preserving focus and drafts.
         existing.className = card.className;
-        const next = [...card.childNodes];
-        const slotIndex = next.indexOf(modelSlot);
-        for (const child of [...existing.childNodes]) if (child !== models) child.remove();
-        next.forEach((child, index) => {
-          if (child === modelSlot) return;
-          if (index < slotIndex) existing.insertBefore(child, models);
-          else existing.append(child);
-        });
+        const volatile = [...card.childNodes].filter(child => !slots.includes(child));
+        for (const child of [...existing.childNodes]) if (!keep.includes(child)) child.remove();
+        for (const child of volatile) existing.insertBefore(child, login);
       } else {
-        modelSlot.replaceWith(models);
+        slots.forEach((slot, index) => slot.replaceWith(keep[index]));
         if (existing) existing.replaceWith(card);
         else accounts.append(card);
       }
-      if (['starting', 'pending'].includes(account.login?.status)) {
+      if (['starting', 'pending'].includes(account.login?.status) && !login.hasChildNodes()) {
         pendingLogins.push(action(() => showLogin(account, login, false)));
       }
     }
