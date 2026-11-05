@@ -238,6 +238,8 @@ jobs:
         run: python .github/scripts/check_ultra_card_state.py
       - name: Check solver resource policy
         run: python .github/scripts/check_solver_resource_policy.py
+      - name: Check solver job time-limit parity
+        run: python .github/scripts/check_solver_limit_contract.py
       - name: Check local remaining-space floor
         run: python .github/scripts/check_local_storage_floor.py
       - name: Check pinned CLI version monitor

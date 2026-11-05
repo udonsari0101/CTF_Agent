@@ -6792,6 +6792,7 @@ class SolverWorker:
                 "sandbox_canary": self.sandbox_attested,
                 "instance_id": self.instance_id,
                 "pid": os.getpid(),
+                "max_job_seconds": MAX_JOB_SECONDS,
                 "reason": reason or self.restart_reason or base.get("reason"),
                 "diagnostic": self.startup_diagnostic,
             }

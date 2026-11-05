@@ -4040,6 +4040,16 @@ class SolverExchangeCoordinator:
 
     def _worker_status(self, *, require_clean: bool) -> dict[str, Any]:
         value = _read_json_file(self.exchange / "worker.json", 128 * 1024)
+        # The web process writes this limit into each immutable job manifest.
+        # A worker with a different limit would reject the manifest before it
+        # could create an EventWriter, leaving the claimed slot stuck forever.
+        if type(value.get("max_job_seconds")) is not int or value["max_job_seconds"] != MAX_JOB_SECONDS:
+            raise ExchangeError(
+                "solver_limit_mismatch",
+                "The web and solver job time limits differ. Check CTF_SOLVER_MAX_SECONDS for both containers.",
+                category="safety",
+                retryable=True,
+            )
         checks = value.get("checks")
         required = {
             "linux",
