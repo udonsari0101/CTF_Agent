@@ -250,7 +250,7 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         "sox", "chromium", "ctf-browser", "dig", "socat", "wasm2wat", "whois",
         "zbarimg", "apktool", "gdbserver", "nmap", "sqlmap", "testdisk", "photorec",
         "java", "javac", "ghidra_headless", "jadx", "gp", "stegseek", "multimon-ng",
-        "pwndbg", "websocat",
+        "pwndbg", "websocat", "xxd",
     ):
         assert shutil.which(executable), executable + " is missing from the CTF toolchain"
     ffuf = Path("/usr/local/bin/ffuf")
@@ -304,6 +304,16 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         assert result.returncode == 0, (
             executable + " failed its runtime check: " + result.stderr.strip()
         )
+    binary_fixture = b"\x00CTF\x01\xfe\xff\n"
+    hex_dump = subprocess.run(
+        ["xxd", "-p"], input=binary_fixture, capture_output=True,
+        check=True, timeout=15, cwd=tool_tmp, env=tool_env,
+    ).stdout
+    restored = subprocess.run(
+        ["xxd", "-r", "-p"], input=hex_dump, capture_output=True,
+        check=True, timeout=15, cwd=tool_tmp, env=tool_env,
+    ).stdout
+    assert restored == binary_fixture
     java_source = tool_tmp / "CTFSmoke.java"
     java_source.write_text("public class CTFSmoke { public static int answer() { return 42; } }", encoding="utf-8")
     subprocess.run(

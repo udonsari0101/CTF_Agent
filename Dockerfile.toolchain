@@ -28,7 +28,7 @@ RUN apt-get update \
         libffi-dev libgmp-dev libimage-exiftool-perl libmagic1 \
         libmpfr-dev libssl-dev ltrace mediainfo multimon-ng netcat-openbsd nmap openssl p7zip-full pari-gp patchelf \
         pkg-config pngcheck poppler-utils procps qemu-system-x86 qemu-user ripgrep sleuthkit sqlmap \
-        socat sox steghide strace tesseract-ocr testdisk tshark tmux unzip wabt whois xz-utils yara zbar-tools \
+        socat sox steghide strace tesseract-ocr testdisk tshark tmux unzip wabt whois xxd xz-utils yara zbar-tools \
     && curl --fail --silent --show-error --location --retry 3 \
         --output /tmp/radare2.deb \
         "https://github.com/radareorg/radare2/releases/download/${RADARE2_VERSION}/radare2_${RADARE2_VERSION}_amd64.deb" \

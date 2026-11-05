@@ -17,7 +17,7 @@ Debian 12 (bookworm) packages provide:
 - number theory: PARI/GP (`gp`);
 - web and protocol analysis: headless Chromium through the `ctf-browser`
   job-local launcher, ffuf, sqlmap, nmap, DNS utilities, socat, whois, WABT and zbar;
-- general analysis: Git, file, jq, ripgrep, netcat, OpenSSL, tmux and a C/C++
+- general analysis: Git, file, `xxd`, jq, ripgrep, netcat, OpenSSL, tmux and a C/C++
   build toolchain.
 
 Radare2 is not shipped in bookworm. The image therefore installs the official
@@ -61,7 +61,8 @@ the pinned framework version. It compiles and decompiles tiny native and Java
 programs with Ghidra and JADX, evaluates a PARI/GP factorization, and checks
 StegSeek startup. It also renders a local page to PNG through the
 same `ctf-browser` launcher available to a solve. Pwndbg's `vmmap` command
-and Websocat's CLI are checked in the image.
+and Websocat's CLI are checked in the image. A byte round-trip through `xxd`
+verifies that hex conversion works, rather than merely finding the executable.
 The worker readiness canary
 repeats a compact set and the browser render through Codex's real AppArmor
 command profile. Claude jobs check the provider-to-command inspection
