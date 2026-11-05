@@ -515,7 +515,10 @@ _PROGRESS_ONLY_EVIDENCE = re.compile(
     r"\b(?:i|we)\s+(?:have\s+)?(?:found|identified|verified|determined|"
     r"confirmed|extracted|decoded|decrypted|solved)\b|"
     r"\b(?:the|this|that)\s+[^.!?\n]{0,80}\s+"
-    r"(?:contains|shows|indicates|reveals|proves)\b|"
+    r"(?:is|are|was|were|contains|shows|indicates|reveals|proves|"
+    r"returned|responded|matched|failed|passed|produced|accepted|rejected)\b|"
+    r"\b(?:got|observed|measured|received|returned|responded|matched|"
+    r"failed|passed|produced|accepted|rejected)\b|"
     r"(?:^|\s)(?:flag|result|output)\s*[:=])",
     re.IGNORECASE,
 )
@@ -551,10 +554,17 @@ def _bounded_soft_turn_outcome(
         )
 
     text = re.sub(r"\s+", " ", message).strip()
+    # Structured private notes can begin with a plan and then report an actual
+    # finding.  Treat a response as a bare promise only when every sentence is
+    # itself a promise; otherwise keep the observation for checkpoint/resume.
+    clauses = [
+        part.strip() for part in re.split(r"(?<=[.!?])[ \t]+|[,;:][ \t]+|[\r\n]+", message)
+        if part.strip()
+    ]
     if (
-        text
+        clauses
         and len(text.split()) <= 120
-        and _PROGRESS_ONLY_PROMISE.search(text)
+        and all(_PROGRESS_ONLY_PROMISE.search(part) for part in clauses)
         and not _PROGRESS_ONLY_EVIDENCE.search(text)
     ):
         return "progress_only"

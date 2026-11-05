@@ -34,6 +34,7 @@ from ctf_agent.solver_worker import (  # noqa: E402
     AppServerFailure,
     ClaudePrintDriver,
     CodexAppServer,
+    _bounded_soft_turn_outcome,
 )
 
 INPUT_SHA256 = "a" * 64
@@ -41,6 +42,31 @@ SESSION_ID = "12345678-1234-1234-1234-123456789abc"
 
 
 class ContinuationContractTests(unittest.TestCase):
+    def test_progress_only_detection_preserves_observed_facts(self) -> None:
+        # Claude's structured private_notes pass through this detector.  A
+        # false positive clears the notes before a later retry can inherit them.
+        for observation in (
+            "I will analyze the cipher. The key is 0x13; XOR each byte with it.",
+            "I will inspect the service. The endpoint returned HTTP 403 for an invalid token.",
+            "I will review the binary; its header specifies a 256-byte payload.",
+            "I will inspect, got HTTP 403 from the endpoint.",
+            "I will test; got an error from the parser.",
+            "I will inspect the service.\nKey=0x13 matched the digest.",
+        ):
+            with self.subTest(observation=observation):
+                self.assertIsNone(_bounded_soft_turn_outcome(
+                    observation, command_execution_seen=False,
+                ))
+        for promise in (
+            "I will check the attachment next.",
+            "I will inspect the binary. Then I will test its parser.",
+            "I will inspect the binary, and I will test its parser.",
+        ):
+            with self.subTest(promise=promise):
+                self.assertEqual(_bounded_soft_turn_outcome(
+                    promise, command_execution_seen=False,
+                ), "progress_only")
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
