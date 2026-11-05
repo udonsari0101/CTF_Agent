@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -24,6 +25,7 @@ from ctf_agent.solver_continuation import (  # noqa: E402
     workspace_baseline,
 )
 from ctf_agent.solver import ModelConfiguration  # noqa: E402
+from ctf_agent.solver_retry import RetryCheckpoint  # noqa: E402
 from ctf_agent.db import SCHEMA as DATABASE_SCHEMA  # noqa: E402
 from ctf_agent.solver_exchange import (  # noqa: E402
     SCHEMA as SOLVER_SCHEMA,
@@ -66,6 +68,85 @@ class ContinuationContractTests(unittest.TestCase):
                 self.assertEqual(_bounded_soft_turn_outcome(
                     promise, command_execution_seen=False,
                 ), "progress_only")
+
+    def test_rejected_flag_retry_keeps_offline_candidates_and_remote_modes_distinct(self) -> None:
+        rejected = "CTF{rejected}"
+        for mode, remote in (
+            ("none", ""),
+            ("unknown", ""),
+            ("endpoint", "https://example.invalid/challenge"),
+        ):
+            for structured in (False, True):
+                with self.subTest(remote_mode=mode, structured_discovery=structured):
+                    self._check_rejected_flag_retry(mode, remote, structured, rejected)
+
+    def _check_rejected_flag_retry(
+        self, mode: str, remote: str, structured: bool, rejected: str,
+    ) -> None:
+        challenge = self.root / f"retry-{mode}-{structured}"
+        (challenge / "notes").mkdir(parents=True)
+        (challenge / "attachments").mkdir()
+        artifact = challenge / "attachments" / "verified-flag.txt"
+        artifact.write_text("CTF{artifact-verified}", encoding="utf-8")
+        prompts: list[str] = []
+        driver = object.__new__(CodexAppServer)
+        driver.structured_discovery = structured
+        manifest = SimpleNamespace(
+            configuration=ModelConfiguration("codex", "gpt-6-sol", "high"),
+            remote_mode=mode,
+            remote=remote,
+            retry_checkpoint=RetryCheckpoint(
+                revision=1, rejected_flags=(rejected,),
+                private_notes="rejected candidate was a placeholder",
+                prior_writeup="",
+            ),
+            max_reasoning_available=False,
+            ultra_escalation_mode="off",
+        )
+
+        async def turn(_manifest, prompt, _schema, _cancelled, _progress):
+            prompts.append(prompt)
+            # Simulate submit-flag after checking the supplied artifact.
+            candidate = artifact.read_text(encoding="utf-8")
+            descriptor = os.open(
+                challenge / ".flag-candidate", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+            )
+            try:
+                os.write(descriptor, candidate.encode("utf-8"))
+            finally:
+                os.close(descriptor)
+            return (
+                {"flag": candidate, "private_notes": "verified from artifact"}
+                if structured else {}
+            )
+
+        async def progress(_state, **_details):
+            return None
+
+        driver._turn = turn
+        result = asyncio.run(driver.run_discovery(
+            manifest, challenge, asyncio.Event(), progress,
+        ))
+        self.assertEqual(result["flag"], "CTF{artifact-verified}")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("never resubmit it", prompts[0])
+        self.assertIn("A local value may be genuine or a placeholder", prompts[0])
+        self.assertNotIn("run solver.py against the remote", prompts[0])
+        self.assertEqual(
+            json.loads((challenge / "notes" / "POISON.json").read_text(encoding="utf-8"))[
+                "rejected_flags"
+            ],
+            [rejected],
+        )
+        if mode == "none":
+            self.assertIn("Configured remote state for this job: `none`", prompts[0])
+            self.assertIn("do not assume a service exists", prompts[0])
+        elif mode == "unknown":
+            self.assertIn("Authoritative remote state for this job: `unknown`", prompts[0])
+            self.assertIn("Do not invent or probe an endpoint", prompts[0])
+        else:
+            self.assertIn("Authoritative remote state for this job: `endpoint`", prompts[0])
+            self.assertIn("Use the endpoint documented", prompts[0])
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)

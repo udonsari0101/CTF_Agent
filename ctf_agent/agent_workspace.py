@@ -92,10 +92,13 @@ NUDGE = (
 POISON_REGOAL = (
     "The flag you submitted was WRONG. Record that exact string as POISON in "
     "notes/NEXT.md and never resubmit it. Re-analyze from notes/VULN.md and "
-    "../chal_desc.md to find the REAL flag (check assumptions: encoding, offset, "
-    "wrong primitive, wrong endpoint; and if you tested locally, a local/placeholder "
-    "flag is NOT real — run solver.py against the remote and confirm the flag is in "
-    "that run's output), then submit the correct flag with submit-flag."
+    "../chal_desc.md to find the genuine flag (check assumptions: encoding, "
+    "offset, primitive, and flag provenance). A local value may be genuine or "
+    "a placeholder; determine which from the supplied artifacts, brief, and "
+    "observed behavior. If a remote endpoint is configured, verify against it "
+    "when the challenge requires that. Do not invent an endpoint or discard a "
+    "local candidate solely because it is local. Submit the verified flag with "
+    "submit-flag."
 )
 
 
