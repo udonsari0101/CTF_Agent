@@ -92,8 +92,12 @@ jobs:
               git log --no-merges --reverse --max-count=50 --format='- %s' "$revision"
             fi
           } > "$notes"
+          python3 scripts/check_release_notes.py "$notes" \
+            --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG"
+          cp "$notes" dist/release-notes.md
           gh release create "$RELEASE_TAG" \
             "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" \
             "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip.sha256" \
+            "dist/release-notes.md" \
             --title "CTF Agent $RELEASE_TAG" \
             --notes-file "$notes"

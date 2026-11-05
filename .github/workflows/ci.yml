@@ -42,6 +42,8 @@ jobs:
           cache: pip
       - name: Check release identity verifier
         run: python .github/scripts/check_release_identity.py
+      - name: Check release notes asset and privacy guard
+        run: python .github/scripts/check_release_notes_asset.py
       - name: Install application dependencies
         run: python -m pip install -r requirements.txt
       - name: Smoke check application and documentation
