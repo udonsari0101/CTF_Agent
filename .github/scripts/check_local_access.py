@@ -46,6 +46,8 @@ class LocalAccessTest(unittest.TestCase):
                 self.assertEqual(untrusted.post("/api/workspaces", json={}).status_code, 401)
                 self.assertIn(untrusted.post("/api/auth/local/ticket", json={"token": "x" * 64}).status_code,
                               (403, 422))
+                self.assertEqual(untrusted.post("/api/auth/local/ticket",
+                                                json={"token": "\uD55C" * 64}).status_code, 422)
                 self.assertEqual(untrusted.post("/api/auth/local/bootstrap",
                                                 json={"ticket": "x" * 32}).status_code, 403)
                 self.assertEqual(untrusted.get("/api/auth/local/ticket").status_code, 405)

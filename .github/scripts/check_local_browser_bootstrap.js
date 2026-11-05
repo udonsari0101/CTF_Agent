@@ -17,18 +17,20 @@ const method = app.slice(start, end);
     location: {hash: '#/local-access/' + ticket, pathname: '/', search: ''},
     history: {replaceState(...args) { events.push(['replace', ...args]); }},
   };
+  const i18n = {init: async () => { events.push(['language']); }, t: value => value};
   const fetch = async (url, options) => {
     events.push(['fetch', url, options]);
     return {ok: true};
   };
-  const bootstrap = vm.runInNewContext(method + '\nbootstrapLocalBrowser', {window, fetch});
-  await bootstrap();
+  const bootstrap = vm.runInNewContext(method + '\nbootstrapLocalBrowser', {window, fetch, i18n});
+  assert.equal(await bootstrap(), true);
   assert.equal(events[0][0], 'replace');
   assert.equal(events[0][3], '/');
-  assert.equal(events[1][0], 'fetch');
-  assert.equal(events[1][1], '/api/auth/local/bootstrap');
-  assert.equal(events[1][2].credentials, 'same-origin');
-  assert.deepEqual(JSON.parse(events[1][2].body), {ticket});
-  assert(!events[1][2].body.includes('local-access/'));
+  assert.equal(events[1][0], 'language');
+  assert.equal(events[2][0], 'fetch');
+  assert.equal(events[2][1], '/api/auth/local/bootstrap');
+  assert.equal(events[2][2].credentials, 'same-origin');
+  assert.deepEqual(JSON.parse(events[2][2].body), {ticket});
+  assert(!events[2][2].body.includes('local-access/'));
   console.log('PASS: local browser ticket cleared before exchange');
 })().catch(error => { console.error(error); process.exitCode = 1; });

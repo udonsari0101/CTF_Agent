@@ -4701,16 +4701,18 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('beforeunload', event => { if (notesDirty() || formDirty() || transferState?.running || transferState?.importing || directSendBusy || [...activeUploads.values()].some(upload => upload.running)) { event.preventDefault(); event.returnValue = ''; } });
 async function bootstrapLocalBrowser() {
   const match = /^#\/local-access\/([A-Za-z0-9_-]{32})$/.exec(window.location.hash);
-  if (!match) return;
+  if (!match) return false;
   // The fragment never enters the HTTP request or access log. Remove it from
   // browser history before exchanging the single-use ticket for a cookie.
   window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  await i18n.init();
   const response = await fetch('/api/auth/local/bootstrap', {
     method: 'POST', credentials: 'same-origin',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ticket: match[1]}),
   });
-  if (!response.ok) throw new Error('로컬 접속 링크를 확인할 수 없습니다. Start.cmd를 다시 실행하세요.');
+  if (!response.ok) throw new Error(i18n.t('로컬 접속 링크를 확인할 수 없습니다. Start.cmd를 다시 실행하세요.'));
+  return true;
 }
 
-run(async () => { await bootstrapLocalBrowser(); const state = await api('/api/auth/state'); if (typeof window.setInterval === 'function') window.setInterval(updateSolverElapsedLabels,1000); await i18n.init(); authMode = state.auth_mode || 'password'; if (state.authenticated) { csrf = state.csrf_token; sessionUser = state.user; sessionPersistent = state.session_persistent === true; await render(); } else if (authMode === 'password') showLogin(false,state.configured,state.setup_available); else app.innerHTML = '<main class="login-shell"><div class="login-card"><h1>Start.cmd를 실행해 이 브라우저를 연결하세요.</h1></div></main>'; });
+run(async () => { const localBrowserInitialized = await bootstrapLocalBrowser(); const state = await api('/api/auth/state'); if (typeof window.setInterval === 'function') window.setInterval(updateSolverElapsedLabels,1000); if (!localBrowserInitialized) await i18n.init(); authMode = state.auth_mode || 'password'; if (state.authenticated) { csrf = state.csrf_token; sessionUser = state.user; sessionPersistent = state.session_persistent === true; await render(); } else if (authMode === 'password') showLogin(false,state.configured,state.setup_available); else app.innerHTML = `<main class="login-shell"><div class="login-card"><h1>${tr('Start.cmd를 실행해 이 브라우저를 연결하세요.')}</h1></div></main>`; });

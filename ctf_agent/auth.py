@@ -61,7 +61,7 @@ class LocalBootstrap(BaseModel):
 
 
 class LocalTicketRequest(BaseModel):
-    token: str = Field(min_length=64, max_length=64)
+    token: str = Field(min_length=64, max_length=64, pattern=r"^[A-Za-z0-9_-]{64}$")
 
 
 class SessionPreference(BaseModel):

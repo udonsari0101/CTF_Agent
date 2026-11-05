@@ -2,6 +2,8 @@
   "locale": "en",
   "name": "English",
   "messages": {
+    "로컬 접속 링크를 확인할 수 없습니다. Start.cmd를 다시 실행하세요.": "The local access link is invalid. Run Start.cmd again.",
+    "Start.cmd를 실행해 이 브라우저를 연결하세요.": "Run Start.cmd to connect this browser.",
     "세션 기록": "Session history",
     "가져온 기록 · 읽기 전용": "Imported history · read-only",
     "이벤트": "events",
