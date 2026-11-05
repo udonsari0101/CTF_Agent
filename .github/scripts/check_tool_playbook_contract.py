@@ -73,6 +73,34 @@ class ToolPlaybookContract(unittest.TestCase):
         self.assertIn("does not expose a Docker daemon/socket", base)
         self.assertIn("confirm reachability and behavior", unknown)
 
+    def test_initial_goal_preserves_flag_provenance_across_remote_modes(self) -> None:
+        from ctf_agent.agent_workspace import INITIAL_GOAL, assemble_manual
+
+        self.assertIn("Verify the genuine flag", INITIAL_GOAL)
+        self.assertIn("a local value may be genuine or a placeholder", INITIAL_GOAL)
+        self.assertIn('submit-flag "<flag>"', INITIAL_GOAL)
+        self.assertNotIn("The REAL flag is on the remote", INITIAL_GOAL)
+        for mode, remote, expected in (
+            ("none", "", "Remote: **none (configured)**"),
+            ("endpoint", "https://example.invalid/", "Remote: `https://example.invalid/`"),
+            ("unknown", "", "Remote: **not supplied yet**"),
+        ):
+            with self.subTest(mode=mode):
+                manual = assemble_manual(
+                    ("unknown",), challenge_name="Provenance contract",
+                    remote=remote, remote_mode=mode,
+                    remote_access=mode == "endpoint",
+                )
+                combined = INITIAL_GOAL + "\n" + manual
+                self.assertIn(expected, combined)
+                self.assertNotIn("The REAL flag is on the remote", combined)
+                if mode == "none":
+                    self.assertIn("do not assume that an endpoint exists", combined)
+                elif mode == "unknown":
+                    self.assertIn("This is unknown, not proof", combined)
+                else:
+                    self.assertIn("use normal clients", combined)
+
     def test_unknown_category_allows_cheap_remote_first_contact(self) -> None:
         unknown = asset("skill_unknown.md")
         remote_only = asset("remote_only.md")

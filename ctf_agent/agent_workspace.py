@@ -60,8 +60,8 @@ _RESERVED_TOP_LEVEL = {
 }
 
 
-# Copied verbatim from the original driver. The web worker uses the same solve
-# loop rather than replacing it with a generic one-shot prompt.
+# Adapted from the original driver. The web worker uses the same solve loop;
+# flag provenance follows the challenge evidence and configured remote mode.
 INITIAL_GOAL = (
     "You are competing to solve this CTF challenge; your job is to build a working "
     "exploit and capture the flag. Read your operating manual (CLAUDE.md or "
@@ -72,8 +72,10 @@ INITIAL_GOAL = (
     "build solver.py -> on failure, branch (more skills only if relevant, check "
     "patch/CVE for 0/1-day, side-channels, re-chain the primitives you already have). "
     "Write notes/{ANALYSIS,VULN,NEXT}.md at each cycle end (don't read them at the "
-    "start), keep scratch in tmp/. The REAL flag is on the remote (local flags are "
-    "fake); solve any PoW. Submit with submit-flag \"<flag>\". Don't stop until it's "
+    "start), keep scratch in tmp/. Verify the genuine flag from the brief, "
+    "supplied artifacts, and observed target behavior; a local value may be "
+    "genuine or a placeholder. Solve any PoW if required. Submit with "
+    "submit-flag \"<flag>\". Don't stop until it's "
     "accepted; don't grind — when stuck, vary the tactic."
 )
 
