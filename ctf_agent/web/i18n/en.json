@@ -475,6 +475,7 @@
     "Flag 확인": "View flag",
     "문제 열기": "Open challenge",
     "풀이 시간": "Solve time",
+    "풀이 시간 짧은 순": "Shortest solve time first",
     "풀이 경과 시간": "Time solving",
     "대기 포함 경과 시간": "Time since requested, including queue",
     "대기 포함 소요 시간": "Elapsed time including queue",

@@ -17,6 +17,15 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Check commit attribution
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          identity="$(git log -1 --format='%an <%ae> %cn <%ce>')"
+          if [[ "$identity" == *'codex@users.noreply.github.com'* ]]; then
+            echo 'Commit attribution is not configured for the repository owner.' >&2
+            exit 1
+          fi
       - name: Check Docker Desktop image disk preflight
         shell: pwsh
         run: ./.github/scripts/check_docker_disk.ps1
@@ -223,6 +232,8 @@ jobs:
         run: python .github/scripts/check_solver_continuation_contract.py
       - name: Check solver timing milestones
         run: python .github/scripts/check_solver_timing.py
+      - name: Check challenge solve-time sorting
+        run: python .github/scripts/check_challenge_solve_sort.py
       - name: Check Ultra and remote input card states
         run: python .github/scripts/check_ultra_card_state.py
       - name: Check solver resource policy

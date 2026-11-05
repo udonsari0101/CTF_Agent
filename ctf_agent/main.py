@@ -1111,6 +1111,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "latest_solver.started_at IS NULL,"
                 "latest_solver.started_at ASC,c.created_at ASC,c.id ASC"
             ),
+            # The displayed solve time includes active continuation segments.
+            # Compute it through latest_solver_summary below; SQL cannot safely
+            # reconstruct that clock from the current job row alone.
+            "solve_time_asc": "c.created_at DESC,c.id DESC",
         }.get(sort)
         if order_by is None:
             raise HTTPException(400, "잘못된 문제 정렬 방식입니다.")
@@ -1151,6 +1155,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 result["latest_solver"] = latest_solver_summary(
                     db, workspace_id, result["id"]
                 )
+            if sort == "solve_time_asc":
+                # Show only measured, completed agent solves first. Manual
+                # completions and unfinished runs have no comparable duration.
+                def solve_time_key(result):
+                    seconds = (result.get("latest_solver") or {}).get("elapsed_seconds")
+                    measured = result["status"] == "solved" and isinstance(seconds, (int, float))
+                    return (not measured, seconds if measured else float("inf"))
+
+                results.sort(key=solve_time_key)
         return {"challenges": results, "counts": counts, "categories": categories}
 
     @app.post("/api/workspaces/{workspace_id}/challenges", status_code=201, dependencies=[Depends(require_auth)])
