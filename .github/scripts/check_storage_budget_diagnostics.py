@@ -24,6 +24,7 @@ from ctf_agent.storage_budget import (  # noqa: E402
 )
 from ctf_agent.solver_exchange import (  # noqa: E402
     ExchangeError, SolverExchangeCoordinator, _stage_budget_error, _stage_io_error,
+    _log_stage_storage_failure,
     _write_json_file, _write_live_attachment_chunk,
     _publish_live_attachment_no_replace, _LIVE_ATTACHMENT_CHUNK_BYTES,
 )
@@ -276,6 +277,36 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
         sqlite_full = sqlite3.OperationalError("database or disk is full")
         sqlite_full.sqlite_errorname = "SQLITE_FULL"
         self.assertEqual(_stage_io_error(sqlite_full).code, "solver_database_full")
+
+    def test_stage_log_keeps_raw_error_codes_without_paths_or_exception_text(self):
+        secret = "private-source-path-and-secret-value"
+        source = self.data / secret
+        source.mkdir()
+        filesystem_error = OSError(errno.ENOSPC, f"{secret}: injected write failure")
+        with self.assertLogs("ctf_agent.solver_exchange", level="WARNING") as captured:
+            _log_stage_storage_failure(filesystem_error, self.data, self.database)
+        entry = captured.output[0]
+        self.assertIn(f"'errno': {errno.ENOSPC}", entry)
+        self.assertNotIn(secret, entry)
+        self.assertNotIn(str(source), entry)
+        self.assertNotIn(str(self.database), entry)
+
+        sqlite_error = sqlite3.OperationalError(f"{secret}: database busy")
+        sqlite_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        sqlite_error.sqlite_errorname = "SQLITE_BUSY"
+        with self.assertLogs("ctf_agent.solver_exchange", level="WARNING") as captured:
+            _log_stage_storage_failure(sqlite_error, self.data, self.database)
+        entry = captured.output[0]
+        self.assertIn(f"'sqlite_errorcode': {sqlite3.SQLITE_BUSY}", entry)
+        self.assertIn("'sqlite_errorname': 'SQLITE_BUSY'", entry)
+        self.assertNotIn(secret, entry)
+        self.assertNotIn(str(self.database), entry)
+
+        sqlite_error.sqlite_errorname = "SQLITE_BUSY\n" + secret
+        with self.assertLogs("ctf_agent.solver_exchange", level="WARNING") as captured:
+            _log_stage_storage_failure(sqlite_error, self.data, self.database)
+        self.assertNotIn(secret, captured.output[0])
+        self.assertNotIn("sqlite_errorname", captured.output[0])
 
     def test_existing_slot_stage_failure_is_not_reported_as_success(self):
         with closing(sqlite3.connect(":memory:")) as db:

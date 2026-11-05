@@ -353,6 +353,18 @@ def _log_stage_storage_failure(exc: BaseException, data_dir: Path, database_path
                    "projected_reserved_bytes", "minimum_free_bytes", "free_bytes", "errno"}
         and (value is None or type(value) is int)
     } if isinstance(details, Mapping) else {}
+    # Errors raised directly by filesystem or SQLite operations do not carry
+    # StorageBudgetError.diagnostics. Preserve only machine-readable codes;
+    # exception text can contain private file paths and must never be logged.
+    if isinstance(exc, OSError) and type(exc.errno) is int:
+        safe_details["errno"] = exc.errno
+    if isinstance(exc, sqlite3.Error):
+        sqlite_code = getattr(exc, "sqlite_errorcode", None)
+        sqlite_name = getattr(exc, "sqlite_errorname", None)
+        if type(sqlite_code) is int:
+            safe_details["sqlite_errorcode"] = sqlite_code
+        if isinstance(sqlite_name, str) and re.fullmatch(r"SQLITE_[A-Z0-9_]{1,64}", sqlite_name):
+            safe_details["sqlite_errorname"] = sqlite_name
     _STORAGE_LOG.warning(
         "solver_stage_storage_failure code=%s budget=%s data=%s database=%s",
         getattr(exc, "code", type(exc).__name__), safe_details,
