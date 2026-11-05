@@ -190,6 +190,8 @@ def run_dom_check():
                 assert "제외됨" in page.locator("#transfer-preview").inner_text()
                 page.locator('[data-action="confirm-transfer-import"]').click()
                 page.wait_for_url("**#w/" + w2)
+                assert page.locator('.page-head [data-action="export-workspace-transfer"]').count() == 0
+                page.locator('[data-action="edit-workspace"]').click()
                 page.locator('[data-action="export-workspace-transfer"]').click()
                 assert not page.locator("#transfer-include-remote").is_checked()
                 page.locator("#transfer-include-remote").check()
@@ -198,6 +200,9 @@ def run_dom_check():
                 assert download.value.suggested_filename.endswith(".zip")
                 assert state["exports"][-1] == {"include_remote":["true"]}
 
+                page.locator('#modal').wait_for(state='hidden')
+                page.locator('[data-action="edit-workspace"]').click()
+                assert page.locator('#modal [data-action="send-workspace-direct"]').count() == 1, page.locator('#modal').inner_text()[:600]
                 page.locator('[data-action="send-workspace-direct"]').click()
                 page.locator("#direct-send-url").fill("https://destination.example/api/transfers/direct/invitations/invite1")
                 page.locator("#direct-send-token").fill("one-time-secret")
@@ -210,6 +215,7 @@ def run_dom_check():
                 page.locator("#direct-send-progress").wait_for(state="visible", timeout=12000)
                 assert "send2" in page.evaluate("JSON.stringify(localStorage)")
                 page.locator('#modal [data-action="close-modal"]').last.click()
+                page.locator('[data-action="edit-workspace"]').click()
                 page.locator('[data-action="send-workspace-direct"]').click()
                 page.locator("#direct-send-status").get_by_text("전송 완료", exact=False).wait_for(timeout=12000)
                 assert page.locator("#direct-send-token").input_value() == ""

@@ -43,7 +43,11 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
   refresh.type = 'button';
   refresh.className = 'small ghost';
   refresh.textContent = en ? 'Refresh' : '새로고침';
-  heading.append(title,refresh);
+  const manage = document.createElement('a');
+  manage.href = '#accounts';
+  manage.className = 'button-link small';
+  manage.textContent = en ? 'Update agent CLI' : '에이전트 CLI 업데이트';
+  heading.append(title,manage,refresh);
   container.replaceChildren(heading);
   const rows = new Map();
   for (const source of SOURCES) {

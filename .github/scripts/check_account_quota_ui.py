@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import re
 import subprocess
 import sys
 import tempfile
@@ -61,7 +62,7 @@ const api = async path => {
   if (path === '/api/accounts') return {accounts:items};
   if (path.endsWith('/refresh')) return {};
   if (path === '/api/providers/codex/runtime' || path === '/api/providers/claude/runtime')
-    return {operation:{status:'idle'},can_manage:false,update_supported:false};
+    return {operation:{status:'idle'},can_manage:true,update_supported:true};
   throw new Error('Unexpected API route: '+path);
 };
 const check = (condition, message) => {if (!condition) throw new Error(message)};
@@ -77,6 +78,12 @@ try {
   check(aged.stale && !aged.blocked && !aged.exhausted, 'aged limit is historical');
   check(!quotaDisplayState(items[4]).exhausted, 'unknown usage is not exhausted');
   await renderAccounts(document.querySelector('#root'), api);
+  const updates = document.querySelectorAll('.runtime-provider');
+  check(updates.length === 2, 'both provider CLI update sections visible');
+  for (const section of updates) {
+    check([...section.querySelectorAll('button')].some(item => item.textContent === '최신 버전으로 업데이트'),
+      'direct CLI update control visible');
+  }
   const card = id => document.querySelector(`.account-list [data-account-id="${id}"]`);
   const codex = card('codex-zero-week');
   check(codex.classList.contains('quota-exhausted') && !codex.classList.contains('quota-limited'),
@@ -131,15 +138,26 @@ try {
         page = root / "index.html"
         page.write_text(fixture, encoding="utf-8")
         cmd = [browser, "--headless=new", "--disable-gpu", "--no-first-run",
-               "--disable-extensions", f"--user-data-dir={root / 'profile'}",
-               "--virtual-time-budget=2000", "--dump-dom", page.as_uri()]
+               "--disable-extensions", "--disable-dev-shm-usage",
+               "--virtual-time-budget=5000", "--dump-dom"]
         if sys.platform != "win32":
             cmd.append("--no-sandbox")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                                encoding="utf-8", errors="replace")
+        for attempt in range(2):
+            result = subprocess.run(
+                [*cmd, f"--user-data-dir={root / f'profile-{attempt}'}", page.as_uri()],
+                capture_output=True, text=True, timeout=45,
+                encoding="utf-8", errors="replace",
+            )
+            if result.returncode == 0 and '<pre id="result">PASS</pre>' in result.stdout:
+                break
+            result_text = re.search(r'<pre id="result">([^<]*)</pre>', result.stdout)
+            if result_text and result_text.group(1).startswith("FAIL"):
+                break
+        else:
+            result_text = re.search(r'<pre id="result">([^<]*)</pre>', result.stdout)
         if result.returncode != 0 or '<pre id="result">PASS</pre>' not in result.stdout:
-            print(result.stdout[-3500:])
-            print(result.stderr[-1000:])
+            print("Browser result:", result_text.group(1) if result_text else "not rendered")
+            print(result.stderr[-500:])
             return 1
     print("PASS: quota windows, stale state, and compact auth.json upload")
     return 0

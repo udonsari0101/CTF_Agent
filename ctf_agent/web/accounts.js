@@ -604,6 +604,13 @@ export async function renderAccounts(container, api, options = {}) {
       const version = el('input'); version.placeholder = '버전 (예: 0.164.0)'; version.setAttribute('aria-label', '설치할 Codex 버전');
       const controls = el('div', undefined, 'runtime-controls');
       controls.append(version, button('최신 버전 조회', async () => { const data = await api('/api/providers/codex/catalog'); version.value = data.latest; }),
+        button('최신 버전으로 업데이트', async () => {
+          const data = await api('/api/providers/codex/catalog');
+          if (!data.latest) throw new Error('최신 Codex 버전을 확인하지 못했습니다.');
+          version.value = data.latest;
+          await api('/api/providers/codex/update', {method: 'POST', body: {version: data.latest}});
+          await loadRuntime();
+        }),
         button('버전 설치', async () => {
           await api('/api/providers/codex/update', {method: 'POST', body: {version: version.value.trim()}}); await loadRuntime();
         }));
@@ -624,6 +631,13 @@ export async function renderAccounts(container, api, options = {}) {
       claudeActions.append(
         claudeVersion,
         button('최신 버전 조회', async () => { const data = await api('/api/providers/claude/catalog'); claudeVersion.value = data.latest; }),
+        button('최신 버전으로 업데이트', async () => {
+          const data = await api('/api/providers/claude/catalog');
+          if (!data.latest) throw new Error('최신 Claude Code 버전을 확인하지 못했습니다.');
+          claudeVersion.value = data.latest;
+          await api('/api/providers/claude/update', {method: 'POST', body: {version: data.latest}});
+          await loadRuntime();
+        }),
         button('버전 설치', async () => { await api('/api/providers/claude/update', {method: 'POST', body: {version: claudeVersion.value.trim()}}); await loadRuntime(); })
       );
       if (claude.selected) claudeActions.append(button('이전 버전으로 복원', async () => {

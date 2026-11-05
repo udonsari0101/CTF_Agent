@@ -67,6 +67,13 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
         assert [row["name"] for row in rows[:2]] == ["fast", "slow"]
         assert {row["name"] for row in rows[2:]} == {"unstarted", "manual"}
         assert [row["latest_solver"]["elapsed_seconds"] for row in rows[:2]] == [12, 85]
+        response = browser.get(
+            f"/api/workspaces/{workspace}/challenges", params={"sort": "solve_time_desc"}
+        )
+        assert response.status_code == 200, response.text
+        rows = response.json()["challenges"]
+        assert [row["name"] for row in rows[:2]] == ["slow", "fast"]
+        assert {row["name"] for row in rows[2:]} == {"unstarted", "manual"}
         assert browser.get(
             f"/api/workspaces/{workspace}/challenges", params={"sort": "bogus"}
         ).status_code == 400

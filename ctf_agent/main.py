@@ -1115,6 +1115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Compute it through latest_solver_summary below; SQL cannot safely
             # reconstruct that clock from the current job row alone.
             "solve_time_asc": "c.created_at DESC,c.id DESC",
+            "solve_time_desc": "c.created_at DESC,c.id DESC",
         }.get(sort)
         if order_by is None:
             raise HTTPException(400, "잘못된 문제 정렬 방식입니다.")
@@ -1155,13 +1156,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 result["latest_solver"] = latest_solver_summary(
                     db, workspace_id, result["id"]
                 )
-            if sort == "solve_time_asc":
+            if sort in {"solve_time_asc", "solve_time_desc"}:
                 # Show only measured, completed agent solves first. Manual
                 # completions and unfinished runs have no comparable duration.
                 def solve_time_key(result):
                     seconds = (result.get("latest_solver") or {}).get("elapsed_seconds")
                     measured = result["status"] == "solved" and isinstance(seconds, (int, float))
-                    return (not measured, seconds if measured else float("inf"))
+                    duration = seconds if measured else 0
+                    return (not measured, duration if sort == "solve_time_asc" else -duration)
 
                 results.sort(key=solve_time_key)
         return {"challenges": results, "counts": counts, "categories": categories}
