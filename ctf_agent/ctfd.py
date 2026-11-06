@@ -531,10 +531,14 @@ class CTFdClient:
             if not form or not form["fields"]["nonce"] or len(form["fields"]["nonce"]) > 4096:
                 # Some CTFd-compatible sites use a Next.js login page and a
                 # same-origin JSON session API instead of CTFd's HTML form.
-                # Require its bootstrap marker before sending credentials to
-                # that endpoint so unrelated SSO/CAPTCHA pages still fail.
+                # Older pages advertise that API in an inline bootstrap. Newer
+                # pages render a plain JS form; confirm both its credential
+                # fields and the same-origin session API before posting secrets.
                 if ("window.__ctfdInitialRequests" in login_html
-                        and '"/api/v2/auth/check/cookie"' in login_html):
+                        and '"/api/v2/auth/check/cookie"' in login_html) or (
+                            self._has_json_login_form(parser, login_url)
+                            and self._has_json_session_api()
+                        ):
                     self._authenticate_json_session()
                     return
                 raise CTFdError("The site does not expose the supported CTFd password login form. Use an API token if SSO or CAPTCHA is required.")
@@ -557,6 +561,39 @@ class CTFdClient:
             self.logged_in = True
         finally:
             self.username = self.password = ""
+
+    def _has_json_login_form(self, parser: LoginForm, login_url: str) -> bool:
+        if not urlsplit(login_url).path.rstrip("/").endswith("/login"):
+            return False
+        for form in parser.forms:
+            if not {"name", "password"} <= form["fields"].keys():
+                continue
+            action = form["action"].strip()
+            if not action:
+                return True
+            try:
+                if origin(normalize_url(urljoin(login_url, action))) == origin(self.url):
+                    return True
+            except CTFdError:
+                continue
+        return False
+
+    def _has_json_session_api(self) -> bool:
+        response, _ = self._request(
+            self.url + "/api/v2/auth/check/cookie", self.limits.json_bytes,
+            api=True, same_origin=True, allow_error_status=True,
+        )
+        if response.status not in {200, 401} or response.headers.get(
+            "content-type", ""
+        ).split(";", 1)[0].strip().lower() != "application/json":
+            return False
+        try:
+            payload = json.loads(response.content)
+        except (ValueError, UnicodeError):
+            return False
+        return (isinstance(payload, dict)
+                and payload.get("success") is False
+                and payload.get("authenticated") is False)
 
     def _authenticate_json_session(self):
         credentials = json.dumps(
