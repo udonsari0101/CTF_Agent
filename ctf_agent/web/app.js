@@ -1038,6 +1038,11 @@ function solverGuidanceMarkup(job, active) {
   </form>`;
 }
 
+function solverPeerEvidenceButton(job, active) {
+  if (!active || !solverJobId(job) || job?.guidance_allowed === false) return '';
+  return `<button type="button" class="small ghost solver-peer-evidence-button" data-action="open-solver-peer-evidence">${tr('공동 풀이 자료')}</button>`;
+}
+
 function solverSessionMarkup(job, events, active) {
   const jobId = solverJobId(job);
   return `<details class="solver-event-log solver-session-log" ${active ? 'open' : ''}>
@@ -1484,6 +1489,7 @@ function solverPanelMarkup(job, events = [], loading = false) {
     ${solverErrorMarkup(job.error)}
     ${solverSessionMarkup(job,events,active)}
     ${solverGuidanceMarkup(job,active)}
+    ${solverPeerEvidenceButton(job,active)}
     ${active ? '' : solverProviderSelector()}
     <div class="actions solver-actions">${controls}</div>`;
 }
@@ -4096,6 +4102,47 @@ async function sendSolverGuidance(value, requestedDelivery = 'same_turn', {expec
   toast('추가 명령을 전달했습니다.');
 }
 
+async function openSolverPeerEvidence() {
+  const job = currentSolverJob, jobId = solverJobId(job);
+  if (!jobId || !solverIsActive(job)) throw new Error(i18n.t('진행 중인 풀이가 없습니다.'));
+  const workspaceId = currentWorkspace?.id, challengeId = currentChallenge?.id;
+  const result = await api(`/api/solver/jobs/${encodeURIComponent(jobId)}/peers`);
+  if (currentWorkspace?.id !== workspaceId || currentChallenge?.id !== challengeId || solverJobId(currentSolverJob) !== jobId) return;
+  const peers = Array.isArray(result?.peers) ? result.peers.filter(peer => peer?.job_id && peer.job_id !== jobId) : [];
+  if (!peers.length) { toast(i18n.t('함께 푸는 복제 문제가 없습니다.')); return; }
+  const options = peers.map(peer => {
+    const model = typeof peer.model === 'string' ? peer.model : peer.model?.model || '';
+    const label = [peer.challenge_name || peer.challenge_id, model, peer.reasoning_effort, peer.status].filter(Boolean).join(' · ');
+    return `<option value="${esc(peer.job_id)}" data-i18n-ignore>${esc(label)}</option>`;
+  }).join('');
+  const shares = Array.isArray(result?.shares) ? result.shares.slice(-5) : [];
+  const history = shares.length ? `<ul class="solver-peer-history">${shares.map(item => `<li><span data-i18n-ignore>${esc(item.observation || '')}</span><small>${esc(i18n.t(item.delivery_status || ''))}</small></li>`).join('')}</ul>` : '';
+  const claude = (job.provider || job.configuration?.provider || job.model?.provider) === 'claude';
+  openModal(i18n.t('공동 풀이 자료'), currentChallenge?.name || '',
+    `<label>${tr('자료 출처')}<select name="source_job_id" required>${options}</select></label>
+     <label>${tr('확인한 관찰')}<textarea name="observation" rows="4" maxlength="1200" required placeholder="${esc(i18n.t('다른 풀이에서 재현한 사실이나 명령 결과를 입력하세요.'))}"></textarea></label>
+     <label>${tr('전달 시점')}<select name="requested_delivery"><option value="${claude ? 'next_turn' : 'same_turn'}">${tr(claude ? '다음 응답' : '현재 응답')}</option>${claude ? '' : `<option value="next_turn">${tr('다음 응답')}</option>`}</select></label>
+     ${history}`,
+    `<button type="button" data-action="close-modal">${tr('취소')}</button><button type="submit" class="primary">${tr('전달')}</button>`,
+    'solver-peer-evidence-form');
+  const form = modal.querySelector('#solver-peer-evidence-form');
+  form.dataset.jobId = jobId;
+  form.dataset.challengeId = challengeId;
+}
+
+async function sendSolverPeerEvidence(form, body) {
+  const jobId = form.dataset.jobId;
+  if (!jobId || solverJobId(currentSolverJob) !== jobId || currentChallenge?.id !== form.dataset.challengeId || !solverIsActive(currentSolverJob)) {
+    throw new Error(i18n.t('풀이가 변경됐습니다. 다시 확인해 주세요.'));
+  }
+  await api(`/api/solver/jobs/${encodeURIComponent(jobId)}/peer-evidence`, {
+    method:'POST', body:{source_job_id:body.source_job_id,observation:body.observation,requested_delivery:body.requested_delivery}
+  });
+  if (modal.open && modal.querySelector('#solver-peer-evidence-form') === form) modal.close();
+  scheduleSolverPoll(currentSolverJob,currentWorkspace.id,currentChallenge.id,solverRendering,100);
+  toast(i18n.t('다른 풀이의 관찰을 전달했습니다.'));
+}
+
 async function rejectSolverFlag() {
   const job = currentSolverJob, jobId = solverJobId(job);
   if (!jobId || !job?.flag || job.flag_rejected || solverIsActive(job)) return;
@@ -5134,6 +5181,7 @@ document.addEventListener('click', event => {
       repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
     },
     'approve-ultra-escalation': () => approveUltraEscalation(),
+    'open-solver-peer-evidence': () => openSolverPeerEvidence(),
     'cancel-solver': () => cancelSolver(button),
     'reject-solver-flag': () => rejectSolverFlag(),
     'copy-solver-flag': async () => { if (!currentSolverJob?.flag) throw new Error(i18n.t('발견된 Flag가 없습니다.')); const flag = currentSolverJob.flag; const result = await copyText(flag); copyToast(result, flag); },
@@ -5192,7 +5240,7 @@ document.addEventListener('submit', event => {
     return;
   }
   if (!form.id) return;
-  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-guidance-form','solver-console-guidance-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-preview-form','ctfd-refresh-auth-form','ctfd-submit-connection-form','related-evidence-form'];
+  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-guidance-form','solver-console-guidance-form','solver-peer-evidence-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-preview-form','ctfd-refresh-auth-form','ctfd-submit-connection-form','related-evidence-form'];
   if (!known.includes(form.id)) return;
   event.preventDefault();
   const challengeFiles = form.id === 'new-challenge-form' ? [...selectedChallengeFiles(form)] : [];
@@ -5257,6 +5305,7 @@ document.addEventListener('submit', event => {
     else if (form.id === 'solver-capacity-form') { const maximum = String(body.maximum || '').trim(); await api('/api/admin/solver-capacity',{method:'PUT',body:{maximum:maximum ? Number(maximum) : null}}); await renderAdmin(); toast('솔버 최대 수를 저장했습니다.'); }
     else if (form.id === 'solver-guidance-form') { await sendSolverGuidance(body.message,'same_turn',{expectedJobId:form.dataset.jobId}); }
     else if (form.id === 'solver-console-guidance-form') { await sendSolverGuidance(body.message,body.requested_delivery || 'next_turn',{expectedJobId:form.dataset.jobId}); }
+    else if (form.id === 'solver-peer-evidence-form') { await sendSolverPeerEvidence(form,body); }
     else if (form.id === 'ctfd-preview-form') {
       const saved = body.connection_mode === 'saved';
       delete body.connection_mode;

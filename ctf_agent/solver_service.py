@@ -60,6 +60,13 @@ class SolverGuidanceInput(BaseModel):
     requested_delivery: Literal["same_turn", "next_turn"] = "same_turn"
 
 
+class SolverPeerEvidenceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_job_id: str = Field(pattern=r"^[A-Za-z0-9_-]{20,100}$")
+    observation: str = Field(min_length=1, max_length=1200)
+    requested_delivery: Literal["same_turn", "next_turn"] = "same_turn"
+
+
 async def _validated_configuration_override(
     accounts,
     owner_id: str,
@@ -1114,6 +1121,30 @@ def register_solver(app, require_auth, require_admin, settings, database):
                 user["id"],
                 message,
                 payload.requested_delivery,
+            )
+            service.notify()
+            return result
+        except ExchangeError as exc:
+            _raise_exchange(exc)
+
+    @router.get("/solver/jobs/{job_id}/peers")
+    async def solver_peers(job_id: str, user=Depends(require_auth)):
+        try:
+            return await asyncio.to_thread(
+                service.coordinator.peer_evidence, job_id, user["id"]
+            )
+        except ExchangeError as exc:
+            _raise_exchange(exc)
+
+    @router.post("/solver/jobs/{job_id}/peer-evidence", status_code=202)
+    async def share_solver_peer_evidence(
+        job_id: str, payload: SolverPeerEvidenceInput, user=Depends(require_auth),
+    ):
+        try:
+            result = await asyncio.to_thread(
+                service.coordinator.share_peer_evidence,
+                job_id, user["id"], payload.source_job_id,
+                payload.observation, payload.requested_delivery,
             )
             service.notify()
             return result

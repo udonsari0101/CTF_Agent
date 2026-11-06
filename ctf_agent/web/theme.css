@@ -652,6 +652,10 @@ input:focus, textarea:focus, select:focus {
 .solver-guidance-history li { display: grid; grid-template-columns: minmax(0,1fr) auto; min-width: 0; max-width: 100%; gap: 9px; color: #9b8caf; font-size: 9px; }
 .solver-guidance-history span { min-width: 0; max-height: 5em; overflow: auto; overflow-wrap: anywhere; white-space: normal; }
 .solver-guidance-history small { align-self: start; color: #c8a7ef; white-space: nowrap; }
+.solver-peer-evidence-button { justify-self: start; }
+.solver-peer-history { display:grid; gap:6px; margin:8px 0 0; padding:8px 0 0; border-top:1px solid #26344f; list-style:none; }
+.solver-peer-history li { display:grid; gap:2px; min-width:0; overflow-wrap:anywhere; font-size:11px; }
+.solver-peer-history small { color:#9bb1bf; }
 @media(max-width:500px) { .solver-guidance-history li { grid-template-columns: minmax(0,1fr); gap: 2px; } }
 
 .solver-confirm-dialog { width: min(420px,calc(100vw - 24px)); max-width: none; padding: 0; border: 1px solid #295063; border-radius: 11px; background: #03080d; color: var(--text); box-shadow: 0 22px 76px #000e; }

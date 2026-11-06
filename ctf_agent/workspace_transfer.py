@@ -34,7 +34,7 @@ from .storage_layout import StorageLayout
 
 
 FORMAT = "ctf-agent-workspace"
-VERSION = 2
+VERSION = 3
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_ENTRIES = 50_000
 CHUNK = 1024 * 1024
@@ -170,6 +170,14 @@ def _snapshot(db: sqlite3.Connection, owner: str, workspace_id: str) -> dict:
         "WHERE workspace_id=? ORDER BY prerequisite_id,dependent_id",
         (workspace_id,),
     ).fetchall()
+    has_clone_members = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='challenge_clone_members'"
+    ).fetchone()
+    clone_members = db.execute(
+        """SELECT challenge_id,family_id FROM challenge_clone_members
+            WHERE workspace_id=? ORDER BY family_id,challenge_id""",
+        (workspace_id,),
+    ).fetchall() if has_clone_members else []
     has_shares = db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='challenge_evidence_shares'"
     ).fetchone()
@@ -188,6 +196,7 @@ def _snapshot(db: sqlite3.Connection, owner: str, workspace_id: str) -> dict:
             for item in challenges
         ],
         "relations": [dict(item) for item in relations],
+        "clone_members": [dict(item) for item in clone_members],
         "evidence_shares": [dict(item) for item in shares],
         "attachments": [
             {field: item[field] for field in (
@@ -297,6 +306,7 @@ def export_workspace(
             item for item in snapshot["attachments"] if item["challenge_id"] == challenge_id
         ]
         snapshot["relations"] = []
+        snapshot["clone_members"] = []
         snapshot["evidence_shares"] = []
     if len(snapshot["attachments"]) > MAX_ENTRIES:
         raise TransferError("Too many attachments for one bundle.")
@@ -341,6 +351,7 @@ def export_workspace(
                     "users", "sessions", "provider_accounts", "ctfd_credentials",
                     "telegram_settings", "native_provider_sessions", "worker_state",
                     "retry_checkpoints", "upload_sessions",
+                    "peer_evidence_ledger",
                 ],
                 "solver_history": history,
                 **bundle_metadata,
@@ -360,6 +371,7 @@ def export_workspace(
                 item for item in current["attachments"] if item["challenge_id"] == challenge_id
             ]
             current["relations"] = []
+            current["clone_members"] = []
             current["evidence_shares"] = []
         if current != snapshot:
             raise TransferError("The workspace changed during export; retry.")
@@ -428,17 +440,20 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
             zipfile.BadZipFile) as exc:
         raise TransferError("Bundle manifest is not valid JSON.") from exc
     if (not isinstance(manifest, dict) or manifest.get("format") != FORMAT
-            or manifest.get("version") not in (1, VERSION)):
+            or manifest.get("version") not in (1, 2, VERSION)):
         raise TransferError("Unsupported workspace bundle version.")
     mandatory = {
         "format", "version", "scope", "exported_at", "included_remote",
         "excluded", "workspace", "challenges", "relations", "attachments",
     }
-    extra = {"solver_history"} if manifest["version"] == VERSION else set()
-    if set(manifest) not in (mandatory | extra, mandatory | extra | {"evidence_shares"}):
+    extra = {"solver_history"} if manifest["version"] >= 2 else set()
+    required = mandatory | extra
+    optional = {"evidence_shares", "clone_members"}
+    if not required <= set(manifest) or not set(manifest) <= required | optional:
         raise TransferError("Bundle manifest contains unknown metadata fields.")
     manifest.setdefault("evidence_shares", [])
-    if manifest["version"] == VERSION:
+    manifest.setdefault("clone_members", [])
+    if manifest["version"] >= 2:
         try:
             validate_history_descriptor(bundle, manifest["solver_history"])
         except HistoryError as exc:
@@ -457,13 +472,15 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
     attachments = manifest.get("attachments")
     relations = manifest.get("relations")
     shares = manifest["evidence_shares"]
+    clone_members = manifest["clone_members"]
     if (not isinstance(ws, dict) or not isinstance(challenges, list)
             or not isinstance(attachments, list) or not isinstance(relations, list)
-            or not isinstance(shares, list)):
+            or not isinstance(shares, list) or not isinstance(clone_members, list)):
         raise TransferError("Bundle metadata is incomplete.")
     if set(ws) != set(_WORKSPACE_FIELDS):
         raise TransferError("Workspace metadata has unknown fields.")
-    if len(challenges) > MAX_ENTRIES or len(relations) > MAX_ENTRIES or len(shares) > MAX_ENTRIES:
+    if (len(challenges) > MAX_ENTRIES or len(relations) > MAX_ENTRIES
+            or len(shares) > MAX_ENTRIES or len(clone_members) > MAX_ENTRIES):
         raise TransferError("Too many challenges, relations, or shares in bundle.")
     _identifier(ws.get("id"), "workspace ID")
     for field in ("name", "description", "created_at", "updated_at"):
@@ -492,8 +509,17 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
             raise TransferError("Invalid remote mode in bundle.")
         if item.get("completion_source") not in (None, "manual", "agent"):
             raise TransferError("Invalid completion source in bundle.")
+    seen_clone_members: set[str] = set()
+    for item in clone_members:
+        if not isinstance(item, dict) or set(item) != {"challenge_id", "family_id"}:
+            raise TransferError("Invalid clone lineage in bundle.")
+        challenge_id = item["challenge_id"]
+        if challenge_id not in ids or challenge_id in seen_clone_members:
+            raise TransferError("Orphan or duplicate clone lineage in bundle.")
+        _identifier(item["family_id"], "clone family ID")
+        seen_clone_members.add(challenge_id)
     expected = {"manifest.json"}
-    if manifest["version"] == VERSION:
+    if manifest["version"] >= 2:
         expected.add(HISTORY_ARCHIVE_PATH)
     attachment_ids: set[str] = set()
     for item in attachments:
@@ -559,7 +585,7 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
             raise TransferError("Invalid flag sharing setting in bundle.")
         _string(item["source_updated_at"], "share source timestamp")
         _string(item["verified_at"], "share verification timestamp")
-    if manifest.get("scope") == "challenge" and (len(challenges) != 1 or relations or shares):
+    if manifest.get("scope") == "challenge" and (len(challenges) != 1 or relations or shares or clone_members):
         raise TransferError("A challenge bundle must contain exactly one challenge.")
     return manifest
 
@@ -813,6 +839,23 @@ def import_workspace(settings: Settings, layout: StorageLayout, owner_user_id: s
                            workspace_id,prerequisite_id,dependent_id,created_at)
                            VALUES(?,?,?,?)""",
                         (workspace_id, first, second, stamp),
+                    )
+                family_ids: dict[str, str] = {
+                    item["family_id"]: challenge_ids[item["family_id"]]
+                    for item in manifest["clone_members"]
+                    if item["family_id"] in challenge_ids
+                }
+                for item in manifest["clone_members"]:
+                    family_ids.setdefault(
+                        item["family_id"], challenge_ids[item["challenge_id"]]
+                    )
+                for item in manifest["clone_members"]:
+                    db.execute(
+                        """INSERT INTO challenge_clone_members
+                           (workspace_id,challenge_id,family_id,created_at)
+                           VALUES(?,?,?,?)""",
+                        (workspace_id, challenge_ids[item["challenge_id"]],
+                         family_ids[item["family_id"]], stamp),
                     )
                 for item in manifest["evidence_shares"]:
                     if not item["observation"]:

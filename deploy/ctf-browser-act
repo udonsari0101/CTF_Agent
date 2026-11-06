@@ -1,0 +1,319 @@
+#!/usr/local/libexec/ctf-command/python
+"""Drive job-local Chromium and report bounded browser observations as JSON.
+
+Steps are a JSON list. Example:
+  [{"action":"fill","selector":"#user","value":"guest"},
+   {"action":"click","selector":"button[type=submit]"},
+   {"action":"wait_for","selector":"#result"}]
+"""
+
+from __future__ import annotations
+
+import argparse
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+import json
+from pathlib import Path
+import shutil
+import sys
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
+
+
+MAX_STEPS = 100
+MAX_EVENTS = 200
+MAX_BODY = 16000
+MAX_EVENT_TEXT = 1000
+MAX_ACTION_RESULT = 4000
+MAX_WAIT_MS = 30000
+
+
+def _load_browser_guard():
+    """Share the existing job/session validator without changing its CLI."""
+
+    loader = SourceFileLoader(
+        "_ctf_browser_guard", str(Path(__file__).with_name("ctf-browser"))
+    )
+    spec = spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise RuntimeError("ctf-browser guard is unavailable")
+    module = module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def _job_path(value: str, job_root: Path, *, input_file: bool = False) -> Path:
+    """Keep step files, uploads, and saved results inside this solve job."""
+
+    if not value or "\x00" in value:
+        raise ValueError("a job-local file path is required")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    if input_file:
+        path = candidate.resolve(strict=True)
+        if not path.is_file():
+            raise ValueError(f"not a regular file: {value}")
+    else:
+        parent = candidate.parent.resolve(strict=True)
+        path = (parent / candidate.name).resolve(strict=False)
+    try:
+        path.relative_to(job_root)
+    except ValueError as error:
+        raise ValueError("browser files must stay inside the current solve job") from error
+    return path
+
+
+def _steps(path: Path | None) -> list[dict]:
+    if path is None:
+        return []
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, list) or len(document) > MAX_STEPS:
+        raise ValueError(f"steps must be a JSON list of at most {MAX_STEPS} actions")
+    for index, step in enumerate(document):
+        if not isinstance(step, dict) or not isinstance(step.get("action"), str):
+            raise ValueError(f"step {index + 1} needs an action name")
+    return document
+
+
+def _text(value: object, length: int = MAX_EVENT_TEXT) -> str:
+    return str(value)[:length]
+
+
+def _url(value: str) -> str:
+    """Keep request shape without printing authentication query values."""
+
+    parts = urlsplit(value)
+    if parts.username or parts.password:
+        host = parts.hostname or ""
+        authority = f"[{host}]" if ":" in host else host
+        if parts.port is not None:
+            authority += f":{parts.port}"
+    else:
+        authority = parts.netloc
+    query = urlencode([(key, "<redacted>") for key, _ in parse_qsl(parts.query, keep_blank_values=True)])
+    return _text(urlunsplit((parts.scheme, authority, parts.path, query, "")), 1000)
+
+
+def _required(step: dict, key: str) -> str:
+    value = step.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{step['action']} requires a non-empty {key}")
+    return value
+
+
+def _execute(page, step: dict, job_root: Path, timeout: int) -> object:
+    action = step["action"]
+    if action == "goto":
+        response = page.goto(_required(step, "url"), wait_until="domcontentloaded", timeout=timeout)
+        return response.status if response is not None else None
+    if action == "click":
+        page.locator(_required(step, "selector")).click(timeout=timeout)
+    elif action == "fill":
+        value = step.get("value")
+        if not isinstance(value, str):
+            raise ValueError("fill requires a string value")
+        page.locator(_required(step, "selector")).fill(value, timeout=timeout)
+    elif action == "press":
+        page.locator(_required(step, "selector")).press(_required(step, "key"), timeout=timeout)
+    elif action == "check":
+        page.locator(_required(step, "selector")).check(timeout=timeout)
+    elif action == "uncheck":
+        page.locator(_required(step, "selector")).uncheck(timeout=timeout)
+    elif action == "select":
+        page.locator(_required(step, "selector")).select_option(_required(step, "value"), timeout=timeout)
+    elif action == "upload":
+        files = step.get("files")
+        if isinstance(files, str):
+            files = [files]
+        if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
+            raise ValueError("upload requires a non-empty files list")
+        paths = [_job_path(name, job_root, input_file=True) for name in files]
+        page.locator(_required(step, "selector")).set_input_files([str(path) for path in paths], timeout=timeout)
+    elif action == "wait_for":
+        page.locator(_required(step, "selector")).wait_for(timeout=timeout)
+    elif action == "wait":
+        milliseconds = step.get("milliseconds")
+        if not isinstance(milliseconds, int) or not 0 <= milliseconds <= MAX_WAIT_MS:
+            raise ValueError(f"wait milliseconds must be 0-{MAX_WAIT_MS}")
+        page.wait_for_timeout(milliseconds)
+    elif action == "evaluate":
+        return page.evaluate(_required(step, "expression"))
+    elif action == "screenshot":
+        path = _job_path(_required(step, "path"), job_root)
+        page.screenshot(path=str(path), full_page=True, timeout=timeout)
+        return str(path)
+    else:
+        raise ValueError(f"unsupported browser action: {action}")
+    return None
+
+
+def _summary(page, observations: dict, actions: list[dict]) -> dict:
+    try:
+        body = page.locator("body").inner_text(timeout=3000)
+    except PlaywrightError:
+        body = ""
+    try:
+        title = page.title()
+    except PlaywrightError:
+        title = ""
+    return {
+        "url": _url(page.url),
+        "title": _text(title, 300),
+        "body": body[:MAX_BODY],
+        "body_truncated": len(body) > MAX_BODY,
+        "actions": actions,
+        "console": observations["console"],
+        "network": observations["network"],
+        "dropped_events": observations["dropped_events"],
+    }
+
+
+def _run_browser(arguments: argparse.Namespace) -> int:
+    guard = _load_browser_guard()
+    workdir = guard.job_workdir(Path.cwd())
+    job_root = workdir.parents[2]
+    steps = _steps(_job_path(arguments.steps, job_root, input_file=True) if arguments.steps else None)
+    if not arguments.url and not any(step["action"] == "goto" for step in steps):
+        raise ValueError("provide a URL or a goto step")
+    if not 1000 <= arguments.timeout <= 120000:
+        raise ValueError("timeout must be between 1000 and 120000 milliseconds")
+    output = _job_path(arguments.output, job_root) if arguments.output else None
+    html = _job_path(arguments.html, job_root) if arguments.html else None
+    screenshot = _job_path(arguments.screenshot, job_root) if arguments.screenshot else None
+
+    runtime = None
+    session_lock = None
+    ephemeral = arguments.session is None
+    try:
+        if ephemeral:
+            runtime = guard._make_runtime(workdir)
+        else:
+            runtime = guard._persistent_runtime(workdir, arguments.session)
+            session_lock = guard._lock_session(runtime)
+        guard._ensure_private_directory(runtime / "downloads")
+        observations = {"console": [], "network": [], "dropped_events": 0}
+
+        def add(kind: str, event: dict) -> None:
+            target = observations[kind]
+            if len(target) < MAX_EVENTS:
+                target.append(event)
+            else:
+                observations["dropped_events"] += 1
+
+        with sync_playwright() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(runtime / "profile"),
+                executable_path=guard.CHROMIUM,
+                headless=True,
+                accept_downloads=True,
+                downloads_path=str(runtime / "downloads"),
+                env=guard.browser_environment(runtime),
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-background-networking",
+                    "--disable-component-update",
+                    "--disable-sync",
+                    f"--disk-cache-dir={runtime / 'cache'}",
+                    f"--crash-dumps-dir={runtime / 'crashes'}",
+                ],
+            )
+            try:
+                active = [context.pages[0] if context.pages else context.new_page()]
+
+                def attach(page) -> None:
+                    page.on("console", lambda message: add("console", {
+                        "type": _text(message.type, 40), "text": _text(message.text)
+                    }))
+                    page.on("pageerror", lambda error: add("console", {
+                        "type": "pageerror", "text": _text(error)
+                    }))
+
+                for page in context.pages:
+                    attach(page)
+
+                def on_page(page) -> None:
+                    attach(page)
+                    active[0] = page
+
+                context.on("page", on_page)
+                context.on("request", lambda request: add("network", {
+                    "event": "request", "method": request.method,
+                    "resource": request.resource_type, "url": _url(request.url),
+                }))
+                context.on("response", lambda response: add("network", {
+                    "event": "response", "status": response.status,
+                    "method": response.request.method, "url": _url(response.url),
+                }))
+                context.on("requestfailed", lambda request: add("network", {
+                    "event": "failure", "method": request.method,
+                    "url": _url(request.url), "reason": _text(request.failure),
+                }))
+
+                if arguments.url:
+                    active[0].goto(arguments.url, wait_until="domcontentloaded", timeout=arguments.timeout)
+                actions = []
+                for index, step in enumerate(steps, start=1):
+                    try:
+                        value = _execute(active[0], step, job_root, arguments.timeout)
+                    except (OSError, ValueError, PlaywrightError) as error:
+                        actions.append({"index": index, "action": step["action"],
+                                        "error": _text(error, MAX_ACTION_RESULT)})
+                        partial = _summary(active[0], observations, actions)
+                        if output is not None:
+                            output.write_text(json.dumps(partial, ensure_ascii=False, indent=2), encoding="utf-8")
+                        print(json.dumps(partial, ensure_ascii=False))
+                        raise
+                    encoded = json.dumps(value, ensure_ascii=False, default=str)
+                    actions.append({"index": index, "action": step["action"],
+                                    "result": value if len(encoded) <= MAX_ACTION_RESULT else {
+                                        "truncated": True, "text": encoded[:MAX_ACTION_RESULT]
+                                    }})
+                page = active[0]
+                if not page.is_closed():
+                    page.wait_for_load_state("domcontentloaded", timeout=arguments.timeout)
+                if html is not None:
+                    html.write_text(page.content(), encoding="utf-8")
+                if screenshot is not None:
+                    page.screenshot(path=str(screenshot), full_page=True, timeout=arguments.timeout)
+                result = _summary(page, observations, actions)
+                if output is not None:
+                    output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(json.dumps(result, ensure_ascii=False))
+            finally:
+                context.close()
+    finally:
+        if session_lock is not None:
+            import os
+            os.close(session_lock)
+        if ephemeral and runtime is not None:
+            shutil.rmtree(runtime, ignore_errors=True)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="ctf-browser-act",
+        description="Click, fill, upload, and inspect a job-local headless Chromium page.",
+    )
+    parser.add_argument("url", nargs="?", help="initial http(s) or file URL")
+    parser.add_argument("--session", help="reuse the named job-local browser profile")
+    parser.add_argument("--steps", help="JSON list of browser actions in the current solve job")
+    parser.add_argument("--output", help="write bounded JSON observations to a job-local file")
+    parser.add_argument("--html", help="save final DOM to a job-local file")
+    parser.add_argument("--screenshot", help="save final PNG to a job-local file")
+    parser.add_argument("--timeout", type=int, default=20000, help="per-action timeout in ms")
+    arguments = parser.parse_args(argv)
+    try:
+        return _run_browser(arguments)
+    except (OSError, ValueError, json.JSONDecodeError, PlaywrightError) as error:
+        print(f"ctf-browser-act: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

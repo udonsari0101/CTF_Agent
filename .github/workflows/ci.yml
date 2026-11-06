@@ -202,6 +202,8 @@ jobs:
           python .github/scripts/check_staged_files_ui.py
       - name: Check linked challenge evidence API
         run: python .github/scripts/check_related_evidence_api.py
+      - name: Check parallel clone evidence sharing
+        run: python .github/scripts/check_solver_peer_evidence.py
       - name: Check CTFd submission auth contract
         run: python .github/scripts/check_ctfd_submission_contract.py
       - name: Check CTFd submission deduplication
@@ -291,6 +293,7 @@ jobs:
       - name: Check scripts and local stack
         run: |
           python -m compileall -q ctf_agent deploy/local-compose.py deploy/local_runtime.py scripts/package_local_release.py
+          python -m py_compile deploy/ctf-browser-act deploy/image-smoke.py
           python -m py_compile installer/installer/uninstall.py installer/installer/storage_control.py
           for script in ctf_agent/web/*.js ctf_agent/web/i18n/*.js; do node --check "$script"; done
           bash -n installer/installer/install.sh

@@ -187,6 +187,7 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         Path("/usr/local/libexec/ctf-command/request-remote"),
         Path("/usr/local/libexec/ctf-command/ctf-connect"),
         Path("/usr/local/libexec/ctf-command/ctf-browser"),
+        Path("/usr/local/libexec/ctf-command/ctf-browser-act"),
     )
     launcher_inodes = set()
     for launcher in launchers:
@@ -218,6 +219,9 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     ctf_browser = Path("/usr/local/bin/ctf-browser")
     assert ctf_browser.is_symlink()
     assert ctf_browser.resolve(strict=True) == Path("/usr/local/libexec/ctf-command/ctf-browser")
+    ctf_browser_act = Path("/usr/local/bin/ctf-browser-act")
+    assert ctf_browser_act.is_symlink()
+    assert ctf_browser_act.resolve(strict=True) == Path("/usr/local/libexec/ctf-command/ctf-browser-act")
     subprocess.run(
         [str(ctf_connect), "--help"],
         check=True,
@@ -254,10 +258,10 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         "tesseract", "tshark", "qemu-x86_64", "qemu-system-x86_64", "tmux",
         "r2", "ffuf", "yara", "gdb-multiarch", "git", "strace", "ltrace",
         "patchelf", "cpio", "pngcheck", "pdfinfo", "pdftotext", "mediainfo",
-        "sox", "chromium", "ctf-browser", "dig", "socat", "wasm2wat", "whois",
+        "sox", "chromium", "ctf-browser", "ctf-browser-act", "dig", "socat", "wasm2wat", "whois",
         "zbarimg", "apktool", "gdbserver", "nmap", "sqlmap", "testdisk", "photorec",
         "java", "javac", "ghidra_headless", "jadx", "gp", "stegseek", "multimon-ng",
-        "pwndbg", "websocat", "xxd",
+        "pwndbg", "websocat", "xxd", "GoReSym", "seccomp-tools",
     ):
         assert shutil.which(executable), executable + " is missing from the CTF toolchain"
     ffuf = Path("/usr/local/bin/ffuf")
@@ -290,6 +294,8 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         ("sox", ("--version",)),
         ("chromium", ("--version",)),
         ("ctf-browser", ("--version",)),
+        ("ctf-browser-act", ("--help",)),
+        ("seccomp-tools", ("--version",)),
         ("dig", ("-v",)),
         ("socat", ("-V",)),
         ("wasm2wat", ("--version",)),
@@ -341,6 +347,12 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         ["gcc", "-o", str(native_binary), str(native_source)], check=True,
         capture_output=True, text=True, timeout=30, cwd=tool_tmp, env=tool_env,
     )
+    go_symbols = subprocess.run(
+        ["GoReSym", "/usr/local/bin/GoReSym"],
+        capture_output=True, text=True, timeout=30, cwd=tool_tmp, env=tool_env,
+    )
+    assert go_symbols.returncode == 0, go_symbols.stderr.strip()[-3000:]
+    assert json.loads(go_symbols.stdout).get("Arch") == "amd64"
     ghidra_result = subprocess.run(
         ["ghidra_headless", str(tool_tmp), "smoke-project", "-import", str(native_binary),
          "-postScript", "DecompileAll.java", "-deleteProject"],
@@ -433,9 +445,31 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     assert not list(browser_workdir.parents[2].glob(".ctf-browser-*"))
 
     browser_cookies_seen = []
+    browser_submissions = []
 
     class BrowserSessionHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path == "/action":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(
+                    b"<!doctype html><title>CTF browser action check</title><body>"
+                    b"<input id=user><input id=upload type=file><button id=send>Send</button>"
+                    b"<div id=state></div><div id=result></div><script>"
+                    b"console.log('browser-action-ready');"
+                    b"document.querySelector('#state').textContent=localStorage.getItem('action_smoke')||'0';"
+                    b"document.querySelector('#send').onclick=async()=>{"
+                    b"const f=await document.querySelector('#upload').files[0].text();"
+                    b"const r=await fetch('/submit?token=private',{method:'POST',"
+                    b"headers:{'Content-Type':'application/json'},"
+                    b"body:JSON.stringify({user:document.querySelector('#user').value,file:f})});"
+                    b"const node=document.querySelector('#result');node.textContent=await r.text();"
+                    b"node.className='done';localStorage.setItem('action_smoke','1');"
+                    b"console.log('smoke-submitted')};</script>"
+                )
+                return
             if self.path != "/test":
                 self.send_error(404)
                 return
@@ -451,6 +485,17 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
                 b"(localStorage.getItem('ctf_browser_smoke')||'0');"
                 b"localStorage.setItem('ctf_browser_smoke','1')</script>"
             )
+
+        def do_POST(self):
+            if self.path != "/submit?token=private":
+                self.send_error(404)
+                return
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            browser_submissions.append(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(f"submitted:{payload['user']}:{payload['file']}".encode())
 
         def log_message(self, *_args):
             pass
@@ -475,6 +520,47 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
             assert len(browser_cookies_seen) > previous_requests
             assert browser_cookies_seen[previous_requests] is expected_cookie
             assert expected_storage in result.stdout
+
+        upload_file = browser_workdir / "tmp" / "sample.txt"
+        upload_file.write_text("sample-data", encoding="utf-8")
+        steps_file = browser_workdir / "tmp" / "actions.json"
+        steps_file.write_text(json.dumps([
+            {"action": "fill", "selector": "#user", "value": "guest"},
+            {"action": "upload", "selector": "#upload", "files": ["tmp/sample.txt"]},
+            {"action": "click", "selector": "#send"},
+            {"action": "wait_for", "selector": "#result.done"},
+            {"action": "evaluate", "expression": "localStorage.getItem('action_smoke')"},
+        ]), encoding="utf-8")
+        action_html = browser_workdir / "tmp" / "action.html"
+        action_png = browser_workdir / "tmp" / "action.png"
+        action_json = browser_workdir / "tmp" / "action.json"
+        result = subprocess.run(
+            [str(ctf_browser_act), "--session=action", "--steps=tmp/actions.json",
+             "--html=tmp/action.html", "--screenshot=tmp/action.png",
+             "--output=tmp/action.json",
+             f"http://127.0.0.1:{browser_server.server_port}/action"],
+            capture_output=True, text=True, timeout=45,
+            cwd=browser_workdir, env=tool_env,
+        )
+        assert result.returncode == 0, result.stderr.strip()[-3000:]
+        action = json.loads(result.stdout)
+        assert action["actions"][-1]["result"] == "1"
+        assert "submitted:guest:sample-data" in action["body"]
+        assert browser_submissions == [{"user": "guest", "file": "sample-data"}]
+        assert any(event["text"] == "smoke-submitted" for event in action["console"])
+        assert any(event.get("status") == 200 and event.get("method") == "POST"
+                   for event in action["network"])
+        assert "private" not in result.stdout and "private" not in action_json.read_text()
+        assert "CTF browser action check" in action_html.read_text()
+        assert action_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        reused = subprocess.run(
+            [str(ctf_browser_act), "--session=action",
+             f"http://127.0.0.1:{browser_server.server_port}/action"],
+            capture_output=True, text=True, timeout=30,
+            cwd=browser_workdir, env=tool_env,
+        )
+        assert reused.returncode == 0, reused.stderr.strip()[-3000:]
+        assert json.loads(reused.stdout)["body"].strip().splitlines()[-1] == "1"
     finally:
         browser_server.shutdown()
         browser_server.server_close()

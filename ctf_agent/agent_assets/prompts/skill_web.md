@@ -69,7 +69,22 @@ IDOR (increment/swap IDs & UUIDs; try all-zero `00000000-…`/default admin id) 
 
 ## Recon & OOB
 Script requests in `solver.py`, don't drive a GUI proxy.
-The image has `curl`, `ffuf`, `sqlmap`, `nmap`, `ctf-browser`, Python `httpx` and `flask-unsign`. It does not bundle a web wordlist. Build `tmp/paths.txt`/`tmp/params.txt` from the supplied routes, JavaScript and framework conventions before fuzzing; use a bigger list only when justified. The other named scanners, callback/tunnel clients, Playwright, Puppeteer and dalfox below are optional, so check availability first; `ctf-browser` is the installed browser path.
+The image has `curl`, `ffuf`, `sqlmap`, `nmap`, `ctf-browser`, `ctf-browser-act` (Playwright with job-local Chromium), Python `httpx` and `flask-unsign`. It does not bundle a web wordlist. Build `tmp/paths.txt`/`tmp/params.txt` from the supplied routes, JavaScript and framework conventions before fuzzing; use a bigger list only when justified. Other named scanners, callback/tunnel clients, Puppeteer and dalfox below are optional, so check availability first.
+
+For a JavaScript-heavy page, use `ctf-browser-act` to click, fill, upload and inspect what the browser actually requested. Steps run in order in one live tab. `--session NAME` reuses cookies and localStorage between calls within this solve job; leave it off for a fresh profile. The result includes bounded page text, console messages and request method/URL/status (query values are redacted). Save the final DOM or PNG separately when needed. Files referenced by steps must be in this solve job.
+```bash
+cat > tmp/browser-steps.json <<'JSON'
+[
+  {"action":"fill","selector":"input[name=username]","value":"guest"},
+  {"action":"fill","selector":"input[name=password]","value":"guest"},
+  {"action":"click","selector":"button[type=submit]"},
+  {"action":"wait_for","selector":"#result"}
+]
+JSON
+ctf-browser-act --session login --steps tmp/browser-steps.json \
+  --html tmp/after-login.html --screenshot tmp/after-login.png https://TARGET/login
+```
+For uploads use `{"action":"upload","selector":"input[type=file]","files":["attachments/sample.bin"]}`; for in-page state use `{"action":"evaluate","expression":"localStorage.getItem('key')"}`. `ctf-browser-act --help` lists output and timeout options. This is a separate headless browser inside the solve job, not the operator's browser.
 ```bash
 curl -sSi https://TARGET/ | sed -n '1,25p'           # headers, cookies, server, framework tells
 curl -sS https://TARGET/robots.txt https://TARGET/sitemap.xml https://TARGET/.well-known/

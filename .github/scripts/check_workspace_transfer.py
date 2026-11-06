@@ -222,6 +222,55 @@ class WorkspaceTransferTests(unittest.TestCase):
                              if item["id"] == self.first)
             self.assertIn("token=value", challenge["remote"])
 
+    def test_workspace_bundle_preserves_clone_lineage_without_live_peer_shares(self):
+        with closing(connect(self.settings)) as db, db:
+            for challenge_id in (self.first, self.second):
+                db.execute(
+                    """INSERT INTO challenge_clone_members
+                       (workspace_id,challenge_id,family_id,created_at)
+                       VALUES(?,?,?,?)""",
+                    (self.workspace_id, challenge_id, self.first,
+                     "2026-11-01T00:00:00+00:00"),
+                )
+        self.export()
+        with zipfile.ZipFile(self.archive) as bundle:
+            manifest = json.loads(bundle.read("manifest.json"))
+        self.assertEqual(
+            {item["challenge_id"] for item in manifest["clone_members"]},
+            {self.first, self.second},
+        )
+        self.assertIn("peer_evidence_ledger", manifest["excluded"])
+        imported = import_workspace(self.settings, self.layout, self.owner, self.archive)
+        with closing(connect(self.settings)) as db:
+            members = db.execute(
+                """SELECT challenge_id,family_id FROM challenge_clone_members
+                    WHERE workspace_id=?""", (imported["workspace_id"],),
+            ).fetchall()
+        self.assertEqual(len(members), 2)
+        self.assertEqual(
+            {row["challenge_id"] for row in members},
+            set(imported["challenge_ids"].values()),
+        )
+        self.assertEqual(
+            {row["family_id"] for row in members},
+            {imported["challenge_ids"][self.first]},
+        )
+
+    def test_previous_bundle_version_remains_importable(self):
+        self.export()
+        legacy = self.archive.with_name("legacy-v2.zip")
+        with zipfile.ZipFile(self.archive) as source, zipfile.ZipFile(legacy, "w") as target:
+            for item in source.infolist():
+                content = source.read(item.filename)
+                if item.filename == "manifest.json":
+                    manifest = json.loads(content)
+                    manifest["version"] = 2
+                    manifest.pop("clone_members")
+                    content = json.dumps(manifest).encode("utf-8")
+                target.writestr(item, content)
+        imported = import_workspace(self.settings, self.layout, self.owner, legacy)
+        self.assertEqual(imported["challenge_count"], 2)
+
     def test_single_challenge_bundle_imports_into_existing_workspace(self):
         result = export_challenge(
             self.settings, self.layout, self.owner, self.workspace_id,
@@ -233,6 +282,7 @@ class WorkspaceTransferTests(unittest.TestCase):
             self.assertEqual(manifest["scope"], "challenge")
             self.assertEqual([c["id"] for c in manifest["challenges"]], [self.first])
             self.assertEqual(manifest["relations"], [])
+            self.assertEqual(manifest["clone_members"], [])
             self.assertEqual(manifest["evidence_shares"], [])
         imported = import_challenge(
             self.settings, self.layout, self.owner, self.workspace_id,

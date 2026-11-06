@@ -1322,6 +1322,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     timestamp,
                 ),
             )
+            family = connection.execute(
+                """SELECT family_id FROM challenge_clone_members
+                    WHERE workspace_id=? AND challenge_id=?""",
+                (workspace_id, challenge_id),
+            ).fetchone()
+            family_id = family["family_id"] if family else challenge_id
+            if family is None:
+                connection.execute(
+                    """INSERT INTO challenge_clone_members
+                       (workspace_id,challenge_id,family_id,created_at)
+                       VALUES(?,?,?,?)""",
+                    (workspace_id, challenge_id, family_id, timestamp),
+                )
+            connection.execute(
+                """INSERT INTO challenge_clone_members
+                   (workspace_id,challenge_id,family_id,created_at)
+                   VALUES(?,?,?,?)""",
+                (workspace_id, clone_id, family_id, timestamp),
+            )
             connection.executemany(
                 """INSERT INTO attachments(
                        id,workspace_id,challenge_id,original_name,stored_name,size,created_at

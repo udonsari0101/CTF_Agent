@@ -30,6 +30,7 @@ FIXED_APP_FILES = {
     "deploy/request-remote",
     "deploy/connect-remote",
     "deploy/ctf-browser",
+    "deploy/ctf-browser-act",
     "deploy/DecompileAll.java",
     "deploy/DecompileFn.java",
     "deploy/production-update.py",

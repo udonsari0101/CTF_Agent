@@ -13,10 +13,12 @@ COPY --chown=0:0 --chmod=0555 deploy/submit-flag /usr/local/libexec/ctf-command/
 COPY --chown=0:0 --chmod=0555 deploy/request-remote /usr/local/libexec/ctf-command/request-remote
 COPY --chown=0:0 --chmod=0555 deploy/connect-remote /usr/local/libexec/ctf-command/ctf-connect
 COPY --chown=0:0 --chmod=0555 deploy/ctf-browser /usr/local/libexec/ctf-command/ctf-browser
+COPY --chown=0:0 --chmod=0555 deploy/ctf-browser-act /usr/local/libexec/ctf-command/ctf-browser-act
 RUN ln -s /usr/local/libexec/ctf-command/submit-flag /usr/local/bin/submit-flag \
     && ln -s /usr/local/libexec/ctf-command/request-remote /usr/local/bin/request-remote \
     && ln -s /usr/local/libexec/ctf-command/ctf-connect /usr/local/bin/ctf-connect \
-    && ln -s /usr/local/libexec/ctf-command/ctf-browser /usr/local/bin/ctf-browser
+    && ln -s /usr/local/libexec/ctf-command/ctf-browser /usr/local/bin/ctf-browser \
+    && ln -s /usr/local/libexec/ctf-command/ctf-browser-act /usr/local/bin/ctf-browser-act
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     CTF_DATA_DIR=/data CTF_DB_DIR=/database/sqlite \

@@ -95,6 +95,17 @@ CREATE TABLE IF NOT EXISTS challenge_relations (
 );
 CREATE INDEX IF NOT EXISTS idx_challenge_relations_dependent
     ON challenge_relations(workspace_id,dependent_id,prerequisite_id);
+-- Clone lineage is separate from ordinary challenge relations. Clones may be
+-- compared independently unless their owner explicitly shares an observation.
+CREATE TABLE IF NOT EXISTS challenge_clone_members (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    challenge_id TEXT NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+    family_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id,challenge_id)
+);
+CREATE INDEX IF NOT EXISTS idx_challenge_clone_family
+    ON challenge_clone_members(workspace_id,family_id,challenge_id);
 -- Sharing evidence is directional even though challenge links are not.
 -- A link alone never exports another challenge's notes, write-up or flag.
 CREATE TABLE IF NOT EXISTS challenge_evidence_shares (

@@ -2,7 +2,7 @@
 
 Field manual for OSINT: follow a public-data trail across platforms to a person, place, or flag. There's no "bug" — there's a chain of pivots (handle → account → linked account → post/avatar/route → flag). Base methodology governs; this is tools and pivots. By role: any lookup/decode/scrape script → `solver.py`; the trail so far + every confirmed identity/location/lead → `notes/ANALYSIS.md`; ranked next pivots, dead-ends, and POISON flags → `notes/NEXT.md`. Scratch/scrapes → `tmp/`.
 
-**Headless limits — mark `[human]` steps.** Reverse image search (Google Lens/Yandex), Google Maps pin-drop / Street View, Telegram/Discord bot chat, and login-walled sites need a browser you don't have. When the trail hits one, write the exact ask in `notes/NEXT.md` (attach the image + which region to crop, or the coords to convert), and if it's blocking use `request-remote "<the browser action needed>"` to alert the operator. Do every headless step (APIs, curl, dig, decode) yourself first.
+**Headless limits — mark `[human]` steps only when needed.** The job has headless Chromium through `ctf-browser` and `ctf-browser-act`; the latter can click, fill and upload in a session. Try that first on login-walled or interactive pages when credentials are supplied. Reverse image search services (Google Lens/Yandex), Maps Street View and chat platforms may still require a human account, CAPTCHA, or a visible desktop. When that blocks progress, record the exact ask in `notes/NEXT.md` and use `request-remote "<the browser action needed>"` to alert the operator. Do every available headless step (APIs, browser, curl, dig, decode) first.
 
 ## Identify the unknown first
 Before chasing, name what you're holding — the challenge often hands you a bare string:
