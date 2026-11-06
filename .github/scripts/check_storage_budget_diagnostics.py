@@ -24,7 +24,7 @@ from ctf_agent.storage_budget import (  # noqa: E402
     StorageBudget, StorageBudgetError, storage_http_status, storage_io_http_response,
 )
 from ctf_agent.solver_exchange import (  # noqa: E402
-    ExchangeError, SCHEMA as SOLVER_SCHEMA, SolverExchangeCoordinator,
+    EXCHANGE_PROTOCOL, ExchangeError, SCHEMA as SOLVER_SCHEMA, SolverExchangeCoordinator,
     _stage_budget_error, _stage_io_error,
     _log_stage_storage_failure,
     _write_json_file, _write_live_attachment_chunk,
@@ -170,6 +170,142 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
         self.budget.release(legacy_runtime)
         self.assertFalse(self.budget.snapshot(kind="solver"))
         self.assertFalse(self.budget.snapshot(kind="solver_runtime"))
+
+    def test_published_active_job_reclaims_crash_left_stage_and_auth_reservations(self):
+        job_id = "a" * 32
+        with closing(sqlite3.connect(self.database)) as db:
+            with db:
+                db.executescript(SOLVER_SCHEMA)
+                db.execute("CREATE TABLE users (id TEXT PRIMARY KEY, active INTEGER)")
+                db.execute("INSERT INTO users VALUES ('owner',1)")
+                db.execute(
+                    """INSERT INTO solver_jobs
+                       (id,owner_user_id,workspace_id,challenge_id,account_id,
+                        provider,model,reasoning_effort,status,created_at,updated_at)
+                       VALUES (?,?,?,?,?,'codex','test-model','low','running',1,1)""",
+                    (job_id, "owner", "workspace", "challenge", "account"),
+                )
+                db.execute("INSERT INTO solver_slots VALUES ('slot-1',?)", (job_id,))
+
+        exchange = self.data / "solver-exchange" / "slots" / "slot-1"
+        active = exchange / "active"
+        active.mkdir(parents=True)
+        stage_key = "solver:" + job_id
+        auth_key = "solver-auth:" + job_id
+        self.budget.reserve(stage_key, "solver", "owner", "workspace", "challenge", 700)
+        self.budget.reserve(auth_key, "solver", "owner", "workspace", "challenge", 100)
+        with patch.object(self.budget, "_free", return_value=900):
+            self.assert_error("insufficient_space", lambda: self.reserve("next", 1))
+
+        # An incomplete or mismatched active tree must retain its conservative
+        # accounting; only the complete tree for this exact claimed job may
+        # release a crash-left reservation.
+        SolverExchangeCoordinator(
+            self.database, self.data, self.data / "accounts", exchange,
+            storage_budget=self.budget, slot_id="slot-1", enforce_host_ownership=False,
+        )
+        self.assertEqual(
+            {row["reservation_key"] for row in self.budget.snapshot(kind="solver")},
+            {stage_key, auth_key},
+        )
+
+        _write_json_file(active / "manifest.json", {"protocol": EXCHANGE_PROTOCOL, "job_id": "b" * 32})
+        SolverExchangeCoordinator(
+            self.database, self.data, self.data / "accounts", exchange,
+            storage_budget=self.budget, slot_id="slot-1", enforce_host_ownership=False,
+        )
+        self.assertEqual(
+            {row["reservation_key"] for row in self.budget.snapshot(kind="solver")},
+            {stage_key, auth_key},
+        )
+
+        _write_json_file(active / "manifest.json", {"protocol": EXCHANGE_PROTOCOL, "job_id": job_id})
+        with closing(sqlite3.connect(self.database)) as db:
+            with db:
+                db.execute("UPDATE solver_jobs SET status='cleanup_blocked' WHERE id=?", (job_id,))
+        SolverExchangeCoordinator(
+            self.database, self.data, self.data / "accounts", exchange,
+            storage_budget=self.budget, slot_id="slot-1", enforce_host_ownership=False,
+        )
+        self.assertEqual(
+            {row["reservation_key"] for row in self.budget.snapshot(kind="solver")},
+            {stage_key, auth_key},
+        )
+        with closing(sqlite3.connect(self.database)) as db:
+            with db:
+                db.execute("UPDATE solver_jobs SET status='running' WHERE id=?", (job_id,))
+        SolverExchangeCoordinator(
+            self.database, self.data, self.data / "accounts", exchange,
+            storage_budget=self.budget, slot_id="slot-1", enforce_host_ownership=False,
+        )
+
+        self.assertFalse(self.budget.snapshot(kind="solver"))
+        with patch.object(self.budget, "_free", return_value=900):
+            self.reserve("next", 1)
+        self.budget.release("next")
+
+    def test_post_publication_accounting_failure_does_not_fail_runnable_job(self):
+        exchange = self.data / "solver-exchange" / "slots" / "slot-1"
+        coordinator = SolverExchangeCoordinator(
+            self.database, self.data, self.data / "accounts", exchange,
+            storage_budget=self.budget, slot_id="slot-1", enforce_host_ownership=False,
+        )
+        job_id = "a" * 32
+        with coordinator._connect() as db:
+            db.execute(
+                """INSERT INTO solver_jobs
+                   (id,owner_user_id,workspace_id,challenge_id,account_id,
+                    provider,model,reasoning_effort,status,created_at,updated_at)
+                   VALUES (?,?,?,?,?,'codex','gpt-6-sol','low','staging',1,1)""",
+                (job_id, "owner", "workspace", "challenge", "account"),
+            )
+            db.execute("INSERT INTO solver_slots VALUES ('slot-1',?)", (job_id,))
+            job = dict(db.execute("SELECT * FROM solver_jobs WHERE id=?", (job_id,)).fetchone())
+        auth = self.data / "auth.json"
+        auth.write_bytes(b"{}")
+        auth.chmod(0o600)
+        coordinator._auth_source = lambda _job: auth
+        coordinator._continuation_for_stage = lambda _job: None
+        coordinator._copy_attachments = lambda *_args: None
+        coordinator._is_cancelled = lambda _job_id: False
+        coordinator._stage_records = lambda _job: (
+            {"name": "test", "description": "test", "remote_mode": "none"}, []
+        )
+
+        def copy_auth(_job, destination, *, expected_size):
+            self.assertEqual(expected_size, 2)
+            with destination.open("xb") as output:
+                output.write(b"{}")
+                output.flush()
+                os.fsync(output.fileno())
+            return "a" * 64
+
+        coordinator._copy_auth = copy_auth
+        original_release = self.budget.release
+        reservation = "solver:" + job_id
+
+        def transient_release(key, *args, **kwargs):
+            if key == reservation and (exchange / "active").exists():
+                raise StorageBudgetError("transient lock failure", code="lock_unavailable")
+            return original_release(key, *args, **kwargs)
+
+        with patch.object(self.budget, "release", side_effect=transient_release):
+            with self.assertLogs("ctf_agent.solver_exchange", level="WARNING"):
+                coordinator._stage_initial(job, "worker")
+        self.assertTrue((exchange / "active" / "manifest.json").is_file())
+        self.assertEqual(
+            {row["reservation_key"] for row in self.budget.snapshot(kind="solver")},
+            {reservation},
+        )
+        self.assertEqual(coordinator._published_stage_reservations, {reservation})
+        coordinator._fail_staging(job_id, "failed", {"code": "synthetic_post_publish_error"})
+        with coordinator._connect() as db:
+            self.assertEqual(db.execute("SELECT job_id FROM solver_slots WHERE slot_id='slot-1'").fetchone()[0], job_id)
+            self.assertEqual(db.execute("SELECT status FROM solver_jobs WHERE id=?", (job_id,)).fetchone()[0], "staging")
+
+        coordinator._retry_published_stage_reservations()
+        self.assertFalse(coordinator._published_stage_reservations)
+        self.assertFalse(self.budget.snapshot(kind="solver"))
 
     def test_replacing_reservation_counts_only_projected_total(self):
         with patch.object(self.budget, "_free", return_value=1000):

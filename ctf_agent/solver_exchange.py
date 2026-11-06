@@ -835,6 +835,7 @@ class SolverExchangeCoordinator:
         self._activity = threading.Condition()
         self._active_ticks = 0
         self.last_block: dict[str, Any] | None = None
+        self._published_stage_reservations: set[str] = set()
         self._prepare_exchange()
         with self._connect() as db:
             db.executescript(SCHEMA)
@@ -2509,10 +2510,38 @@ class SolverExchangeCoordinator:
                          FROM solver_jobs j JOIN solver_slots s ON s.job_id=j.id"""
                 )
             }
+            own_claim = db.execute(
+                """SELECT s.job_id,j.status FROM solver_slots s
+                     JOIN solver_jobs j ON j.id=s.job_id WHERE s.slot_id=?""",
+                (self.slot_id,),
+            ).fetchone()
+        published_job_id = None
+        active = self.exchange / "active"
+        if own_claim and own_claim[1] != "cleanup_blocked" and active.is_dir() and not active.is_symlink():
+            try:
+                manifest = _read_json_file(active / "manifest.json", _MAX_MANIFEST_BYTES)
+            except (ExchangeError, OSError):
+                manifest = {}
+            if (
+                manifest.get("protocol") == EXCHANGE_PROTOCOL
+                and manifest.get("job_id") == own_claim[0]
+            ):
+                published_job_id = own_claim[0]
+        # A crash after publishing the complete active tree but before the
+        # final release leaves an obsolete stage reservation. The active tree
+        # has already consumed the actual disk bytes, so retaining that row
+        # counts the same content twice and can falsely refuse other jobs.
+        # Startup removes interrupted auth temp files before this callback;
+        # retain an auth reservation if any such copy is still present.
+        auth_copy_present = bool(published_job_id and any(active.glob(".auth-*.tmp")))
         expected: dict[str, tuple[str, str, str | None, int]] = {}
         for row in self.storage_budget.snapshot(kind="solver"):
             key = row.get("reservation_key")
             if not isinstance(key, str):
+                continue
+            if published_job_id and key == "solver:" + published_job_id:
+                continue
+            if published_job_id and not auth_copy_present and key == "solver-auth:" + published_job_id:
                 continue
             if key.startswith("solver:"):
                 job_id = key.removeprefix("solver:")
@@ -2742,6 +2771,7 @@ class SolverExchangeCoordinator:
         with self._lock():
             self._clear_stale_slot_claim()
             self._remove_retired()
+            self._retry_published_stage_reservations()
             # A transient filesystem failure while cleaning a hidden staging
             # copy used to leave the job in cleanup_blocked forever after its
             # slot had already been released. Retry that ownerless cleanup on
@@ -3846,7 +3876,16 @@ class SolverExchangeCoordinator:
                 )
             # Directory metadata and temporary rename headroom remain reserved
             # until the complete active tree and database slot are durable.
-            self.storage_budget.release(reservation)
+            try:
+                self.storage_budget.release(reservation)
+            except (StorageBudgetError, OSError, sqlite3.Error) as exc:
+                # The active tree and its slot are already published. A
+                # transient accounting failure must not mark a runnable job
+                # failed or release its claim; retry the idempotent release on
+                # the next coordinator tick. Startup reconciliation handles a
+                # crash before that tick.
+                _log_stage_storage_failure(exc, self.data_dir, self.database_path)
+                self._published_stage_reservations.add(reservation)
         except BaseException:
             try:
                 self.storage_budget.release(
@@ -3858,6 +3897,14 @@ class SolverExchangeCoordinator:
                 # proven; a later reconcile blocks rather than overcommits.
                 pass
             raise
+
+    def _retry_published_stage_reservations(self) -> None:
+        for reservation in tuple(self._published_stage_reservations):
+            try:
+                self.storage_budget.release(reservation)
+            except (StorageBudgetError, OSError, sqlite3.Error):
+                continue
+            self._published_stage_reservations.discard(reservation)
 
     def _stage_records(self, job: Mapping[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         with self._connect() as db:
@@ -4891,6 +4938,18 @@ class SolverExchangeCoordinator:
             return False
 
     def _fail_staging(self, job_id: str, status_value: str, error: dict[str, Any] | None) -> None:
+        # Publication is an atomic rename. A later fsync, SQLite milestone, or
+        # reservation-release error must not turn an already runnable active
+        # job into a failed/orphaned one. Its claimed slot can recover on the
+        # next tick or after coordinator restart.
+        active = self.exchange / "active"
+        if active.is_dir() and not active.is_symlink():
+            try:
+                manifest = _read_json_file(active / "manifest.json", _MAX_MANIFEST_BYTES)
+            except (ExchangeError, OSError):
+                manifest = {}
+            if manifest.get("protocol") == EXCHANGE_PROTOCOL and manifest.get("job_id") == job_id:
+                return
         staging = self.exchange / f".staging-{job_id}"
         try:
             self.storage_budget.release(
