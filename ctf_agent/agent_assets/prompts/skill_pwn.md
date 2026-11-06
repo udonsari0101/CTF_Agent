@@ -3,9 +3,9 @@
 Shared, read-only playbook for one userland (or kernel) binary-exploitation target. **base.md owns the loop, submission/POISON, belief≠proof, local-build/PoW-general, per-file/function decomposition, boundaries, the notes model, and "never fabricate — measure it."** This file is pwn-specific decision tables, recipes, and tools only. The exploit lives in `solver.py`; remote `host:port` + flag path are in `../chal_desc.md`; findings go in `notes/{ANALYSIS,VULN,NEXT}.md`; cores/logs/scratch in `tmp/`.
 
 ## Toolbox
-The image includes pwntools, ROPgadget, ropper, GDB, pwndbg, checksec, patchelf, binutils and QEMU user/system emulation. Check each optional command with `command -v` before use. Ruby `one_gadget`/`seccomp-tools`, `gef`, `ropr`, AFL++ and `pwninit` are not preinstalled; acquire only a needed extra into this job's scratch.
+The image includes pwntools, ROPgadget, ropper, GDB, pwndbg, checksec, patchelf, binutils, seccomp-tools and QEMU user/system emulation. Check each optional command with `command -v` before use. Ruby `one_gadget`, `gef`, `ropr`, AFL++ and `pwninit` are not preinstalled; acquire only a needed extra into this job's scratch.
 
-- **Core:** `pwntools`, `gdb`+`pwndbg`, `ROPgadget`/`ropper`, `checksec`, `patchelf`, `objdump -d -Mintel`, `strace`/`ltrace`. Use `one_gadget` or `seccomp-tools` only if available.
+- **Core:** `pwntools`, `gdb`+`pwndbg`, `ROPgadget`/`ropper`, `checksec`, `patchelf`, `objdump -d -Mintel`, `strace`/`ltrace`. `seccomp-tools` can disassemble a supplied BPF filter without tracing; its `dump` command needs ptrace.
 - **libc matching:** `pwninit` + `glibc-all-in-one`; ID a leaked libc at libc.rip / libc.blukat.me / libc-database `./find`; no version → pwntools `DynELF(leak, elf=elf)` resolves symbols from a leak alone.
 - **Find the crash:** compile source with `-fsanitize=address,undefined` to pinpoint the overflow; or fuzz (AFL++ / libFuzzer) to a crashing input, then reason from it.
 - **Kernel:** `qemu-system-x86_64 -s -S` + GDB multiarch and `cpio` are installed. `extract-vmlinux`/`vmlinux-to-elf` and gef are optional. (`one_gadget` does not apply in kernel.)
@@ -15,7 +15,7 @@ The image includes pwntools, ROPgadget, ropper, GDB, pwndbg, checksec, patchelf,
 file ./chall
 checksec --file=./chall                     # or: pwn checksec ./chall
 strings -n 6 ./chall | grep -iE 'flag|/bin/sh|system|cat|token|%[dspx]'
-# Optional, only if installed: seccomp-tools dump ./chall
+# If seccomp is present and ptrace works: seccomp-tools dump ./chall
 ```
 Mitigation → what it forces on you:
 
@@ -155,7 +155,7 @@ payload = flat({OFFSET: rop.chain()})
 ```
 
 ## seccomp: inspect the filter before choosing a syscall path
-Use the supplied source or binary disassembly to establish the filter. `seccomp-tools dump` is an optional helper, not part of the image; `strace` can show observed syscall failures when ptrace is permitted but does not dump the BPF policy.
+Use the supplied source or binary disassembly to establish the filter. The installed `seccomp-tools disasm filter.bpf` and `seccomp-tools emu filter.bpf <syscall>` inspect a supplied BPF policy without ptrace. `seccomp-tools dump ./chall` executes the binary under ptrace and may be denied by the container's host seccomp policy; a dump failure does not establish that the challenge has no filter. Fall back to supplied source or static disassembly. `strace` can show observed syscall failures when ptrace is permitted but does not dump the BPF policy.
 
 | Filter blocks | Bypass |
 |---|---|

@@ -52,7 +52,9 @@ jobs:
           app="ghcr.io/$owner/ctf-agent-public"
           toolchain="ghcr.io/$owner/ctf-agent-public-toolchain"
           fingerprint="$(sha256sum Dockerfile.toolchain toolchain.lock requirements.txt requirements-ctf.txt deploy/DecompileAll.java deploy/DecompileFn.java | sha256sum | cut -d' ' -f1)"
-          toolchain_tag="$toolchain:toolchain-4-$fingerprint"
+          toolchain_version="$(sed -n 's/^toolchain_version=//p' toolchain.lock)"
+          [[ "$toolchain_version" =~ ^[1-9][0-9]*$ ]]
+          toolchain_tag="$toolchain:toolchain-$toolchain_version-$fingerprint"
           app_tag="$app:$BUILD_SHA"
 
           retry_once() {

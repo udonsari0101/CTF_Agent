@@ -11,6 +11,13 @@ ARG PWNDBG_VERSION=2026.10.22
 ARG PWNDBG_SHA256=7888bb986d63fc230d29fa96bdf6152b9ce123b2a3b1f333d31f80684363848a
 ARG WEBSOCAT_VERSION=1.14.1
 ARG WEBSOCAT_SHA256=66f8dd3a0394761556339117f8bb5123bddefd44e087af2a72ec22b0bd08d514
+ARG GORESYM_VERSION=3.4.1
+ARG GORESYM_SHA256=a557124857f95a589f8ce3525119c2d18c7c7fc7c4225c92ff94e3effb38748d
+# seccomp-tools 1.7.1 uses Ruby syntax unsupported by bookworm's Ruby 3.1.
+ARG SECCOMP_TOOLS_VERSION=1.6.1
+ARG SECCOMP_TOOLS_SHA256=43e9dbbe6ad7e148263199f8e3b6cdf409fbcce5a8f6d6f20530d257fcf2bf6c
+ARG OS_GEM_VERSION=1.1.4
+ARG OS_GEM_SHA256=57816d6a334e7bd6aed048f4b0308226c5fb027433b67d90a9ab435f35108d3f
 ARG JDK21_VERSION=21.0.13_9
 ARG JDK21_SHA256=d7f5d5cf865a2902b70ff549b97586a7d3f234e016f041ab447ea740c7d66d1c
 ARG GHIDRA_VERSION=12.1.4
@@ -27,7 +34,7 @@ RUN apt-get update \
         dnsutils ffmpeg file fonts-liberation fonts-noto-cjk foremost gdb gdb-multiarch gdbserver git john jq \
         libffi-dev libgmp-dev libimage-exiftool-perl libmagic1 \
         libmpfr-dev libssl-dev ltrace mediainfo multimon-ng netcat-openbsd nmap openssl p7zip-full pari-gp patchelf \
-        pkg-config pngcheck poppler-utils procps qemu-system-x86 qemu-user ripgrep sleuthkit sqlmap \
+        pkg-config pngcheck poppler-utils procps qemu-system-x86 qemu-user ripgrep ruby ruby-dev sleuthkit sqlmap \
         socat sox steghide strace tesseract-ocr testdisk tshark tmux unzip wabt whois xxd xz-utils yara zbar-tools \
     && curl --fail --silent --show-error --location --retry 3 \
         --output /tmp/radare2.deb \
@@ -56,7 +63,29 @@ RUN apt-get update \
         "https://github.com/vi/websocat/releases/download/v${WEBSOCAT_VERSION}/websocat.x86_64-unknown-linux-musl" \
     && echo "${WEBSOCAT_SHA256}  /tmp/websocat" | sha256sum --check --strict \
     && install -o root -g root -m 0555 /tmp/websocat /usr/local/bin/websocat \
-    && rm -f /tmp/radare2.deb /tmp/ffuf.tar.gz /tmp/ffuf /tmp/LICENSE /tmp/stegseek.deb /tmp/pwndbg.deb /tmp/websocat \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/goresym.zip \
+        "https://github.com/mandiant/GoReSym/releases/download/v${GORESYM_VERSION}/GoReSym-linux.zip" \
+    && echo "${GORESYM_SHA256}  /tmp/goresym.zip" | sha256sum --check --strict \
+    && unzip -p /tmp/goresym.zip GoReSym > /tmp/GoReSym \
+    && install -o root -g root -m 0555 /tmp/GoReSym /usr/local/bin/GoReSym \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/os.gem \
+        "https://rubygems.org/downloads/os-${OS_GEM_VERSION}.gem" \
+    && echo "${OS_GEM_SHA256}  /tmp/os.gem" | sha256sum --check --strict \
+    && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/seccomp-tools.gem \
+        "https://rubygems.org/downloads/seccomp-tools-${SECCOMP_TOOLS_VERSION}.gem" \
+    && echo "${SECCOMP_TOOLS_SHA256}  /tmp/seccomp-tools.gem" | sha256sum --check --strict \
+    && gem install --local --no-document /tmp/os.gem \
+    && gem install --local --no-document /tmp/seccomp-tools.gem \
+    && seccomp-tools --version | grep -F "Version ${SECCOMP_TOOLS_VERSION}" \
+    && GoReSym /usr/local/bin/GoReSym > /tmp/goresym-self.json \
+    && grep -Fq '"Arch": "amd64"' /tmp/goresym-self.json \
+    && apt-get purge --yes ruby-dev ruby3.1-dev \
+    && apt-get autoremove --yes --purge \
+    && rm -f /tmp/radare2.deb /tmp/ffuf.tar.gz /tmp/ffuf /tmp/LICENSE /tmp/stegseek.deb /tmp/pwndbg.deb /tmp/websocat /tmp/goresym.zip /tmp/GoReSym /tmp/goresym-self.json /tmp/os.gem /tmp/seccomp-tools.gem \
+    && rm -rf /var/lib/gems/*/cache/* \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \

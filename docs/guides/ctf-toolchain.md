@@ -29,6 +29,13 @@ This repository and its deployment workflow target amd64.
 Pwndbg 2026.10.22 is installed from its verified upstream Debian package and
 provides the separate `pwndbg` debugger command. Websocat 1.14.1 is installed
 from its verified static Linux release for interactive WebSocket problems.
+GoReSym 3.4.1 is installed from its verified Linux release for Go symbol and
+type recovery. `seccomp-tools` 1.6.1 and its `os` dependency are installed
+from SHA-256-verified Ruby gems. The newer 1.7.1 gem was rejected after a
+runtime check reproduced a Ruby syntax error on Debian 12's Ruby 3.1. Static
+`disasm`/`emu` work without ptrace; `dump` needs ptrace and may be denied by
+the host's container policy. These tools are selected from the challenge's
+observed format and constraints, not run for every problem.
 
 Native decompilation uses Ghidra 12.1.4 headless with Temurin JDK 21; Android
 and JVM bytecode decompilation uses JADX 1.5.6. All three upstream archives are
@@ -113,15 +120,16 @@ operations needed by Codex's workspace-write path; see
 
 The playbooks' installed first paths are: ffuf/curl/Python httpx for web;
 PARI/GP, fpylll, gmpy2, SymPy, Z3, PyCryptodome and owiener for crypto;
-pwntools, ROPgadget, ropper, GDB/pwndbg, QEMU user/system and Ghidra for
+pwntools, ROPgadget, ropper, GDB/pwndbg, seccomp-tools, QEMU user/system,
+GoReSym and Ghidra for
 pwn/reverse; and Binwalk, ExifTool, pngcheck, Pillow, StegSeek, Steghide,
 Sleuth Kit, TShark, Volatility 3 and John for forensics. The image does not
 bundle a web or password wordlist. The playbooks construct small,
 challenge-derived lists before using ffuf or a password cracker.
 
 Optional extras outside the core image include SageMath, RsaCtfTool,
-roca-detect, cvc5, Foundry, Python web3, REA, ILSpy/ilspycmd, GoReSym,
-Il2CppDumper, Blutter, AFL++, one_gadget, seccomp-tools, bkcrack, zsteg,
+roca-detect, cvc5, Foundry, Python web3, REA, ILSpy/ilspycmd,
+Il2CppDumper, Blutter, AFL++, one_gadget, bkcrack, zsteg,
 hashcat, outguess, ImageMagick, Aircrack-ng, specialized web scanners,
 and deep-learning frameworks such as PyTorch/Transformers. Their absence
 does not imply the corresponding category is unsupported: each playbook now

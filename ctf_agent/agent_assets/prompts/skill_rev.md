@@ -21,7 +21,7 @@ nm -C ./chal 2>/dev/null | head           # symbols, or none = stripped
 ### Language ID drives the entire toolchain
 | Signal | Lang | Tool |
 |---|---|---|
-| `runtime.`, `go:buildid`, `GOROOT`; giant static bin | Go | **GoReSym** restores names/types; read `main.main`/`main.check`; compares via `runtime.memequal`. Go strings are `{ptr,len}` (not NUL-terminated) so `strings` smears adjacent literals together — take the length from GoReSym/the slice header, don't trust the `strings` split |
+| `runtime.`, `go:buildid`, `GOROOT`; giant static bin | Go | Installed **GoReSym** restores names/types: `GoReSym -human ./chal` for fast triage, `GoReSym -t ./chal > tmp/go-symbols.json` when types matter. Read `main.main`/`main.check`; compare via `runtime.memequal`. Go strings are `{ptr,len}` (not NUL-terminated) so `strings` smears adjacent literals together — take the length from GoReSym/the slice header, don't trust the `strings` split |
 | `core::panicking`, `rustc`, `_ZN` mangling | Rust | `rustfilt` to demangle; panic strings leak logic/paths |
 | `mscoree`/`mscorlib`, CLR header, UTF-16 | .NET/C# | The image has no ILSpy/`ilspycmd`, dnSpy or de4dot. Start with installed `file`, `strings -e l` and `r2` to locate metadata and the relevant method; acquire a compatible .NET decompiler for this job if near-source is needed. Treat deobfuscation as conditional, not mandatory. |
 | `_Z` mangling, vtables, `std::` | C++ | `c++filt`/`nm -C`; expect STL-heavy control flow |
@@ -31,7 +31,7 @@ nm -C ./chal 2>/dev/null | head           # symbols, or none = stripped
 | `libapp.so`/`libflutter.so`, `kDart` | Flutter/Dart | **Blutter** (build it for the *exact* Dart/Flutter version) recovers Dart classes/methods |
 | wasm magic `\0asm` | WASM | `wasm2wat`, or run under node and hook |
 
-GoReSym, Il2CppDumper, Blutter, procyon and cfr in the table are also optional; the preinstalled paths are Ghidra headless, JADX, Apktool, radare2, GDB, WABT and Python analysis libraries. Check availability before selecting a specialized path. **dogbolt.org** runs many decompilers at once — diff them when one emits garbage. Every decompiler's output is an **UNTRUSTED hypothesis**: a wrong signature/cast/implicit type silently corrupts the logic. Confirm the algorithm dynamically (`ltrace`/gdb) before you transcribe any constant or branch into a solver.
+Il2CppDumper, Blutter, procyon and cfr in the table are optional; the preinstalled paths are GoReSym, Ghidra headless, JADX, Apktool, radare2, GDB, WABT and Python analysis libraries. Check availability before selecting a specialized path. **dogbolt.org** runs many decompilers at once — diff them when one emits garbage. Every decompiler's output is an **UNTRUSTED hypothesis**: a wrong signature/cast/implicit type silently corrupts the logic. Confirm the algorithm dynamically (`ltrace`/gdb) before you transcribe any constant or branch into a solver.
 
 ## Find the decision point — work backward from the verdict
 Highest-leverage move: xref the success/failure string; the function that branches to it is the check.
