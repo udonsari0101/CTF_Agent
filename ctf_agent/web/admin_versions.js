@@ -1,9 +1,11 @@
 // Read-only CLI version overview. Installing a version requires the explicit
-// controls in the Agent page.
+// controls in the Agent page. The TTL covers the registry lookup only: the
+// local runtime is read on every entry, so an install never shows the old version.
 const SUCCESS_TTL_MS = 5 * 60 * 1000;
 const FAILURE_RETRY_MS = 30 * 1000;
 const SOURCES = [{name:'Codex',key:'codex'}, {name:'Claude Code',key:'claude'}];
 let cacheScope = '';
+let activeLanguageListener = null;
 const cache = new Map();
 
 function entry(key) {
@@ -34,19 +36,17 @@ function fetchVersion(api,key,kind,force=false) {
 
 export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) {
   if (cacheScope !== scope) { cache.clear(); cacheScope = scope; }
-  const en = locale === 'en';
+  const english = () => (globalThis.ctfI18n?.locale || locale) === 'en';
   const heading = document.createElement('div');
   heading.className = 'release-update-head';
   const title = document.createElement('h2');
-  title.textContent = en ? 'Agent CLI versions' : '에이전트 CLI 버전';
   const refresh = document.createElement('button');
   refresh.type = 'button';
   refresh.className = 'small ghost';
-  refresh.textContent = en ? 'Refresh' : '새로고침';
   const manage = document.createElement('a');
   manage.href = '#accounts';
   manage.className = 'button-link small';
-  manage.textContent = en ? 'Update agent CLI' : '에이전트 CLI 업데이트';
+  manage.addEventListener('click',() => { globalThis.ctfAccountsTarget = 'runtime'; });
   heading.append(title,manage,refresh);
   container.replaceChildren(heading);
   const rows = new Map();
@@ -66,6 +66,10 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
 
   function paint() {
     if (!container.isConnected) return;
+    const en = english();
+    title.textContent = en ? 'Agent CLI versions' : '에이전트 CLI 버전';
+    refresh.textContent = en ? 'Refresh' : '새로고침';
+    manage.textContent = en ? 'Update agent CLI' : '에이전트 CLI 업데이트';
     for (const source of SOURCES) {
       const current = entry(`${source.key}:current`);
       const latest = entry(`${source.key}:latest`);
@@ -79,18 +83,28 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
         : failures.length ? (en ? 'Lookup failed' : '조회 실패') +
           (current.checkedAt || latest.checkedAt ? (en ? ' · showing previous result' : ' · 이전 결과 표시') : '')
         : current.checkedAt || latest.checkedAt ? (en ? 'Checked' : '조회 완료') : (en ? 'Waiting' : '대기');
-      row.status.title = failures.map(item => item.error).join(' / ');
+      row.status.title = failures.map(item => globalThis.ctfI18n?.t(item.error) ?? item.error).join(' / ');
     }
     refresh.disabled = SOURCES.some(source => entry(`${source.key}:current`).pending || entry(`${source.key}:latest`).pending);
     refresh.setAttribute('aria-busy',String(refresh.disabled));
   }
 
   function load(force=false) {
-    const requests = SOURCES.flatMap(source => [fetchVersion(api,source.key,'current',force),fetchVersion(api,source.key,'latest',force)]);
+    const requests = SOURCES.flatMap(source => [fetchVersion(api,source.key,'current',true),fetchVersion(api,source.key,'latest',force)]);
     paint();
     for (const request of requests) request.then(paint);
   }
   refresh.addEventListener('click',() => load(true));
+  const onLanguageChanged = () => {
+    if (container.isConnected) paint();
+    else {
+      document.removeEventListener('ctf-language-changed',onLanguageChanged);
+      if (activeLanguageListener === onLanguageChanged) activeLanguageListener = null;
+    }
+  };
+  if (activeLanguageListener) document.removeEventListener('ctf-language-changed',activeLanguageListener);
+  activeLanguageListener = onLanguageChanged;
+  document.addEventListener('ctf-language-changed',onLanguageChanged);
   paint();
   // Slow/offline registries never block the administrator page.
   load();

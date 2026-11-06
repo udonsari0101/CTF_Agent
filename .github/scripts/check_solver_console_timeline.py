@@ -100,7 +100,8 @@ const solverIsActive=()=>true;
 const solverJobId=j=>j?.id||'';
 const solverCollapsedAgentIds=new Set(),solverConsoleCardStates=new Map();
 let solverConsoleAgentId='root',solverConsoleFollowLatest=true,solverLogExpanded=false;
-let solverConsoleDialog=null,solverGuidanceDraft='';
+let solverConsoleDialog=null,solverGuidanceDraft='',currentWorkspace=null;
+const paintUploads=()=>{};
 let currentChallenge={name:'Example'},currentSolverJob={id:'job-1',provider:'claude',phase:'running',agents:[]};
 let currentSolverEvents=[
  {kind:'activity',sequence:1,activity_id:'a'.repeat(32),phase:'started',tool:'shell',summary:'Run solver',command:'python solver.py',created_at:1},

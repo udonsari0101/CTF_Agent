@@ -1,11 +1,14 @@
 .account-management { --account-control-height: 40px; }
-.account-management button, .account-create input, .account-create select, .account-list form.account-api-key input { box-sizing: border-box; min-height: var(--account-control-height); padding-block: 0; line-height: 1.2; }
+.account-management button, .account-create input, .account-create select, .account-list form.account-api-key input, .account-list form.auth-upload input { box-sizing: border-box; min-height: var(--account-control-height); padding-block: 0; line-height: 1.2; }
 .account-management > p { color: var(--muted); line-height: 1.7; }
 .account-management .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 1.3rem; min-width: 0; }
 .account-management .account-create { display: flex; align-items: center; gap: .7rem; flex-wrap: wrap; margin: 1.4rem 0 .5rem; }
 .account-create input { flex: 1; min-width: 190px; }
 .account-create button { background: var(--accent); color: #10200d; font-weight: 700; }
 .account-management .notice { color: #f3c38e; }
+.account-management .notice.error-notice { color: #ffc2c9; }
+.account-list .notice, .account-runtime .notice { margin: .65rem 0 0; }
+.account-management .notice, .account-management .account-runtime { scroll-margin-block: 16px; }
 .account-management .notice:empty, .account-management .notice[hidden] { display: none; margin: 0; padding: 0; border: 0; }
 .account-list .model-help { color: var(--muted); font-size: .85rem; }
 .account-list .model-help p { margin: .35rem 0; }
@@ -26,6 +29,8 @@
 .account-list .auth-upload label { flex: 1 1 210px; }
 .account-list form.auth-upload { align-items: flex-end; }
 .account-list form.auth-upload button { align-self: flex-end; flex: 0 0 auto; }
+.account-list form.auth-upload input { height: var(--account-control-height); padding-block: 5px; }
+.account-list form.auth-upload input::file-selector-button { box-sizing: border-box; height: 28px; margin-block: 0; padding-block: 0; }
 .account-list .claude-login-guide { margin: .8rem 0; padding: .8rem 1rem; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
 .account-list .claude-login-guide p { margin: .35rem 0; }
 .account-list .claude-login-link { display: flex; align-items: center; flex-wrap: wrap; gap: .6rem; min-width: 0; }
@@ -56,6 +61,7 @@
 .account-runtime .runtime-provider + .runtime-provider { border-top: 1px solid var(--border); margin-top: 1.5rem; padding-top: 1.5rem; }
 .account-runtime h3 { margin: 0 0 .6rem; }
 .account-runtime p { color: var(--muted); margin: .4rem 0 .7rem; }
+.account-runtime p.error-text { color: #ff9eaa; }
 .account-runtime .runtime-controls { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
 .account-runtime .runtime-controls input { flex: 1 1 220px; min-width: 0; max-width: 350px; margin: 0; }
 .account-runtime .runtime-controls button { margin: 0; }
@@ -65,4 +71,11 @@
 .account-runtime progress { display: block; width: min(100%, 350px); height: 5px; margin: .35rem 0 1rem; accent-color: var(--accent); }
 @keyframes runtime-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .account-runtime .runtime-progress::before { animation: none; } }
-@media (max-width: 620px) { .account-create > * { width: 100%; } .account-management .card { padding: 1rem; } .account-list .model-fields { grid-template-columns: 1fr; } .account-list .actions button { flex: 1 1 130px; } }
+@media (max-width: 620px) { .account-create > * { width: 100%; } .account-management .card { padding: 1rem; } .account-list .model-fields { grid-template-columns: 1fr; } .account-list .actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); } }
+@media (max-width: 800px) { .account-management .notice, .account-management .account-runtime { scroll-margin-top: 130px; } }
+@media (max-width: 500px) {
+  .challenge-table.admin-user-table, .admin-user-table thead, .admin-user-table tbody { display: block; }
+  .admin-user-table tr { display: grid; grid-template-columns: minmax(0,1.2fr) 88px minmax(0,1fr); }
+  .admin-user-table th:last-child { display: none; }
+  .admin-user-table td:last-child { grid-column: 1 / -1; padding-top: 0; border-top: 0; }
+}

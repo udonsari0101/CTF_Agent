@@ -1,6 +1,6 @@
 const sourceText = new WeakMap();
 const sourceAttributes = new WeakMap();
-const excluded = 'script,style,textarea,pre,code,.markdown-preview,.solver-console,[data-i18n-ignore]';
+const excluded = 'script,style,textarea,pre,code,.markdown-preview,[data-i18n-ignore]';
 
 function storedLanguage() {
   try {
@@ -50,17 +50,46 @@ class Localizer {
     });
   }
 
+  // Language packs are plain objects, so a name such as constructor or __proto__
+  // must only ever match a key the pack really defines.
+  message(key) {
+    return Object.hasOwn(this.messages, key) && typeof this.messages[key] === 'string' ? this.messages[key] : null;
+  }
+
+  // A key with {n} covers any count. A "one|other" value picks the plural form.
+  counted(source) {
+    const number = /\d+/.exec(source)?.[0];
+    const template = number ? this.message(source.replace(number, '{n}')) : null;
+    return template === null ? null : this.plural(template, number);
+  }
+
+  plural(template, count) {
+    const forms = template.split('|');
+    return forms[String(count) === '1' ? 0 : forms.length - 1].replaceAll('{n}', () => count);
+  }
+
+  // The page observer stops here. It cannot tell a label from a name, so it never
+  // looks inside a longer string.
+  lookup(source) {
+    return this.message(source) ?? this.counted(source);
+  }
+
   t(source) {
-    if (this.messages[source]) return this.messages[source];
-    if (this.locale === 'en') {
-      let match = /^(\d+)개 문제$/.exec(source);
-      if (match) return `${match[1]} challenges`;
-      match = /^문제 (\d+)$/.exec(source);
-      if (match) return `${match[1]} challenges`;
-      match = /^(\d+)개 작업 중$/.exec(source);
-      if (match) return `${match[1]} running`;
-    }
-    return source;
+    if (typeof source !== 'string') return source == null ? '' : String(source);
+    const found = this.lookup(source);
+    if (found !== null || !source.includes(' · ')) return found ?? source;
+    // " · " joins labels that translate on their own. One unknown part means the
+    // text holds data such as a name, URL or size, and all of it stays as it is.
+    const parts = source.split(' · ').map(part => this.lookup(part));
+    return parts.includes(null) ? source : parts.join(' · ');
+  }
+
+  // Values go in after the lookup and in one pass, so they are never matched
+  // against a key or expanded again. {n} also picks the plural form.
+  format(source, values = {}) {
+    const template = this.message(source) ?? source;
+    const counted = Object.hasOwn(values, 'n') ? this.plural(template, values.n) : template;
+    return counted.replace(/\{(\w+)\}/g, (hole, name) => Object.hasOwn(values, name) ? String(values[name]) : hole);
   }
 
   async setLocale(locale) {
@@ -85,7 +114,7 @@ class Localizer {
     const previous = sourceText.get(node);
     const original = previous && current === previous.output ? previous.original : current;
     const match = /^(\s*)(.*?)(\s*)$/s.exec(original);
-    const output = match ? match[1] + this.t(match[2]) + match[3] : original;
+    const output = match ? match[1] + (this.lookup(match[2]) ?? match[2]) + match[3] : original;
     sourceText.set(node, {original, output});
     if (current !== output) node.nodeValue = output;
   }
@@ -97,7 +126,7 @@ class Localizer {
       if (!element.hasAttribute(name)) continue;
       const current = element.getAttribute(name);
       const original = previous[name]?.output === current ? previous[name].original : current;
-      const output = this.t(original);
+      const output = this.lookup(original) ?? original;
       previous[name] = {original, output};
       if (current !== output) element.setAttribute(name, output);
     }

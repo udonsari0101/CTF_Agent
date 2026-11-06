@@ -38,6 +38,7 @@ def main() -> int:
         return 0
     implementation = "\n".join((
         section("function solverConfigurationMatchesVisibleForm()", "function solverUltraEscalationEligible()"),
+        section("function solverMorphKey(", "function solverGuidanceHistoryMarkup("),
         section("function replaceSolverPanelPreservingConfiguration(", "function paintSolver("),
         section("function repaintSolverConfiguration(", "async function loadSolverConfiguration("),
     ))

@@ -52,6 +52,7 @@ const ctfdJobMarkupCache=new WeakMap();
 let ctfdJobsPollTimer=null,ctfdJobsRequestGeneration=0,currentWorkspace={id:'w'};
 let importPreview=null;
 let refreshCount=0, jobs=[];
+const i18n={locale:'ko',t:value=>value,format:(value,values)=>value.replace(/\\{(\\w+)\\}/g,(hole,name)=>values[name]??hole)};
 const esc=x=>String(x??'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
 const size=x=>String(x)+' B';
 const importErrors=xs=>xs.map(x=>esc(x.message)).join(' ');

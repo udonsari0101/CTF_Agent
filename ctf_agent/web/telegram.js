@@ -1,4 +1,4 @@
-const i18n = globalThis.ctfI18n || {locale:'ko',t:value=>value};
+const i18n = globalThis.ctfI18n || {locale:'ko',t:value=>value,format:(value,values) => value.replace(/\{(\w+)\}/g,(hole,name) => values[name] ?? hole)};
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
@@ -13,7 +13,7 @@ async function copyText(value) {
       const writing = navigator.clipboard.writeText(text);
       await Promise.race([
         writing,
-        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('클립보드 응답이 지연되었습니다.')), 1200); }),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(i18n.t('클립보드 응답이 지연되었습니다.'))), 1200); }),
       ]);
       return 'unverified';
     } catch { /* The link remains available for manual copying. */ }
@@ -47,6 +47,8 @@ function dateText(value) {
 export async function renderTelegram(container, api) {
   let active = true;
   let link = null;
+  let painted = null;
+  let notice = ['',false];
   let pollTimer = null;
 
   const stopPolling = () => {
@@ -55,6 +57,7 @@ export async function renderTelegram(container, api) {
   };
 
   const message = (text = '', error = false) => {
+    notice = [text,error];
     const node = container.querySelector('[data-telegram-notice]');
     if (!node) return;
     node.textContent = text;
@@ -91,6 +94,7 @@ export async function renderTelegram(container, api) {
   };
 
   const paint = state => {
+    painted = state;
     const configured = state.configured;
     const linked = state.linked;
     const unavailable = state.configuration_error
@@ -104,7 +108,7 @@ export async function renderTelegram(container, api) {
           <button type="button" class="small ghost icon-action" data-telegram-action="copy-link" aria-label="Telegram 연결 링크 복사" title="Telegram 연결 링크 복사">⧉</button>
           <button type="button" class="small ghost icon-action" data-telegram-action="refresh" aria-label="Telegram 연결 확인" title="Telegram 연결 확인">↻</button>
         </div>
-        <small>${escapeHtml(dateText(link.expires_at))}까지 유효</small>
+        <small>${escapeHtml(i18n.format('{time}까지 유효',{time:dateText(link.expires_at)}))}</small>
       </div>` : '';
     container.innerHTML = `
       <div class="section-head"><div><h2>Telegram 알림</h2></div><span class="connection-state ${linked ? 'connected' : ''}">${i18n.t(linked ? '연결됨' : '연결 안 됨')}</span></div>
@@ -157,14 +161,14 @@ export async function renderTelegram(container, api) {
         const state = await load();
         if (state && !state.linked) message('아직 봇 인증을 기다리고 있습니다.');
       } else if (action === 'delete-bot') {
-        if (!window.confirm('이 봇과 Telegram 연결, 대기 중인 알림을 삭제할까요?')) return;
+        if (!window.confirm(i18n.t('이 봇과 Telegram 연결, 대기 중인 알림을 삭제할까요?'))) return;
         stopPolling();
         link = null;
         const state = await api('/api/telegram/bot', {method:'DELETE'});
         paint(state);
         message('봇 토큰을 삭제했습니다.');
       } else if (action === 'unlink') {
-        if (!window.confirm('이 Telegram 연결과 대기 중인 알림을 해제할까요?')) return;
+        if (!window.confirm(i18n.t('이 Telegram 연결과 대기 중인 알림을 해제할까요?'))) return;
         stopPolling();
         link = null;
         const state = await api('/api/telegram', {method:'DELETE'});
@@ -236,10 +240,25 @@ export async function renderTelegram(container, api) {
     }
   });
 
+  // paint() rebuilds the forms, so typed values and focus are carried over.
+  const onLanguageChanged = () => {
+    if (!active || !container.isConnected || !painted) return;
+    const values = [...container.querySelectorAll('input[name]')].map(input => [input.name,input.value]);
+    const focused = container.contains(document.activeElement) ? document.activeElement.name : '';
+    paint(painted);
+    for (const [name,value] of values) {
+      const input = container.querySelector(`input[name="${name}"]`);
+      if (input) input.value = value;
+    }
+    if (focused) container.querySelector(`input[name="${focused}"]`)?.focus({preventScroll:true});
+    message(...notice);
+  };
+  document.addEventListener('ctf-language-changed',onLanguageChanged);
   container.innerHTML = '<p class="muted">Telegram 설정을 불러오는 중입니다…</p>';
   await load();
   return () => {
     active = false;
     stopPolling();
+    document.removeEventListener('ctf-language-changed',onLanguageChanged);
   };
 }

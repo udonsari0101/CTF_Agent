@@ -40,14 +40,25 @@ def main() -> int:
 <pre id="result">PENDING</pre><script>
 """ + implementation + """
 const root=document.querySelector('#root');
+const nativeAdd=document.addEventListener.bind(document), nativeRemove=document.removeEventListener.bind(document);
+const languageListeners=new Set();
+document.addEventListener=(type,listener,...options)=>{
+ if(type==='ctf-language-changed') languageListeners.add(listener);
+ return nativeAdd(type,listener,...options);
+};
+document.removeEventListener=(type,listener,...options)=>{
+ if(type==='ctf-language-changed') languageListeners.delete(listener);
+ return nativeRemove(type,listener,...options);
+};
 const tick=()=>new Promise(resolve=>setTimeout(resolve,0));
-let calls=[],offline=false,hold=false,resolvers=[];
+let calls=[],offline=false,hold=false,resolvers=[],codexCurrent='0.164.0';
+const catalogs=()=>calls.filter(url=>url.endsWith('/catalog')).length;
 const api=url=>{
  calls.push(url);
  if(hold && url.endsWith('/catalog')) return new Promise(resolve=>resolvers.push([url,resolve]));
  if(offline && url.endsWith('/catalog')) return Promise.reject(new Error('offline'));
  return Promise.resolve(url.endsWith('/catalog')?{latest:url.includes('/codex/')?'0.166.0':'2.1.310'}:
-  {version:url.includes('/codex/')?'0.164.0':'2.1.300'});
+  {version:url.includes('/codex/')?codexCurrent:'2.1.300'});
 };
 (async()=>{
  const first=document.querySelector('#versions');
@@ -56,28 +67,33 @@ const api=url=>{
  await tick();await tick();
  const firstResult=first.textContent.includes('현재 0.164.0 · 최신 0.166.0')
   &&first.textContent.includes('현재 2.1.300 · 최신 2.1.310')&&calls.length===4;
+ // Re-entry keeps the registry result but reads the local runtime again,
+ // so an install is visible without waiting for the registry TTL.
+ codexCurrent='0.166.0';
  const second=document.createElement('section');root.replaceChildren(second);
  renderAdminCliVersions(second,api,{scope:'admin-a'});
- const cached=second.textContent.includes('최신 0.166.0')&&calls.length===4;
+ await tick();await tick();
+ const cached=second.textContent.includes('현재 0.166.0 · 최신 0.166.0')&&catalogs()===2&&calls.length===6;
  offline=true;second.querySelector('button').click();await tick();await tick();
- const offlineResult=calls.length===8&&second.textContent.includes('최신 0.166.0')
+ const offlineResult=catalogs()===4&&second.textContent.includes('최신 0.166.0')
   &&second.textContent.includes('조회 실패 · 이전 결과 표시')&&!second.querySelector('button').disabled;
  const third=document.createElement('section');root.replaceChildren(third);
  renderAdminCliVersions(third,api,{scope:'admin-a'});
- await tick();
- const backoff=calls.length===8&&third.textContent.includes('이전 결과 표시');
+ await tick();await tick();
+ const backoff=catalogs()===4&&third.textContent.includes('이전 결과 표시');
  offline=false;hold=true;
  const fourth=document.createElement('section');root.replaceChildren(fourth);
  renderAdminCliVersions(fourth,api,{scope:'admin-b',locale:'en'});
  await tick();
- const beforeReentry=calls.length===12&&fourth.textContent.includes('Checking');
+ const beforeReentry=catalogs()===6&&fourth.textContent.includes('Checking');
  const fifth=document.createElement('section');root.replaceChildren(fifth);
  renderAdminCliVersions(fifth,api,{scope:'admin-b',locale:'en'});
  await tick();
- const deduplicated=calls.length===12;
+ const deduplicated=catalogs()===6;
  for(const [url,resolve] of resolvers) resolve({latest:url.includes('/codex/')?'0.166.0':'2.1.310'});
  await tick();await tick();
  const result=nonblocking&&firstResult&&cached&&offlineResult&&backoff&&beforeReentry&&deduplicated
+  &&languageListeners.size===1
   &&fifth.textContent.includes('Latest 0.166.0')&&!calls.some(url=>url.endsWith('/update'));
  document.querySelector('#result').textContent=result?'PASS':'FAIL '+JSON.stringify({nonblocking,firstResult,cached,offlineResult,backoff,beforeReentry,deduplicated,calls,text:fifth.textContent});
 })().catch(error=>{document.querySelector('#result').textContent='ERROR '+error.stack});

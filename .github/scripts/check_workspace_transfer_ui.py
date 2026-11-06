@@ -296,8 +296,9 @@ def run_dom_check():
                 page.get_by_text("가져오기 미리보기").wait_for()
                 assert page.locator('[data-action="confirm-transfer-import"]').is_enabled()
                 page.locator('[data-action="cancel-transfer-upload"]').click()
+                # The panel clears after the DELETE response resolves in the page.
+                page.locator("#transfer-preview").wait_for(state="hidden")
                 assert state["deletes"] == 1
-                assert page.locator("#transfer-preview").is_hidden()
                 assert page.evaluate("Object.keys(localStorage).filter(key => key.startsWith('ctf-transfer:')).length") == 0
                 page.locator('[data-action="start-transfer-upload"]').click()
                 page.get_by_text("가져오기 미리보기").wait_for()

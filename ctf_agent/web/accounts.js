@@ -1,4 +1,5 @@
-const i18n = globalThis.ctfI18n || {locale:'ko',t:value=>value};
+const i18n = globalThis.ctfI18n || {locale:'ko',t:value=>value,format:(value,values) => value.replace(/\{(\w+)\}/g,(hole,name) => values[name] ?? hole)};
+const localized = (ko, en) => i18n.locale === 'en' ? en : ko;
 
 const el = (tag, text, className) => {
   const node = document.createElement(tag);
@@ -6,6 +7,25 @@ const el = (tag, text, className) => {
   if (className) node.className = className;
   return node;
 };
+
+// Names, models and account details: the page translator must not treat them as labels.
+const dataEl = (tag, text, className) => {
+  const node = el(tag, text, className);
+  node.setAttribute('data-i18n-ignore', '');
+  return node;
+};
+
+function createNotice() {
+  const node = el('p', '', 'notice');
+  node.setAttribute('role', 'status');
+  node.setAttribute('aria-live', 'polite');
+  node.hidden = true;
+  return {node, set(text, isError = false) {
+    node.textContent = text;
+    node.hidden = !text.trim();
+    node.classList.toggle('error-notice', isError && !node.hidden);
+  }};
+}
 
 async function copyText(value) {
   const text = String(value ?? '');
@@ -16,7 +36,7 @@ async function copyText(value) {
       const writing = navigator.clipboard.writeText(text);
       await Promise.race([
         writing,
-        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('클립보드 응답이 지연되었습니다.')), 1200); }),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(i18n.t('클립보드 응답이 지연되었습니다.'))), 1200); }),
       ]);
       return 'unverified';
     } catch { /* The text remains available for manual copying. */ }
@@ -56,6 +76,26 @@ const quotaLimitLabels = {
   workspace_owner_usage_limit_reached: '워크스페이스 소유자 사용 한도에 도달했습니다.',
   workspace_member_usage_limit_reached: '워크스페이스 사용자 사용 한도에 도달했습니다.',
 };
+
+// Providers report computed windows such as 90분 or Opus 7일, so the language
+// pack cannot list every label.
+const windowUnits = {일:'day', 시간:'hour', 분:'minute'};
+function quotaWindowLabel(label) {
+  const text = String(label ?? '');
+  const translated = i18n.t(text);
+  const match = i18n.locale === 'en' && translated === text && /^(.*?)([\d.]+)(일|시간|분)$/.exec(text);
+  return match ? `${match[1]}${match[2]} ${windowUnits[match[3]]}${match[2] === '1' ? '' : 's'}` : translated;
+}
+
+const VERSION_FORMAT = /^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$/;
+const runtimeStatusLabels = {installing:'설치 중', verifying:'검증 중', completed:'업데이트 완료', failed:'업데이트 실패', interrupted:'업데이트 중단'};
+const runtimeBusy = info => ['installing', 'verifying'].includes(info?.operation?.status);
+const runtimeSources = [
+  {key:'codex', name:'Codex', title:'Codex 업데이트', adminOnly:'Codex 업데이트는 관리자만 실행할 수 있습니다.',
+    placeholder:'버전 (예: 0.164.0)', versionLabel:'설치할 Codex 버전', latestMissing:'최신 Codex 버전을 확인하지 못했습니다.'},
+  {key:'claude', name:'Claude Code', title:'Claude Code 업데이트', adminOnly:'Claude Code 업데이트는 관리자만 실행할 수 있습니다.',
+    placeholder:'버전 (예: 2.1.310)', versionLabel:'설치할 Claude Code 버전', latestMissing:'최신 Claude Code 버전을 확인하지 못했습니다.'},
+];
 
 const proIdentity = identity => [identity?.planType,identity?.subscriptionType]
   .some(value => String(value || '').toLowerCase().split(/[^a-z0-9]+/).includes('pro'));
@@ -103,6 +143,9 @@ export function quotaDisplayState(account) {
 }
 
 export async function renderAccounts(container, api, options = {}) {
+  // Set by the #admin 'Update agent CLI' link: land on the update controls.
+  const revealRuntime = globalThis.ctfAccountsTarget === 'runtime';
+  delete globalThis.ctfAccountsTarget;
   container.replaceChildren();
   const shell = el('section', undefined, 'account-management');
   container.append(shell);
@@ -120,17 +163,17 @@ export async function renderAccounts(container, api, options = {}) {
     returnButton.addEventListener('click', options.onReturnToChallenge);
     returnActions.append(returnButton);
   }
-  const feedback = el('p', '', 'notice');
-  feedback.setAttribute('role', 'status');
-  feedback.setAttribute('aria-live', 'polite');
-  feedback.hidden = true;
-  const setFeedback = text => { feedback.textContent = text; feedback.hidden = !text.trim(); };
+  // Background usage status stays apart from the action notices, so neither
+  // can erase the other. Action results appear beside the control that failed.
+  const usageStatus = createNotice();
+  const feedback = createNotice();
   const errorText = error => {
     const providerCode = String(error.provider_code || '').toUpperCase();
     const policy = error.code === 'policy_security' || error.category === 'policy_security' || /^(TAC|CVP)(?:[-_]|$)/.test(providerCode);
-    return [error.message || '요청에 실패했습니다.', providerCode,
-      error.stage && `단계: ${error.stage}`, error.retryable === false && '자동 재시도하지 않습니다.',
-      policy && '보안 작업 정책 제한입니다. 다른 모델을 선택하거나 계정 권한을 확인하세요.'].filter(Boolean).join(' · ');
+    const httpFailure = /^요청에 실패했습니다 \((\d+)\)\.$/.exec(error.message || '');
+    return [httpFailure ? localized(error.message, `Request failed (${httpFailure[1]}).`) : i18n.t(error.message || '요청에 실패했습니다.'), providerCode,
+      error.stage && `${i18n.t('단계')}: ${error.stage}`, error.retryable === false && i18n.t('자동 재시도하지 않습니다.'),
+      policy && i18n.t('보안 작업 정책 제한입니다. 다른 모델을 선택하거나 계정 권한을 확인하세요.')].filter(Boolean).join(' · ');
   };
   const accounts = el('div', undefined, 'account-list');
   const runtime = el('section', undefined, 'card account-runtime');
@@ -143,7 +186,7 @@ export async function renderAccounts(container, api, options = {}) {
   const authKind = el('select');
   authKind.setAttribute('aria-label', '계정 연결 방식');
   for (const [value, name] of [['oauth', '브라우저 로그인'], ['api_key', 'API 키']]) {
-    const option = el('option', i18n.t(name)); option.value = value; authKind.append(option);
+    const option = el('option', name); option.value = value; authKind.append(option);
   }
   const label = el('input');
   label.placeholder = '계정 이름 (예: 개인 Plus)'; label.required = true; label.maxLength = 100;
@@ -152,28 +195,51 @@ export async function renderAccounts(container, api, options = {}) {
   form.append(provider, authKind, label, submit);
   if (returnActions) pageHead.append(returnActions);
   shell.append(pageHead);
-  shell.append(form, feedback, accounts, runtime);
+  shell.append(form, usageStatus.node, feedback.node, accounts, runtime);
   heading.focus?.();
   let stopped = false;
   let loadGeneration = 0;
   let runtimeLoadGeneration = 0;
+  let runtimePollFailures = 0;
+  let runtimeTimer = null;
+  let buttonCount = 0;
+  const runtimeStates = new Map(runtimeSources.map(source => [source.key, {info:null, error:'', notice:createNotice()}]));
   const loginGeneration = new WeakMap();
   const modelTargets = new Map();
   const formTargets = new Map();
   const active = () => !stopped && container.contains(accounts);
-  async function action(task) {
-    setFeedback('');
+  async function quietly(task, notice) {
     try { return await task(); }
-    catch (error) { setFeedback(errorText(error)); }
+    catch (error) { notice.set(errorText(error), true); }
   }
-  function button(text, task) {
+  async function action(task, notice = feedback) {
+    notice.set('');
+    try { return await task(); }
+    catch (error) {
+      notice.set(errorText(error), true);
+      notice.node.scrollIntoView({block:'nearest'});
+    }
+  }
+  // Refreshes rebuild the action rows and a busy button loses focus. Return
+  // focus to the matching control unless the user already moved elsewhere.
+  function restoreFocus(key) {
+    if (!key || (document.activeElement && document.activeElement !== document.body)) return;
+    const target = shell.querySelector(`[data-focus-key="${CSS.escape(key)}"]`);
+    (target?.disabled ? target.parentElement.querySelector('button:not(:disabled)') : target)?.focus({preventScroll:true});
+  }
+  function button(text, task, notice = feedback, focusKey = `button-${++buttonCount}`) {
     const node = el('button', text); node.type = 'button';
+    node.dataset.focusKey = focusKey;
     node.addEventListener('click', () => action(async () => {
+      const focused = document.activeElement === node;
       // Invoke first so clipboard writes retain the click's user activation.
       const pending = task();
       node.disabled = true;
-      try { return await pending; } finally { node.disabled = false; }
-    }));
+      try { return await pending; } finally {
+        node.disabled = false;
+        if (focused) restoreFocus(focusKey);
+      }
+    }, notice));
     return node;
   }
   form.addEventListener('submit', event => {
@@ -189,6 +255,7 @@ export async function renderAccounts(container, api, options = {}) {
     const generation = (loginGeneration.get(target) || 0) + 1;
     loginGeneration.set(target, generation);
     const current = () => active() && container.contains(target) && loginGeneration.get(target) === generation;
+    const {notice} = formTargets.get(account.id);
     let result = await api(`/api/accounts/${account.id}/login`, start ? {method: 'POST'} : {});
     if (!current()) return;
     target.replaceChildren();
@@ -208,8 +275,8 @@ export async function renderAccounts(container, api, options = {}) {
       link.href = state.verification_url; link.target = '_blank'; link.rel = 'noopener noreferrer';
       claudeLink.append(link, button('링크 복사', async () => {
         const result = await copyText(state.verification_url);
-        setFeedback(i18n.t(result === 'manual' ? '링크를 선택했습니다. Ctrl+C를 눌러 복사하세요.' : '복사를 시도했습니다. 링크가 필요하면 직접 열어 주소를 복사하세요.'));
-      }));
+        notice.set(result === 'manual' ? '링크를 선택했습니다. Ctrl+C를 눌러 복사하세요.' : '복사를 시도했습니다. 링크가 필요하면 직접 열어 주소를 복사하세요.');
+      }, notice));
     };
     if (isClaudeLogin) {
       const guide = el('div', undefined, 'claude-login-guide');
@@ -251,7 +318,7 @@ export async function renderAccounts(container, api, options = {}) {
         event.preventDefault();
         if (submitted || !code.value.trim()) return;
         submitted = true;
-        setFeedback('');
+        notice.set('');
         setSubmitting(true, '인증 코드를 전송하고 로그인 완료를 확인 중입니다.');
         try {
           await api(`/api/accounts/${account.id}/login/code`, {method: 'POST', body: {code: code.value.trim()}});
@@ -260,7 +327,7 @@ export async function renderAccounts(container, api, options = {}) {
           if (current()) {
             submitted = false;
             setSubmitting(false);
-            setFeedback(errorText(error));
+            notice.set(errorText(error), true);
           }
         }
       });
@@ -270,7 +337,7 @@ export async function renderAccounts(container, api, options = {}) {
       target.append(button('로그인 취소', async () => {
         await api(`/api/accounts/${account.id}/login/cancel`, {method: 'POST'});
         await showLogin(account, target, false);
-      }));
+      }, notice));
       // Poll status without replacing an in-progress code input.
       const poll = async () => {
         if (!current()) return;
@@ -298,7 +365,7 @@ export async function renderAccounts(container, api, options = {}) {
           }
         } catch (error) {
           if (current()) {
-            setFeedback(errorText(error));
+            notice.set(errorText(error), true);
             if (error.retryable !== false) window.setTimeout(poll, 5000);
           }
         }
@@ -324,7 +391,7 @@ export async function renderAccounts(container, api, options = {}) {
     const help = el('div', undefined, 'model-help');
     model.append(Object.assign(el('option', '계정 기본 모델'), {value: ''}));
     for (const item of data.models) {
-      const option = el('option', item.displayName || item.model || item.id); option.value = item.model || item.id;
+      const option = dataEl('option', item.displayName || item.model || item.id); option.value = item.model || item.id;
       option.selected = option.value === account.model; model.append(option);
     }
     const setEfforts = () => {
@@ -333,7 +400,7 @@ export async function renderAccounts(container, api, options = {}) {
       const efforts = selected?.supportedReasoningEfforts || [];
       const desiredEffort = model.value === account.model ? account.reasoning_effort : selected?.defaultReasoningEffort;
       for (const value of efforts) {
-        const option = el('option', value.reasoningEffort); option.value = value.reasoningEffort;
+        const option = dataEl('option', value.reasoningEffort); option.value = value.reasoningEffort;
         option.selected = value.reasoningEffort === desiredEffort; effort.append(option);
       }
       effort.disabled = !selected;
@@ -367,15 +434,16 @@ export async function renderAccounts(container, api, options = {}) {
       ultracodeField.append(ultracode, el('span', 'Ultracode'));
       fields.append(ultracodeField);
     }
+    const notice = createNotice();
     const save = button('모델 설정 저장', async () => {
       await api(`/api/accounts/${account.id}`, {method: 'PATCH', body: {model: model.value || null,
         reasoning_effort: model.value && effort.value || null, service_tier: model.value && tier.value || null,
         ultracode: account.provider === 'claude' && ultracode.checked}});
       modelTargets.delete(account.id);
       await load();
-    });
+    }, notice);
     save.className = 'model-save';
-    target.append(fields, help, save);
+    target.append(fields, help, save, notice.node);
   }
 
   function authUpload(account, target) {
@@ -386,35 +454,37 @@ export async function renderAccounts(container, api, options = {}) {
     const submit = el('button', 'auth.json 가져오기'); submit.type = 'submit';
     target.append(el('p', 'auth.json · 최대 2 MiB'));
     const fileField = el('label', 'auth.json 파일'); fileField.append(input);
-    form.append(fileField, submit); target.append(form);
+    const notice = createNotice();
+    form.append(fileField, submit); target.append(form, notice.node);
     form.addEventListener('submit', event => {
       event.preventDefault();
       action(async () => {
         const file = input.files[0];
-        if (!file || file.name !== 'auth.json' || file.size > 2 * 1024 * 1024) throw new Error('2MiB 이하의 auth.json 파일을 선택해 주세요.');
+        if (!file || file.name !== 'auth.json' || file.size > 2 * 1024 * 1024) throw new Error(i18n.t('2MiB 이하의 auth.json 파일을 선택해 주세요.'));
         submit.disabled = true;
         try {
           const body = new FormData(); body.append('file', file);
           await api(`/api/accounts/${account.id}/auth-file`, {method: 'POST', body});
           modelTargets.delete(account.id);
-          await load(); setFeedback('auth.json을 가져오고 Codex 계정 정보를 확인했습니다.');
+          await load(); notice.set('auth.json을 가져오고 Codex 계정 정보를 확인했습니다.');
         } finally { input.value = ''; submit.disabled = false; }
-      });
+      }, notice);
     });
   }
 
   function showApiKey(account, target) {
     target.replaceChildren();
     const form = el('form', undefined, 'account-api-key');
-    const field = el('label', i18n.t('API 키'));
+    const field = el('label', 'API 키');
     const input = el('input');
     input.type = 'password'; input.autocomplete = 'off'; input.required = true;
     input.minLength = 20; input.maxLength = 8192;
-    input.setAttribute('aria-label', i18n.t('API 키'));
+    input.setAttribute('aria-label', 'API 키');
     field.append(input);
-    const submit = el('button', i18n.t('API 키 연결')); submit.type = 'submit';
+    const submit = el('button', 'API 키 연결'); submit.type = 'submit';
+    const notice = createNotice();
     form.append(field, submit);
-    target.append(form);
+    target.append(form, notice.node);
     form.addEventListener('submit', event => {
       event.preventDefault();
       action(async () => {
@@ -425,9 +495,9 @@ export async function renderAccounts(container, api, options = {}) {
           target.replaceChildren();
           modelTargets.delete(account.id);
           await load();
-          setFeedback(i18n.t('API 키가 연결되었습니다.'));
+          formTargets.get(account.id)?.notice.set('API 키가 연결되었습니다.');
         } finally { input.value = ''; submit.disabled = false; }
-      });
+      }, notice);
     });
   }
 
@@ -435,6 +505,7 @@ export async function renderAccounts(container, api, options = {}) {
     const generation = ++loadGeneration;
     const data = await api('/api/accounts');
     if (!active() || generation !== loadGeneration) return;
+    const focusKey = document.activeElement?.dataset?.focusKey;
     const pendingLogins = [];
     const liveAccountIds = new Set(data.accounts.map(account => account.id));
     for (const id of modelTargets.keys()) if (!liveAccountIds.has(id)) modelTargets.delete(id);
@@ -447,12 +518,12 @@ export async function renderAccounts(container, api, options = {}) {
       const card = el('section', undefined, 'card');
       card.dataset.accountId = account.id;
       const snapshot = account.snapshot || {};
-      card.append(el('h3', `${account.label} · ${account.provider}${account.selected ? ` · ${i18n.t('현재 선택')}` : ''}`));
+      card.append(dataEl('h3', `${account.label} · ${account.provider}${account.selected ? ` · ${i18n.t('현재 선택')}` : ''}`));
       const identity = snapshot.identity || {};
       const modelSummary = [`${i18n.t('모델')}: ${account.model || i18n.t('계정 기본')}`, `${i18n.t('추론')}: ${account.reasoning_effort || i18n.t('계정 기본')}`,
         `${i18n.t('속도')}: ${account.service_tier === 'fast' ? 'Fast 1.5×' : i18n.t('기본')}`];
       if (account.provider === 'claude') modelSummary.push(`Ultracode: ${account.ultracode ? (i18n.locale === 'en' ? 'On' : '켜짐') : (i18n.locale === 'en' ? 'Off' : '꺼짐')}`);
-      card.append(el('p', [i18n.t(labels[snapshot.status] || '아직 조회하지 않음'),
+      card.append(dataEl('p', [i18n.t(labels[snapshot.status] || '아직 조회하지 않음'),
         account.auth_kind === 'api_key' ? i18n.t('API 키') : null, identity.email,
         identity.planType || identity.subscriptionType].filter(Boolean).join(' · ')));
       if (snapshot.message) card.append(el('p', snapshot.message));
@@ -473,19 +544,19 @@ export async function renderAccounts(container, api, options = {}) {
         for (const bucketState of quotaView.buckets) {
           const {bucket} = bucketState;
           const list = el('div', undefined, `quota-bucket${bucketState.blocked ? ' quota-limited' : ''}${bucketState.exhausted ? ' quota-exhausted' : ''}${quotaView.stale ? ' quota-stale' : ''}`);
-          list.setAttribute('aria-label', `${bucket.name || bucket.id || 'Codex'} 사용량`);
-          list.append(el('strong', bucket.name || bucket.id));
+          list.setAttribute('aria-label', `${bucket.name || bucket.id || 'Codex'} ${i18n.t('사용량')}`);
+          list.append(dataEl('strong', bucket.name || bucket.id));
           if (bucketState.blocked) {
             const reason = quotaLimitLabels[bucket.reached_type] || (bucket.spend_control_reached ? '설정된 지출 한도에 도달했습니다.' : quotaLimitLabels.rate_limit_reached);
             list.append(el('p', reason, 'quota-reason'));
           }
           if (!bucketState.windows.length) list.append(el('p', '사용량 구간이 제공되지 않았습니다.'));
           for (const {window,remaining,exhausted:windowExhausted} of bucketState.windows) {
-            list.append(el('p', `${i18n.t(window.label)}: ${remaining == null ? i18n.t('남은 사용량 미제공') : `${remaining}% ${i18n.t('남음')}`} · ${i18n.t('초기화')} ${date(window.resets_at)}`, windowExhausted ? 'quota-window-exhausted' : undefined));
+            list.append(el('p', `${quotaWindowLabel(window.label)}: ${remaining == null ? i18n.t('남은 사용량 미제공') : `${remaining}% ${i18n.t('남음')}`} · ${i18n.t('초기화')} ${date(window.resets_at)}`, windowExhausted ? 'quota-window-exhausted' : undefined));
             if (remaining != null) {
               const meter = el('progress'); meter.max = 100; meter.value = remaining;
               if (windowExhausted) meter.className = 'quota-window-exhausted';
-              meter.setAttribute('aria-label', `${window.label} 남은 사용량`);
+              meter.setAttribute('aria-label', `${quotaWindowLabel(window.label)} ${i18n.t('남은 사용량')}`);
               meter.setAttribute('aria-valuetext', `${remaining}% ${i18n.t('남음')}`); list.append(meter);
             }
           }
@@ -505,29 +576,30 @@ export async function renderAccounts(container, api, options = {}) {
       const summary = el('p', modelSummary.join(' · '), 'account-model-summary');
       summary.setAttribute('aria-label', '기본 풀이 설정');
       card.append(summary);
-      const forms = formTargets.get(account.id) || {login: el('div'), upload: el('div'), apiKey: el('div')};
+      const forms = formTargets.get(account.id) || {notice: createNotice(), login: el('div'), upload: el('div'), apiKey: el('div')};
       formTargets.set(account.id, forms);
-      const {login, upload, apiKey} = forms;
+      const {notice, login, upload, apiKey} = forms;
       const models = modelTargets.get(account.id) || el('div');
       modelTargets.set(account.id, models);
       // Build the refreshed card without moving an open form. Removing even the
       // same <select> for one render closes its native dropdown, and a rebuilt
       // API-key or file field would drop what the user already entered.
-      const keep = [login, models, upload, apiKey];
+      const keep = [notice.node, login, models, upload, apiKey];
       const slots = keep.map(() => el('div'));
       const controls = el('div', undefined, 'actions');
-      const select = button(account.selected ? '선택됨' : '이 계정 선택', async () => { await api(`/api/accounts/${account.id}/select`, {method: 'POST'}); await load(); });
+      const accountButton = (key, text, task) => button(text, task, notice, `${account.id}:${key}`);
+      const select = accountButton('select', account.selected ? '선택됨' : '이 계정 선택', async () => { await api(`/api/accounts/${account.id}/select`, {method: 'POST'}); await load(); });
       select.disabled = account.selected;
-      controls.append(select, button('사용량 새로고침', async () => { await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }));
-      if (account.auth_kind !== 'api_key') controls.append(button(snapshot.status === 'authenticated' ? '다시 로그인' : '로그인', () => showLogin(account, login, true)));
-      controls.append(button('API 키 연결', () => showApiKey(account, apiKey)), button('모델·속도 설정', () => showModels(account, models)),
-        button('로그아웃', async () => { await api(`/api/accounts/${account.id}/logout`, {method: 'POST'}); modelTargets.delete(account.id); login.replaceChildren(); await load(); }),
-        button('계정 삭제', async () => {
-          if (!window.confirm(`${account.label} 계정 등록과 서버에 저장된 로그인 정보를 삭제할까요?`)) return;
+      controls.append(select, accountButton('refresh', '사용량 새로고침', async () => { await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }));
+      if (account.auth_kind !== 'api_key') controls.append(accountButton('login', snapshot.status === 'authenticated' ? '다시 로그인' : '로그인', () => showLogin(account, login, true)));
+      controls.append(accountButton('api-key', 'API 키 연결', () => showApiKey(account, apiKey)), accountButton('models', '모델·속도 설정', () => showModels(account, models)),
+        accountButton('logout', '로그아웃', async () => { await api(`/api/accounts/${account.id}/logout`, {method: 'POST'}); modelTargets.delete(account.id); login.replaceChildren(); await load(); }),
+        accountButton('delete', '계정 삭제', async () => {
+          if (!window.confirm(localized(`${account.label} 계정 등록과 서버에 저장된 로그인 정보를 삭제할까요?`, `Remove ${account.label} and the sign-in saved on the server?`))) return;
           await api(`/api/accounts/${account.id}`, {method: 'DELETE'});
           await load();
         }));
-      if (account.provider === 'codex') controls.append(button('auth.json 업로드', () => authUpload(account, upload)));
+      if (account.provider === 'codex') controls.append(accountButton('upload', 'auth.json 업로드', () => authUpload(account, upload)));
       card.append(controls, ...slots);
       const existing = existingCards.get(account.id);
       existingCards.delete(account.id);
@@ -537,18 +609,19 @@ export async function renderAccounts(container, api, options = {}) {
         existing.className = card.className;
         const volatile = [...card.childNodes].filter(child => !slots.includes(child));
         for (const child of [...existing.childNodes]) if (!keep.includes(child)) child.remove();
-        for (const child of volatile) existing.insertBefore(child, login);
+        for (const child of volatile) existing.insertBefore(child, notice.node);
       } else {
         slots.forEach((slot, index) => slot.replaceWith(keep[index]));
         if (existing) existing.replaceWith(card);
         else accounts.append(card);
       }
       if (['starting', 'pending'].includes(account.login?.status) && !login.hasChildNodes()) {
-        pendingLogins.push(action(() => showLogin(account, login, false)));
+        pendingLogins.push(quietly(() => showLogin(account, login, false), notice));
       }
     }
     for (const stale of existingCards.values()) stale.remove();
     if (!data.accounts.length) accounts.append(el('p', '등록된 계정이 없습니다.'));
+    restoreFocus(focusKey);
     await Promise.all(pendingLogins);
     return data;
   }
@@ -556,105 +629,124 @@ export async function renderAccounts(container, api, options = {}) {
   async function refreshUsageOnEnter(data) {
     const eligible = (data?.accounts || []).filter(account => account?.snapshot?.status === 'authenticated');
     if (!eligible.length || !active()) return;
-    setFeedback('사용량 새로고침 중');
+    usageStatus.set('사용량 새로고침 중');
     const results = await Promise.allSettled(eligible.map(account =>
       api(`/api/accounts/${account.id}/refresh`, {method: 'POST'})
     ));
     if (!active()) return;
-    await load();
+    try { await load(); }
+    catch (error) { usageStatus.set(errorText(error), true); return; }
     const failed = results.filter(result => result.status === 'rejected').length;
-    setFeedback(failed ? `${failed}개 계정의 사용량을 새로고침하지 못했습니다.` : '');
+    usageStatus.set(failed ? localized(`${failed}개 계정의 사용량을 새로고침하지 못했습니다.`, `Could not refresh usage for ${failed} account(s).`) : '', failed > 0);
+  }
+
+  function runtimeControls(source, state, disabled) {
+    const path = `/api/providers/${source.key}`;
+    const version = el('input');
+    version.placeholder = source.placeholder;
+    version.dataset.focusKey = `runtime:${source.key}:version`;
+    version.setAttribute('aria-label', source.versionLabel);
+    const runtimeButton = (name, text, task) => button(text, task, state.notice, `runtime:${source.key}:${name}`);
+    const fillLatest = async () => {
+      const data = await api(`${path}/catalog`);
+      if (!data.latest) throw new Error(source.latestMissing);
+      version.value = data.latest;
+      return data.latest;
+    };
+    const install = async value => {
+      const operation = await api(`${path}/update`, {method: 'POST', body: {version: value}});
+      // The install is running now, so polling must start even if the next status read fails.
+      state.info = {...state.info, operation};
+      await loadRuntime();
+    };
+    const controls = el('div', undefined, 'runtime-controls');
+    controls.append(version, runtimeButton('check', '최신 버전 조회', fillLatest),
+      runtimeButton('update', '최신 버전으로 업데이트', async () => install(await fillLatest())),
+      runtimeButton('install', '버전 설치', async () => {
+        const value = version.value.trim();
+        if (!VERSION_FORMAT.test(value)) throw new Error(i18n.t('버전은 0.164.0 같은 정확한 숫자 버전이어야 합니다.'));
+        await install(value);
+      }));
+    if (state.info.selected) controls.append(runtimeButton('rollback', '이전 버전으로 복원', async () => {
+      await api(`${path}/rollback`, {method: 'POST'}); await loadRuntime();
+    }));
+    if (disabled) for (const control of controls.children) control.disabled = true;
+    return controls;
+  }
+
+  function runtimeSection(source, polling) {
+    const state = runtimeStates.get(source.key);
+    const {info} = state;
+    const operation = info?.operation || {};
+    const section = el('section', undefined, 'runtime-provider');
+    section.append(el('h3', source.title), el('p', `${i18n.t('현재 버전')}: ${info?.version || i18n.t(info ? '설치 확인 불가' : '확인 불가')}`));
+    if (info) {
+      const label = !operation.status || operation.status === 'idle' ? localized('대기', 'Idle') : i18n.t(runtimeStatusLabels[operation.status] || operation.status);
+      const busy = runtimeBusy(info);
+      const status = el('p', `${i18n.t('상태')}: ${label}${operation.version ? ` · ${operation.version}` : ''}`,
+        busy ? 'runtime-progress' : ['failed', 'interrupted'].includes(operation.status) ? 'runtime-status error-text' : 'runtime-status');
+      status.setAttribute('role', 'status');
+      status.setAttribute('aria-live', 'polite');
+      section.append(status);
+      if (busy) {
+        const progress = el('progress');
+        progress.setAttribute('aria-label', `${source.name} ${label}`);
+        section.append(progress);
+      }
+      if (operation.message) section.append(el('p', operation.message, 'error-text'));
+    }
+    if (state.error && polling) section.append(el('p', '상태 확인에 실패해 다시 시도합니다.', 'error-text'));
+    else if (state.error) section.append(el('p', `${i18n.t('상태를 확인하지 못했습니다.')} ${state.error}`, 'error-text'),
+      button('다시 조회', loadRuntime, state.notice, `runtime:${source.key}:retry`));
+    if (info && !info.can_manage) section.append(el('p', source.adminOnly));
+    else if (info && !info.update_supported) section.append(el('p', '이 환경에서는 웹 업데이트를 지원하지 않습니다.'));
+    else if (info) section.append(runtimeControls(source, state, polling));
+    section.append(state.notice.node);
+    return section;
   }
 
   async function loadRuntime() {
     const generation = ++runtimeLoadGeneration;
-    const [info, claude] = await Promise.all([
-      api('/api/providers/codex/runtime'),
-      api('/api/providers/claude/runtime'),
-    ]);
+    window.clearTimeout(runtimeTimer);
+    const results = await Promise.allSettled(runtimeSources.map(source => api(`/api/providers/${source.key}/runtime`)));
     if (!active() || generation !== runtimeLoadGeneration) return;
-    const operation = info.operation || {};
-    const claudeOperation = claude.operation || {};
-    const busy = status => ['installing', 'verifying'].includes(status);
-    const anyBusy = busy(operation.status) || busy(claudeOperation.status);
-    const operationLabels = {idle: '대기', installing: '설치 중', verifying: '검증 중', completed: '업데이트 완료', failed: '업데이트 실패', interrupted: '업데이트 중단'};
-    const claudeStatus = {idle: '대기', installing: '설치 중', verifying: '검증 중', completed: '업데이트 완료', failed: '업데이트 실패', interrupted: '중단'};
-    const addStatus = (section, state, labels, name) => {
-      const status = el('p', `상태: ${labels[state.status] || state.status || '대기'}${state.version ? ` · ${state.version}` : ''}`,
-        busy(state.status) ? 'runtime-progress' : 'runtime-status');
-      status.setAttribute('role', 'status');
-      status.setAttribute('aria-live', 'polite');
-      section.append(status);
-      if (busy(state.status)) {
-        const progress = el('progress');
-        progress.setAttribute('aria-label', `${name} ${labels[state.status]}`);
-        section.append(progress);
-      }
-      if (state.message) section.append(el('p', state.message, 'error-text'));
-    };
-    const disableControls = controls => {
-      if (anyBusy) for (const control of controls.children) control.disabled = true;
-    };
-    const codexSection = el('section', undefined, 'runtime-provider');
-    codexSection.append(el('h3', 'Codex 업데이트'), el('p', `현재 버전: ${info.version || '설치 확인 불가'}`));
-    addStatus(codexSection, operation, operationLabels, 'Codex');
-    if (!info.can_manage) codexSection.append(el('p', 'Codex 업데이트는 관리자만 실행할 수 있습니다.'));
-    else if (!info.update_supported) codexSection.append(el('p', '이 환경에서는 웹 업데이트를 지원하지 않습니다.'));
-    else {
-      const version = el('input'); version.placeholder = '버전 (예: 0.164.0)'; version.setAttribute('aria-label', '설치할 Codex 버전');
-      const controls = el('div', undefined, 'runtime-controls');
-      controls.append(version, button('최신 버전 조회', async () => { const data = await api('/api/providers/codex/catalog'); version.value = data.latest; }),
-        button('최신 버전으로 업데이트', async () => {
-          const data = await api('/api/providers/codex/catalog');
-          if (!data.latest) throw new Error('최신 Codex 버전을 확인하지 못했습니다.');
-          version.value = data.latest;
-          await api('/api/providers/codex/update', {method: 'POST', body: {version: data.latest}});
-          await loadRuntime();
-        }),
-        button('버전 설치', async () => {
-          await api('/api/providers/codex/update', {method: 'POST', body: {version: version.value.trim()}}); await loadRuntime();
-        }));
-      if (info.selected) controls.append(button('이전 버전으로 복원', async () => {
-        await api('/api/providers/codex/rollback', {method: 'POST'}); await loadRuntime();
-      }));
-      disableControls(controls);
-      codexSection.append(controls);
+    runtimeSources.forEach((source, index) => {
+      const state = runtimeStates.get(source.key);
+      const {status, value, reason} = results[index];
+      if (status === 'fulfilled') { state.info = value; state.error = ''; }
+      else state.error = errorText(reason);
+    });
+    // A failed read says nothing about the install, so keep following the last known state.
+    const polling = [...runtimeStates.values()].some(state => runtimeBusy(state.info));
+    runtimePollFailures = results.some(item => item.status === 'rejected') ? runtimePollFailures + 1 : 0;
+    const focusKey = document.activeElement?.dataset?.focusKey;
+    const versions = [...runtime.querySelectorAll('input[data-focus-key]')].map(input => [input.dataset.focusKey, input.value]);
+    runtime.replaceChildren(...runtimeSources.map(source => runtimeSection(source, polling)));
+    for (const [key, value] of versions) {
+      const input = runtime.querySelector(`input[data-focus-key="${CSS.escape(key)}"]`);
+      if (input) input.value = value;
     }
-    const claudeSection = el('section', undefined, 'runtime-provider');
-    claudeSection.append(el('h3', 'Claude Code 업데이트'), el('p', `현재 버전: ${claude.version || '확인 불가'}`));
-    addStatus(claudeSection, claudeOperation, claudeStatus, 'Claude Code');
-    if (claude.can_manage && claude.update_supported) {
-      const claudeVersion = el('input');
-      claudeVersion.placeholder = '버전 (예: 2.1.310)';
-      claudeVersion.setAttribute('aria-label', '설치할 Claude Code 버전');
-      const claudeActions = el('div', undefined, 'runtime-controls');
-      claudeActions.append(
-        claudeVersion,
-        button('최신 버전 조회', async () => { const data = await api('/api/providers/claude/catalog'); claudeVersion.value = data.latest; }),
-        button('최신 버전으로 업데이트', async () => {
-          const data = await api('/api/providers/claude/catalog');
-          if (!data.latest) throw new Error('최신 Claude Code 버전을 확인하지 못했습니다.');
-          claudeVersion.value = data.latest;
-          await api('/api/providers/claude/update', {method: 'POST', body: {version: data.latest}});
-          await loadRuntime();
-        }),
-        button('버전 설치', async () => { await api('/api/providers/claude/update', {method: 'POST', body: {version: claudeVersion.value.trim()}}); await loadRuntime(); })
-      );
-      if (claude.selected) claudeActions.append(button('이전 버전으로 복원', async () => {
-        await api('/api/providers/claude/rollback', {method: 'POST'}); await loadRuntime();
-      }));
-      disableControls(claudeActions);
-      claudeSection.append(claudeActions);
-    }
-    runtime.replaceChildren(codexSection, claudeSection);
-    if (anyBusy) window.setTimeout(() => {
-      if (active() && generation === runtimeLoadGeneration) action(loadRuntime);
-    }, 3000);
+    restoreFocus(focusKey);
+    if (polling) runtimeTimer = window.setTimeout(() => { if (active()) loadRuntime(); }, Math.min(3000 * 2 ** runtimePollFailures, 30000));
   }
-  await action(async () => {
-    const data = await load();
-    await loadRuntime();
-    await refreshUsageOnEnter(data);
-  });
-  return () => { stopped = true; };
+
+  const onLanguageChanged = () => {
+    if (!active()) return;
+    quietly(load, feedback);
+    loadRuntime();
+  };
+  document.addEventListener('ctf-language-changed', onLanguageChanged);
+  const data = await quietly(load, feedback);
+  await loadRuntime();
+  if (revealRuntime && active()) {
+    runtime.tabIndex = -1;
+    runtime.focus({preventScroll:true});
+    runtime.scrollIntoView({block:'start'});
+  }
+  await refreshUsageOnEnter(data);
+  return () => {
+    stopped = true;
+    window.clearTimeout(runtimeTimer);
+    document.removeEventListener('ctf-language-changed', onLanguageChanged);
+  };
 }
