@@ -885,12 +885,26 @@ def validate_local_autoscaled_containers(
     return identifiers
 
 
+def local_solver_restart_policy(policy: str) -> str:
+    if policy == "no":
+        return "on-failure:3"
+    if policy == "unless-stopped":
+        return policy
+    raise RuntimeError("Invalid local restart policy")
+
+
 def main() -> int:
     requested_count = recommended_solver_concurrency()
     effective_slots = _selected_slots(requested_count, {1})
     retained_dynamic: set[int] = set()
     arguments = normalize_arguments(sys.argv[1:] or ["up", "-d", "--build"])
     environment = os.environ.copy()
+    # An external database VHD must be verified by the launcher before web or
+    # the autoscaler starts. A solver may still retry an abnormal exit while
+    # the daemon is running; on-failure never starts it on daemon restart.
+    environment["CTF_LOCAL_SOLVER_RESTART_POLICY"] = local_solver_restart_policy(
+        environment.get("CTF_LOCAL_RESTART_POLICY", "no")
+    )
     # The managed local stack leaves 5 GiB on its data filesystem for WSL and
     # Docker bookkeeping. An explicit operator setting remains available.
     set_local_storage_floor(environment)

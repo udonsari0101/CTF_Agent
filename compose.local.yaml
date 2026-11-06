@@ -19,7 +19,9 @@ x-local-volumes: &local-volumes
 
 x-solver-common: &solver-common
   <<: *app-image
-  restart: ${CTF_LOCAL_RESTART_POLICY:-no}
+  # Recover an unexpectedly exited worker without starting it after a Docker
+  # daemon restart. The launcher sets unless-stopped for ordinary autostart.
+  restart: ${CTF_LOCAL_SOLVER_RESTART_POLICY:-on-failure:3}
   user: "${CTF_LOCAL_UID:-1000}:${CTF_LOCAL_GID:-1000}"
   command: [python, -m, ctf_agent.solver_worker]
   networks: [solver_egress]

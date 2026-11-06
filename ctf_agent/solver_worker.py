@@ -8014,6 +8014,7 @@ class SolverWorker:
         if stop.is_set():
             return
         if outcome and isinstance(outcome[0], BaseException):
+            self.startup_diagnostic = "runtime_attestation:" + type(outcome[0]).__name__
             self._require_restart("runtime_attestation_failed")
             return
         if not self.runtime_ready or not self.sandbox_attested:
@@ -8028,6 +8029,9 @@ class SolverWorker:
                 outcome = await asyncio.gather(self.current_task, return_exceptions=True)
                 self.current_task = None
                 if outcome and isinstance(outcome[0], BaseException) and not stop.is_set():
+                    # Exception messages can include model output or secrets.
+                    # Only the class name is safe in the shared status file.
+                    self.startup_diagnostic = "worker_task:" + type(outcome[0]).__name__
                     self._require_restart("worker_task_failed")
                 if self.restart_required:
                     stop.set()
@@ -8202,10 +8206,14 @@ async def _enforce_deadline(
         task.cancel()
 
 
-def main() -> None:
+def main() -> int:
     worker = SolverWorker(Path(os.environ.get("CTF_SOLVER_EXCHANGE", "/solver-exchange")))
     asyncio.run(worker.serve())
+    # The only expected return from this long-lived service is an operator
+    # stop. Docker must see all other exits as failures so its bounded local
+    # restart policy can restore a fresh isolated worker process.
+    return 0 if worker.stopping else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
