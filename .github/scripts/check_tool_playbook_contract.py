@@ -112,6 +112,15 @@ class ToolPlaybookContract(unittest.TestCase):
         self.assertIn("A category label from the platform is a hint, not a gate", unknown)
         self.assertIn("first contact is one gentle touch", remote_only)
 
+    def test_remote_only_missing_endpoint_does_not_continue_after_request(self) -> None:
+        base = asset("base.md")
+        remote_only = asset("remote_only.md")
+        for prompt in (base, remote_only):
+            with self.subTest(prompt=prompt[:32]):
+                self.assertIn("request-remote", prompt)
+                self.assertIn("stop this attempt", prompt)
+        self.assertNotIn("then re-read `../chal_desc.md` for the address they add", remote_only)
+
     def test_assembled_unknown_manual_respects_remote_mode(self) -> None:
         from ctf_agent.agent_workspace import assemble_manual
 
