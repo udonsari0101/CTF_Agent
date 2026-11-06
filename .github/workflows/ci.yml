@@ -242,6 +242,8 @@ jobs:
         run: python .github/scripts/check_activity_provenance.py
       - name: Check solver sandbox canary inventory
         run: python .github/scripts/check_solver_canary_inventory.py
+      - name: Check solver worker status crash recovery
+        run: python .github/scripts/check_solver_worker_status_recovery.py
       - name: Check solver failure diagnostics
         run: python .github/scripts/check_solver_failure_diagnostics.py
       - name: Check solver context usage provenance

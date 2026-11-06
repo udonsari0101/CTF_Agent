@@ -1235,6 +1235,75 @@ def assert_runtime_exchange_inventory(exchange: Path) -> None:
         raise WorkerRefusal("auth_cleanup_failed", "자체 점검 전에 인증 파일을 제거하지 못했습니다.", category="auth")
 
 
+_ORPHAN_WORKER_STATUS = re.compile(r"\.worker\.json\.[1-9][0-9]{0,9}\.[1-9][0-9]{15,19}\.tmp")
+
+
+def recover_crash_worker_status(exchange: Path) -> None:
+    """Remove only interrupted atomic status writes before worker attestation.
+
+    The caller has already checked that the prior PID namespace is clean.
+    Unknown exchange entries remain visible to the runtime inventory canary.
+    """
+
+    def invalid() -> WorkerRefusal:
+        return WorkerRefusal("invalid_exchange_inventory", "Worker status recovery failed.")
+
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else None
+
+    def valid(details: os.stat_result) -> bool:
+        return bool(
+            stat.S_ISREG(details.st_mode)
+            and details.st_nlink == 1
+            and (current_uid is None or details.st_uid == current_uid)
+            and details.st_size <= 128 * 1024
+            and (os.name != "posix" or not (stat.S_IMODE(details.st_mode) & ~0o644))
+        )
+
+    if os.name == "posix":
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            directory = os.open(exchange, flags)
+        except OSError as exc:
+            raise invalid() from exc
+        try:
+            if not stat.S_ISDIR(os.fstat(directory).st_mode):
+                raise invalid()
+            removed = False
+            for name in os.listdir(directory):
+                if not _ORPHAN_WORKER_STATUS.fullmatch(name):
+                    continue
+                try:
+                    details = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if not valid(details):
+                        raise invalid()
+                    os.unlink(name, dir_fd=directory)
+                except OSError as exc:
+                    raise invalid() from exc
+                removed = True
+            if removed:
+                os.fsync(directory)
+        finally:
+            os.close(directory)
+        return
+
+    # Windows development hosts do not provide dir_fd operations.
+    if exchange.is_symlink() or not exchange.is_dir():
+        raise invalid()
+    removed = False
+    for entry in exchange.iterdir():
+        if not _ORPHAN_WORKER_STATUS.fullmatch(entry.name):
+            continue
+        try:
+            if not valid(entry.lstat()):
+                raise invalid()
+            entry.unlink()
+        except OSError as exc:
+            raise invalid() from exc
+        removed = True
+    if removed:
+        _fsync_directory(exchange)
+
+
 def assert_scratch_root_clean(root: Path) -> None:
     if root.is_symlink() or not root.is_dir():
         raise WorkerRefusal("scratch_isolation_failed", "solver 임시 작업공간을 확인할 수 없습니다.")
@@ -2004,14 +2073,17 @@ def _write_json(
     data = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
-    _fsync_directory(path.parent)
+        temporary.unlink(missing_ok=True)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -6919,6 +6991,7 @@ class SolverWorker:
         if self.attestation.ready:
             try:
                 self.process_assertion()
+                recover_crash_worker_status(self.exchange)
                 recover_crash_scratch(self.scratch_root)
                 assert_scratch_root_clean(self.scratch_root)
                 self.clean = True
