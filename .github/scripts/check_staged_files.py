@@ -297,8 +297,12 @@ class StagedFileApiTest(unittest.TestCase):
         self.assertEqual(self.browser.post(
             f"/api/workspaces/{self.workspace}/challenges/{third}/staged-files/{file_id}/attach"
         ).status_code, 200)
+        # Finalized files are read-only on POSIX. Simulate an owner who
+        # explicitly changes permissions before editing the file in Explorer.
+        source.chmod(0o600)
         with source.open("r+b") as handle:
             handle.write(b"evil")
+        source.chmod(0o400)
         os.utime(source, ns=(old + 2_000_000_000, old + 2_000_000_000))
         fourth = self.challenge("fourth")
         self.assertEqual(self.browser.post(
