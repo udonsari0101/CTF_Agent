@@ -2,6 +2,9 @@ $ErrorActionPreference = 'Stop'
 $dockerDesktopHelper = Join-Path $PSScriptRoot 'DockerDesktop.ps1'
 if (-not (Test-Path -LiteralPath $dockerDesktopHelper -PathType Leaf)) { throw 'DockerDesktop.ps1 is missing. Reinstall the patched release.' }
 . $dockerDesktopHelper
+$dockerDiskHelper = Join-Path $PSScriptRoot 'DockerDisk.ps1'
+if (-not (Test-Path -LiteralPath $dockerDiskHelper -PathType Leaf)) { throw 'DockerDisk.ps1 is missing. Reinstall the patched release.' }
+. $dockerDiskHelper
 function Invoke-WslNative([string[]]$command, [switch]$Quiet, [switch]$Visible) {
     $previousPreference = $ErrorActionPreference
     try {
@@ -54,6 +57,14 @@ if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue) -and
     Start-Process -FilePath $desktop -WindowStyle Hidden
 }
 Wait-WslDockerReady $distro -AllowRepair
+# Warn about low Windows backing-drive space without blocking a restart of an
+# installed service. New writes still enforce their separate storage reserve.
+try {
+    Warn-LocalStartVolumeCapacity -WslDiskPath (Get-WslDiskHostPath $distro) `
+        -DockerDiskPath (Resolve-DockerDesktopDiskFile) -DatabaseDiskPath $dbVhd
+} catch {
+    Write-Warning ('Windows storage reserve could not be checked; startup will continue. ' + $_.Exception.Message)
+}
 # Docker Desktop startup or integration repair can stop and restart WSL. Attach
 # the external database only after its engine is ready, or Docker may detach
 # the VHD and leave its old bind mount visible to containers.

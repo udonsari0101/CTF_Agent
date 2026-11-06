@@ -420,8 +420,10 @@ if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", diges
 print(digest)
 ')"
 image_ref="$image_repository@$image_digest"
-# Preserve a 5 GiB data/DB floor after estimated Docker pull and overlay work.
-# A cold image needs more headroom than a digest already present locally.
+# Preserve 5 GiB on the application and database filesystems. Image layers
+# live on Docker Desktop's separate disk; the Windows launcher has already
+# budgeted its cold/cached image pull on that disk, combining planned writes
+# when it shares a physical drive with the WSL and database VHDX files.
 image_cache_state=cold
 if docker image inspect "$image_ref" >/dev/null 2>&1; then
     image_cache_state=cached

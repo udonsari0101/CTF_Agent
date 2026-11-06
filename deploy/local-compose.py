@@ -32,9 +32,10 @@ ALL_PROFILES = [
 
 
 def set_local_storage_floor(environment: dict[str, str]) -> None:
-    """Use the 5 GiB local default without overriding an explicit setting."""
+    """Use the 5 GiB local floor for uploads and solver archive scratch."""
 
     environment.setdefault("CTF_STORAGE_MIN_FREE_BYTES", str(LOCAL_MINIMUM_REMAINING_BYTES))
+    environment.setdefault("CTF_SOLVER_MIN_FREE_BYTES", str(LOCAL_MINIMUM_REMAINING_BYTES))
 
 
 def _compose_base() -> list[str]:

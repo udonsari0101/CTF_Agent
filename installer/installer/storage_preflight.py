@@ -1,8 +1,7 @@
-"""Conservative free-space checks for the managed Windows/WSL installer.
+"""Application and database filesystem checks for the Windows/WSL installer.
 
-The source archive and the local overlay are small, but a cold GHCR pull
-temporarily stores compressed and extracted layers. These are estimates, not a
-promise about Docker Desktop's separately configured Windows disk image.
+The Windows launcher checks the separate Docker Desktop image disk and adds
+planned writes when it shares a physical Windows drive with these filesystems.
 """
 
 from __future__ import annotations
@@ -14,15 +13,15 @@ from pathlib import Path
 
 GIB = 1024**3
 MINIMUM_REMAINING_BYTES = 5 * GIB
-CACHED_IMAGE_WORK_BYTES = 2 * GIB
-COLD_PULL_WORK_BYTES = 10 * GIB
+APPLICATION_STAGING_BYTES = GIB
 
 
 def required_free_bytes(stage: str, image_cached: bool) -> int:
     if stage == "before-pull":
-        return MINIMUM_REMAINING_BYTES + (
-            CACHED_IMAGE_WORK_BYTES if image_cached else COLD_PULL_WORK_BYTES
-        )
+        # Docker Desktop stores image layers on its own disk. The application
+        # filesystem needs room for the release/launcher staging, not a
+        # duplicate copy of the entire image pull estimate.
+        return MINIMUM_REMAINING_BYTES + APPLICATION_STAGING_BYTES
     if stage == "after-pull":
         return MINIMUM_REMAINING_BYTES
     raise ValueError("Invalid local storage preflight stage")

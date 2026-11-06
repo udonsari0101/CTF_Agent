@@ -545,15 +545,6 @@ function Select-WslDistribution([object[]]$infos, [string]$savedName) {
     }
 }
 
-function Get-HostVolumeFree([string]$path) {
-    $expanded = [Environment]::ExpandEnvironmentVariables($path)
-    if ($expanded -match '^\\\\\?\\[A-Za-z]:\\') { $expanded = $expanded.Substring(4) }
-    if ($expanded -match '^[A-Za-z]:$') { $expanded += '\' }
-    $root = [IO.Path]::GetPathRoot($expanded)
-    if (-not $root -or $root.StartsWith('\\')) { throw "Cannot check the Windows volume for $path" }
-    return [int64](Get-PSDrive -Name $root.Substring(0, 1) -ErrorAction Stop).Free
-}
-
 function Assert-StorageCapacity([string]$distro, [string]$linuxHome,
     [int64]$estimatedWriteBytes = 0) {
     $diskProbe = @'
@@ -568,14 +559,7 @@ print(json.dumps({'free':shutil.disk_usage(p).free,'existing':p}))
     $probeResult = Invoke-WslPython $distro $diskProbe @($linuxHome)
     if ($probeResult.ExitCode -ne 0) { throw 'Could not check free space inside the selected WSL distribution.' }
     $wslFree = [int64](($probeResult.Output | ConvertFrom-Json).free)
-    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
-    $registered = @(Get-ChildItem -Path $key -ErrorAction SilentlyContinue |
-        ForEach-Object { Get-ItemProperty -Path $_.PSPath } |
-        Where-Object { $_.DistributionName -eq $distro } | Select-Object -First 1)
-    if (-not $registered.Count -or -not $registered[0].BasePath) {
-        throw 'Could not locate the selected WSL disk on Windows.'
-    }
-    $hostFree = Get-HostVolumeFree ([string]$registered[0].BasePath)
+    $hostFree = Get-HostVolumeFree (Get-WslDiskHostPath $distro)
     Write-Host ('WSL free: {0:N1} GB; Windows backing volume free: {1:N1} GB' -f ($wslFree / 1GB), ($hostFree / 1GB))
     $required = $minimumFreeBytes + $estimatedWriteBytes
     if ($wslFree -lt $required -or $hostFree -lt $required) {
@@ -584,23 +568,6 @@ print(json.dumps({'free':shutil.disk_usage(p).free,'existing':p}))
     if ((Get-HostVolumeFree $env:SystemDrive) -lt $minimumFreeBytes) {
         Write-Warning 'The Windows system drive has less than 5 GiB free. Docker Desktop may need more space there.'
     }
-}
-
-function Get-EstimatedImageWorkBytes {
-    # An already installed copy of this exact release has cached toolchain
-    # layers. Otherwise leave room for a cold pull and extracted layers.
-    $revisionFile = Join-Path $PSScriptRoot 'COMMIT'
-    if (-not (Test-Path -LiteralPath $revisionFile -PathType Leaf)) { return [int64]10GB }
-    $revision = (Get-Content -LiteralPath $revisionFile -Raw).Trim()
-    if ($revision -notmatch '^[0-9a-f]{40}$') { return [int64]10GB }
-    $docker = Get-DesktopDockerCli
-    $result = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
-        'image', 'inspect', 'ctf-agent-local:latest',
-        '--format={{index .Config.Labels "org.opencontainers.image.revision"}}') 8
-    if ($result.ExitCode -eq 0 -and $result.Stdout.Trim() -eq $revision) {
-        return [int64]2GB
-    }
-    return [int64]10GB
 }
 
 function Get-DockerDesktopExecutable {
@@ -754,11 +721,21 @@ $loginDefault = -not ($saved -and $saved.authMode -eq 'nologin')
 $requireLogin = Ask-YesNo 'Require account login on this computer?' $loginDefault
 $authMode = if ($requireLogin) { 'password' } else { 'nologin' }
 Ensure-DockerDesktop $distro
-# This second check includes pull and temporary layer headroom; the earlier
-# check only establishes that choosing a location is feasible.
-$imageWorkBytes = Get-EstimatedImageWorkBytes
-Assert-StorageCapacity $distro $linuxHome $imageWorkBytes
+# The second pass budgets application staging, Docker image work and optional
+# database VHDX growth on their actual Windows drives. The initial check only
+# establishes that the selected WSL location is feasible.
+$revisionFile = Join-Path $PSScriptRoot 'COMMIT'
+$releaseRevision = if (Test-Path -LiteralPath $revisionFile -PathType Leaf) {
+    (Get-Content -LiteralPath $revisionFile -Raw).Trim()
+} else { '' }
+$imageWorkBytes = Get-EstimatedImageWorkBytes $releaseRevision
+$applicationWorkBytes = [int64]1GB
+Assert-StorageCapacity $distro $linuxHome $applicationWorkBytes
 Assert-DockerDesktopImageCapacity $imageWorkBytes
+$dockerImageDisk = Resolve-DockerDesktopDiskFile
+Assert-LocalInstallVolumeCapacity -WslDiskPath (Get-WslDiskHostPath $distro) `
+    -DockerDiskPath $dockerImageDisk -DatabaseDiskPath $dbVhd `
+    -ApplicationWorkBytes $applicationWorkBytes -ImageWorkBytes $imageWorkBytes | Out-Null
 if ($separateDatabase) {
     $dbUuid = Initialize-DatabaseVhd $distro $dbVhd $dbUuid
     Write-Host "Database filesystem: $dbVhd -> $databasePath"

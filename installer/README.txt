@@ -17,14 +17,22 @@ CTF Agent - Windows local installation
 
 Requirements: x64 Windows, WSL 2, Docker Desktop with its WSL 2 engine and
 integration enabled for the selected distribution, and internet access.
-Installation leaves at least 5 GiB free on the WSL data filesystem and its
-Windows backing volume. Before pulling a new image it requires an estimated
-10 GiB of extra work space (15 GiB total); if that exact release image is
-cached, it requires 2 GiB extra (7 GiB total). A separate database drive
-needs at least 5 GiB free. Docker Desktop's image VHDX is checked separately,
-including a disk-image location changed in Docker Desktop settings. If its
-location cannot be detected, the installer stops before changing service
+Installation preserves 5 GiB of free space on the WSL application filesystem
+and each Windows backing drive. It plans another 1 GiB for application
+staging, 10 GiB for a cold Docker image pull (2 GiB when the exact image is
+cached), and 1 GiB when creating or growing a separate database VHDX. When
+these files are on the same Windows drive, the installer adds their planned
+writes before checking that drive; on separate drives it checks each one.
+Docker Desktop's image VHDX location is read from its settings. If the
+location cannot be detected, installation stops before changing service
 data. Set CTF_AGENT_DOCKER_DATA_ROOT to that disk-image folder and rerun.
+During use, application uploads share a 5 GiB WSL filesystem floor and
+reserve large and concurrent writes; managed solver archive expansion uses
+the same 5 GiB default floor. Windows backing-drive growth after
+installation must still be monitored in Windows, especially for a separate
+database VHDX; the container cannot read that host drive's free space.
+Start.cmd warns when a Windows backing volume falls below 5 GiB but still
+starts an existing installation. New uploads or solver writes may be refused.
 
 If installed WSL distributions are listed but readiness checks fail, read the
 reason shown for each one. Retry Install.cmd as administrator under the same

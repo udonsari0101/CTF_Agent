@@ -83,7 +83,8 @@ does not impose a solver memory, process-count or scratch-size ceiling.
 Archive expansion likewise has no default byte, member, time, compression-ratio
 or helper-memory ceiling. Deployments can opt into each ceiling with
 `CTF_SOLVER_ARCHIVE_MAX_*`; streamed writes always preserve
-`CTF_SOLVER_MIN_FREE_BYTES` (1 GiB by default) on the scratch filesystem.
+`CTF_SOLVER_MIN_FREE_BYTES` on the scratch filesystem (5 GiB for the managed
+Windows installation; 1 GiB for the generic container default).
 
 `ctf-browser` always uses headless Chromium with a fresh profile, cache, crash
 directory and short runtime directory under the current job scratch. A solve

@@ -58,7 +58,7 @@ from .solver_retry import (
     merge_continuation,
     parse_solver_artifact,
 )
-from .storage_budget import MAX_SQLITE_INTEGER, StorageBudget, StorageBudgetError
+from .storage_budget import MAX_SQLITE_INTEGER, StorageBudget, StorageBudgetError, _configured_floor
 from .solver_time import continuation_elapsed, continuation_start
 from .writeups import merge_generated_writeup, remove_generated_writeup
 from .writeup_publication import contains_internal_operation
@@ -99,6 +99,14 @@ _MAX_EVENT_BYTES = MAX_OUTPUT_TEXT + 256 * 1024
 _MIN_FREE_BYTES_AFTER_STAGE = 512 * 1024 * 1024
 _STAGE_CONTROL_RESERVE = 2 * 1024 * 1024
 _LIVE_ATTACHMENT_CHUNK_BYTES = 8 * 1024 * 1024
+
+
+def _minimum_free_after_unreserved_stage() -> int:
+    """Keep legacy unreserved copies above the configured data-volume floor."""
+
+    return max(_MIN_FREE_BYTES_AFTER_STAGE, _configured_floor())
+
+
 _MAX_MANIFEST_BYTES = 512 * 1024
 _MAX_CONTINUATION_BYTES = 512 * 1024 * 1024
 _MAX_OWNER_CONTINUATIONS_BYTES = 4 * 1024 * 1024 * 1024
@@ -5583,7 +5591,7 @@ class SolverCoordinatorPool:
             )
         version = source.name.removeprefix("codex-")
         files, total = _runtime_files(source, version)
-        if shutil.disk_usage(destination.parent).free - total < _MIN_FREE_BYTES_AFTER_STAGE:
+        if shutil.disk_usage(destination.parent).free - total < _minimum_free_after_unreserved_stage():
             raise ExchangeError(
                 "insufficient_solver_storage",
                 "solver runtime을 이전할 저장 공간이 부족합니다.",
@@ -7137,7 +7145,7 @@ def _copy_regular_file(
                     category="storage",
                     retryable=True,
                 ) from exc
-            if free - details.st_size < _MIN_FREE_BYTES_AFTER_STAGE:
+            if free - details.st_size < _minimum_free_after_unreserved_stage():
                 raise ExchangeError(
                     "insufficient_solver_storage",
                     "격리 복사본을 만들 저장공간이 부족합니다. 원본 파일은 보존되었습니다.",
