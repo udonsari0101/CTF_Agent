@@ -70,6 +70,8 @@ class ToolPlaybookContract(unittest.TestCase):
         self.assertNotIn("the changed lines are the planted bug", base)
         self.assertNotIn("the changed lines ARE the planted bug", unknown)
         self.assertIn("A genuine Flag can come from a supplied artifact", base)
+        self.assertIn("never submit an unverified local value", base)
+        self.assertNotIn("never submit a local/placeholder flag", base)
         self.assertIn("does not expose a Docker daemon/socket", base)
         self.assertIn("confirm reachability and behavior", unknown)
 
@@ -78,6 +80,7 @@ class ToolPlaybookContract(unittest.TestCase):
 
         self.assertIn("Verify the genuine flag", INITIAL_GOAL)
         self.assertIn("a local value may be genuine or a placeholder", INITIAL_GOAL)
+        self.assertIn("only when a tactic or tool is needed", INITIAL_GOAL)
         self.assertIn('submit-flag "<flag>"', INITIAL_GOAL)
         self.assertNotIn("The REAL flag is on the remote", INITIAL_GOAL)
         for mode, remote, expected in (
