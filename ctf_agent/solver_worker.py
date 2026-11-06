@@ -148,17 +148,27 @@ MAX_LIVE_MESSAGE_BYTES = 4 * 1_024
 _STARTUP_TIMING_PHASES = frozenset({
     "workspace_prepare", "credential_consume", "provider_start",
     "app_server_spawn", "initialize_rpc", "canary_pre_login",
+    "canary_native", "canary_browser", "canary_strace", "canary_python",
     "account_login_rpc", "account_read_rpc", "rate_limits_rpc",
     "provider_login", "canary_post_login", "startup_total",
     "first_model_text_after_running", "first_tool_result_after_running",
 })
 
 
-def _record_startup_timing(phase: str, started_ns: int, run_key: str) -> None:
+def _record_startup_timing(
+    phase: str, started_ns: int | None, run_key: str, *, duration_ms: int | None = None,
+) -> None:
     if phase not in _STARTUP_TIMING_PHASES:
         return
     try:
-        elapsed_ms = max(0, (time.perf_counter_ns() - started_ns) // 1_000_000)
+        if duration_ms is None:
+            if started_ns is None:
+                return
+            elapsed_ms = max(0, (time.perf_counter_ns() - started_ns) // 1_000_000)
+        else:
+            if type(duration_ms) is not int or not 0 <= duration_ms <= 120_000:
+                return
+            elapsed_ms = duration_ms
         sys.stderr.write(json.dumps({
             "event": "solver_startup_timing", "run": run_key,
             "phase": phase, "duration_ms": elapsed_ms,
@@ -2950,6 +2960,7 @@ class CodexAppServer:
         self.sandbox_checks: dict[str, bool] = {}
         self._full_canary_verified = False
         self._full_canary_context: tuple[object, ...] | None = None
+        self._ready_toolchain_checks: dict[str, bool] | None = None
         self.pending: dict[int, asyncio.Future] = {}
         self.notifications: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
         self.sequence = 0
@@ -2957,7 +2968,7 @@ class CodexAppServer:
         self.resume_thread_id: str | None = None
         self.restored_home = False
         self.continuation_event: Callable[[str], None] | None = None
-        self.startup_timing_reporter: Callable[[str, int], None] | None = None
+        self.startup_timing_reporter: Callable[..., None] | None = None
         self.first_model_text_reporter: Callable[[], None] | None = None
         self.first_tool_result_reporter: Callable[[], None] | None = None
         self._first_tool_started_ids: set[tuple[str, str]] = set()
@@ -3211,6 +3222,7 @@ class CodexAppServer:
     async def start(self) -> None:
         self._full_canary_verified = False
         self._full_canary_context = None
+        self._ready_toolchain_checks = None
         if not self.executable:
             raise WorkerRefusal("codex_missing", "격리 worker에 Codex CLI가 설치되지 않았습니다.")
         if self.restored_home:
@@ -3439,7 +3451,7 @@ class CodexAppServer:
     ) -> None:
         """Run deterministic checks under the exact command sandbox used by turns."""
 
-        if profile not in {"full", "post_login_isolation_only"}:
+        if profile not in {"full", "post_login_isolation_only", "ready_toolchain_isolation_only"}:
             raise ValueError("invalid sandbox canary profile")
         external = os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
         sandbox_parameters = self._sandbox_parameters(
@@ -3455,6 +3467,15 @@ class CodexAppServer:
             # available for a post-login shortened check.
             self._full_canary_verified = False
             self._full_canary_context = None
+        elif profile == "ready_toolchain_isolation_only":
+            if not external or not isinstance(self._ready_toolchain_checks, dict) or (
+                self._ready_toolchain_checks.get("toolchain_browser_functional") is not True
+                or type(self._ready_toolchain_checks.get("toolchain_trace_functional")) is not bool
+            ):
+                raise WorkerRefusal(
+                    "sandbox_canary_failed", "Ready toolchain attestation is unavailable.",
+                    requirements=("ready_toolchain_attestation",),
+                )
         elif not self._full_canary_verified or self._full_canary_context != canary_context:
             raise WorkerRefusal(
                 "sandbox_canary_failed", "로그인 전 전체 실행 환경 점검이 현재 실행 환경과 일치하지 않습니다.",
@@ -3462,7 +3483,7 @@ class CodexAppServer:
             )
 
         script = r'''
-import errno,hashlib,json,mmap,os,secrets,shutil,socket,subprocess,sys
+import errno,hashlib,json,mmap,os,secrets,shutil,socket,subprocess,sys,time
 input_root,input_probe,input_control,input_auth,input_api_key,input_digest,worker,worker_identity,server,server_identity,exchange,scratch,challenge,sandbox_mode,canary_profile=sys.argv[1:]
 result={}
 mountinfo_readable=True
@@ -3631,10 +3652,10 @@ def network_sockets_available(family):
 result["network_ipv4_available"]=network_sockets_available(socket.AF_INET)
 result["network_ipv6_available"]=network_sockets_available(socket.AF_INET6)
 
-# The second check runs after credentials have entered protected provider
-# memory. Recheck every isolation boundary, but use the earlier full command
-# probe for toolchain functionality in the same unchanged command profile.
-if canary_profile == "post_login_isolation_only":
+# A shortened check can run after login, or before login when the persistent
+# worker already proved the same pinned toolchain during readiness. Both still
+# recheck every isolation boundary in this job's command profile.
+if canary_profile in ("post_login_isolation_only","ready_toolchain_isolation_only"):
     print(json.dumps(result,separators=(",",":")))
     sys.exit(0)
 
@@ -3669,6 +3690,7 @@ try:
         with open(probe,"wb") as handle: handle.write(b"ok")
         os.unlink(probe)
     result["toolchain_environment_writable"]=True
+    native_started_ns=time.monotonic_ns()
     commands=(
         "r2","ffuf","yara","gdb-multiarch","git","strace","ltrace",
         "patchelf","cpio","pngcheck","pdfinfo","pdftotext","mediainfo","sox",
@@ -3691,6 +3713,8 @@ try:
         command_ok(("gdb-multiarch","--version")),
         command_ok(("patchelf","--print-interpreter","/bin/true")),
     ))
+    result["canary_native_ms"]=max(0,(time.monotonic_ns()-native_started_ns)//1_000_000)
+    browser_started_ns=time.monotonic_ns()
     browser_page=os.path.join(tool_tmp,"browser.html")
     browser_png=os.path.join(tool_tmp,"browser.png")
     with open(browser_page,"w",encoding="utf-8") as handle:
@@ -3702,11 +3726,15 @@ try:
         ),timeout=20) and os.path.isfile(browser_png) and
         open(browser_png,"rb").read(8)==b"\x89PNG\r\n\x1a\n"
     )
+    result["canary_browser_ms"]=max(0,(time.monotonic_ns()-browser_started_ns)//1_000_000)
+    strace_started_ns=time.monotonic_ns()
     trace_path=os.path.join(tool_tmp,"trace")
     result["toolchain_trace_functional"]=(
         command_ok(("strace","-qq","-o",trace_path,"/bin/true")) and
         os.path.isfile(trace_path) and os.path.getsize(trace_path)>0
     )
+    result["canary_strace_ms"]=max(0,(time.monotonic_ns()-strace_started_ns)//1_000_000)
+    python_started_ns=time.monotonic_ns()
     os.environ.update({
         key:tool_env[key]
         for key in ("HOME","XDG_CONFIG_HOME","XDG_CACHE_HOME","TMP","TEMP","TMPDIR")
@@ -3733,6 +3761,7 @@ try:
             volatility_constants.PACKAGE_VERSION=="2.28.0"
         )
     except Exception: pass
+    result["canary_python_ms"]=max(0,(time.monotonic_ns()-python_started_ns)//1_000_000)
 finally:
     shutil.rmtree(tool_root,ignore_errors=True)
 print(json.dumps(result,separators=(",",":")))
@@ -3864,6 +3893,15 @@ print(json.dumps(result,separators=(",",":")))
                 "Codex 실행 격리 결과를 확인할 수 없습니다.",
                 requirements=("invalid_canary_output",),
             ) from exc
+        if profile == "full" and isinstance(checks, dict) and self.startup_timing_reporter:
+            for phase in ("canary_native", "canary_browser", "canary_strace", "canary_python"):
+                duration_ms = checks.get(phase + "_ms")
+                if type(duration_ms) is int and 0 <= duration_ms <= 120_000:
+                    try:
+                        self.startup_timing_reporter(phase, None, duration_ms)
+                    except Exception:
+                        # A worker-local diagnostic must not reject a solve.
+                        pass
         sandbox_checks = {
             "toolchain_browser_functional": bool(
                 isinstance(checks, dict)
@@ -3930,6 +3968,11 @@ print(json.dumps(result,separators=(",",":")))
             self.sandbox_checks = sandbox_checks
             self._full_canary_verified = True
             self._full_canary_context = canary_context
+        elif profile == "ready_toolchain_isolation_only":
+            self.sandbox_checks = dict(self._ready_toolchain_checks)
+            self._full_canary_verified = True
+            self._full_canary_context = canary_context
+            self._ready_toolchain_checks = None
 
     async def login_memory(self, credential: MemoryCredential) -> None:
         self.chatgpt_preflight_verified = False
@@ -6971,6 +7014,10 @@ class SolverWorker:
         # that narrow race without hiding a missing in-flight job.
         self.last_released_job_id: str | None = None
         self._canary_in_progress = False
+        # Worker-local only. Never persisted across a restart or failed readiness.
+        self._ready_codex_toolchain: tuple[
+            int, str, tuple[str, ...], tuple[str, ...], str, bool, bool,
+        ] | None = None
 
     def _new_driver(
         self,
@@ -7012,7 +7059,7 @@ class SolverWorker:
     ) -> None:
         """Repeat only a transient command exit; inventory failures stay terminal."""
 
-        if profile not in {"full", "post_login_isolation_only"}:
+        if profile not in {"full", "post_login_isolation_only", "ready_toolchain_isolation_only"}:
             raise ValueError("invalid sandbox canary profile")
 
         async def verify_once() -> None:
@@ -7044,6 +7091,50 @@ class SolverWorker:
                 await verify_once()
         finally:
             self._canary_in_progress = False
+
+    def _ready_toolchain_reuse_candidate(
+        self, driver: CodexDriverProtocol, version: str, runtime_digest: str | None,
+        *, clean_before_job: bool,
+    ) -> dict[str, bool] | None:
+        """Use readiness tool checks only for the same pinned image in this worker."""
+
+        cached = self._ready_codex_toolchain
+        if not (
+            os.environ.get("CTF_SOLVER_REUSE_READY_TOOLCHAIN_CANARY", "false") == "true"
+            and os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
+            and self.driver_factory is None
+            and type(driver) is CodexAppServer
+            and self.attestation is not None and self.attestation.ready
+            and self.runtime_ready and self.sandbox_attested and clean_before_job
+            and not self.restart_required
+            and self.provider_runtime_checks.get("codex_runtime_attested") is True
+            and version == REQUIRED_CODEX_VERSION and runtime_digest is None
+            and cached is not None
+        ):
+            return None
+        pid, instance_id, command, arguments, attested_version, browser_ok, trace_ok = cached
+        try:
+            same_policy = driver._sandbox_parameters(
+                "command/exec", driver.challenge, network_access=True,
+            ).get("sandboxPolicy") == {"type": "externalSandbox", "networkAccess": "enabled"}
+            same_arguments = arguments == tuple(driver.command_arguments())
+        except Exception:
+            return None
+        if (
+            pid != os.getpid()
+            or instance_id != self.instance_id
+            or command != tuple(driver.command_prefix)
+            or not same_arguments
+            or attested_version != driver.expected_version
+            or driver.expected_version != version
+            or browser_ok is not True
+            or not same_policy
+        ):
+            return None
+        return {
+            "toolchain_browser_functional": browser_ok,
+            "toolchain_trace_functional": trace_ok,
+        }
 
     def _publish_worker(self, *, reason: str | None = None) -> None:
         base = self.attestation.public() if self.attestation else PlatformAttestation(False, {}, reason).public()
@@ -7085,9 +7176,11 @@ class SolverWorker:
         self.sandbox_attested = False
         self.restart_required = True
         self.restart_reason = reason
+        self._ready_codex_toolchain = None
         self._publish_worker(reason=reason)
 
     def prepare(self) -> PlatformAttestation:
+        self._ready_codex_toolchain = None
         self.exchange.mkdir(parents=True, exist_ok=True, mode=0o700)
         harden_current_process()
         self.attestation = self.platform_probe(self.exchange)
@@ -7107,6 +7200,8 @@ class SolverWorker:
         """Prove the pinned CLI sandbox before advertising worker readiness."""
 
         self.startup_diagnostic = None
+        self._ready_codex_toolchain = None
+        ready_codex_toolchain = None
         for name in self.provider_runtime_checks:
             self.provider_runtime_checks[name] = False
         if not self.attestation or not self.attestation.ready:
@@ -7197,6 +7292,18 @@ class SolverWorker:
                             isinstance(sandbox_checks, Mapping)
                             and sandbox_checks.get("toolchain_browser_functional") is True
                         )
+                        if (
+                            type(driver) is CodexAppServer
+                            and driver._full_canary_verified
+                            and os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
+                            and self.provider_runtime_checks["toolchain_browser_functional"]
+                        ):
+                            ready_codex_toolchain = (
+                                os.getpid(), self.instance_id,
+                                tuple(driver.command_prefix), tuple(driver.command_arguments()),
+                                driver.expected_version,
+                                True, self.provider_runtime_checks["toolchain_trace_functional"],
+                            )
                     self.provider_runtime_checks[provider + "_runtime_attested"] = True
                 finally:
                     try:
@@ -7283,6 +7390,8 @@ class SolverWorker:
                 except Exception:
                     failure = "scratch_cleanup_failed"
                     self.runtime_ready = self.sandbox_attested = self.clean = False
+        if not failure and self.runtime_ready and self.sandbox_attested and self.clean:
+            self._ready_codex_toolchain = ready_codex_toolchain
         self._publish_worker(reason=failure)
         if failure:
             self.attestation = PlatformAttestation(False, self.attestation.checks, failure)
@@ -7319,6 +7428,7 @@ class SolverWorker:
         release_status: str | None = None
         release_payload: dict[str, Any] = {}
         needs_credential = False
+        clean_before_job = False
 
         def released_active_retired_before_execution() -> bool:
             if (
@@ -7367,6 +7477,7 @@ class SolverWorker:
                         asyncio.current_task(),
                     )
                 )
+            clean_before_job = self.clean
             self.clean = False
             self._publish_worker()
             prior = _load_optional_state(active, manifest.job_id)
@@ -7611,8 +7722,10 @@ class SolverWorker:
             if isinstance(driver, (CodexAppServer, ClaudePrintDriver)):
                 driver.continuation_event = lambda code: writer.emit("progress", code=code)
                 if isinstance(driver, CodexAppServer):
-                    driver.startup_timing_reporter = lambda phase, started_ns: (
-                        _record_startup_timing(phase, started_ns, startup_run_key)
+                    driver.startup_timing_reporter = lambda phase, started_ns=None, duration_ms=None: (
+                        _record_startup_timing(
+                            phase, started_ns, startup_run_key, duration_ms=duration_ms,
+                        )
                     )
                 if continuation_input is not None and continuation_input.mode == "session":
                     if isinstance(driver, ClaudePrintDriver):
@@ -7626,8 +7739,16 @@ class SolverWorker:
             await driver.start()
             _record_startup_timing("provider_start", provider_started_ns, startup_run_key)
             canary_started_ns = time.perf_counter_ns()
+            ready_toolchain_checks = self._ready_toolchain_reuse_candidate(
+                driver, manifest.codex_version, manifest.codex_runtime_sha256,
+                clean_before_job=clean_before_job,
+            ) if manifest.configuration.provider == "codex" else None
+            pre_login_profile = "full"
+            if ready_toolchain_checks is not None:
+                driver._ready_toolchain_checks = ready_toolchain_checks
+                pre_login_profile = "ready_toolchain_isolation_only"
             await self._verify_sandbox_canary(
-                driver, scratch, prepared.brief.parent
+                driver, scratch, prepared.brief.parent, profile=pre_login_profile,
             )
             _record_startup_timing("canary_pre_login", canary_started_ns, startup_run_key)
             login_started_ns = time.perf_counter_ns()
