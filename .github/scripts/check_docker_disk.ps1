@@ -80,22 +80,36 @@ try {
         throw 'Low Windows free space blocked existing-service startup instead of warning'
     }
     function Get-DesktopDockerCli { return 'docker.exe' }
-    $script:localDigestListing = ''
+    $script:publishedDigest = ''
+    $script:cachedDigest = ''
     $script:localRevision = ''
     function Invoke-DesktopNative([string]$file, [string[]]$arguments, [int]$timeoutSeconds) {
-        if ($arguments -contains 'ls') {
-            return [pscustomobject]@{ExitCode=0;Stdout=$script:localDigestListing}
+        if ($arguments -contains 'manifest') {
+            if (-not $script:publishedDigest) {
+                return [pscustomobject]@{ExitCode=1;Stdout=''}
+            }
+            $manifest = @{Descriptor=@{digest=$script:publishedDigest}} | ConvertTo-Json -Compress
+            return [pscustomobject]@{ExitCode=0;Stdout=$manifest}
         }
-        return [pscustomobject]@{ExitCode=0;Stdout=$script:localRevision}
+        $reference = 'ghcr.io/udonsari0101/ctf-agent-public@' + $script:cachedDigest
+        if ($script:cachedDigest -and $arguments -contains $reference) {
+            return [pscustomobject]@{ExitCode=0;Stdout=$script:localRevision}
+        }
+        return [pscustomobject]@{ExitCode=1;Stdout=''}
     }
     $revision = 'a' * 40
     if ((Get-EstimatedImageWorkBytes $revision) -ne 10GB) {
-        throw 'An overlay without its public base digest was treated as cached'
+        throw 'An image with no published digest was treated as cached'
     }
-    $script:localDigestListing = 'ghcr.io/udonsari0101/ctf-agent-public sha256:' + ('b' * 64)
+    $script:publishedDigest = 'sha256:' + ('b' * 64)
+    $script:cachedDigest = 'sha256:' + ('c' * 64)
     $script:localRevision = $revision
+    if ((Get-EstimatedImageWorkBytes $revision) -ne 10GB) {
+        throw 'A stale local digest carrying the same revision was treated as the published image'
+    }
+    $script:cachedDigest = $script:publishedDigest
     if ((Get-EstimatedImageWorkBytes $revision) -ne 2GB) {
-        throw 'An exact cached public base digest was treated as a cold pull'
+        throw 'The exact published image digest was treated as a cold pull'
     }
     Remove-Item -LiteralPath $customDisk
     try {

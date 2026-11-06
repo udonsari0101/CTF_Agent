@@ -58,27 +58,26 @@ function Resolve-DockerDesktopDiskFile {
 }
 
 function Get-EstimatedImageWorkBytes([string]$revision) {
-    # A local overlay with the requested revision does not prove that the
-    # published base digest is still cached. Pruning may have removed the
-    # base reference, so use the 2 GiB estimate only for a verified local
-    # public-image digest whose revision label matches this release.
+    # Only the digest currently published for this exact revision can be
+    # treated as cached. A different local digest can carry the same revision
+    # label and would still require a cold pull.
     if ($revision -notmatch '^[0-9a-f]{40}$') { return [int64]10GB }
     $docker = Get-DesktopDockerCli
     $repository = 'ghcr.io/udonsari0101/ctf-agent-public'
-    $listed = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
-        'image', 'ls', '--digests', '--format={{.Repository}} {{.Digest}}') 8
-    if ($listed.ExitCode -ne 0) { return [int64]10GB }
-    foreach ($line in @($listed.Stdout -split "`n")) {
-        $parts = @($line.Trim() -split '\s+')
-        if ($parts.Count -ne 2 -or $parts[0] -ne $repository -or
-            $parts[1] -notmatch '^sha256:[0-9a-f]{64}$') { continue }
-        $image = "$repository@$($parts[1])"
-        $checked = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
-            'image', 'inspect', $image,
-            '--format={{index .Config.Labels "org.opencontainers.image.revision"}}') 8
-        if ($checked.ExitCode -eq 0 -and $checked.Stdout.Trim() -eq $revision) {
-            return [int64]2GB
-        }
+    $manifest = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
+        'manifest', 'inspect', '--verbose', "$repository`:$revision") 30
+    if ($manifest.ExitCode -ne 0) { return [int64]10GB }
+    try {
+        $published = $manifest.Stdout | ConvertFrom-Json -ErrorAction Stop
+        $digest = [string]$published.Descriptor.digest
+    } catch { return [int64]10GB }
+    if ($digest -notmatch '^sha256:[0-9a-f]{64}$') { return [int64]10GB }
+    $image = "$repository@$digest"
+    $checked = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
+        'image', 'inspect', $image,
+        '--format={{index .Config.Labels "org.opencontainers.image.revision"}}') 8
+    if ($checked.ExitCode -eq 0 -and $checked.Stdout.Trim() -eq $revision) {
+        return [int64]2GB
     }
     return [int64]10GB
 }
