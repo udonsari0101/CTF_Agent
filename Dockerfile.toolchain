@@ -81,7 +81,7 @@ RUN apt-get update \
     && gem install --local --no-document /tmp/seccomp-tools.gem \
     && seccomp-tools --version | grep -F "Version ${SECCOMP_TOOLS_VERSION}" \
     && GoReSym /usr/local/bin/GoReSym > /tmp/goresym-self.json \
-    && grep -Fq '"Arch": "amd64"' /tmp/goresym-self.json \
+    && python3 -c 'import json; assert json.load(open("/tmp/goresym-self.json", encoding="utf-8")).get("Arch") == "amd64"' \
     && apt-get purge --yes ruby-dev ruby3.1-dev \
     && apt-get autoremove --yes --purge \
     && rm -f /tmp/radare2.deb /tmp/ffuf.tar.gz /tmp/ffuf /tmp/LICENSE /tmp/stegseek.deb /tmp/pwndbg.deb /tmp/websocat /tmp/goresym.zip /tmp/GoReSym /tmp/goresym-self.json /tmp/os.gem /tmp/seccomp-tools.gem \

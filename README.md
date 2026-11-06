@@ -13,6 +13,7 @@ The screenshots use synthetic challenges and account data.
 ## Features
 
 - Keep each CTF in a separate workspace. Save a CTFd site and API token or username/password in workspace settings, then reuse that connection for import and optional flag submission; imports can also use new credentials for a single session. Add challenges manually or import selected challenges from CTFd; sync new or changed challenges later. Link related challenges by ID, including challenges with duplicate names.
+- Run cloned challenges independently. To coordinate parallel solves, select a sibling run and send a verified observation to one active job. Observations do not cross over automatically.
 - Connect Codex and Claude Code through account sign-in or an API key. Choose the account, model, and reasoning level per challenge; see remaining quota when supported by the account connection, live solve time, session activity, and child agents.
 - Send instructions during a solve. On retry, a compatible provider session can resume directly. Switching between Codex and Claude Code carries available work files and bounded analysis notes into a new session; if a run stops before it writes notes, a bounded summary of its recorded activity supplies the retry context.
 - Upload multiple files, including large binaries with resumable transfers. Stage files in a workspace before challenge details are available, then attach them to one or more challenges. Challenge files and the database use separate data directories.
@@ -75,8 +76,8 @@ Each solver runs in a separate container with its own scratch space. The challen
 | Field | Available tools and typical uses |
 | --- | --- |
 | Web | `curl`, Chromium via `ctf-browser`, Playwright interaction via `ctf-browser-act`, `ffuf`, `sqlmap`, `websocat`, Python HTTP libraries: request inspection, paths, sessions, browser forms and uploads. |
-| Pwn | `gdb`, `gdbserver`, `pwndbg`, `pwntools`, `ROPgadget`, `ropper`, `patchelf`, `qemu-user`, `strace`: binary behavior and exploit reproduction. |
-| Reverse | Ghidra headless, JADX, `radare2`, `objdump`, `readelf`, `angr`, LIEF, Capstone, Unicorn, `apktool`, `wabt`: native, Android, and WebAssembly analysis. |
+| Pwn | `gdb`, `gdbserver`, `pwndbg`, `pwntools`, `ROPgadget`, `ropper`, `seccomp-tools`, `patchelf`, `qemu-user`, `strace`: binary behavior, seccomp filters, and exploit reproduction. |
+| Reverse | Ghidra headless, JADX, `GoReSym`, `radare2`, `objdump`, `readelf`, `angr`, LIEF, Capstone, Unicorn, `apktool`, `wabt`: native, Go, Android, and WebAssembly analysis. |
 | Crypto | PARI/GP, PyCryptodome, SymPy, `gmpy2`, Z3, `fpylll`, `owiener`, `john`: algebra, lattice, RSA, and password challenges. |
 | Forensics | `binwalk`, `foremost`, `exiftool`, Sleuth Kit, `testdisk`, Volatility 3, `tshark`, YARA, `ffmpeg`, `steghide`, `stegseek`: file, disk, memory, traffic, media, and steganography analysis. |
 | Network and misc | `dig`, `whois`, `nmap`, Scapy, `socat`, `tesseract`, `zbarimg`, Python: protocol inspection, automation, and OCR. |

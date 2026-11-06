@@ -13,6 +13,7 @@
 ## 주요 기능
 
 - 대회마다 작업공간을 분리합니다. 작업공간 설정에서 CTFd 주소와 API 토큰 또는 아이디·비밀번호를 저장해 문제 가져오기와 선택적 Flag 자동 제출에 함께 사용할 수 있습니다. 가져올 때 새 인증 정보를 일회성으로 입력할 수도 있습니다. 문제를 직접 등록하거나 CTFd에서 선택해 가져올 수 있으며, 이후 추가되거나 수정된 문제를 동기화할 수 있습니다. 이름이 같은 복제 문제도 고유 ID로 구분해 관련 문제를 양방향으로 연결할 수 있습니다.
+- 복제한 동일 문제를 독립적으로 풀 수 있습니다. 병렬 풀이 결과를 공유하려면 출처 풀이를 선택하고 확인한 관찰을 입력해 진행 중인 풀이에 전달합니다. 다른 풀이 내용은 자동으로 섞이지 않습니다.
 - Codex와 Claude Code를 계정 로그인 또는 API 키로 연결합니다. 문제별 계정·모델·추론 수준을 선택하고, 계정 연결 방식에서 지원하는 경우 남은 사용량과 진행 중인 풀이 시간·세션 활동·하위 에이전트를 확인할 수 있습니다.
 - 풀이 중 추가 명령을 보낼 수 있습니다. 다시 풀 때 호환되는 공급자 세션은 직접 재개합니다. Codex와 Claude Code 사이를 전환하면 저장된 작업 파일과 범위를 제한한 분석 기록을 새 세션으로 전달하며, 노트를 쓰기 전에 중단된 경우에는 기록된 활동의 제한된 요약을 이어받습니다.
 - 여러 첨부파일을 올릴 수 있습니다. 대용량 파일은 중단된 지점부터 이어 올립니다. 문제 정보가 나오기 전에 작업공간에 파일을 보관하고, 나중에 하나 이상의 문제에 연결할 수 있습니다. 문제 파일과 데이터베이스는 별도 데이터 디렉터리에 저장합니다.
@@ -66,8 +67,8 @@ git clone https://github.com/udonsari0101/CTF_Agent.git ~/CTF_Agent && cd ~/CTF_
 | 분야 | 제공 도구와 용도 |
 | --- | --- |
 | Web | `curl`, `ctf-browser`를 통한 Chromium, `ctf-browser-act`를 통한 Playwright 조작, `ffuf`, `sqlmap`, `websocat`, Python HTTP 라이브러리: 요청, 경로, 세션, 브라우저 폼·업로드 분석 |
-| Pwn | `gdb`, `gdbserver`, `pwndbg`, `pwntools`, `ROPgadget`, `ropper`, `patchelf`, `qemu-user`, `strace`: 바이너리 분석과 익스플로잇 재현 |
-| Reverse | Ghidra headless, JADX, `radare2`, `objdump`, `readelf`, `angr`, LIEF, Capstone, Unicorn, `apktool`, `wabt`: 네이티브, Android, WebAssembly 분석 |
+| Pwn | `gdb`, `gdbserver`, `pwndbg`, `pwntools`, `ROPgadget`, `ropper`, `seccomp-tools`, `patchelf`, `qemu-user`, `strace`: 바이너리 동작, seccomp 필터 분석, 익스플로잇 재현 |
+| Reverse | Ghidra headless, JADX, `GoReSym`, `radare2`, `objdump`, `readelf`, `angr`, LIEF, Capstone, Unicorn, `apktool`, `wabt`: 네이티브, Go, Android, WebAssembly 분석 |
 | Crypto | PARI/GP, PyCryptodome, SymPy, `gmpy2`, Z3, `fpylll`, `owiener`, `john`: 대수, 격자, RSA, 암호 문제 |
 | Forensics | `binwalk`, `foremost`, `exiftool`, Sleuth Kit, `testdisk`, Volatility 3, `tshark`, YARA, `ffmpeg`, `steghide`, `stegseek`: 파일, 디스크, 메모리, 패킷, 미디어, 스테가노그래피 분석 |
 | Network 및 기타 | `dig`, `whois`, `nmap`, Scapy, `socat`, `tesseract`, `zbarimg`, Python: 프로토콜, 자동화, OCR |
