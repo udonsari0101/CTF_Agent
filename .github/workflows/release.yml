@@ -70,7 +70,9 @@ jobs:
                           'app/deploy/production-update.py', 'app/deploy/bootstrap-production-update.sh',
                           'app/deploy/PRODUCTION_UPDATE.md',
                           'app/.github/scripts/remote-rollout.sh',
-                          'app/ctf_agent/main.py', 'app/ctf_agent/web/i18n/en.json',
+                          'app/ctf_agent/main.py', 'app/ctf_agent/staged_files.py',
+                          'app/ctf_agent/transfer_export_budget.py',
+                          'app/ctf_agent/web/i18n/en.json',
                           'app/ctf_agent/web/i18n/ko.json'}
               assert all(prefix + name in names for name in required)
               assert not any('/tests/' in name or name.endswith('/requirements-dev.txt') for name in names)

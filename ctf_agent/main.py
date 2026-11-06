@@ -156,6 +156,10 @@ class BodySizeLimit:
             chunk_path.startswith("/api/uploads/")
             or chunk_path.startswith("/api/transfers/uploads/")
             or chunk_path.startswith("/api/transfers/direct/invitations/")
+            or re.fullmatch(
+                r"/api/workspaces/[^/]+/staged-files/[0-9a-f]{32}/chunks",
+                chunk_path,
+            ) is not None
         )
         max_bytes = self.chunk_bytes if chunk_request else self.max_bytes
 
@@ -812,6 +816,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request.url.path.startswith("/api/uploads/")
             or request.url.path.startswith("/api/transfers/uploads/")
             or request.url.path.startswith("/api/transfers/direct/invitations/")
+            or re.fullmatch(
+                r"/api/workspaces/[^/]+/staged-files/[0-9a-f]{32}/chunks",
+                request.url.path,
+            ) is not None
         )
         request_limit = 8 * 1024 * 1024 if chunk_request else 4 * 1024 * 1024
         if (not _legacy_attachment_post(request.scope)
@@ -1056,6 +1064,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(409, "가져오기를 중단하고 있습니다. 잠시 후 다시 삭제하세요.")
         if not app.state.uploads.cancel_workspace(workspace_id, CURRENT_USER.get()):
             raise HTTPException(409, "파일 저장 중입니다. 업로드를 중단한 뒤 다시 삭제하세요.")
+        if not app.state.staged_files.cancel_workspace(workspace_id, CURRENT_USER.get()):
+            raise HTTPException(409, "Workspace staged-file cleanup is still in progress.")
         submit_jobs = getattr(app.state, "ctfd_submit", None)
         if submit_jobs and not submit_jobs.cancel_workspace(workspace_id, CURRENT_USER.get()):
             try:
@@ -1808,16 +1818,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from .uploads import register_uploads
     register_uploads(app, require_auth, settings, validate_filename, now)
+    from .staged_files import register_staged_files
+    register_staged_files(app, require_auth, settings, validate_filename, now)
     from .transfer_uploads import TransferUploadError, TransferUploadManager
     from .transfer_export_cleanup import TransferExportManager, TransferExportResponse
+    from .transfer_export_budget import export_manual_bundle
+    from .storage_budget import StorageBudgetError, storage_http_status
     from .workspace_transfer import (
-        TransferError, export_challenge, export_workspace, import_challenge,
+        TransferError, import_challenge,
         import_workspace, lookup_import, preview_bundle,
     )
 
     transfer_uploads = TransferUploadManager(settings)
     app.state.transfer_uploads = transfer_uploads
-    transfer_exports = TransferExportManager(settings)
+    transfer_exports = TransferExportManager(settings, app.state.storage_budget)
     app.state.transfer_exports = transfer_exports
     try:
         transfer_exports.cleanup_stale()
@@ -1845,22 +1859,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 challenge = challenge_row(db, workspace_id, challenge_id) if challenge_id else None
             destination, export_lock = transfer_exports.reserve()
             try:
-                if challenge is None:
-                    export_workspace(
-                        settings, app.state.storage_layout, owner_id(),
-                        workspace_id, destination, include_remote=include_remote,
-                    )
-                    name = workspace["name"]
-                else:
-                    export_challenge(
-                        settings, app.state.storage_layout, owner_id(),
-                        workspace_id, challenge_id, destination,
-                        include_remote=include_remote,
-                    )
-                    name = challenge["name"]
+                export_manual_bundle(
+                    settings, app.state.storage_layout, app.state.storage_budget,
+                    owner_id(), workspace_id, challenge_id, destination,
+                    include_remote=include_remote,
+                )
+                name = challenge["name"] if challenge is not None else workspace["name"]
             except TransferError as exc:
                 transfer_exports.discard(destination, export_lock)
                 raise transfer_error(exc) from None
+            except StorageBudgetError as exc:
+                transfer_exports.discard(destination, export_lock)
+                raise HTTPException(storage_http_status(exc), str(exc)) from None
             except BaseException:
                 transfer_exports.discard(destination, export_lock)
                 raise

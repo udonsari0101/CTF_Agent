@@ -11,13 +11,16 @@ from pathlib import Path
 
 from fastapi.responses import FileResponse
 
-from .db import Settings
+from .db import Settings, connect
 from .process_lock import ProcessFileLock
+from .storage_budget import StorageBudget
+from .transfer_export_budget import MANUAL_RESERVATION_KIND, remove_partial_export
 
 
 EXPORT_TTL_SECONDS = 7 * 24 * 3600
 _ZIP = re.compile(r"([0-9a-f]{32})\.zip\Z")
 _STAGE = re.compile(r"\.([0-9a-f]{32})\.zip\.[0-9a-f]{32}\.tmp\Z")
+_RESERVATION = re.compile(r"manual-export:([0-9a-f]{32})\Z")
 
 
 class TransferExportResponse(FileResponse):
@@ -39,7 +42,11 @@ class TransferExportResponse(FileResponse):
 
 
 class TransferExportManager:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, budget: StorageBudget | None = None):
+        self.budget = budget or StorageBudget(
+            settings.data_dir, lambda: connect(settings),
+            minimum_free_bytes=settings.storage_min_free_bytes,
+        )
         self.root = Path(settings.data_dir) / "workspaces" / ".transfers" / "exports"
         self.lock_root = Path(settings.config_dir) / ".locks" / "transfer_exports"
         for directory in (self.root, self.lock_root):
@@ -72,6 +79,26 @@ class TransferExportManager:
         """Delete up to 100 old ZIPs/stages, skipping files locked by downloads."""
         threshold = time.time() - EXPORT_TTL_SECONDS
         cleaned = 0
+        # An interrupted export can leave a fresh staging file and a durable
+        # budget reservation. Its per-export lock is the liveness check: a
+        # live exporter or download must never have its reservation removed.
+        for reservation in self.budget.snapshot(kind=MANUAL_RESERVATION_KIND):
+            match = _RESERVATION.fullmatch(reservation["reservation_key"])
+            if match is None:
+                continue
+            identifier = match.group(1)
+            lock = self._lock(identifier)
+            if not lock.try_acquire():
+                continue
+            try:
+                destination = self.root / f"{identifier}.zip"
+                self.budget.release(
+                    reservation["reservation_key"],
+                    cleanup=lambda: remove_partial_export(destination),
+                )
+                cleaned += 1
+            finally:
+                lock.release()
         scanned = 0
         with os.scandir(self.root) as entries:
             for entry in entries:

@@ -14,6 +14,9 @@ let sessionPersistent = false;
 let authMode = 'password';
 const activeUploads = new Map();
 const uploadViews = new Map();
+const stagedActiveUploads = new Map();
+const stagedFilesCache = new Map();
+let stagedRefreshTimer = null;
 const startingListSolvers = new Set();
 let challengeFlags = new Map();
 const writeupCopyCache = new Map();
@@ -1522,7 +1525,7 @@ async function renderWorkspace() {
   const w = currentWorkspace;
   stopChallengeListPolling();
   const content = shell('workspaces', w.name);
-  content.innerHTML = `<div class="page-head"><div><div class="eyebrow">CTF WORKSPACE</div><h1>${esc(w.name)}</h1>${w.description ? `<p>${esc(w.description)}</p>` : ''}</div><div class="head-actions"><button class="ghost icon-action" data-action="edit-workspace" aria-label="작업공간 설정" title="작업공간 설정">⚙</button><button data-action="receive-workspace-direct">${tr('직접 받기')}</button><button data-action="import-workspace-transfer">${tr('ZIP 가져오기')}</button><button data-action="ctfd-submit-settings">CTFd 연결</button><button data-action="ctfd-import">CTFd 가져오기 <span class="ctfd-import-badge" hidden></span></button><button data-action="ctfd-sync" title="저장된 CTFd 연결에서 새로 추가된 문제만 확인합니다.">새 문제 동기화</button><button class="primary" data-action="new-challenge">＋ 문제 추가</button></div></div>
+  content.innerHTML = `<div class="page-head"><div><div class="eyebrow">CTF WORKSPACE</div><h1>${esc(w.name)}</h1>${w.description ? `<p>${esc(w.description)}</p>` : ''}</div><div class="head-actions"><button class="ghost icon-action" data-action="edit-workspace" aria-label="작업공간 설정" title="작업공간 설정">⚙</button><button data-action="show-staged-files">${tr('사전 파일')}</button><button data-action="receive-workspace-direct">${tr('직접 받기')}</button><button data-action="import-workspace-transfer">${tr('ZIP 가져오기')}</button><button data-action="ctfd-submit-settings">CTFd 연결</button><button data-action="ctfd-import">CTFd 가져오기 <span class="ctfd-import-badge" hidden></span></button><button data-action="ctfd-sync" title="저장된 CTFd 연결에서 새로 추가된 문제만 확인합니다.">새 문제 동기화</button><button class="primary" data-action="new-challenge">＋ 문제 추가</button></div></div>
     <div class="workspace-summary"><div class="workspace-summary-meta"><span>⚑ Flag 형식 <code>${esc(w.flag_format || '미설정')}</code></span><span>문제 <b data-workspace-challenge-count>${w.challenge_count ?? ''}</b></span></div>${resourceMeterMarkup()}</div>
     <div id="challenge-area"></div>`;
   startResourcePolling(w.id);
@@ -1970,6 +1973,7 @@ function startChallengeListPolling(workspaceId) {
 }
 
 function openModal(title, subtitle, body, footer, formId) {
+  pauseStagedUploads();
   if (transferState?.running) { transferState.paused = true; transferState.controller?.abort(); }
   transferState = null;
   transferExportController?.abort(); transferExportController = null;
@@ -1986,6 +1990,141 @@ function openModal(title, subtitle, body, footer, formId) {
   const form = modal.querySelector('form');
   if (form) { form.dataset.initial = formSnapshot(form); form.dataset.workspaceId = currentWorkspace?.id || ''; }
   if (!modal.open) modal.showModal();
+}
+
+function pauseStagedUploads() {
+  if (stagedRefreshTimer !== null) clearTimeout(stagedRefreshTimer);
+  stagedRefreshTimer = null;
+  for (const active of stagedActiveUploads.values()) {
+    if (!active.running) continue;
+    active.paused = true;
+    active.controller.abort();
+  }
+}
+
+async function showStagedFiles() {
+  const workspaceId = currentWorkspace?.id;
+  if (!workspaceId) return;
+  openModal(i18n.t('사전 파일'), i18n.t('문제 정보가 나오기 전에 파일을 올려두고, 나중에 문제에 연결할 수 있습니다. 사전 파일은 현재 작업공간 ZIP 내보내기·직접 받기에 포함되지 않습니다.'),
+    `<label class="challenge-file-target" for="staged-files-input"><strong>${tr('파일을 여기로 끌어오거나 선택하세요')}</strong><small>${tr('여러 파일을 한 번에 추가할 수 있습니다.')}</small></label><input id="staged-files-input" class="sr-only" type="file" multiple><div id="staged-files-list" class="file-list" role="status" aria-live="polite"></div>`,
+    `<button type="button" data-action="close-modal">${tr('닫기')}</button>`);
+  modal.dataset.kind = 'staged-files';
+  modal.dataset.workspaceId = workspaceId;
+  await refreshStagedFiles(workspaceId);
+}
+
+async function addStagedFiles(files, workspaceId) {
+  const errors = [];
+  for (const file of files) {
+    if (!modal.open || modal.dataset.kind !== 'staged-files' || modal.dataset.workspaceId !== workspaceId) break;
+    try { await uploadStagedFile(file,workspaceId); }
+    catch (error) { errors.push(`${file.name}: ${error.message}`); }
+  }
+  await refreshStagedFiles(workspaceId);
+  if (errors.length) throw new Error(errors.join(' / '));
+}
+
+async function refreshStagedFiles(workspaceId, cachedFiles = null) {
+  const files = cachedFiles || (await api(`/api/workspaces/${workspaceId}/staged-files`)).files || [];
+  stagedFilesCache.set(workspaceId,files);
+  if (!modal.open || modal.dataset.kind !== 'staged-files' || modal.dataset.workspaceId !== workspaceId) return files;
+  const list = modal.querySelector('#staged-files-list');
+  if (!list) return files;
+  list.innerHTML = files.length ? files.map(file => {
+    const active = stagedActiveUploads.get(file.id);
+    const offset = active?.offset ?? file.offset;
+    const ready = file.status === 'ready' && file.file_available !== false;
+    const progress = file.status === 'verifying'
+      ? `<small>${size(file.size)} · ${tr('전체 파일 SHA-256 확인 중')}</small><progress></progress>`
+      : file.status === 'uploading'
+      ? `<small>${size(offset)} / ${size(file.size)} · ${esc(file.verification_error || active?.message || i18n.t('원본 파일을 다시 선택하면 이어 올립니다.'))}</small><progress max="${Math.max(1,file.size)}" value="${offset}"></progress>`
+      : `<small>${size(file.size)} · ${ready ? tr('준비됨') : tr('원본 파일 확인 필요')} · ${tr('문제 연결')} ${Number(file.linked_count || 0)}</small>`;
+    const controls = file.status === 'uploading'
+      ? `${active?.running ? `<button type="button" class="small" data-action="pause-staged-upload" data-id="${esc(file.id)}">${tr('일시 중지')}</button>` : active?.file ? `<button type="button" class="small" data-action="resume-staged-upload" data-id="${esc(file.id)}">${tr('이어 올리기')}</button>` : ''}<label class="small">${tr('원본 재선택')}<input type="file" data-staged-resume="${esc(file.id)}" class="sr-only"></label>`
+      : ready ? `<a class="small" href="/api/workspaces/${encodeURIComponent(workspaceId)}/staged-files/${encodeURIComponent(file.id)}/content" download>${tr('다운로드')}</a>` : '';
+    return `<div class="file-item"><div><strong>${esc(file.name)}</strong>${progress}${ready && file.storage_path ? `<small>${tr('보관 경로')}: <code>${esc(file.storage_path)}</code></small>` : ''}</div><div class="actions">${controls}<button type="button" class="small danger" data-action="delete-staged-file" data-id="${esc(file.id)}">${tr('삭제')}</button></div></div>`;
+  }).join('') : `<p class="muted">${tr('사전 파일이 없습니다.')}</p>`;
+  if (stagedRefreshTimer !== null) clearTimeout(stagedRefreshTimer);
+  stagedRefreshTimer = files.some(file => file.status === 'verifying')
+    ? setTimeout(() => refreshStagedFiles(workspaceId).catch(() => {}), 2000) : null;
+  return files;
+}
+
+async function uploadStagedFile(file, workspaceId, resumeId = '') {
+  if (!file || !workspaceId) return false;
+  const base = `/api/workspaces/${workspaceId}/staged-files`;
+  let upload;
+  if (resumeId) upload = await api(`${base}/${resumeId}`);
+  else {
+    const files = await refreshStagedFiles(workspaceId);
+    upload = files.find(item => item.status === 'uploading' && item.name === file.name && item.size === file.size && item.last_modified === file.lastModified);
+    if (!upload) upload = await api(base,{method:'POST',body:{name:file.name,size:file.size,last_modified:file.lastModified}});
+  }
+  if (upload.name !== file.name || upload.size !== file.size || upload.last_modified !== file.lastModified) throw new Error('이어 올릴 원본 파일이 다릅니다.');
+  if (upload.status === 'ready') return true;
+  if (stagedActiveUploads.get(upload.id)?.running) throw new Error('이 파일은 이미 업로드 중입니다.');
+  const active = {file,offset:upload.offset,workspaceId,controller:new AbortController(),running:true,paused:false,message:'준비 중'};
+  stagedActiveUploads.set(upload.id,active);
+  let completed = false;
+  const cache = stagedFilesCache.get(workspaceId) || [];
+  if (!cache.some(item => item.id === upload.id)) cache.push(upload);
+  const paint = () => {
+    const index = cache.findIndex(item => item.id === upload.id);
+    if (index >= 0) cache[index] = {...cache[index],...upload};
+    return refreshStagedFiles(workspaceId,cache).catch(() => {});
+  };
+  await paint();
+  try {
+    if (upload.offset) {
+      active.message = '기존 파일 검증 중'; await paint();
+      let start = 0;
+      do {
+        const manifest = await api(`${base}/${upload.id}/chunks?start=${start}`);
+        for (const chunk of manifest.chunks) {
+          if (active.paused) return false;
+          if (!crypto.subtle) throw new Error('이어 올리기 검증에는 HTTPS가 필요합니다.');
+          const bytes = await file.slice(chunk.offset,chunk.offset + chunk.size).arrayBuffer();
+          const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),value => value.toString(16).padStart(2,'0')).join('');
+          if (digest !== chunk.sha256) throw new Error('이전 업로드의 원본과 파일 내용이 다릅니다.');
+        }
+        start = manifest.next_offset;
+      } while (start !== null);
+    }
+    while (upload.offset < file.size) {
+      if (active.paused) return false;
+      active.message = '전송 중';
+      const part = file.slice(upload.offset,Math.min(file.size,upload.offset + 8 * 1024 * 1024));
+      upload = await api(`${base}/${upload.id}/chunks?offset=${upload.offset}`,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:part,signal:active.controller.signal});
+      active.offset = upload.offset;
+      await paint();
+    }
+    active.message = '전체 파일 검증 중'; await paint();
+    try { upload = await api(`${base}/${upload.id}/finalize`,{method:'POST',signal:active.controller.signal}); }
+    catch (error) {
+      if (active.paused) return false;
+      // A gateway timeout does not necessarily stop the server-side hash.
+      upload = await api(`${base}/${upload.id}`);
+      if (upload.status !== 'verifying' && upload.status !== 'ready') throw error;
+    }
+    while (upload.status === 'verifying') {
+      if (active.paused) return false;
+      active.message = '전체 파일 SHA-256 확인 중'; await paint();
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      upload = await api(`${base}/${upload.id}`);
+    }
+    if (upload.status !== 'ready') throw new Error(upload.verification_error || '파일 확인을 마치지 못했습니다. 다시 시도하세요.');
+    completed = true;
+    stagedActiveUploads.delete(upload.id);
+    await refreshStagedFiles(workspaceId);
+    return true;
+  } catch (error) {
+    if (error.name !== 'AbortError') { active.message = error.message; throw error; }
+    return false;
+  } finally {
+    active.running = false;
+    if (active.paused) active.message = '일시 중지됨';
+    if (!completed) await paint();
+  }
 }
 
 function transferFilename(name, scope) {
@@ -2237,7 +2376,7 @@ function directInvitationKey(scope, workspaceId) {
 }
 
 function directInvitationStatus(status) {
-  return i18n.t({issued:'수락 대기',uploading:'전송 중',completed:'가져오기 완료',revoked:'초대 취소됨',expired:'초대 만료됨'}[status] || '상태 확인 중');
+  return i18n.t({issued:'보내는 설치 대기',awaiting_approval:'용량 확인 대기',uploading:'전송 중',completed:'가져오기 완료',revoked:'초대 취소됨',expired:'초대 만료됨'}[status] || '상태 확인 중');
 }
 
 function paintDirectInvitation(state) {
@@ -2246,9 +2385,11 @@ function paintDirectInvitation(state) {
   const credentials = modal.querySelector('#direct-invite-credentials');
   const missingToken = modal.querySelector('#direct-invite-missing-token');
   const result = modal.querySelector('#direct-invite-result');
+  const offer = modal.querySelector('#direct-invite-offer');
+  const approve = modal.querySelector('[data-action="approve-direct-invitation"]');
   const create = modal.querySelector('[data-action="create-direct-invitation"]');
   const revoke = modal.querySelector('[data-action="revoke-direct-invitation"]');
-  const active = ['issued','uploading'].includes(state.status);
+  const active = ['issued','awaiting_approval','uploading'].includes(state.status);
   if (status) {
     status.textContent = state.error || (state.invitationId
       ? `${directInvitationStatus(state.status)}${state.expiresAt ? ` · ${i18n.t('만료 시각')} ${new Date(state.expiresAt * 1000).toLocaleString(i18n.locale === 'ko' ? 'ko-KR' : 'en-US')}` : ''}`
@@ -2262,6 +2403,18 @@ function paintDirectInvitation(state) {
     if (token) token.value = state.token || '';
   }
   if (missingToken) missingToken.hidden = !(state.invitationId && active && !state.token);
+  if (offer) {
+    offer.hidden = state.status !== 'awaiting_approval' || !Number.isSafeInteger(state.size);
+    if (!offer.hidden) {
+      const zip = offer.querySelector('#direct-invite-offer-zip');
+      const attachments = offer.querySelector('#direct-invite-offer-attachments');
+      if (zip) zip.textContent = size(state.size);
+      if (attachments) {
+        attachments.hidden = !Number.isSafeInteger(state.attachmentBytes);
+        if (!attachments.hidden) attachments.textContent = size(state.attachmentBytes);
+      }
+    }
+  }
   if (result) {
     result.hidden = state.status !== 'completed';
     const imported = state.result || {};
@@ -2269,7 +2422,8 @@ function paintDirectInvitation(state) {
       ? `<p>${tr('대상 설치에서 가져오기를 마쳤습니다.')}</p>${imported.workspace_id ? `<button type="button" data-action="open-direct-result">${tr('가져온 자료 열기')}</button>` : ''}` : '';
   }
   if (create) { create.hidden = Boolean(state.invitationId && active); create.disabled = state.busy; create.textContent = i18n.t(state.invitationId ? '새 초대 발급' : '초대 발급'); }
-  if (revoke) { revoke.hidden = !state.invitationId || !active; revoke.disabled = state.busy; }
+  if (approve) { approve.hidden = state.status !== 'awaiting_approval'; approve.disabled = state.busy || !state.sha256; }
+  if (revoke) { revoke.hidden = !state.invitationId || !active; revoke.disabled = state.busy; revoke.textContent = i18n.t(state.status === 'awaiting_approval' ? '가져오기 거절' : '초대 취소'); }
 }
 
 async function pollDirectInvitation(state) {
@@ -2282,6 +2436,9 @@ async function pollDirectInvitation(state) {
     state.status = result.status || state.status;
     state.expiresAt = result.expires_at || state.expiresAt;
     state.result = result.result || null;
+    state.size = result.size;
+    state.sha256 = result.sha256 || '';
+    state.attachmentBytes = result.attachment_bytes;
     state.error = '';
     paintDirectInvitation(state);
   } catch (error) {
@@ -2289,7 +2446,7 @@ async function pollDirectInvitation(state) {
     state.error = error.message;
     paintDirectInvitation(state);
   }
-  if (directInviteState === state && ['issued','uploading'].includes(state.status)) {
+  if (directInviteState === state && ['issued','awaiting_approval','uploading'].includes(state.status)) {
     directInviteTimer = setTimeout(() => pollDirectInvitation(state),4000);
   }
 }
@@ -2298,10 +2455,10 @@ function showDirectInvitation(scope, workspaceId = '') {
   if (scope === 'challenge' && !workspaceId) throw new Error(i18n.t('가져올 작업공간을 먼저 선택하세요.'));
   openModal(i18n.t(scope === 'challenge' ? '문제 직접 받기' : '작업공간 직접 받기'),
     scope === 'challenge' ? `${currentWorkspace?.name || i18n.t('작업공간')} · ${i18n.t('새 문제 추가')}` : i18n.t('새 작업공간으로 복원'),
-    `<div class="direct-transfer"><p>${tr('이 설치에서 일회용 초대를 발급한 뒤, 보내는 설치에 URL과 토큰을 입력하세요.')}</p><label>${tr('최대 ZIP 크기')}<select id="direct-max-size"><option value="2147483648">2 GB</option><option value="10737418240">10 GB</option><option value="21474836480" selected>20 GB</option></select></label><p class="form-hint">${tr('초대는 1시간 후 만료됩니다. URL과 토큰은 보내는 설치에만 전달하세요.')}</p><div id="direct-invite-status" class="direct-status" role="status" aria-live="polite"></div><div id="direct-invite-credentials" class="direct-credentials" hidden><label>${tr('초대 URL')}<input id="direct-invite-url" type="text" readonly></label><button type="button" class="small ghost" data-action="copy-direct-url">${tr('URL 복사')}</button><label>${tr('초대 토큰')}<input id="direct-invite-token" type="text" readonly></label><button type="button" class="small ghost" data-action="copy-direct-token">${tr('토큰 복사')}</button></div><p id="direct-invite-missing-token" class="form-hint" hidden>${tr('이 초대의 토큰은 다시 표시되지 않습니다. 새 초대를 발급하려면 현재 초대를 취소하세요.')}</p><div id="direct-invite-result" class="direct-result" hidden></div></div>`,
-    `<button type="button" data-action="close-modal">${tr('닫기')}</button><button type="button" class="danger ghost" data-action="revoke-direct-invitation" hidden>${tr('초대 취소')}</button><button type="button" class="primary" data-action="create-direct-invitation">${tr('초대 발급')}</button>`);
+    `<div class="direct-transfer"><p>${tr('이 설치에서 일회용 초대를 발급한 뒤, 보내는 설치에 URL과 토큰을 입력하세요.')}</p><p class="form-hint">${tr('초대는 1시간 후 만료됩니다. URL과 토큰은 보내는 설치에만 전달하세요.')}</p><div id="direct-invite-status" class="direct-status" role="status" aria-live="polite"></div><div id="direct-invite-offer" class="transfer-preview-facts" hidden><div><strong>${tr('받을 ZIP 크기')}</strong> <span id="direct-invite-offer-zip"></span></div><div><strong>${tr('압축 해제 후 첨부파일')}</strong> <span id="direct-invite-offer-attachments"></span></div><p class="form-hint">${tr('승인하면 파일 전송과 가져오기를 시작합니다.')}</p></div><div id="direct-invite-credentials" class="direct-credentials" hidden><label>${tr('초대 URL')}<input id="direct-invite-url" type="text" readonly></label><button type="button" class="small ghost" data-action="copy-direct-url">${tr('URL 복사')}</button><label>${tr('초대 토큰')}<input id="direct-invite-token" type="text" readonly></label><button type="button" class="small ghost" data-action="copy-direct-token">${tr('토큰 복사')}</button></div><p id="direct-invite-missing-token" class="form-hint" hidden>${tr('이 초대의 토큰은 다시 표시되지 않습니다. 새 초대를 발급하려면 현재 초대를 취소하세요.')}</p><div id="direct-invite-result" class="direct-result" hidden></div></div>`,
+    `<button type="button" data-action="close-modal">${tr('닫기')}</button><button type="button" class="danger ghost" data-action="revoke-direct-invitation" hidden>${tr('초대 취소')}</button><button type="button" class="primary" data-action="approve-direct-invitation" hidden>${tr('크기 확인 후 가져오기')}</button><button type="button" class="primary" data-action="create-direct-invitation">${tr('초대 발급')}</button>`);
   modal.dataset.kind = 'direct-invite';
-  const state = {scope,workspaceId,invitationId:'',url:'',token:'',status:'',expiresAt:0,result:null,error:'',busy:false};
+  const state = {scope,workspaceId,invitationId:'',url:'',token:'',status:'',expiresAt:0,result:null,size:null,sha256:'',attachmentBytes:null,error:'',busy:false};
   directInviteState = state;
   const key = directInvitationKey(scope,workspaceId);
   try { state.invitationId = localStorage.getItem(key) || ''; } catch {}
@@ -2314,9 +2471,8 @@ async function createDirectInvitation() {
   if (!state || state.busy) return;
   state.busy = true; state.error = i18n.t('초대 발급 중…'); paintDirectInvitation(state);
   try {
-    const maxSize = Number(modal.querySelector('#direct-max-size')?.value);
     const result = await api('/api/transfers/direct/invitations',{
-      method:'POST',body:{scope:state.scope,...(state.workspaceId ? {workspace_id:state.workspaceId} : {}),max_size:maxSize,ttl_seconds:3600},
+      method:'POST',body:{scope:state.scope,...(state.workspaceId ? {workspace_id:state.workspaceId} : {}),ttl_seconds:3600},
     });
     if (directInviteState !== state) return;
     state.invitationId = result.invitation_id;
@@ -2325,7 +2481,7 @@ async function createDirectInvitation() {
     state.result = null; state.error = '';
     try { localStorage.setItem(directInvitationKey(state.scope,state.workspaceId),state.invitationId); } catch {}
     paintDirectInvitation(state);
-    if (['issued','uploading'].includes(state.status)) directInviteTimer = setTimeout(() => pollDirectInvitation(state),4000);
+    if (['issued','awaiting_approval','uploading'].includes(state.status)) directInviteTimer = setTimeout(() => pollDirectInvitation(state),4000);
   } catch (error) {
     if (directInviteState === state) {
       state.error = error.code === 'origin_unconfigured'
@@ -2333,6 +2489,37 @@ async function createDirectInvitation() {
         : error.message;
       paintDirectInvitation(state);
     }
+    throw error;
+  } finally {
+    state.busy = false;
+    if (directInviteState === state) paintDirectInvitation(state);
+  }
+}
+
+async function approveDirectInvitation() {
+  const state = directInviteState;
+  if (!state?.invitationId || state.status !== 'awaiting_approval' || !state.sha256 || state.busy) return;
+  state.busy = true; state.error = ''; paintDirectInvitation(state);
+  try {
+    let result;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        result = await api(`/api/transfers/direct/invitations/${encodeURIComponent(state.invitationId)}/approve`,{
+          method:'POST',body:{sha256:state.sha256},
+        });
+        break;
+      } catch (error) {
+        if (error.code !== 'busy' || attempt === 3) throw error;
+        await new Promise(resolve => setTimeout(resolve,200 * (attempt + 1)));
+      }
+    }
+    if (directInviteState !== state) return;
+    state.status = result.status || 'uploading';
+    state.error = '';
+    paintDirectInvitation(state);
+    directInviteTimer = setTimeout(() => pollDirectInvitation(state),4000);
+  } catch (error) {
+    if (directInviteState === state) { state.error = error.message; paintDirectInvitation(state); }
     throw error;
   } finally {
     state.busy = false;
@@ -2388,7 +2575,7 @@ function paintDirectSend(state) {
   const active = directSendActive(state);
   if (status) {
     status.textContent = state.error || (state.jobId || state.status !== 'idle'
-      ? directSendStatusLabel(state.status) + (state.cancelRequested && active ? ' · ' + i18n.t('취소 요청 중') : '')
+      ? (state.status === 'sending' && !state.offset ? i18n.t('받는 설치의 승인 대기') : directSendStatusLabel(state.status)) + (state.cancelRequested && active ? ' · ' + i18n.t('취소 요청 중') : '')
         + (state.status === 'completed' && state.result?.workspace_id ? ' · ' + i18n.t('대상 작업공간 ID') + ': ' + state.result.workspace_id : '')
       : i18n.t('초대 URL과 토큰을 입력한 뒤 전송을 시작하세요.'));
     status.classList.toggle('error-text',Boolean(state.error) || ['failed','interrupted'].includes(state.status));
@@ -2559,9 +2746,13 @@ function workspaceForm(edit = false) {
   }
 }
 
-function challengeForm(edit = false) {
+async function challengeForm(edit = false) {
   const c = edit ? currentChallenge : {};
   const remoteMode = c.remote_mode || (c.remote ? 'endpoint' : 'unknown');
+  const workspaceId = currentWorkspace?.id;
+  const staged = workspaceId ? await api(`/api/workspaces/${workspaceId}/staged-files`) : {files:[]};
+  if (currentWorkspace?.id !== workspaceId) return;
+  const readyFiles = (staged.files || []).filter(file => file.status === 'ready' && file.file_available !== false);
   openModal(edit ? '문제 수정' : '문제 추가', '', `
     <label>문제 이름<input name="name" value="${esc(c.name)}" placeholder="문제 이름을 입력하세요" maxlength="200" required autofocus></label>
     <label>분류 <span class="optional">선택</span><input name="category" value="${esc(c.category)}" placeholder="예: Web, Crypto, Reversing" maxlength="100"></label>
@@ -2569,6 +2760,7 @@ function challengeForm(edit = false) {
     <label>원격 대상<select name="remote_mode"><option value="unknown" ${remoteMode === 'unknown' ? 'selected' : ''}>아직 모름 · 풀이 중 요청 가능</option><option value="endpoint" ${remoteMode === 'endpoint' ? 'selected' : ''}>원격 대상 있음</option><option value="none" ${remoteMode === 'none' ? 'selected' : ''}>원격 대상 없음</option></select></label>
     <label data-remote-endpoint>원격 접속 정보<textarea name="remote" rows="2" maxlength="2000" placeholder="예: nc challenge.example 31337 또는 https://challenge.example/">${esc(c.remote)}</textarea></label>
     <label>Flag <span class="optional">선택</span><input name="flag" value="${esc(c.flag)}" placeholder="찾은 Flag를 기록하세요" maxlength="4000"></label>
+    ${readyFiles.length ? `<fieldset class="challenge-staged-picker"><legend>${tr('사전 업로드 파일')} <span class="optional">${tr('선택')}</span></legend><div class="file-list">${readyFiles.map(file => `<label class="file-item"><input type="checkbox" name="staged_file_ids" value="${esc(file.id)}"><span><strong>${esc(file.name)}</strong><small>${size(file.size)}</small></span></label>`).join('')}</div><small class="form-hint">${tr('같은 파일을 여러 문제에 빠르게 연결할 수 있습니다. 원본을 삭제해도 이미 연결한 첨부는 남습니다. 파일탐색기에서 어느 쪽이든 수정하면 양쪽 내용이 함께 바뀝니다.')}</small></fieldset>` : ''}
     ${edit ? '' : `<section class="challenge-file-picker" data-file-drop-zone>
       <div class="challenge-file-heading"><span>문제 파일 <span class="optional">선택</span></span><strong id="challenge-file-summary">여러 파일 · 용량 제한 없음</strong></div>
       <input id="challenge-files" class="sr-only" type="file" name="files" multiple>
@@ -4244,6 +4436,24 @@ document.addEventListener('click', event => {
     'close-solver-console': () => solverConsoleDialog?.close(),
     'open-solver-accounts': () => openSolverAccounts(),
     'new-workspace': () => workspaceForm(), 'edit-workspace': () => workspaceForm(true),
+    'show-staged-files': () => showStagedFiles(),
+    'pause-staged-upload': () => {
+      const active = stagedActiveUploads.get(button.dataset.id);
+      if (active) { active.paused = true; active.controller.abort(); }
+    },
+    'resume-staged-upload': async () => {
+      const active = stagedActiveUploads.get(button.dataset.id);
+      if (active?.file) await uploadStagedFile(active.file,active.workspaceId,button.dataset.id);
+    },
+    'delete-staged-file': async () => {
+      const workspaceId = modal.dataset.workspaceId, fileId = button.dataset.id;
+      if (!workspaceId || !fileId || !confirm('사전 파일을 삭제할까요? 이미 문제에 연결한 첨부는 남습니다.')) return;
+      const active = stagedActiveUploads.get(fileId);
+      if (active) { active.paused = true; active.controller.abort(); }
+      await api(`/api/workspaces/${workspaceId}/staged-files/${fileId}`,{method:'DELETE'});
+      stagedActiveUploads.delete(fileId);
+      await refreshStagedFiles(workspaceId);
+    },
     'import-workspace-transfer': () => showTransferImport('workspace'),
     'export-workspace-transfer': () => showTransferExport('workspace'),
     'import-challenge-transfer': () => showTransferImport('challenge',currentWorkspace?.id),
@@ -4253,6 +4463,7 @@ document.addEventListener('click', event => {
     'send-workspace-direct': () => showDirectSend('workspace'),
     'send-challenge-direct': () => showDirectSend('challenge'),
     'create-direct-invitation': () => createDirectInvitation(),
+    'approve-direct-invitation': () => approveDirectInvitation(),
     'revoke-direct-invitation': () => revokeDirectInvitation(),
     'copy-direct-url': async () => { const value = directInviteState?.url; if (!value) return; const result = await copyText(value); copyToast(result,value); },
     'copy-direct-token': async () => { const value = directInviteState?.token; if (!value) return; const result = await copyText(value); copyToast(result,value); },
@@ -4268,7 +4479,7 @@ document.addEventListener('click', event => {
       if (formDirty()) throw new Error('작업공간 변경사항을 먼저 저장하세요.');
       return ctfdSubmitSettings();
     },
-    'new-challenge': () => challengeForm(), 'edit-challenge': async () => { const c = currentChallenge; await saveNotes(true); if (currentChallenge === c && currentWorkspace?.id === c.workspace_id) challengeForm(true); },
+    'new-challenge': () => challengeForm(), 'edit-challenge': async () => { const c = currentChallenge; await saveNotes(true); if (currentChallenge === c && currentWorkspace?.id === c.workspace_id) await challengeForm(true); },
     'clone-challenge': () => cloneChallenge(),
     'add-relation': () => changeRelation(),
     'install-release-update': () => installReleaseUpdate(button),
@@ -4292,7 +4503,7 @@ document.addEventListener('click', event => {
       if (!form || !Number.isInteger(index)) return;
       selectedChallengeFiles(form).splice(index,1); renderChallengeFiles(form);
     },
-    'close-modal': () => { if (busyForms.has(modal.querySelector('form')) || transferState?.importing || directSendBusy) return; if (formDirty() && !confirm('작성 중인 변경 내용을 버리고 닫을까요?')) return; ++modalRendering; modal.close(); importPreview = null; },
+    'close-modal': () => { if (busyForms.has(modal.querySelector('form')) || transferState?.importing || directSendBusy) return; if (formDirty() && !confirm('작성 중인 변경 내용을 버리고 닫을까요?')) return; pauseStagedUploads(); ++modalRendering; modal.close(); importPreview = null; },
     'close-detail': () => {
       if (detailBusy) return;
       if (notesDirty() && !confirm('저장하지 않은 노트가 있습니다. 닫을까요?')) return;
@@ -4380,6 +4591,7 @@ document.addEventListener('submit', event => {
   const challengeFiles = form.id === 'new-challenge-form' ? [...selectedChallengeFiles(form)] : [];
   const data = new FormData(form);
   const body = Object.fromEntries(data);
+  const stagedFileIds = data.getAll('staged_file_ids');
   if (form.id === 'ctfd-submit-connection-form') { run(() => saveCTFdSubmitConnection(form,body)); return; }
   runForm(async () => {
     if (form.id === 'setup-form') {
@@ -4405,12 +4617,17 @@ document.addEventListener('submit', event => {
       if (location.hash === `#w/${w.id}`) { currentWorkspace = w; await renderWorkspace(); } else { selectedStatus='';selectedCategory='';selectedSort='added_desc';search='';location.hash = `w/${w.id}`; }
       toast(edit ? '작업공간 설정을 저장했습니다.' : '작업공간을 만들었습니다.');
     } else if (form.id === 'new-challenge-form' || form.id === 'edit-challenge-form') {
-      const edit = form.id === 'edit-challenge-form'; delete body.files;
+      const edit = form.id === 'edit-challenge-form'; delete body.files; delete body.staged_file_ids;
       if (body.remote_mode !== 'endpoint') body.remote = '';
       const workspaceId = form.dataset.workspaceId;
       const c = await api(edit ? path(form.dataset.challengeId,workspaceId) : path(null,workspaceId),{method:edit?'PATCH':'POST',headers:edit ? conditional(form.dataset.editToken) : {},body});
       let failures = [];
       modal.close();
+      for (const fileId of stagedFileIds) {
+        try {
+          await api(`/api/workspaces/${workspaceId}/challenges/${c.id}/staged-files/${encodeURIComponent(fileId)}/attach`,{method:'POST'});
+        } catch (error) { failures.push(`사전 파일 ${fileId}: ${error.message}`); }
+      }
       if (currentWorkspace?.id === workspaceId) {
         await refreshChallenges();
         if (edit || currentWorkspace.open_challenge_after_create) await openChallenge(c.id);
@@ -4483,6 +4700,16 @@ document.addEventListener('change', event => {
     addChallengeFiles(input.closest('form'),input.files);
     input.value = '';
   }
+  if (input.id === 'staged-files-input' && input.files?.length) run(async () => {
+    const workspaceId = modal.dataset.workspaceId, files = [...input.files];
+    input.value = '';
+    await addStagedFiles(files,workspaceId);
+  },input);
+  if (input.dataset.stagedResume && input.files?.length) run(async () => {
+    const workspaceId = modal.dataset.workspaceId, fileId = input.dataset.stagedResume;
+    const file = input.files[0]; input.value = '';
+    await uploadStagedFile(file,workspaceId,fileId);
+  },input);
   if (input.matches?.('.challenge-inline-input select[name="remote_mode"]')) {
     const form = input.closest('form');
     const remote = form?.querySelector('input[name="remote"]');
@@ -4656,6 +4883,21 @@ document.addEventListener('drop', event => {
   if (!form || !fileDrag(event.dataTransfer)) return;
   event.preventDefault(); resetChallengeFileDrag(); addChallengeFiles(form,event.dataTransfer.files);
 });
+document.addEventListener('dragover', event => {
+  if (!modal.open || modal.dataset.kind !== 'staged-files' || !fileDrag(event.dataTransfer)) return;
+  event.preventDefault();
+  modal.classList.add('staged-dragover');
+  try { event.dataTransfer.dropEffect = 'copy'; } catch {}
+});
+document.addEventListener('dragleave', event => {
+  if (!event.relatedTarget) modal.classList.remove('staged-dragover');
+});
+document.addEventListener('drop', event => {
+  if (!modal.open || modal.dataset.kind !== 'staged-files' || !fileDrag(event.dataTransfer)) return;
+  event.preventDefault(); modal.classList.remove('staged-dragover');
+  const workspaceId = modal.dataset.workspaceId;
+  run(() => addStagedFiles([...event.dataTransfer.files],workspaceId));
+});
 window.addEventListener('dragend',resetChallengeFileDrag);
 window.addEventListener('blur',resetChallengeFileDrag);
 
@@ -4667,9 +4909,9 @@ detail.addEventListener('cancel', event => {
   else { rememberNotes(); stopSolverPolling(); ++challengeRendering; }
 });
 detail.addEventListener('close', () => { if (!detail.open) stopSolverPolling(); });
-modal.addEventListener('cancel', event => { if (busyForms.has(modal.querySelector('form')) || transferState?.importing || directSendBusy || (formDirty() && !confirm('작성 중인 변경 내용을 버리고 닫을까요?'))) event.preventDefault(); else ++modalRendering; });
+modal.addEventListener('cancel', event => { if (busyForms.has(modal.querySelector('form')) || transferState?.importing || directSendBusy || (formDirty() && !confirm('작성 중인 변경 내용을 버리고 닫을까요?'))) event.preventDefault(); else { pauseStagedUploads(); ++modalRendering; } });
 modal.addEventListener('close', () => {
-  resetChallengeFileDrag();
+  resetChallengeFileDrag(); modal.classList.remove('staged-dragover'); pauseStagedUploads();
   if (!modal.open) {
     if (transferState?.running) { transferState.paused = true; transferState.controller?.abort(); }
     transferState = null;
@@ -4685,11 +4927,11 @@ modal.addEventListener('close', () => {
   importPreview = null;
 });
 window.addEventListener('hashchange', event => {
-  if ((formDirty() || notesDirty() || detailBusy || transferState?.running || transferState?.importing || directSendBusy || (modal.open && busyForms.has(modal.querySelector('form')))) && !confirm('저장하지 않은 내용이나 진행 중인 요청이 있습니다. 다른 화면으로 이동할까요?')) { if (accountsReturnPending) clearAccountsReturnTarget(); history.replaceState(null,'',event.oldURL); return; }
+  if ((formDirty() || notesDirty() || detailBusy || transferState?.running || transferState?.importing || directSendBusy || [...stagedActiveUploads.values()].some(upload => upload.running) || (modal.open && busyForms.has(modal.querySelector('form')))) && !confirm('저장하지 않은 내용이나 진행 중인 요청이 있습니다. 다른 화면으로 이동할까요?')) { if (accountsReturnPending) clearAccountsReturnTarget(); history.replaceState(null,'',event.oldURL); return; }
   accountsReturnPending = false;
   const returnRoute = accountsReturnRoute();
   if (returnRoute && location.hash === `#${returnRoute}`) clearAccountsReturnTarget();
-  rememberNotes(); stopSolverPolling(); stopResourcePolling(); stopChallengeListPolling(); ++challengeRendering; ++listRendering; ++modalRendering; challengeFlags.clear(); selectedStatus=''; selectedCategory=''; selectedSort='added_desc'; search=''; if (solverConsoleDialog?.open) solverConsoleDialog.close(); detail.close(); modal.close(); if (csrf) run(render);
+  rememberNotes(); pauseStagedUploads(); stopSolverPolling(); stopResourcePolling(); stopChallengeListPolling(); ++challengeRendering; ++listRendering; ++modalRendering; challengeFlags.clear(); selectedStatus=''; selectedCategory=''; selectedSort='added_desc'; search=''; if (solverConsoleDialog?.open) solverConsoleDialog.close(); detail.close(); modal.close(); if (csrf) run(render);
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') { stopResourcePolling(); stopChallengeListPolling(); }
@@ -4698,7 +4940,7 @@ document.addEventListener('visibilitychange', () => {
     if (document.querySelector('#challenge-area')) startChallengeListPolling(currentWorkspace.id);
   }
 });
-window.addEventListener('beforeunload', event => { if (notesDirty() || formDirty() || transferState?.running || transferState?.importing || directSendBusy || [...activeUploads.values()].some(upload => upload.running)) { event.preventDefault(); event.returnValue = ''; } });
+window.addEventListener('beforeunload', event => { if (notesDirty() || formDirty() || transferState?.running || transferState?.importing || directSendBusy || [...activeUploads.values()].some(upload => upload.running) || [...stagedActiveUploads.values()].some(upload => upload.running)) { event.preventDefault(); event.returnValue = ''; } });
 async function bootstrapLocalBrowser() {
   const match = /^#\/local-access\/([A-Za-z0-9_-]{32})$/.exec(window.location.hash);
   if (!match) return false;

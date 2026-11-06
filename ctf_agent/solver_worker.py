@@ -114,9 +114,11 @@ MAX_PROVIDER_RETRY_SECONDS = 180
 MAX_PROVIDER_RETRY_EVENTS = 8
 TERMINAL_PROVIDER_SIGNAL_GRACE_SECONDS = 0.5
 MAX_TERMINAL_PROVIDER_SIGNAL_EVENTS = 32
-# CTF Agent nudges three times after 30-minute no-progress windows.  Deployments
-# can set zero to keep nudging indefinitely without imposing a turn count.
+# Each completed Flag-less model turn consumes one nudge slot. The default is
+# four turns total (the initial turn and three nudges). Additional turns require
+# completed tools and updated work notes; zero remains unlimited.
 MAX_SOLVE_NUDGES = _nonnegative_int_setting("CTF_SOLVER_MAX_NUDGES", 3)
+MAX_PROGRESS_NUDGES = _nonnegative_int_setting("CTF_SOLVER_PROGRESS_NUDGES", 2)
 MAX_SOFT_MESSAGE_BYTES = 64 * 1024
 FLAG_WATCH_INTERVAL_SECONDS = 0.025
 CODEX_LAUNCHER = Path("/usr/local/libexec/ctf-agent-codex-launcher")
@@ -4662,6 +4664,8 @@ print(json.dumps(result,separators=(",",":")))
     ) -> dict[str, str]:
         self._last_turn_soft_outcome = None
         self._discovery_command_execution_seen = False
+        self._solve_tool_count = 0
+        self._first_solve_tool_at = None
         configuration = getattr(manifest, "configuration", None)
         self.effective_reasoning_effort = getattr(
             configuration, "reasoning_effort", None
@@ -4814,10 +4818,15 @@ is a fresh isolated job; do not repeat completed work.
         phase_first_prompt = first_prompt
         reasoning_escalated = False
         attempt = 0
-        while MAX_SOLVE_NUDGES == 0 or attempt <= MAX_SOLVE_NUDGES:
+        last_allowed_attempt = MAX_SOLVE_NUDGES
+        progress_nudges = 0
+        while MAX_SOLVE_NUDGES == 0 or attempt <= last_allowed_attempt:
             current_attempt = attempt
             attempt += 1
             await progress("analyzing")
+            prior_tool_count = self._solve_tool_count
+            prior_written_notes = _solver_notes(challenge)
+            prior_private_notes = private_notes
             prompt = (
                 phase_first_prompt if current_attempt == 0 else NUDGE
             ) + result_bridge
@@ -4869,9 +4878,10 @@ is a fresh isolated job; do not repeat completed work.
                 challenge / ".flag-candidate"
             )
             if candidate is None:
-                objective_evidence = bool(
-                    self._discovery_command_execution_seen or current_attempt > 0
-                )
+                # Additional model turns alone do not prove the agent has
+                # tested anything. Only a completed root tool can authorize
+                # MAX_REQUIRED after the agent records its blocker in NEXT.md.
+                objective_evidence = self._solve_tool_count > 0
                 ultra_evidence = (
                     _ultra_request_evidence(challenge)
                     if getattr(manifest, "ultra_escalation_mode", "off") != "off"
@@ -4937,10 +4947,25 @@ is a fresh isolated job; do not repeat completed work.
                     reasoning_escalated = True
                     phase_first_prompt = """Continue the current solve in this same session and working directory. The worker accepted the documented MAX_REQUIRED request and raised reasoning effort to max. Preserve the existing notes, solver.py, tested hypotheses, and remote state; do not restart reconnaissance or repeat a dead end. Execute the recorded next experiment and continue the original autonomous solve loop."""
                     attempt = 0
+                    last_allowed_attempt = MAX_SOLVE_NUDGES
+                    progress_nudges = 0
                     continue
                 if (
                     MAX_SOLVE_NUDGES > 0
-                    and current_attempt == MAX_SOLVE_NUDGES
+                    and current_attempt == last_allowed_attempt
+                    and progress_nudges < MAX_PROGRESS_NUDGES
+                    and self._solve_tool_count > prior_tool_count
+                    and (
+                        written_notes != prior_written_notes
+                        or private_notes != prior_private_notes
+                    )
+                    and not cancelled.is_set()
+                ):
+                    last_allowed_attempt += 1
+                    progress_nudges += 1
+                if (
+                    MAX_SOLVE_NUDGES > 0
+                    and current_attempt == last_allowed_attempt
                     and self._last_turn_soft_outcome == "progress_only"
                     and not self._discovery_command_execution_seen
                 ):
@@ -5277,6 +5302,8 @@ class ClaudePrintDriver(CodexAppServer):
         self.safe_startup_stderr: str | None = None
         self._last_turn_soft_outcome: str | None = None
         self._discovery_command_execution_seen = False
+        self._solve_tool_count = 0
+        self._first_solve_tool_at: float | None = None
         self.guidance_mailbox: GuidanceMailbox | None = None
         self.activity_reporter: Callable[..., Awaitable[None]] | None = None
         self.evidence_reporter: Callable[..., Awaitable[None]] | None = None
@@ -6005,6 +6032,10 @@ class ClaudePrintDriver(CodexAppServer):
                             continue
                         await self._complete_claude_agent_tool(block)
                         activity_id = _provider_activity_id("claude", session, block.get("tool_use_id"))
+                        if activity_id in self.activity_tool_types:
+                            self._solve_tool_count += 1
+                            if self._first_solve_tool_at is None:
+                                self._first_solve_tool_at = time.monotonic()
                         tool_type = self.activity_tool_types.pop(activity_id, "tool") if activity_id else "tool"
                         await self._report_activity(
                             "completed",

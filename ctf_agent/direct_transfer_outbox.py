@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import shutil
 import sqlite3
 import stat
 import time
@@ -21,12 +23,14 @@ from typing import Iterator
 from .db import Settings, connect
 from .direct_transfer_client import MAX_BUNDLE_BYTES
 from .process_lock import ProcessFileLock
+from .storage_budget import StorageBudget
+from .transfer_uploads import MIN_FREE_BYTES
 
 
 OUTBOX_TTL_SECONDS = 7 * 24 * 3600
 MAX_ACTIVE_PER_OWNER = 2
-MAX_OWNER_BYTES = 40 * 1024**3
-MAX_GLOBAL_BYTES = 100 * 1024**3
+EXPORT_RESERVATION_KIND = "direct_export"
+_EXPORT_RESERVATION_PREFIX = "direct-export:"
 
 
 class DirectOutboxError(ValueError):
@@ -48,8 +52,12 @@ def _directory(path: Path) -> None:
 
 
 class DirectTransferOutbox:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, budget: StorageBudget | None = None):
         self.settings = settings
+        self.budget = budget or StorageBudget(
+            settings.data_dir, lambda: connect(settings),
+            minimum_free_bytes=settings.storage_min_free_bytes,
+        )
         self.root = Path(settings.data_dir) / "workspaces" / ".transfers" / "outbox"
         self.lock_root = Path(settings.config_dir) / ".locks" / "direct_outbox"
         _directory(self.root)
@@ -85,6 +93,52 @@ class DirectTransferOutbox:
         directory = self.root / owner
         _directory(directory)
         return directory / f"{outbox_id}.zip"
+
+    @staticmethod
+    def _reservation_key(lock_key: str, outbox_id: str) -> str:
+        return f"{_EXPORT_RESERVATION_PREFIX}{lock_key}:{outbox_id}"
+
+    def reservation_key(self, outbox_id: str) -> str:
+        with closing(connect(self.settings)) as db:
+            row = db.execute(
+                "SELECT lock_key FROM direct_transfer_outbox WHERE id=?", (outbox_id,),
+            ).fetchone()
+        if row is None:
+            raise DirectOutboxError("missing_snapshot", "Source snapshot was not found.")
+        return self._reservation_key(row["lock_key"], outbox_id)
+
+    @staticmethod
+    def _checked_unlink(path: Path) -> None:
+        try:
+            details = path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(details.st_mode):
+            raise DirectOutboxError("unsafe_path", "Source snapshot path is invalid.")
+        path.unlink()
+
+    def _remove_partial(self, archive: Path) -> None:
+        self._checked_unlink(archive)
+        # The ZIP writer creates a hidden staging file in the same directory.
+        # A process crash can leave it behind even if the published ZIP is gone.
+        for staging in archive.parent.glob(f".{archive.name}.*.tmp"):
+            self._checked_unlink(staging)
+
+    def _discard_locked(self, owner: str, outbox_id: str,
+                        lock_key: str, *, delete_row: bool) -> None:
+        """With the per-key lock held, remove an abandoned export atomically.
+
+        The reservation survives if file cleanup fails. It is only released
+        after both the ZIP and any crash-left staging files are removed.
+        """
+        archive = self._archive(owner, outbox_id)
+        self.budget.release(
+            self._reservation_key(lock_key, outbox_id),
+            cleanup=lambda: self._remove_partial(archive),
+            db_update=(lambda db: db.execute(
+                "DELETE FROM direct_transfer_outbox WHERE id=?", (outbox_id,),
+            )) if delete_row else None,
+        )
 
     @staticmethod
     def _key(owner: str, workspace: str, challenge: str, scope: str,
@@ -156,10 +210,9 @@ class DirectTransferOutbox:
             archive = self._archive(owner_user_id, outbox_id)
             if newly_exported:
                 # An exporting row can survive a crash before publication; the
-                # receiver has never seen it, so a fresh export is safe.
-                if archive.is_symlink():
-                    raise DirectOutboxError("unsafe_path", "Source snapshot path is invalid.")
-                archive.unlink(missing_ok=True)
+                # receiver has never seen it, so a fresh export is safe. The
+                # per-key lock proves any previous exporter is no longer live.
+                self._discard_locked(owner_user_id, outbox_id, key, delete_row=False)
             else:
                 try:
                     details = archive.lstat()
@@ -172,14 +225,13 @@ class DirectTransferOutbox:
             finally:
                 # Export failure never reached the receiver; release its row
                 # and partial ZIP. A ready row is retained for exact-SHA retry.
-                with closing(connect(self.settings)) as db, db:
+                with closing(connect(self.settings)) as db:
                     current = db.execute(
                         "SELECT status FROM direct_transfer_outbox WHERE id=?",
                         (outbox_id,),
                     ).fetchone()
                     if current is not None and current["status"] == "exporting":
-                        db.execute("DELETE FROM direct_transfer_outbox WHERE id=?", (outbox_id,))
-                        archive.unlink(missing_ok=True)
+                        self._discard_locked(owner_user_id, outbox_id, key, delete_row=True)
         finally:
             lock.release()
 
@@ -189,7 +241,9 @@ class DirectTransferOutbox:
         except FileNotFoundError as exc:
             raise DirectOutboxError("missing_snapshot", "Source snapshot is missing.") from exc
         if not stat.S_ISREG(details.st_mode) or not 0 < details.st_size <= MAX_BUNDLE_BYTES:
-            raise DirectOutboxError("invalid_size", "Source snapshot exceeds the direct transfer limit.")
+            raise DirectOutboxError("invalid_size", "Source snapshot size is invalid.")
+        if shutil.disk_usage(self.root).free < max(MIN_FREE_BYTES, self.settings.storage_min_free_bytes):
+            raise DirectOutboxError("outbox_full", "Insufficient free space for the source snapshot.")
         if os.name != "nt":
             archive.chmod(0o600)
         with closing(connect(self.settings)) as db, db:
@@ -199,17 +253,6 @@ class DirectTransferOutbox:
             ).fetchone()
             if row is None or row["status"] != "exporting":
                 raise DirectOutboxError("wrong_state", "Source snapshot is not ready for publication.")
-            owner_bytes = db.execute(
-                """SELECT COALESCE(SUM(size),0) FROM direct_transfer_outbox
-                   WHERE owner_user_id=? AND status='ready'""",
-                (row["owner_user_id"],),
-            ).fetchone()[0]
-            global_bytes = db.execute(
-                "SELECT COALESCE(SUM(size),0) FROM direct_transfer_outbox WHERE status='ready'"
-            ).fetchone()[0]
-            if (owner_bytes + details.st_size > MAX_OWNER_BYTES
-                    or global_bytes + details.st_size > MAX_GLOBAL_BYTES):
-                raise DirectOutboxError("outbox_full", "Source transfer snapshot limit was reached.")
             db.execute(
                 """UPDATE direct_transfer_outbox SET status='ready',size=?,updated_at=?
                    WHERE id=?""",
@@ -237,7 +280,7 @@ class DirectTransferOutbox:
         with closing(connect(self.settings)) as db:
             rows = db.execute(
                 """SELECT id,owner_user_id,lock_key FROM direct_transfer_outbox
-                   WHERE status='completed' OR updated_at<=?
+                   WHERE status IN ('exporting','completed') OR updated_at<=?
                    LIMIT 100""",
                 (now - OUTBOX_TTL_SECONDS,),
             ).fetchall()
@@ -247,20 +290,51 @@ class DirectTransferOutbox:
             if not lock.try_acquire():
                 continue
             try:
-                with closing(connect(self.settings)) as db, db:
-                    db.execute("BEGIN IMMEDIATE")
+                with closing(connect(self.settings)) as db:
                     current = db.execute(
                         "SELECT * FROM direct_transfer_outbox WHERE id=?", (row["id"],),
                     ).fetchone()
-                    if current is None or (current["status"] != "completed"
+                    if current is None or (current["status"] not in {"exporting", "completed"}
                                            and current["updated_at"] > now - OUTBOX_TTL_SECONDS):
                         continue
-                    archive = self._archive(current["owner_user_id"], current["id"])
-                    if archive.is_symlink():
-                        raise DirectOutboxError("unsafe_path", "Source snapshot path is invalid.")
-                    archive.unlink(missing_ok=True)
-                    db.execute("DELETE FROM direct_transfer_outbox WHERE id=?", (current["id"],))
+                    self._discard_locked(
+                        current["owner_user_id"], current["id"], current["lock_key"],
+                        delete_row=True,
+                    )
                     cleaned += 1
+            finally:
+                lock.release()
+        # A crash may occur after a ZIP is published but before its reservation
+        # is released. Conversely, a reservation can outlive a deleted row.
+        # Only the matching per-key lock can prove that no exporter is active.
+        for reservation in self.budget.snapshot(kind=EXPORT_RESERVATION_KIND):
+            reservation_key = reservation["reservation_key"]
+            match = re.fullmatch(r"direct-export:([0-9a-f]{64}):([0-9a-f]{32})",
+                                 reservation_key)
+            if match is None:
+                continue
+            lock_key, outbox_id = match.groups()
+            lock = ProcessFileLock(self.lock_root / f"{lock_key}.lock")
+            if not lock.try_acquire():
+                continue
+            try:
+                with closing(connect(self.settings)) as db:
+                    row = db.execute(
+                        "SELECT * FROM direct_transfer_outbox WHERE id=?", (outbox_id,),
+                    ).fetchone()
+                if row is not None and row["lock_key"] != lock_key:
+                    continue
+                if row is not None and row["status"] == "exporting":
+                    self._discard_locked(row["owner_user_id"], outbox_id,
+                                         lock_key, delete_row=True)
+                    cleaned += 1
+                elif row is None:
+                    self._discard_locked(reservation["owner_user_id"], outbox_id,
+                                         lock_key, delete_row=False)
+                    cleaned += 1
+                else:
+                    # Ready ZIP remains available for an exact-SHA retry.
+                    self.budget.release(reservation_key)
             finally:
                 lock.release()
         return cleaned

@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -32,9 +33,14 @@ from .direct_transfer_client import (
     MAX_BUNDLE_BYTES, DirectTransferClient, DirectTransferClientError,
 )
 from .direct_transfer_outbox import DirectOutboxError, DirectTransferOutbox
+from .direct_transfer_outbox import EXPORT_RESERVATION_KIND
 from .direct_transfer_jobs import DirectSendJobError, DirectSendJobs
 from .process_lock import ProcessFileLock
+from .storage_budget import StorageBudgetError
 from .storage_layout import StorageLayout
+from .transfer_export_budget import (
+    estimate_bundle_bytes as _export_reservation_bytes, reserve_bundle_bytes,
+)
 from .transfer_uploads import CHUNK_BYTES, TransferUploadError, TransferUploadManager
 from .workspace_transfer import (
     TransferError, export_challenge, export_workspace, import_challenge,
@@ -49,8 +55,6 @@ MAX_ACTIVE_INVITATIONS_PER_OWNER = 5
 _HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _BEARER = re.compile(r"Bearer ([A-Za-z0-9_-]{40,128})\Z")
-
-
 class DirectTransferError(ValueError):
     """Safe API error that contains no invitation token or ZIP content."""
 
@@ -107,6 +111,7 @@ class DirectInvitationManager:
                    upload_id TEXT,
                    size INTEGER,
                    sha256 TEXT,
+                   attachment_bytes INTEGER,
                    result_json TEXT,
                    created_at INTEGER NOT NULL,
                    updated_at INTEGER NOT NULL)"""
@@ -115,6 +120,9 @@ class DirectInvitationManager:
                 """CREATE INDEX IF NOT EXISTS idx_direct_transfer_owner
                    ON direct_transfer_invitations(owner_user_id,status,expires_at)"""
             )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(direct_transfer_invitations)")}
+            if "attachment_bytes" not in columns:
+                db.execute("ALTER TABLE direct_transfer_invitations ADD COLUMN attachment_bytes INTEGER")
 
     @contextmanager
     def _exclusive(self, invitation_id: str) -> Iterator[None]:
@@ -144,7 +152,10 @@ class DirectInvitationManager:
             "invitation_id": row["id"], "scope": row["scope"],
             "workspace_id": row["destination_workspace_id"],
             "max_size": row["max_size"], "expires_at": row["expires_at"],
-            "status": row["status"], "size": row["size"],
+            "status": ("awaiting_approval" if row["status"] == "issued" and row["size"] is not None
+                       else row["status"]),
+            "size": row["size"], "sha256": row["sha256"],
+            "attachment_bytes": row["attachment_bytes"],
             "result": json.loads(row["result_json"]) if row["status"] == "completed" else None,
         }
 
@@ -184,7 +195,7 @@ class DirectInvitationManager:
         self._live(row)
 
     def create(self, owner_user_id: str, scope: str,
-               destination_workspace_id: str | None, max_size: int,
+               destination_workspace_id: str | None, max_size: int = MAX_BUNDLE_BYTES,
                ttl_seconds: int = DEFAULT_TTL_SECONDS) -> dict:
         owner = _identifier(owner_user_id, "owner ID")
         if scope not in {"workspace", "challenge"}:
@@ -196,7 +207,7 @@ class DirectInvitationManager:
         else:
             destination = None
         if type(max_size) is not int or not 0 < max_size <= MAX_BUNDLE_BYTES:
-            raise DirectTransferError("invalid_size", "Invitation size must be within the bundle limit.")
+            raise DirectTransferError("invalid_size", "Invitation size is invalid.")
         if type(ttl_seconds) is not int or not MIN_TTL_SECONDS <= ttl_seconds <= MAX_TTL_SECONDS:
             raise DirectTransferError("invalid_ttl", "Invitation lifetime is outside the allowed range.")
         origin = _origin(self.settings)
@@ -254,11 +265,15 @@ class DirectInvitationManager:
         return {"status": upload["status"], "offset": upload["offset"], "size": upload["size"]}
 
     def prepare(self, invitation_id: str, token: str, scope: str,
-                size: int, sha256: str) -> dict:
-        if scope not in {"workspace", "challenge"} or type(size) is not int or size <= 0:
+                size: int, sha256: str, attachment_bytes: int | None = None) -> dict:
+        if (scope not in {"workspace", "challenge"} or type(size) is not int
+                or not 0 < size <= MAX_BUNDLE_BYTES):
             raise DirectTransferError("invalid_bundle", "Bundle declaration is invalid.")
         if not isinstance(sha256, str) or not _HEX64.fullmatch(sha256):
             raise DirectTransferError("invalid_bundle", "Bundle checksum is invalid.")
+        if (attachment_bytes is not None and (type(attachment_bytes) is not int
+                                               or not 0 <= attachment_bytes <= MAX_BUNDLE_BYTES)):
+            raise DirectTransferError("invalid_bundle", "Bundle attachment size is invalid.")
         with self._exclusive(invitation_id):
             row = self._authorized_row(invitation_id, token)
             self._live(row)
@@ -270,27 +285,73 @@ class DirectInvitationManager:
                 return self._progress(row)
             if row["status"] != "issued":
                 raise DirectTransferError("wrong_state", "Invitation is not accepting a bundle.")
+            if row["size"] is not None:
+                if (row["size"] != size or row["sha256"] != sha256
+                        or (attachment_bytes is not None and row["attachment_bytes"] is not None
+                            and row["attachment_bytes"] != attachment_bytes)):
+                    raise DirectTransferError("bundle_conflict", "Invitation is bound to another bundle.")
+                if attachment_bytes is not None and row["attachment_bytes"] is None:
+                    with closing(connect(self.settings)) as db, db:
+                        db.execute(
+                            """UPDATE direct_transfer_invitations SET attachment_bytes=?,updated_at=?
+                               WHERE id=? AND status='issued' AND attachment_bytes IS NULL""",
+                            (attachment_bytes, int(time.time()), invitation_id),
+                        )
+            else:
+                with closing(connect(self.settings)) as db, db:
+                    db.execute(
+                        """UPDATE direct_transfer_invitations SET size=?,sha256=?,
+                           attachment_bytes=?,updated_at=? WHERE id=? AND status='issued' AND size IS NULL""",
+                        (size, sha256, attachment_bytes, int(time.time()), invitation_id),
+                    )
+            return {"status": "awaiting_approval", "offset": 0, "size": size}
+
+    def approve(self, owner_user_id: str, invitation_id: str, sha256: str) -> dict:
+        owner = _identifier(owner_user_id, "owner ID")
+        if not isinstance(sha256, str) or not _HEX64.fullmatch(sha256):
+            raise DirectTransferError("invalid_bundle", "Bundle checksum is invalid.")
+        with self._exclusive(invitation_id):
+            with closing(connect(self.settings)) as db:
+                row = self._row(db, invitation_id)
+            if row["owner_user_id"] != owner:
+                raise DirectTransferError("not_found", "Invitation was not found.")
+            self._live(row)
+            if row["sha256"] != sha256:
+                raise DirectTransferError("bundle_conflict", "Invitation is bound to another bundle.")
+            if row["status"] == "uploading":
+                return self._public_status(row)
+            if row["status"] != "issued" or row["size"] is None:
+                raise DirectTransferError("wrong_state", "Invitation has no bundle awaiting approval.")
             upload_id = None
             try:
-                upload = self.uploads.create(row["owner_user_id"], size, sha256)
+                upload = self.uploads.create(owner, row["size"], sha256)
                 upload_id = upload["upload_id"]
-                now = int(time.time())
+                if row["attachment_bytes"] is not None:
+                    # The ZIP is staged on the data volume, then attachments
+                    # are imported there as additional files. This is an
+                    # early estimate; final ZIP metadata is checked again
+                    # before import because the declaration is untrusted.
+                    free = shutil.disk_usage(self.settings.data_dir).free
+                    if free - row["size"] - row["attachment_bytes"] < self.uploads.free_floor:
+                        raise DirectTransferError(
+                            "low_space", "Insufficient free space for the declared bundle contents.",
+                        )
                 with closing(connect(self.settings)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     current = self._row(db, invitation_id)
-                    self._authorize(current, token)
                     self._live(current)
-                    if current["status"] != "issued":
-                        raise DirectTransferError("wrong_state", "Invitation changed during preparation.")
+                    if current["status"] != "issued" or current["sha256"] != sha256:
+                        raise DirectTransferError("wrong_state", "Invitation changed during approval.")
+                    now = int(time.time())
                     db.execute(
                         """UPDATE direct_transfer_invitations SET status='uploading',
-                           upload_id=?,size=?,sha256=?,updated_at=? WHERE id=?""",
-                        (upload_id, size, sha256, now, invitation_id),
+                           upload_id=?,expires_at=?,updated_at=? WHERE id=?""",
+                        (upload_id, now + MAX_TTL_SECONDS, now, invitation_id),
                     )
-                return {"status": "uploading", "offset": 0, "size": size}
+                return self.status(owner, invitation_id)
             except BaseException:
                 if upload_id is not None:
-                    self.uploads.cancel(row["owner_user_id"], upload_id)
+                    self.uploads.cancel(owner, upload_id)
                 raise
 
     def append(self, invitation_id: str, token: str, offset: int,
@@ -437,7 +498,7 @@ class DirectInvitationManager:
 class InvitationInput(BaseModel):
     scope: str
     workspace_id: str | None = None
-    max_size: int = Field(gt=0, le=MAX_BUNDLE_BYTES)
+    max_size: int = Field(default=MAX_BUNDLE_BYTES, gt=0, le=MAX_BUNDLE_BYTES)
     ttl_seconds: int = Field(default=DEFAULT_TTL_SECONDS,
                              ge=MIN_TTL_SECONDS, le=MAX_TTL_SECONDS)
 
@@ -445,6 +506,11 @@ class InvitationInput(BaseModel):
 class PrepareInput(BaseModel):
     scope: str
     size: int = Field(gt=0, le=MAX_BUNDLE_BYTES)
+    sha256: str
+    attachment_bytes: int | None = Field(default=None, ge=0, le=MAX_BUNDLE_BYTES)
+
+
+class ApprovalInput(BaseModel):
     sha256: str
 
 
@@ -478,7 +544,7 @@ def register_direct_transfer(app: FastAPI, require_auth, settings: Settings,
     )
     app.state.direct_transfers = manager
     client = DirectTransferClient()
-    outbox = DirectTransferOutbox(settings)
+    outbox = DirectTransferOutbox(settings, app.state.storage_budget)
     app.state.direct_transfer_outbox = outbox
     send_jobs = DirectSendJobs(settings)
     app.state.direct_send_jobs = send_jobs
@@ -544,10 +610,16 @@ def register_direct_transfer(app: FastAPI, require_auth, settings: Settings,
     def revoke_invitation(invitation_id: str):
         return manager.revoke(owner_id(), invitation_id)
 
+    @app.post("/api/transfers/direct/invitations/{invitation_id}/approve",
+              dependencies=[Depends(require_auth)])
+    def approve_invitation(invitation_id: str, payload: ApprovalInput):
+        return manager.approve(owner_id(), invitation_id, payload.sha256)
+
     @app.post("/api/transfers/direct/invitations/{invitation_id}/prepare")
     def prepare_invitation(invitation_id: str, payload: PrepareInput, request: Request):
         return manager.prepare(invitation_id, _bearer(request),
-                               payload.scope, payload.size, payload.sha256)
+                               payload.scope, payload.size, payload.sha256,
+                               payload.attachment_bytes)
 
     @app.put("/api/transfers/direct/invitations/{invitation_id}/chunks")
     def receive_chunk(invitation_id: str, request: Request, offset: int,
@@ -570,6 +642,18 @@ def register_direct_transfer(app: FastAPI, require_auth, settings: Settings,
                 if new_export:
                     send_jobs.update(job_id, "exporting")
                     with app.state.uploads.try_workspace_lock(workspace_id):
+                        estimate = _export_reservation_bytes(
+                            settings, app.state.storage_layout, owner,
+                            workspace_id, challenge_id,
+                        )
+                        budget = outbox.budget
+                        reservation_key = outbox.reservation_key(outbox_id)
+                        reserve_bundle_bytes(
+                            budget,
+                            reservation_key, EXPORT_RESERVATION_KIND,
+                            owner, workspace_id, challenge_id,
+                            estimate,
+                        )
                         if challenge_id is None:
                             export_workspace(
                                 settings, app.state.storage_layout, owner, workspace_id,
@@ -581,13 +665,21 @@ def register_direct_transfer(app: FastAPI, require_auth, settings: Settings,
                                 workspace_id, challenge_id, archive,
                                 include_remote=include_remote,
                             )
-                    outbox.publish(outbox_id, archive)
+                        if archive.stat().st_size > estimate:
+                            raise TransferError("Export exceeded its reserved size.")
+                        outbox.publish(outbox_id, archive)
+                        # On failure, slot() removes partial files before it
+                        # releases the reservation. A crash between those
+                        # steps must never leave unreserved partial ZIP bytes.
+                        budget.release(reservation_key)
                 if send_jobs.cancelled(job_id):
                     raise DirectTransferClientError("cancelled", "Direct transfer was cancelled.")
                 send_jobs.update(job_id, "sending", size=archive.stat().st_size)
+                preview = preview_bundle(archive)
                 result = client.send_bundle(
                     invitation_url, token, archive,
                     scope="workspace" if challenge_id is None else "challenge",
+                    attachment_bytes=preview["attachment_bytes"],
                     progress=lambda offset, size: send_jobs.update(
                         job_id, "sending", offset=offset, size=size,
                     ),
@@ -596,7 +688,7 @@ def register_direct_transfer(app: FastAPI, require_auth, settings: Settings,
                 outbox.complete(outbox_id, archive)
                 send_jobs.finish(job_id, result)
         except (DirectTransferClientError, DirectOutboxError,
-                TransferError, TransferUploadError) as exc:
+                TransferError, TransferUploadError, StorageBudgetError) as exc:
             code = getattr(exc, "code", "transfer_error")
             try:
                 send_jobs.fail(job_id, code, str(exc))

@@ -17,7 +17,7 @@ c1 = "c" * 32
 c2 = "d" * 32
 workspace = {"id": w1, "name": "Demo workspace", "description": "", "flag_format": "", "challenge_count": 0, "solved_count": 0, "running_count": 0}
 challenge = {"id": c1, "workspace_id": w1, "name": "Demo challenge", "category": "Web", "description": "", "remote_mode": "unknown", "remote": "", "status": "pending", "attachments": [], "notes": "", "flag": "", "related_challenges": [{"id":"e" * 32,"name":"Related","status":"solved","evidence_reapproval_required":True}]}
-state = {"size": 0, "offset": 0, "status": "uploading", "puts": [], "chunk_lengths": [], "fail_second": True, "previews": 0, "creates": 0, "deletes": 0, "exports": [], "origin_error": True, "invite_creates": 0, "invite_requests": [], "invite_status": "issued", "direct_posts": [], "direct_job_polls": {}, "direct_cancelled": set()}
+state = {"size": 0, "offset": 0, "status": "uploading", "puts": [], "chunk_lengths": [], "fail_second": True, "previews": 0, "creates": 0, "deletes": 0, "exports": [], "origin_error": True, "invite_creates": 0, "invite_requests": [], "invite_status": "issued", "invite_approvals": 0, "direct_posts": [], "direct_job_polls": {}, "direct_cancelled": set()}
 
 class QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, *_args):
@@ -59,12 +59,17 @@ def api(route):
         state["invite_creates"] += 1
         state["invite_requests"].append(request.post_data_json)
         state["invite_status"] = "issued"
-        return fulfill(route, {"invitation_id":"invite1","token":"one-time-secret","url":"https://destination.example/api/transfers/direct/invitations/invite1","scope":request.post_data_json["scope"],"workspace_id":request.post_data_json.get("workspace_id"),"max_size":request.post_data_json["max_size"],"expires_at":9999999999,"status":"issued"})
+        return fulfill(route, {"invitation_id":"invite1","token":"one-time-secret","url":"https://destination.example/api/transfers/direct/invitations/invite1","scope":request.post_data_json["scope"],"workspace_id":request.post_data_json.get("workspace_id"),"max_size":9007199254740991,"expires_at":9999999999,"status":"issued"})
     if path == "/api/transfers/direct/invitations/invite1" and method == "GET":
-        response = {"invitation_id":"invite1","scope":"workspace","workspace_id":None,"max_size":21474836480,"expires_at":9999999999,"status":state["invite_status"],"size":5}
+        response = {"invitation_id":"invite1","scope":"workspace","workspace_id":None,"max_size":9007199254740991,"expires_at":9999999999,"status":state["invite_status"],"size":5242880,"sha256":"a"*64,"attachment_bytes":10485760}
         if state["invite_status"] == "completed":
             response["result"] = {"workspace_id":w2,"challenge_ids":[c2]}
         return fulfill(route, response)
+    if path == "/api/transfers/direct/invitations/invite1/approve" and method == "POST":
+        assert request.post_data_json == {"sha256":"a"*64}
+        state["invite_approvals"] += 1
+        state["invite_status"] = "uploading"
+        return fulfill(route, {"invitation_id":"invite1","status":"uploading","size":5242880})
     if path == "/api/transfers/direct/invitations/invite1" and method == "DELETE":
         state["invite_status"] = "revoked"
         return fulfill(route, {"revoked":True})
@@ -229,7 +234,15 @@ def run_dom_check():
                 page.locator("#direct-invite-token").wait_for(state="visible")
                 assert page.locator("#direct-invite-token").input_value() == "one-time-secret"
                 assert state["invite_requests"][-1]["scope"] == "workspace"
+                assert "max_size" not in state["invite_requests"][-1]
                 assert "one-time-secret" not in page.evaluate("JSON.stringify(localStorage)")
+                state["invite_status"] = "awaiting_approval"
+                page.locator("#direct-invite-offer").wait_for(state="visible", timeout=12000)
+                assert "5.0 MB" in page.locator("#direct-invite-offer").inner_text()
+                assert "10.0 MB" in page.locator("#direct-invite-offer").inner_text()
+                page.locator('[data-action="approve-direct-invitation"]').click()
+                page.locator("#direct-invite-offer").wait_for(state="hidden")
+                assert state["invite_approvals"] == 1
                 page.locator('#modal [data-action="close-modal"]').last.click()
                 state["invite_status"] = "completed"
                 page.locator('[data-action="receive-workspace-direct"]').click()
@@ -258,6 +271,8 @@ def run_dom_check():
                 page.locator("#direct-invite-token").wait_for(state="visible")
                 assert state["invite_requests"][-1]["scope"] == "challenge"
                 assert state["invite_requests"][-1]["workspace_id"] == w1
+                state["invite_status"] = "awaiting_approval"
+                page.locator('[data-action="revoke-direct-invitation"]').get_by_text("가져오기 거절").wait_for(timeout=12000)
                 page.locator('[data-action="revoke-direct-invitation"]').click()
                 page.locator('#modal [data-action="close-modal"]').last.click()
 
