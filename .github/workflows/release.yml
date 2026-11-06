@@ -10,11 +10,13 @@ on:
         required: true
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -22,6 +24,7 @@ jobs:
           persist-credentials: false
       - name: Build and verify local installer archive
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
@@ -33,9 +36,12 @@ jobs:
             exit 1
           fi
           git merge-base --is-ancestor "$revision" origin/main
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ctf-agent-public"
+          python3 -m scripts.wait_release_image \
+            --revision "$revision" --image "$image" \
+            --repository "$GITHUB_REPOSITORY" --timeout-seconds 10200
           git checkout --detach "$revision"
           test "$(git rev-parse HEAD)" = "$revision"
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ctf-agent-public"
           python3 scripts/package_local_release.py --version "$RELEASE_TAG" --commit "$revision"
           (cd dist && sha256sum --check "CTF_Agent-${RELEASE_TAG}-local-windows.zip.sha256")
           digest="$(python3 scripts/check_release_identity.py \

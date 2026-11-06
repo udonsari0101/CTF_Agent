@@ -42,6 +42,8 @@ jobs:
           cache: pip
       - name: Check release identity verifier
         run: python .github/scripts/check_release_identity.py
+      - name: Check release image wait behavior
+        run: python .github/scripts/check_release_image_wait.py
       - name: Check release notes asset and privacy guard
         run: python .github/scripts/check_release_notes_asset.py
       - name: Check production update marker permissions
