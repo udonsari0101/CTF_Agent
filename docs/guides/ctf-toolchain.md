@@ -86,8 +86,13 @@ or helper-memory ceiling. Deployments can opt into each ceiling with
 `CTF_SOLVER_MIN_FREE_BYTES` on the scratch filesystem (5 GiB for the managed
 Windows installation; 1 GiB for the generic container default).
 
-`ctf-browser` always uses headless Chromium with a fresh profile, cache, crash
-directory and short runtime directory under the current job scratch. A solve
+`ctf-browser` uses headless Chromium with a fresh profile, cache, crash
+directory and short runtime directory under the current job scratch by default.
+`ctf-browser --session NAME` reuses a named profile within that job, preserving
+persistent cookies and localStorage across calls. Session-only cookies,
+sessionStorage, and open tabs do not survive a one-shot Chromium exit; keep one
+Chromium/DevTools process running or use an explicit cookie jar for those flows.
+Named profiles are job-local and are not carried into a restarted solve. A solve
 may request a DevTools port for browser automation; its address is fixed to
 `127.0.0.1` inside that solver container. General Internet access remains
 available to Chromium and every other challenge tool.

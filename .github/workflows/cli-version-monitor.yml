@@ -48,10 +48,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          release_version="$(python3 -c 'import tomllib; print("v" + tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           docker build --file Dockerfile.toolchain --tag ctf-agent-cli-candidate:toolchain .
           docker build --file Dockerfile \
             --build-arg TOOLCHAIN_IMAGE=ctf-agent-cli-candidate:toolchain \
             --build-arg RELEASE_SHA="$GITHUB_SHA" \
+            --build-arg RELEASE_VERSION="$release_version" \
             --tag ctf-agent-cli-candidate:app .
           docker run --rm -i --network none \
             --tmpfs /data:uid=10001,gid=10001,mode=0700 \

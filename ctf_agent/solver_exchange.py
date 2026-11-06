@@ -2516,6 +2516,8 @@ class SolverExchangeCoordinator:
                 continue
             if key.startswith("solver:"):
                 job_id = key.removeprefix("solver:")
+            elif key.startswith("solver-auth:"):
+                job_id = key.removeprefix("solver-auth:")
             elif key.startswith("solver-live:"):
                 job_id = key.removeprefix("solver-live:").split(":", 1)[0]
             else:

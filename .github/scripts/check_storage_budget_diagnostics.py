@@ -105,7 +105,7 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
         self.assertEqual(original.read_bytes(), b"preserved")
         self.assertFalse(self.budget.snapshot())
 
-    def test_new_slot_keeps_other_claimed_stage_and_live_copy_reservations(self):
+    def test_new_slot_keeps_other_claimed_stage_auth_and_live_copy_reservations(self):
         jobs = {
             "a" * 32: "staging",
             "b" * 32: "running",
@@ -128,10 +128,12 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
 
         stage_key = "solver:" + "a" * 32
         live_key = "solver-live:" + "b" * 32 + ":" + "e" * 32
+        auth_key = "solver-auth:" + "b" * 32
         cleanup_key = "solver:" + "c" * 32
         orphan_key = "solver:" + "d" * 32
         for index, key in enumerate((stage_key, live_key, cleanup_key, orphan_key)):
             self.budget.reserve(key, "solver", "owner", "workspace", f"challenge-{index}", 10)
+        self.budget.reserve(auth_key, "solver", "owner", "workspace", "challenge-1", 10)
         other_runtime = "solver-runtime:other-slot:0.166.0:" + "f" * 32
         own_runtime = "solver-runtime:new-slot:0.166.0:" + "e" * 32
         legacy_runtime = "solver-runtime:0.166.0:" + "d" * 32
@@ -154,13 +156,14 @@ class StorageBudgetDiagnosticsTests(unittest.TestCase):
             )
         self.assertEqual(
             {row["reservation_key"] for row in self.budget.snapshot(kind="solver")},
-            {stage_key, live_key, cleanup_key},
+            {stage_key, auth_key, live_key, cleanup_key},
         )
         self.assertEqual(
             {row["reservation_key"] for row in self.budget.snapshot(kind="solver_runtime")},
             {other_runtime, legacy_runtime},
         )
         self.budget.commit_reserved_write(stage_key, 10, lambda: None)
+        self.budget.commit_reserved_write(auth_key, 10, lambda: None)
         self.budget.consume_durable_reserved_write(live_key, 10)
         self.budget.release(cleanup_key)
         self.budget.release(other_runtime)

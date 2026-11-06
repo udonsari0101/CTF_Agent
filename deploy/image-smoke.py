@@ -1,6 +1,7 @@
 """Exercise the packaged image with disposable data and no network access."""
 import asyncio
 import hashlib
+import http.server
 import importlib
 import json
 import os
@@ -12,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 
 from fastapi.testclient import TestClient
 
@@ -428,6 +430,55 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     )
     assert browser_result.returncode == 0, browser_result.stderr.strip()
     assert browser_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert not list(browser_workdir.parents[2].glob(".ctf-browser-*"))
+
+    browser_cookies_seen = []
+
+    class BrowserSessionHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/test":
+                self.send_error(404)
+                return
+            browser_cookies_seen.append("ctf_browser_smoke=1" in self.headers.get("Cookie", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Set-Cookie", "ctf_browser_smoke=1; Max-Age=3600; Path=/; SameSite=Lax")
+            self.end_headers()
+            self.wfile.write(
+                b"<!doctype html><title>CTF browser session check</title><body>"
+                b"<script>document.body.textContent='storage='+"
+                b"(localStorage.getItem('ctf_browser_smoke')||'0');"
+                b"localStorage.setItem('ctf_browser_smoke','1')</script>"
+            )
+
+        def log_message(self, *_args):
+            pass
+
+    browser_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), BrowserSessionHandler)
+    browser_thread = threading.Thread(target=browser_server.serve_forever, daemon=True)
+    browser_thread.start()
+    try:
+        browser_url = f"http://127.0.0.1:{browser_server.server_port}/test"
+        for options, expected_cookie, expected_storage in (
+            (["--session=smoke", "--dump-dom", browser_url], False, "storage=0"),
+            (["--session=smoke", "--dump-dom", browser_url], True, "storage=1"),
+            (["--dump-dom", browser_url], False, "storage=0"),
+        ):
+            previous_requests = len(browser_cookies_seen)
+            result = subprocess.run(
+                [str(ctf_browser), *options],
+                capture_output=True, text=True, timeout=15,
+                cwd=browser_workdir, env=tool_env,
+            )
+            assert result.returncode == 0, result.stderr.strip()[-3000:]
+            assert len(browser_cookies_seen) > previous_requests
+            assert browser_cookies_seen[previous_requests] is expected_cookie
+            assert expected_storage in result.stdout
+    finally:
+        browser_server.shutdown()
+        browser_server.server_close()
+        browser_thread.join(timeout=5)
     assert not list(browser_workdir.parents[2].glob(".ctf-browser-*"))
     print("Pinned ctf_agent CTF toolchain passed functional checks")
 

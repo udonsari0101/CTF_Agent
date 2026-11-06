@@ -281,6 +281,8 @@ jobs:
         run: python .github/scripts/check_cli_version_monitor.py
       - name: Check tool playbook contract
         run: python .github/scripts/check_tool_playbook_contract.py
+      - name: Check job-local Chromium profile isolation
+        run: python .github/scripts/check_ctf_browser_sessions.py
       - name: Check scripts and local stack
         run: |
           python -m compileall -q ctf_agent deploy/local-compose.py deploy/local_runtime.py scripts/package_local_release.py

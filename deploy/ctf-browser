@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -13,10 +14,14 @@ import subprocess
 import sys
 import tempfile
 
+if os.name == "posix":
+    import fcntl
+
 
 CHROMIUM = "/usr/bin/chromium"
 SCRATCH_ROOT = Path("/solver-scratch")
 JOB_NAME = re.compile(r"ctf-(?:job|attest)-[A-Za-z0-9_-]+\Z")
+SESSION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}\Z")
 PROTECTED_OPTIONS = (
     "--crash-dumps-dir",
     "--disk-cache-dir",
@@ -72,6 +77,33 @@ def validate_options(arguments: list[str]) -> None:
         name = argument.split("=", 1)[0]
         if name in PROTECTED_OPTIONS:
             raise ValueError(f"ctf-browser manages {name} itself")
+
+
+def parse_options(arguments: list[str]) -> tuple[list[str], str | None]:
+    """Remove one wrapper-only session option before invoking Chromium."""
+
+    forwarded: list[str] = []
+    session: str | None = None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--session":
+            index += 1
+            if index >= len(arguments):
+                raise ValueError("ctf-browser --session requires a name")
+            name = arguments[index]
+        elif argument.startswith("--session="):
+            name = argument.partition("=")[2]
+        else:
+            forwarded.append(argument)
+            index += 1
+            continue
+        if session is not None or not SESSION_NAME.fullmatch(name):
+            raise ValueError("ctf-browser session name is invalid or repeated")
+        session = name
+        index += 1
+    validate_options(forwarded)
+    return forwarded, session
 
 
 def browser_command(arguments: list[str], runtime: Path) -> list[str]:
@@ -131,6 +163,25 @@ def _make_runtime(workdir: Path) -> Path:
     if not _real_directory(parent):
         raise ValueError("the solve job temporary directory is unsafe")
     runtime = Path(tempfile.mkdtemp(prefix=".ctf-browser-", dir=parent))
+    _ensure_runtime_directories(runtime)
+    return runtime
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Reject links and directories writable by another user."""
+
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    details = path.lstat()
+    if not stat.S_ISDIR(details.st_mode):
+        raise ValueError("ctf-browser session directory is unsafe")
+    if os.name == "posix" and (details.st_uid != os.geteuid() or details.st_mode & 0o077):
+        raise ValueError("ctf-browser session directory is unsafe")
+
+
+def _ensure_runtime_directories(runtime: Path) -> None:
     for name in (
         "cache",
         "crashes",
@@ -141,23 +192,89 @@ def _make_runtime(workdir: Path) -> Path:
         "xdg-config",
         "xdg-runtime",
     ):
-        (runtime / name).mkdir(mode=0o700)
+        _ensure_private_directory(runtime / name)
+
+
+def _persistent_runtime(workdir: Path, session: str) -> Path:
+    """Keep browser state only within this solve job's private directory."""
+
+    if not SESSION_NAME.fullmatch(session):
+        raise ValueError("ctf-browser session name is invalid")
+    job_root = workdir.parents[2]
+    if not _real_directory(job_root):
+        raise ValueError("the solve job temporary directory is unsafe")
+    # Chromium's TMPDIR/SingletonSocket must fit Linux's short Unix-socket
+    # path limit. Keep the runtime path short even when the user-facing name is
+    # long; the hash also prevents path punctuation from changing its shape.
+    sessions = job_root / ".b"
+    _ensure_private_directory(sessions)
+    runtime = sessions / _session_key(session)
+    _ensure_private_directory(runtime)
+    _ensure_runtime_directories(runtime)
     return runtime
+
+
+def _session_key(session: str) -> str:
+    return hashlib.sha256(session.encode("ascii")).hexdigest()[:16]
+
+
+def _lock_session(runtime: Path) -> int | None:
+    """Prevent two Chromium processes from writing the same profile."""
+
+    if os.name != "posix":
+        return None
+    descriptor = os.open(
+        runtime / ".browser.lock",
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        details = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_nlink != 1
+            or details.st_uid != os.geteuid()
+            or details.st_mode & 0o077
+        ):
+            raise ValueError("ctf-browser session lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("ctf-browser session is already in use") from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 def run(arguments: list[str]) -> int:
     if arguments == ["--help"]:
-        print("usage: ctf-browser [CHROMIUM_OPTION ...] [URL]")
-        print("Runs headless Chromium with an ephemeral profile in the solve job.")
+        print("usage: ctf-browser [--session NAME] [CHROMIUM_OPTION ...] [URL]")
+        print("Without --session, the browser profile is removed after this call.")
+        print("--session reuses persistent cookies and localStorage in this solve job.")
+        print("Session-only cookies and sessionStorage do not survive a one-shot call.")
         return 0
     if arguments == ["--version"]:
         return subprocess.run([CHROMIUM, "--version"], check=False).returncode
 
+    runtime: Path | None = None
+    session_lock: int | None = None
+    ephemeral = False
     try:
+        chromium_arguments, session = parse_options(arguments)
         workdir = job_workdir(Path.cwd())
-        runtime = _make_runtime(workdir)
-        command = browser_command(arguments, runtime)
-    except ValueError as error:
+        if session is None:
+            runtime = _make_runtime(workdir)
+            ephemeral = True
+        else:
+            runtime = _persistent_runtime(workdir, session)
+            session_lock = _lock_session(runtime)
+        command = browser_command(chromium_arguments, runtime)
+    except (OSError, ValueError) as error:
+        if session_lock is not None:
+            os.close(session_lock)
+        if ephemeral and runtime is not None:
+            shutil.rmtree(runtime, ignore_errors=True)
         print(str(error), file=sys.stderr)
         return 2
 
@@ -192,7 +309,10 @@ def run(arguments: list[str]) -> int:
             except ProcessLookupError:
                 pass
             process.wait()
-        shutil.rmtree(runtime, ignore_errors=True)
+        if session_lock is not None:
+            os.close(session_lock)
+        if ephemeral:
+            shutil.rmtree(runtime, ignore_errors=True)
 
 
 if __name__ == "__main__":
