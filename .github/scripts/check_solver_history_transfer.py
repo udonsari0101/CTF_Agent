@@ -1,4 +1,4 @@
-"""Round-trip regression for v2 solver log transfer."""
+"""Round-trip regression for versioned solver log transfer."""
 
 import json
 import shutil
@@ -83,7 +83,7 @@ def main():
         exported = export_workspace(settings, layout, owner, ws, whole)
         assert exported["solver_job_count"] == 2 and exported["solver_event_count"] == 1
         preview = preview_bundle(whole, settings=settings, owner_user_id=owner)
-        assert preview["version"] == 2 and preview["solver_job_count"] == 2
+        assert preview["version"] == 3 and preview["solver_job_count"] == 2
         real_disk_usage = shutil.disk_usage
         with patch("ctf_agent.workspace_transfer.shutil.disk_usage",
                    side_effect=lambda path: SimpleNamespace(free=0) if Path(path) == settings.db_dir else real_disk_usage(path)):
@@ -130,7 +130,7 @@ def main():
         assert imported_single["solver_job_count"] == 2
         with closing(connect(settings)) as db, db:
             assert db.execute("SELECT COUNT(*) FROM solver_jobs WHERE challenge_id=? AND imported_historical=1", (imported_single["challenge_id"],)).fetchone()[0] == 2
-        # A v1 bundle remains readable. Removing the v2 history section makes
+        # A v1 bundle remains readable. Removing the versioned history section makes
         # the old manifest shape and preserves all challenge/file data.
         legacy = root / "legacy.zip"
         with zipfile.ZipFile(single) as source, zipfile.ZipFile(legacy, "w", allowZip64=True) as target:
@@ -160,7 +160,7 @@ def main():
         with closing(connect(settings)) as db:
             after = db.execute("SELECT COUNT(*) FROM challenges").fetchone()[0]
         assert before == after
-        print("v2 workspace/challenge round trip, read-only history, v1 compatibility, corruption rollback: passed")
+        print("workspace/challenge round trip, read-only history, v1 compatibility, corruption rollback: passed")
 
 
 if __name__ == "__main__":

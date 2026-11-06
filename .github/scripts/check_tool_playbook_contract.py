@@ -47,7 +47,9 @@ class ToolPlaybookContract(unittest.TestCase):
 
         pwn = asset("skill_pwn.md")
         self.assertNotIn("qemu-x86_64-static -g", pwn)
-        self.assertIn("seccomp-tools dump\u0060 is an optional helper", pwn)
+        self.assertIn("The image includes pwntools", pwn)
+        self.assertIn("seccomp-tools disasm filter.bpf", pwn)
+        self.assertIn("may be denied by the container's host seccomp policy", pwn)
         self.assertIn("qemu-x86_64 -g 1234", pwn)
 
         forensics = asset("skill_forensics.md")
