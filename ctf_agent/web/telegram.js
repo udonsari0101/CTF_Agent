@@ -135,6 +135,7 @@ export async function renderTelegram(container, api) {
       ${linked ? `
         <label class="telegram-toggle"><input type="checkbox" data-telegram-action="toggle" ${state.enabled ? 'checked' : ''}> Flag·write-up 알림 받기</label>
         <div class="telegram-meta"><span>${i18n.t('연결 시각')} ${escapeHtml(dateText(state.linked_at))}</span><span>${i18n.t('최근 전송')} ${escapeHtml(dateText(state.last_success_at))}</span>${state.last_failure_at ? `<span class="error-text">${i18n.t('최근 실패')} ${escapeHtml(dateText(state.last_failure_at))} · ${escapeHtml(state.last_failure_code || i18n.t('전송 오류'))}</span>` : ''}</div>
+        <button type="button" class="small" data-telegram-action="test">${i18n.t('테스트 알림 보내기')}</button>
         <button type="button" class="small danger" data-telegram-action="unlink">Telegram 연결 해제</button>` : ''}
       <p class="notice" data-telegram-notice hidden></p>`;
   };
@@ -160,6 +161,11 @@ export async function renderTelegram(container, api) {
       } else if (action === 'refresh') {
         const state = await load();
         if (state && !state.linked) message('아직 봇 인증을 기다리고 있습니다.');
+      } else if (action === 'test') {
+        await api('/api/telegram/test', {method:'POST'});
+        const state = await api('/api/telegram');
+        paint(state);
+        message(i18n.t('테스트 알림을 보냈습니다.'));
       } else if (action === 'delete-bot') {
         if (!window.confirm(i18n.t('이 봇과 Telegram 연결, 대기 중인 알림을 삭제할까요?'))) return;
         stopPolling();

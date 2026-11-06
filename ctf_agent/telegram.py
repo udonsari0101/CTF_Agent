@@ -510,6 +510,51 @@ class TelegramService:
         except TimeoutError:
             raise HTTPException(503, "Telegram delivery is still finishing. Try again shortly.") from None
 
+    async def send_test(self, user_id: str) -> dict[str, Any]:
+        """Deliver one test message using the saved installation name."""
+
+        try:
+            async with self.delivery_boundary(user_id):
+                with self.database() as db:
+                    row = db.execute(
+                        "SELECT chat_id,instance_name FROM telegram_settings WHERE user_id=?",
+                        (user_id,),
+                    ).fetchone()
+                if row is None or row["chat_id"] is None:
+                    raise HTTPException(409, "Connect a Telegram chat before sending a test alert.")
+                token = self._token_for(user_id)
+                if not token:
+                    raise HTTPException(503, "Telegram bot is not configured.")
+                name = row["instance_name"] or ""
+                prefix = f"📍 <b>{html.escape(telegram_text(name))}</b>\n" if name else ""
+                try:
+                    await self._api(
+                        "sendMessage",
+                        {
+                            "chat_id": row["chat_id"],
+                            "text": f"{prefix}🔔 <b>테스트 알림</b>\nTelegram 연결이 정상입니다.",
+                            "parse_mode": "HTML",
+                            "link_preview_options": {"is_disabled": True},
+                        },
+                        token=token,
+                    )
+                except TelegramAPIError as exc:
+                    with self.database() as db:
+                        db.execute(
+                            "UPDATE telegram_settings SET last_failure_at=?,last_failure_code=? WHERE user_id=?",
+                            (utc_stamp(), exc.code, user_id),
+                        )
+                    raise HTTPException(502, f"Telegram test alert failed: {exc.code}") from None
+                sent_at = utc_stamp()
+                with self.database() as db:
+                    db.execute(
+                        "UPDATE telegram_settings SET last_success_at=?,last_failure_at=NULL,last_failure_code=NULL WHERE user_id=?",
+                        (sent_at, user_id),
+                    )
+                return {"sent": True, "instance_name": name, "sent_at": sent_at}
+        except TimeoutError:
+            raise HTTPException(503, "Telegram delivery is still finishing. Try again shortly.") from None
+
     async def cancel_owner(self, user_id: str) -> bool:
         """Cancel delivery before an administrative deactivation returns."""
         try:
@@ -1510,6 +1555,10 @@ def register_telegram(app, require_auth, settings, database):
     @app.post("/api/telegram/link", dependencies=[Depends(require_auth)])
     def create_telegram_link(request: Request):
         return service.issue_link(request.state.user["id"])
+
+    @app.post("/api/telegram/test", dependencies=[Depends(require_auth)])
+    async def send_telegram_test(request: Request):
+        return await service.send_test(request.state.user["id"])
 
     @app.patch("/api/telegram", dependencies=[Depends(require_auth)])
     async def toggle_telegram(payload: TelegramToggle, request: Request):

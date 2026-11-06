@@ -320,6 +320,24 @@ def attachment_name(url: str) -> str:
     return name or "attachment"
 
 
+def published_attachment_sha256(description: str, attachment_count: int) -> str:
+    """Accept only an unambiguous SHA-256 explicitly published for one file.
+
+    CTFd's standard file list contains URLs, not content hashes.  A generic
+    64-character value in a description is not evidence for an attachment.
+    Multiple files require a per-file digest mapping, which standard CTFd
+    does not provide, so those files always follow the normal download path.
+    """
+    if attachment_count != 1 or not isinstance(description, str):
+        return ""
+    matches = re.findall(
+        r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?sha(?:-|\s*)?256(?:\*\*)?"
+        r"\s*[:=]\s*`?([0-9a-f]{64})\b",
+        description,
+    )
+    return matches[0].lower() if len(matches) == 1 else ""
+
+
 class LoginForm(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -868,10 +886,16 @@ class CTFdClient:
                         attachments.append({"url": file_url, "name": attachment_name(file_url)})
                     except CTFdError as exc:
                         errors.append({"challenge_id": challenge_id, "message": str(exc)})
+                description = str(detail.get("description") or "")[:200000]
+                published_digest = published_attachment_sha256(
+                    description, len(files)
+                )
+                if published_digest and len(attachments) == 1:
+                    attachments[0]["published_sha256"] = published_digest
                 challenges.append({"id": challenge_id,
                                    "name": str(detail.get("name") or f"Challenge {challenge_id}")[:200],
                                    "category": str(detail.get("category") or "")[:100],
-                                   "description": str(detail.get("description") or "")[:200000],
+                                   "description": description,
                                    "remote": connection_info(detail.get("connection_info")),
                                    "files": attachments})
             except CTFdError as exc:
@@ -1096,6 +1120,7 @@ CREATE TABLE IF NOT EXISTS ctfd_job_files (
  remote_id INTEGER NOT NULL, file_index INTEGER NOT NULL, original_name TEXT NOT NULL,
  url_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', bytes INTEGER NOT NULL DEFAULT 0,
  total INTEGER, validator TEXT NOT NULL DEFAULT '', sha256 TEXT NOT NULL DEFAULT '',
+ reuse_mode TEXT NOT NULL DEFAULT '' CHECK(reuse_mode IN ('','published_hash','after_download')),
  UNIQUE(job_id,remote_id,file_index)
 );
 CREATE TABLE IF NOT EXISTS ctfd_managed_attachments (
@@ -1184,6 +1209,9 @@ class ImportJobs:
                 db.execute(
                     "ALTER TABLE ctfd_jobs ADD COLUMN refreshed INTEGER NOT NULL DEFAULT 0"
                 )
+            file_columns = {row[1] for row in db.execute("PRAGMA table_info(ctfd_job_files)")}
+            if "reuse_mode" not in file_columns:
+                db.execute("ALTER TABLE ctfd_job_files ADD COLUMN reuse_mode TEXT NOT NULL DEFAULT ''")
             # Attachments imported by older releases can be identified exactly:
             # their public attachment id is the durable job-file id.  Backfill
             # that provenance once so later refreshes never touch manual files.
@@ -1398,6 +1426,16 @@ class ImportJobs:
             raise HTTPException(404, "CTFd import job not found.")
         result = dict(row)
         result["errors"] = json.loads(result["errors"])
+        with self.db() as db:
+            reused = db.execute(
+                """SELECT
+                     SUM(CASE WHEN reuse_mode='published_hash' THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN reuse_mode='after_download' THEN 1 ELSE 0 END)
+                   FROM ctfd_job_files WHERE job_id=? AND status='done'""",
+                (job_id,),
+            ).fetchone()
+        result["reused_without_download"] = reused[0] or 0
+        result["downloaded_then_reused"] = reused[1] or 0
         # Attachment lengths arrive independently; do not present one file's
         # length as the total for a multi-file job.
         result["current_file_total"] = result["total_bytes"]
@@ -2193,7 +2231,7 @@ class ImportJobs:
     def progress(self, job_id, file_id, name, size, total, validator):
         with self.db() as db:
             db.execute("UPDATE ctfd_job_files SET bytes=?,total=?,validator=? WHERE id=?", (size, total, validator, file_id))
-            db.execute("UPDATE ctfd_jobs SET downloaded_bytes=(SELECT COALESCE(SUM(bytes),0) FROM ctfd_job_files WHERE job_id=?),current_file=?,total_bytes=?,updated_at=? WHERE id=?", (job_id, name, total, _now(), job_id))
+            db.execute("UPDATE ctfd_jobs SET downloaded_bytes=(SELECT COALESCE(SUM(CASE WHEN reuse_mode='published_hash' THEN 0 ELSE bytes END),0) FROM ctfd_job_files WHERE job_id=?),current_file=?,total_bytes=?,updated_at=? WHERE id=?", (job_id, name, total, _now(), job_id))
 
     @staticmethod
     def reservation(file_id):
@@ -2867,24 +2905,53 @@ class ImportJobs:
                                     artifact.unlink(missing_ok=True)
                                 self.budget.release(self.reservation(file["id"]))
                                 with self.db() as db:
-                                    db.execute("UPDATE ctfd_job_files SET status='pending',bytes=0,total=NULL,validator='',sha256='' WHERE id=?", (file["id"],))
-                                file.update(status="pending", bytes=0, total=None, validator="", sha256="")
+                                    db.execute("UPDATE ctfd_job_files SET status='pending',bytes=0,total=NULL,validator='',sha256='',reuse_mode='' WHERE id=?", (file["id"],))
+                                file.update(status="pending", bytes=0, total=None, validator="", sha256="", reuse_mode="")
                         if file["status"] != "ready":
                             def progress(size, total, validator):
                                 self.alive(job_id, workspace_id, owner, cancel)
                                 self.progress(job_id, file["id"], file["original_name"], size, total, validator)
-                            result = client.download_to(
-                                source["url"], partial, validator=file["validator"],
-                                progress=progress, cancel=cancel,
-                                storage_budget=self.budget,
-                                storage_reservation=(
-                                    self.reservation(file["id"]), owner,
-                                    workspace_id, challenge_id,
-                                ),
-                            )
-                            file.update(result)
+                            result = None
+                            reuse_mode = ""
+                            staged = getattr(self.app.state, "staged_files", None)
+                            published_digest = source.get("published_sha256", "")
+                            if (mode != "refresh" and staged is not None
+                                    and file["bytes"] == 0 and not partial.exists()
+                                    and isinstance(published_digest, str)
+                                    and re.fullmatch(r"[0-9a-f]{64}", published_digest)):
+                                if client.file_count >= client.limits.files:
+                                    raise CTFdError("The attachment count limit was reached.")
+                                size = staged.link_verified_sha256(
+                                    workspace_id, owner, published_digest, partial,
+                                    max_size=client.limits.file_bytes, cancel=cancel,
+                                )
+                                if size is not None:
+                                    client.file_count += 1
+                                    self.budget.release(self.reservation(file["id"]))
+                                    result = {"bytes": size, "total": size,
+                                              "validator": "", "sha256": published_digest}
+                                    reuse_mode = "published_hash"
+                            if result is None:
+                                result = client.download_to(
+                                    source["url"], partial, validator=file["validator"],
+                                    progress=progress, cancel=cancel,
+                                    storage_budget=self.budget,
+                                    storage_reservation=(
+                                        self.reservation(file["id"]), owner,
+                                        workspace_id, challenge_id,
+                                    ),
+                                )
+                                if mode != "refresh" and staged is not None:
+                                    size = staged.link_verified_sha256(
+                                        workspace_id, owner, result["sha256"], partial,
+                                        max_size=client.limits.file_bytes, cancel=cancel,
+                                    )
+                                    if size == result["bytes"]:
+                                        reuse_mode = "after_download"
+                            file.update(result, reuse_mode=reuse_mode)
                             with self.db() as db:
-                                db.execute("UPDATE ctfd_job_files SET status='ready',bytes=?,total=?,validator=?,sha256=? WHERE id=?", (result["bytes"], result["total"], result["validator"], result["sha256"], file["id"]))
+                                db.execute("UPDATE ctfd_job_files SET status='ready',bytes=?,total=?,validator=?,sha256=?,reuse_mode=? WHERE id=?", (result["bytes"], result["total"], result["validator"], result["sha256"], reuse_mode, file["id"]))
+                                db.execute("UPDATE ctfd_jobs SET downloaded_bytes=(SELECT COALESCE(SUM(CASE WHEN reuse_mode='published_hash' THEN 0 ELSE bytes END),0) FROM ctfd_job_files WHERE job_id=?),current_file=?,updated_at=? WHERE id=?", (job_id, file["original_name"], _now(), job_id))
                         self.alive(job_id, workspace_id, owner, cancel)
                         self.finalize(
                             job_id, workspace_id, file, partial, destination,

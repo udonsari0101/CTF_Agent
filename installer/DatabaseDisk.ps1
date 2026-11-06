@@ -7,15 +7,113 @@ function Get-DatabaseDiskHelperPath {
     return (Join-Path $PSScriptRoot 'DatabaseDisk.ps1')
 }
 
-function Invoke-DatabaseNative([string]$file, [string[]]$arguments, [switch]$Quiet) {
-    $previousPreference = $ErrorActionPreference
+function New-DatabaseVhdFile([string]$path) {
+    # WSL must grant its VM access to the file, which needs this account to be
+    # able to change the file's permissions. A VHDX made by elevated DiskPart is
+    # owned by Administrators and fails with HCS/E_ACCESSDENIED. CreateVirtualDisk
+    # needs no elevation and leaves the calling account as the owner.
+    if (-not ('CtfAgentVirtDisk' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CtfAgentVirtDisk {
+    [StructLayout(LayoutKind.Sequential)]
+    struct StorageType { public uint DeviceId; public Guid VendorId; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct CreateParameters {
+        public int Version; public int Padding;
+        public Guid UniqueId; public ulong MaximumSize;
+        public uint BlockSizeInBytes; public uint SectorSizeInBytes; public uint PhysicalSectorSizeInBytes;
+        public IntPtr ParentPath; public IntPtr SourcePath;
+        public uint OpenFlags;
+        public StorageType ParentType; public StorageType SourceType;
+        public Guid ResiliencyGuid;
+    }
+    [DllImport("virtdisk.dll", CharSet = CharSet.Unicode)]
+    static extern uint CreateVirtualDisk(ref StorageType type, string path, uint access, IntPtr descriptor,
+        uint flags, uint providerFlags, ref CreateParameters parameters, IntPtr overlapped, out IntPtr handle);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+    public static uint Create(string path, ulong size) {
+        StorageType type = new StorageType { DeviceId = 3, VendorId = new Guid("EC984AEC-A0F9-47e9-901F-71415A66345B") };
+        CreateParameters parameters = new CreateParameters { Version = 2, UniqueId = Guid.NewGuid(), MaximumSize = size };
+        IntPtr handle;
+        uint result = CreateVirtualDisk(ref type, path, 0, IntPtr.Zero, 0, 0, ref parameters, IntPtr.Zero, out handle);
+        if (result == 0) CloseHandle(handle);
+        return result;
+    }
+}
+'@
+    }
+    $result = [CtfAgentVirtDisk]::Create($path, [uint64]64GB)
+    if ($result -ne 0) {
+        throw "Could not create the VHDX: $((New-Object ComponentModel.Win32Exception([int]$result)).Message)"
+    }
+}
+
+function Set-DatabaseVhdOwner([string]$path, [string]$sid) {
+    $acl = Get-Acl -LiteralPath $path
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier($sid)))
+    Set-Acl -LiteralPath $path -AclObject $acl
+}
+
+function Test-DatabaseVhdUnused([string]$path) {
+    # An interrupted installation can leave a VHDX that was never formatted. An
+    # all-zero Block Allocation Table proves that no block was ever written.
+    $batRegion = [Guid]'2DC27766-F623-4200-9D64-115E9BFD4A08'
+    try { $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite) }
+    catch [System.IO.IOException] { return $false }
     try {
-        $ErrorActionPreference = 'Continue'
-        if ($Quiet) { & $file @arguments *> $null }
-        else { & $file @arguments | Out-Host }
-        $exitCode = $LASTEXITCODE
-    } finally { $ErrorActionPreference = $previousPreference }
-    return [int]$exitCode
+        $reader = New-Object IO.BinaryReader($stream)
+        $stream.Position = 192KB
+        if ([Text.Encoding]::ASCII.GetString($reader.ReadBytes(4)) -ne 'regi') { return $false }
+        $stream.Position = 192KB + 8
+        $entries = [Math]::Min($reader.ReadUInt32(), [uint32]2047)
+        for ($index = 0; $index -lt $entries; $index++) {
+            $stream.Position = 192KB + 16 + 32 * $index
+            $region = [Guid]::new([byte[]]$reader.ReadBytes(16))
+            $offset = [int64]$reader.ReadUInt64()
+            $length = [int]$reader.ReadUInt32()
+            if ($region -ne $batRegion) { continue }
+            if ($length -le 0 -or $length -gt 16MB -or $offset + $length -gt $stream.Length) { return $false }
+            $stream.Position = $offset
+            $table = $reader.ReadBytes($length)
+            return ($table.Length -eq $length -and @($table -ne 0).Count -eq 0)
+        }
+        return $false
+    } finally { $stream.Dispose() }
+}
+
+function Invoke-DatabaseDiskAction([string]$action, [string]$vhd, [string]$ownerSid = '') {
+    # Runs at the caller's privilege level. Returns '' on success, otherwise the
+    # failure text so that the caller can show WSL's own message.
+    try {
+        if ($action -eq 'create-bare') {
+            [IO.Directory]::CreateDirectory((Split-Path -Parent $vhd)) | Out-Null
+            $vhd = Assert-DatabaseVhdPath $vhd $false
+            New-DatabaseVhdFile $vhd
+            Assert-DatabaseVhdHeader $vhd | Out-Null
+        } elseif ($action -eq 'mount') {
+            Assert-DatabaseVhdHeader $vhd | Out-Null
+        } elseif ($action -eq 'remove-unused') {
+            if (-not (Test-DatabaseVhdUnused $vhd)) { return 'The VHDX contains data; it was not removed.' }
+            Remove-Item -LiteralPath $vhd -Force
+            return ''
+        }
+        if ($ownerSid -and $action -ne 'unmount') { Set-DatabaseVhdOwner $vhd $ownerSid }
+    } catch { return $_.Exception.Message }
+    $arguments = if ($action -eq 'create-bare') { @('--mount', '--vhd', $vhd, '--bare') }
+        elseif ($action -eq 'mount') { @('--mount', '--vhd', $vhd, '--name', 'ctf-agent-db') }
+        else { @('--unmount', $vhd) }
+    $result = Invoke-DesktopNative 'wsl.exe' $arguments 60
+    if ($result.ExitCode -ne 0 -and $action -eq 'mount' -and $result.Output -match 'ALREADY_ATTACHED') {
+        # A failed run can leave the disk attached without a mounted filesystem.
+        Invoke-DesktopNative 'wsl.exe' @('--unmount', $vhd) 60 | Out-Null
+        $result = Invoke-DesktopNative 'wsl.exe' $arguments 60
+    }
+    if ($result.ExitCode -eq 0) { return '' }
+    if ($action -eq 'create-bare') { Remove-Item -LiteralPath $vhd -Force -ErrorAction SilentlyContinue }
+    return $result.Output
 }
 
 function Invoke-DatabaseRootTool([string]$distro, [string]$tool, [string[]]$arguments = @()) {
@@ -132,12 +230,20 @@ function Get-DatabaseMountInfo([string]$distro) {
 
 function Invoke-ElevatedDatabaseAction([string]$action, [string]$vhd, [string]$userSid = '') {
     $full = Assert-DatabaseVhdPath $vhd
-    if ($action -notin @('create-bare', 'mount', 'unmount', 'register-task', 'unregister-task')) {
+    if ($action -notin @('create-bare', 'mount', 'unmount', 'remove-unused', 'unregister-task')) {
         throw 'Unsupported database disk action.'
     }
+    # Only a VHDX left by an older release, owned by Administrators, reaches
+    # the UAC prompt below. That prompt hands the file to this account for good.
+    if ($action -ne 'unregister-task') {
+        $failure = Invoke-DatabaseDiskAction $action $full
+        if (-not $failure) { return }
+        Write-Host "Requesting administrator access for the database disk ($action): $failure"
+    }
     if (-not $userSid) { $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
+    $logId = [Guid]::NewGuid().ToString('N')
     $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(
-        (@{action=$action;vhd=$full;sid=$userSid} | ConvertTo-Json -Compress)))
+        (@{action=$action;vhd=$full;sid=$userSid;log=$logId} | ConvertTo-Json -Compress)))
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         & (Get-DatabaseDiskHelperPath) -ElevatedPayload $payload
@@ -151,7 +257,14 @@ function Invoke-ElevatedDatabaseAction([string]$action, [string]$vhd, [string]$u
     } catch {
         throw "Administrator access is required to $action the database disk."
     }
-    if ($process.ExitCode -ne 0) { throw "Could not $action the database disk (exit code $($process.ExitCode))." }
+    # The elevated window is hidden, so its error has to be carried back.
+    $logFile = Join-Path $env:TEMP "ctf-agent-db-$logId.log"
+    $detail = ''
+    if (Test-Path -LiteralPath $logFile -PathType Leaf) {
+        $detail = (Get-Content -LiteralPath $logFile -Raw -Encoding UTF8).Trim()
+        Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
+    }
+    if ($process.ExitCode -ne 0) { throw "Could not $action the database disk (exit code $($process.ExitCode)). $detail" }
 }
 
 function Test-DatabaseMount([string]$distro, [string]$expectedUuid) {
@@ -304,58 +417,29 @@ function Invoke-DatabaseElevatedPayload([string]$payload) {
     if (-not $sid -or [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne $sid) {
         throw 'UAC used a different Windows account. Sign in with an administrator account to use a separate database VHDX.'
     }
-    if ($action -eq 'create-bare') {
-        $vhd = Assert-DatabaseVhdPath $vhd $false
-        $parent = Split-Path -Parent $vhd
-        [IO.Directory]::CreateDirectory($parent) | Out-Null
-        $vhd = Assert-DatabaseVhdPath $vhd $false
-        $scriptPath = Join-Path $env:TEMP ("ctf-agent-db-" + [Guid]::NewGuid().ToString('N') + '.txt')
-        try {
-            @(
-                ('create vdisk file="' + $vhd + '" maximum=65536 type=expandable')
-                'exit'
-            ) |
-                Set-Content -LiteralPath $scriptPath -Encoding ASCII
-            $exitCode = Invoke-DatabaseNative 'diskpart.exe' @('/s', $scriptPath) -Quiet
-            if ($exitCode -ne 0) { throw 'DiskPart could not create the VHDX.' }
-        } finally { Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue }
-        Assert-DatabaseVhdHeader $vhd | Out-Null
-        $exitCode = Invoke-DatabaseNative 'wsl.exe' @('--mount', '--vhd', $vhd, '--bare')
-        if ($exitCode -ne 0) { throw 'WSL could not attach the new VHDX.' }
+    if ($action -in @('create-bare', 'mount', 'unmount', 'remove-unused')) {
+        $failure = Invoke-DatabaseDiskAction $action $vhd $sid
+        if ($failure) { throw $failure }
         return
     }
-    if ($action -eq 'mount') {
-        Assert-DatabaseVhdHeader $vhd | Out-Null
-        $exitCode = Invoke-DatabaseNative 'wsl.exe' @('--mount', '--vhd', $vhd,
-            '--name', 'ctf-agent-db')
-        if ($exitCode -ne 0) { throw 'WSL could not mount the database VHDX.' }
-        return
-    }
-    if ($action -eq 'unmount') {
-        $exitCode = Invoke-DatabaseNative 'wsl.exe' @('--unmount', $vhd)
-        if ($exitCode -ne 0) { throw 'WSL could not detach the database VHDX.' }
-        return
-    }
-    if ($action -notin @('register-task', 'unregister-task')) { throw 'Unsupported database disk action.' }
+    if ($action -ne 'unregister-task') { throw 'Unsupported database disk action.' }
     if ($sid -notmatch '^S-1-5-') { throw 'Invalid Windows account identity.' }
-    $execute = Join-Path $env:WINDIR 'System32\wsl.exe'
-    $arguments = '--mount --vhd "' + $vhd + '" --name ctf-agent-db'
-    $existing = Get-ScheduledTask -TaskName (Get-DatabaseTaskName) -ErrorAction SilentlyContinue
-    if ($existing) {
+    if (Get-ScheduledTask -TaskName (Get-DatabaseTaskName) -ErrorAction SilentlyContinue) {
         if (-not (Test-DatabaseMountTask $vhd $sid)) {
             throw 'An unrelated scheduled task uses the CTF Agent database name.'
         }
-        if ($action -eq 'register-task') { return }
         Unregister-ScheduledTask -TaskName (Get-DatabaseTaskName) -Confirm:$false
-        return
     }
-    if ($action -eq 'unregister-task') { return }
-    $taskAction = New-ScheduledTaskAction -Execute $execute -Argument $arguments
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $sid
-    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-    Register-ScheduledTask -TaskName (Get-DatabaseTaskName) -Action $taskAction -Trigger $trigger `
-        -Principal $taskPrincipal -Settings $settings | Out-Null
 }
 
-if ($ElevatedPayload) { Invoke-DatabaseElevatedPayload $ElevatedPayload }
+if ($ElevatedPayload) {
+    . (Join-Path $PSScriptRoot 'DockerDesktop.ps1')
+    try { Invoke-DatabaseElevatedPayload $ElevatedPayload }
+    catch {
+        $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ElevatedPayload)) | ConvertFrom-Json
+        if ([string]$request.log -match '^[0-9a-f]{32}$') {
+            $_.Exception.Message | Set-Content -LiteralPath (Join-Path $env:TEMP "ctf-agent-db-$($request.log).log") -Encoding UTF8
+        }
+        throw
+    }
+}

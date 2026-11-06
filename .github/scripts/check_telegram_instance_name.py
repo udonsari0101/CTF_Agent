@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import sys
 import tempfile
@@ -9,13 +10,14 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from fastapi import FastAPI, HTTPException
 
 ROOT = Path(__file__).resolve().parents[2] if ".github" in Path(__file__).parts else Path.cwd()
 sys.path.insert(0, str(ROOT))
 
-from ctf_agent.telegram import register_telegram  # noqa: E402
+from ctf_agent.telegram import TelegramAPIError, register_telegram  # noqa: E402
 
 
 class TelegramInstanceNameTests(unittest.TestCase):
@@ -80,6 +82,40 @@ class TelegramInstanceNameTests(unittest.TestCase):
                 _, payload = self.service._notification({**common, "event_type": event, **additions})
                 self.assertTrue(payload["text"].startswith("📍 <b>Lab &lt;One&gt;</b>\n"))
                 self.assertNotIn("<One>", payload["text"])
+
+    def test_test_alert_uses_saved_name_and_reports_delivery(self) -> None:
+        self.service.set_instance_name("owner-a", "Lab <One>")
+        with self.database() as db:
+            db.execute("UPDATE telegram_settings SET chat_id=123,enabled=0 WHERE user_id='owner-a'")
+        self.service._token_for = lambda user_id: "test-bot-token"  # type: ignore[method-assign]
+        self.service._api = AsyncMock(return_value={"ok": True})  # type: ignore[method-assign]
+
+        result = asyncio.run(self.service.send_test("owner-a"))
+
+        self.assertTrue(result["sent"])
+        self.assertEqual(result["instance_name"], "Lab <One>")
+        args, kwargs = self.service._api.call_args
+        self.assertEqual(args[0], "sendMessage")
+        self.assertEqual(args[1]["chat_id"], 123)
+        self.assertIn("📍 <b>Lab &lt;One&gt;</b>", args[1]["text"])
+        self.assertNotIn("<One>", args[1]["text"])
+        self.assertEqual(kwargs["token"], "test-bot-token")
+        self.assertIsNotNone(self.service.settings_for("owner-a")["last_success_at"])
+
+    def test_test_alert_requires_link_and_reports_api_failure(self) -> None:
+        with self.assertRaises(HTTPException) as unlinked:
+            asyncio.run(self.service.send_test("owner-b"))
+        self.assertEqual(unlinked.exception.status_code, 409)
+        with self.database() as db:
+            db.execute("UPDATE telegram_settings SET chat_id=123 WHERE user_id='owner-a'")
+        self.service._token_for = lambda user_id: "test-bot-token"  # type: ignore[method-assign]
+        self.service._api = AsyncMock(side_effect=TelegramAPIError("api_403"))  # type: ignore[method-assign]
+
+        with self.assertRaises(HTTPException) as failed:
+            asyncio.run(self.service.send_test("owner-a"))
+
+        self.assertEqual(failed.exception.status_code, 502)
+        self.assertEqual(self.service.settings_for("owner-a")["last_failure_code"], "api_403")
 
 
 if __name__ == "__main__":

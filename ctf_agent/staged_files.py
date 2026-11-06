@@ -12,6 +12,7 @@ import errno
 import hashlib
 import logging
 import os
+import re
 import shutil
 import stat
 import threading
@@ -179,7 +180,7 @@ class StagedFileManager:
         return details
 
     @classmethod
-    def hash_stable_file(cls, path: Path, size: int) -> tuple[str, os.stat_result]:
+    def hash_stable_file(cls, path: Path, size: int, *, cancel=None) -> tuple[str, os.stat_result]:
         before = cls.verified_stat(path, size)
         digest = hashlib.sha256()
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -188,6 +189,8 @@ class StagedFileManager:
                 raise HTTPException(409, "The staged file is unsafe.")
             with os.fdopen(descriptor, "rb", closefd=False) as handle:
                 while piece := handle.read(1024 * 1024):
+                    if cancel is not None and cancel.is_set():
+                        raise InterruptedError("Staged file reuse was cancelled.")
                     digest.update(piece)
             after = os.fstat(descriptor)
         finally:
@@ -196,6 +199,72 @@ class StagedFileManager:
                 cls.fingerprint(before) != cls.fingerprint(after)):
             raise HTTPException(409, "The staged file changed during verification.")
         return digest.hexdigest(), after
+
+    def link_verified_sha256(self, workspace_id: str, owner_user_id: str,
+                             digest: str, destination: Path,
+                             *, max_size: int | None = None, cancel=None) -> int | None:
+        """Replace an import-owned file with an identical staged hardlink.
+
+        A database digest alone is insufficient: the source is hashed again
+        while its deletion lock is held.  A missing, changed, or busy staged
+        file simply leaves the caller's normal CTFd download path available.
+        """
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return None
+        with self.db() as db:
+            candidates = db.execute(
+                """SELECT id FROM workspace_staged_files
+                   WHERE workspace_id=? AND owner_user_id=? AND status='ready'
+                     AND sha256=? AND (? IS NULL OR size<=?)
+                   ORDER BY created_at,id""",
+                (workspace_id, owner_user_id, digest, max_size, max_size),
+            ).fetchall()
+        for candidate in candidates:
+            file_id = candidate["id"]
+            process_lock = self.verify_lock(file_id)
+            if not process_lock.try_acquire():
+                continue
+            try:
+                with self.lock(file_id):
+                    with self.db() as db:
+                        row = db.execute(
+                            """SELECT * FROM workspace_staged_files
+                               WHERE id=? AND workspace_id=? AND owner_user_id=?
+                                 AND status='ready' AND sha256=?""",
+                            (file_id, workspace_id, owner_user_id, digest),
+                        ).fetchone()
+                    if row is None:
+                        continue
+                    try:
+                        source = self.path(row, "ready")
+                        actual, _ = self.hash_stable_file(source, row["size"], cancel=cancel)
+                    except HTTPException:
+                        continue
+                    if actual != digest:
+                        continue
+                    temporary = destination.with_name(
+                        destination.name + ".staged-" + uuid.uuid4().hex
+                    )
+                    try:
+                        try:
+                            os.link(source, temporary, follow_symlinks=False)
+                        except OSError as exc:
+                            if exc.errno in {
+                                errno.EXDEV, errno.EPERM, errno.EACCES,
+                                getattr(errno, "ENOTSUP", -1),
+                            }:
+                                return None
+                            raise
+                        if not self.regular(temporary, row["size"]):
+                            return None
+                        os.replace(temporary, destination)
+                        self.sync_directory(destination.parent)
+                        return row["size"]
+                    finally:
+                        temporary.unlink(missing_ok=True)
+            finally:
+                process_lock.release()
+        return None
 
     def row(self, workspace_id: str, file_id: str, user: dict):
         self.workspace(workspace_id, user)

@@ -25,14 +25,19 @@ try {
     if ((Resolve-DockerDesktopDiskFile -SettingsFile $settings -DefaultFolder $default -OverrideFolder $default) -ne $defaultDisk) {
         throw 'Explicit Docker Desktop image disk override was not honored'
     }
+    @{ dataFolder = $default; CustomWslDistroDir = $custom } | ConvertTo-Json |
+        Set-Content -LiteralPath $settings -Encoding UTF8
+    if ((Resolve-DockerDesktopDiskFile -SettingsFile $settings -DefaultFolder $default -OverrideFolder '') -ne $customDisk) {
+        throw 'Docker Desktop CustomWslDistroDir was not preferred over the legacy dataFolder'
+    }
 
     function Get-HostVolumeFree([string]$Path) { return $script:mockFree }
-    $script:mockFree = [int64]15GB
-    Assert-DockerDesktopImageCapacity -EstimatedWriteBytes ([int64]10GB) `
+    $script:mockFree = [int64]23GB
+    Assert-DockerDesktopImageCapacity -EstimatedWriteBytes ([int64]18GB) `
         -SettingsFile $settings -DefaultFolder $default -OverrideFolder ''
-    $script:mockFree = [int64]15GB - 1
+    $script:mockFree = [int64]23GB - 1
     try {
-        Assert-DockerDesktopImageCapacity -EstimatedWriteBytes ([int64]10GB) `
+        Assert-DockerDesktopImageCapacity -EstimatedWriteBytes ([int64]18GB) `
             -SettingsFile $settings -DefaultFolder $default -OverrideFolder ''
         throw 'A full Docker Desktop image disk was accepted'
     } catch {
@@ -40,34 +45,34 @@ try {
     }
     $split = @(Get-LocalInstallVolumeRequirements -WslDiskPath 'C:\wsl\ext4.vhdx' `
         -DockerDiskPath 'D:\docker\docker_data.vhdx' -DatabaseDiskPath 'E:\db\ctf-agent-db.vhdx' `
-        -ImageWorkBytes 10GB)
+        -ImageWorkBytes 18GB)
     if ($split.Count -ne 3 -or $split[0].RequiredFreeBytes -ne 6GB -or
-        $split[1].RequiredFreeBytes -ne 15GB -or $split[2].RequiredFreeBytes -ne 6GB) {
+        $split[1].RequiredFreeBytes -ne 23GB -or $split[2].RequiredFreeBytes -ne 6GB) {
         throw 'Separate backing drives incorrectly share or duplicate planned writes'
     }
     $shared = @(Get-LocalInstallVolumeRequirements -WslDiskPath 'C:\wsl\ext4.vhdx' `
         -DockerDiskPath 'c:\docker\docker_data.vhdx' -DatabaseDiskPath 'C:\db\ctf-agent-db.vhdx' `
-        -ImageWorkBytes 10GB)
-    if ($shared.Count -ne 1 -or $shared[0].RequiredFreeBytes -ne 17GB) {
+        -ImageWorkBytes 18GB)
+    if ($shared.Count -ne 1 -or $shared[0].RequiredFreeBytes -ne 25GB) {
         throw 'A shared backing drive did not combine planned writes'
     }
     $extended = @(Get-LocalInstallVolumeRequirements `
         -WslDiskPath '\\?\C:\wsl\ext4.vhdx' `
         -DockerDiskPath 'C:\docker\docker_data.vhdx' `
-        -DatabaseDiskPath '\\?\C:\db\ctf-agent-db.vhdx' -ImageWorkBytes 10GB)
+        -DatabaseDiskPath '\\?\C:\db\ctf-agent-db.vhdx' -ImageWorkBytes 18GB)
     if ($extended.Count -ne 1 -or $extended[0].Root -ne 'C:\' -or
-        $extended[0].RequiredFreeBytes -ne 17GB) {
+        $extended[0].RequiredFreeBytes -ne 25GB) {
         throw 'Extended-length and normal paths on one Windows drive were counted separately'
     }
-    $script:mockFree = [int64]17GB
+    $script:mockFree = [int64]25GB
     Assert-LocalInstallVolumeCapacity -WslDiskPath 'C:\wsl\ext4.vhdx' `
         -DockerDiskPath 'C:\docker\docker_data.vhdx' -DatabaseDiskPath 'C:\db\ctf-agent-db.vhdx' `
-        -ImageWorkBytes 10GB | Out-Null
-    $script:mockFree = [int64]17GB - 1
+        -ImageWorkBytes 18GB | Out-Null
+    $script:mockFree = [int64]25GB - 1
     try {
         Assert-LocalInstallVolumeCapacity -WslDiskPath 'C:\wsl\ext4.vhdx' `
             -DockerDiskPath 'C:\docker\docker_data.vhdx' -DatabaseDiskPath 'C:\db\ctf-agent-db.vhdx' `
-            -ImageWorkBytes 10GB | Out-Null
+            -ImageWorkBytes 18GB | Out-Null
         throw 'A shared backing drive below its combined boundary was accepted'
     } catch {
         if ($_.Exception.Message -notlike '*planned application, image and database writes*') { throw }
@@ -98,17 +103,17 @@ try {
         return [pscustomobject]@{ExitCode=1;Stdout=''}
     }
     $revision = 'a' * 40
-    if ((Get-EstimatedImageWorkBytes $revision) -ne 10GB) {
+    if ((Get-EstimatedImageWorkBytes $revision) -ne 18GB) {
         throw 'An image with no published digest was treated as cached'
     }
     $script:publishedDigest = 'sha256:' + ('b' * 64)
     $script:cachedDigest = 'sha256:' + ('c' * 64)
     $script:localRevision = $revision
-    if ((Get-EstimatedImageWorkBytes $revision) -ne 10GB) {
+    if ((Get-EstimatedImageWorkBytes $revision) -ne 18GB) {
         throw 'A stale local digest carrying the same revision was treated as the published image'
     }
     $script:cachedDigest = $script:publishedDigest
-    if ((Get-EstimatedImageWorkBytes $revision) -ne 2GB) {
+    if ((Get-EstimatedImageWorkBytes $revision) -ne 10GB) {
         throw 'The exact published image digest was treated as a cold pull'
     }
     Remove-Item -LiteralPath $customDisk

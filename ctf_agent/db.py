@@ -9,6 +9,23 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
+
+
+def allowed_origin(value: str) -> str:
+    """Validate a browser Origin, not a URL with a path or credentials."""
+    origin = value.strip().rstrip("/")
+    parsed = urlsplit(origin)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("CTF_ALLOWED_ORIGINS contains an invalid port") from exc
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path or parsed.query or parsed.fragment
+            or parsed.netloc.endswith(":") or origin != f"{parsed.scheme}://{parsed.netloc}"):
+        raise ValueError("CTF_ALLOWED_ORIGINS must contain absolute HTTP(S) origins")
+    return origin
 
 
 @dataclass(frozen=True)
@@ -18,18 +35,30 @@ class Settings:
     config_dir: Path
     log_dir: Path
     public_origin: str = ""
+    allowed_origins: tuple[str, ...] = ()
     cookie_secure: bool = False
     session_hours: int = 12
     storage_min_free_bytes: int = 1024 * 1024 * 1024
     trust_cf_connecting_ip: bool = False
     auth_mode: str = "password"
     allow_web_bootstrap: bool = False
+    local_access: str = "link"
+    first_admin_setup_token: str = ""
+    require_first_admin_token: bool = False
 
     def __post_init__(self) -> None:
         mode = str(self.auth_mode).strip().lower()
         if mode not in {"password", "nologin"}:
             raise ValueError("CTF_AUTH_MODE must be 'password' or 'nologin'.")
         object.__setattr__(self, "auth_mode", mode)
+        access = str(self.local_access).strip().lower()
+        if access not in {"link", "open"} or (access == "open" and mode != "nologin"):
+            raise ValueError("CTF_LOCAL_ACCESS must be 'link' or 'open' in no-login mode")
+        object.__setattr__(self, "local_access", access)
+        origins = tuple(dict.fromkeys(allowed_origin(value) for value in self.allowed_origins))
+        object.__setattr__(self, "allowed_origins", origins)
+        if self.first_admin_setup_token and len(self.first_admin_setup_token) < 32:
+            raise ValueError("CTF_FIRST_ADMIN_SETUP_TOKEN must contain at least 32 characters")
 
     @property
     def database_path(self) -> Path:
@@ -44,11 +73,18 @@ class Settings:
             config_dir=Path(os.environ.get("CTF_CONFIG_DIR", str(data / "config"))),
             log_dir=Path(os.environ.get("CTF_LOG_DIR", "/database/logs")),
             public_origin=os.environ.get("CTF_PUBLIC_ORIGIN", "").rstrip("/"),
+            allowed_origins=tuple(
+                value.strip() for value in os.environ.get("CTF_ALLOWED_ORIGINS", "").split(",")
+                if value.strip()
+            ),
             cookie_secure=os.environ.get("CTF_COOKIE_SECURE", "false").lower() == "true",
             storage_min_free_bytes=int(os.environ.get("CTF_STORAGE_MIN_FREE_BYTES", "1073741824")),
             trust_cf_connecting_ip=os.environ.get("CTF_TRUST_CF_CONNECTING_IP", "false").lower() == "true",
             auth_mode=os.environ.get("CTF_AUTH_MODE", "password"),
             allow_web_bootstrap=os.environ.get("CTF_ALLOW_WEB_BOOTSTRAP", "false").lower() == "true",
+            local_access=os.environ.get("CTF_LOCAL_ACCESS", "link"),
+            first_admin_setup_token=os.environ.get("CTF_FIRST_ADMIN_SETUP_TOKEN", ""),
+            require_first_admin_token=os.environ.get("CTF_REQUIRE_FIRST_ADMIN_TOKEN", "false").lower() == "true",
         )
 
 

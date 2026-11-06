@@ -102,6 +102,11 @@ const openModal=(title,subtitle,body,footer,formId)=>{
   &&header.getAttribute('aria-label').includes('실패');
  const fresh=ctfdJobMarkup({...jobs[0],mode:'refresh',target_challenge_id:'c'})
   .includes('data-action="fresh-refresh-ctfd"');
+ const reused=ctfdJobMarkup({...jobs[0],status:'completed',
+  reused_without_download:987,downloaded_then_reused:654});
+ const reuseVisible=reused.includes('987')&&reused.includes('654')
+  &&reused.includes('다운로드 생략')&&reused.includes('다운로드 후')
+  &&!ctfdJobMarkup({...jobs[0],status:'completed'}).includes('사전 파일 재사용');
  showCTFdSyncPreview({source_url:'https://ctf.example',challenges:[],new_count:0,existing_count:3,
   source_statuses:[{remote_id:7,challenge_id:'local-7',name:'<img src=x>',state:'hidden'},
    {remote_id:8,challenge_id:'local-8',name:'Other',state:'unlisted'},
@@ -110,9 +115,9 @@ const openModal=(title,subtitle,body,footer,formId)=>{
   &&modal.textContent.includes('원본에서 숨김')&&modal.textContent.includes('원본 목록에서 확인되지 않음')
   &&!modal.querySelector('img')&&modal.textContent.includes('<img src=x>')
   &&importPreview.mode==='sync';
- document.querySelector('#result').textContent=active&&preserved&&background&&reopened&&retry&&fresh
+ document.querySelector('#result').textContent=active&&preserved&&background&&reopened&&retry&&fresh&&reuseVisible
   &&runningBadge&&completedBadge&&failedBadge&&sourceStatus?'PASS':'FAIL '
-  +JSON.stringify({active,preserved,background,reopened,retry,fresh,runningBadge,completedBadge,failedBadge,sourceStatus,refreshCount});
+  +JSON.stringify({active,preserved,background,reopened,retry,fresh,reuseVisible,runningBadge,completedBadge,failedBadge,sourceStatus,refreshCount});
 })().catch(error=>{document.querySelector('#result').textContent='ERROR '+error.stack});
 </script></body></html>"""
     with tempfile.TemporaryDirectory(prefix="ctf-agent-ctfd-modal-") as temp:

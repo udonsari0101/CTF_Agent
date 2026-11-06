@@ -501,6 +501,37 @@ export async function renderAccounts(container, api, options = {}) {
     });
   }
 
+  function showRename(account, target) {
+    if (target.hasChildNodes()) { target.replaceChildren(); return; }
+    const form = el('form', undefined, 'account-api-key');
+    const field = el('label', '에이전트 이름');
+    const input = el('input');
+    input.type = 'text'; input.name = 'label'; input.maxLength = 100;
+    input.required = true; input.value = account.label;
+    input.setAttribute('aria-label', '에이전트 이름');
+    field.append(input);
+    const save = el('button', '이름 저장'); save.type = 'submit';
+    const cancel = el('button', '취소'); cancel.type = 'button';
+    cancel.addEventListener('click', () => target.replaceChildren());
+    const notice = createNotice();
+    form.append(field, save, cancel);
+    target.append(form, notice.node);
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      action(async () => {
+        const value = input.value.trim();
+        if (!value) throw new Error(i18n.t('에이전트 이름을 입력하세요.'));
+        save.disabled = true;
+        try {
+          await api(`/api/accounts/${account.id}`, {method:'PATCH', body:{label:value}});
+          target.replaceChildren();
+          await load();
+        } finally { save.disabled = false; }
+      }, notice);
+    });
+    input.focus({preventScroll:true}); input.select();
+  }
+
   async function load() {
     const generation = ++loadGeneration;
     const data = await api('/api/accounts');
@@ -576,15 +607,16 @@ export async function renderAccounts(container, api, options = {}) {
       const summary = el('p', modelSummary.join(' · '), 'account-model-summary');
       summary.setAttribute('aria-label', '기본 풀이 설정');
       card.append(summary);
-      const forms = formTargets.get(account.id) || {notice: createNotice(), login: el('div'), upload: el('div'), apiKey: el('div')};
+      const forms = formTargets.get(account.id) || {notice: createNotice(), login: el('div'), upload: el('div'), apiKey: el('div'), rename: el('div')};
+      forms.rename ||= el('div');
       formTargets.set(account.id, forms);
-      const {notice, login, upload, apiKey} = forms;
+      const {notice, login, upload, apiKey, rename} = forms;
       const models = modelTargets.get(account.id) || el('div');
       modelTargets.set(account.id, models);
       // Build the refreshed card without moving an open form. Removing even the
       // same <select> for one render closes its native dropdown, and a rebuilt
       // API-key or file field would drop what the user already entered.
-      const keep = [notice.node, login, models, upload, apiKey];
+      const keep = [notice.node, login, models, upload, apiKey, rename];
       const slots = keep.map(() => el('div'));
       const controls = el('div', undefined, 'actions');
       const accountButton = (key, text, task) => button(text, task, notice, `${account.id}:${key}`);
@@ -592,7 +624,8 @@ export async function renderAccounts(container, api, options = {}) {
       select.disabled = account.selected;
       controls.append(select, accountButton('refresh', '사용량 새로고침', async () => { await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }));
       if (account.auth_kind !== 'api_key') controls.append(accountButton('login', snapshot.status === 'authenticated' ? '다시 로그인' : '로그인', () => showLogin(account, login, true)));
-      controls.append(accountButton('api-key', 'API 키 연결', () => showApiKey(account, apiKey)), accountButton('models', '모델·속도 설정', () => showModels(account, models)),
+      controls.append(accountButton('rename', '이름 변경', () => showRename(account, rename)),
+        accountButton('api-key', 'API 키 연결', () => showApiKey(account, apiKey)), accountButton('models', '모델·속도 설정', () => showModels(account, models)),
         accountButton('logout', '로그아웃', async () => { await api(`/api/accounts/${account.id}/logout`, {method: 'POST'}); modelTargets.delete(account.id); login.replaceChildren(); await load(); }),
         accountButton('delete', '계정 삭제', async () => {
           if (!window.confirm(localized(`${account.label} 계정 등록과 서버에 저장된 로그인 정보를 삭제할까요?`, `Remove ${account.label} and the sign-in saved on the server?`))) return;

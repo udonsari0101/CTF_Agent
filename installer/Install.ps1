@@ -1,8 +1,27 @@
+param(
+    # Install.cmd finishes without questions unless -Interactive is passed. The
+    # other options are optional; saved settings and detected defaults fill in.
+    [switch]$Interactive,
+    [string]$Distribution = '',
+    [string]$DataFolder = '',
+    [string]$DatabaseFolder = '',
+    [string]$DockerFolder = '',
+    [ValidateSet('Existing', 'Install')][string]$DockerMode = '',
+    [ValidateSet('', '127.0.0.1', '0.0.0.0')][string]$ListenAddress = '',
+    [switch]$NoLogin,
+    [switch]$StartAtSignIn,
+    [string[]]$PublicUrl = @(),
+    [switch]$OpenAccess
+)
+
 $ErrorActionPreference = 'Stop'
+if ($env:CTF_AGENT_LAUNCH_MARKER) { [IO.File]::WriteAllText($env:CTF_AGENT_LAUNCH_MARKER, '') }
 $installer = Join-Path $PSScriptRoot 'installer\install.sh'
 $stateFile = Join-Path $env:LOCALAPPDATA 'CTF Agent\install.json'
 $minimumFreeBytes = 5GB
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw 'Release archive is incomplete.' }
+$wslPreparation = Join-Path $PSScriptRoot 'installer\prepare-wsl.sh'
+if (-not (Test-Path -LiteralPath $wslPreparation -PathType Leaf)) { throw 'Release archive is incomplete: prepare-wsl.sh is missing.' }
 $databaseDiskHelper = Join-Path $PSScriptRoot 'DatabaseDisk.ps1'
 if (-not (Test-Path -LiteralPath $databaseDiskHelper -PathType Leaf)) { throw 'Release archive is incomplete.' }
 . $databaseDiskHelper
@@ -14,6 +33,10 @@ if (-not (Test-Path -LiteralPath $dockerDiskHelper -PathType Leaf)) { throw 'Rel
 . $dockerDiskHelper
 
 function Ask-YesNo([string]$question, [bool]$default = $true) {
+    if (-not $Interactive) {
+        Write-Host "$question $(if ($default) { 'Yes' } else { 'No' })"
+        return $default
+    }
     $hint = if ($default) { 'Y/n' } else { 'y/N' }
     while ($true) {
         $answer = (Read-Host "$question [$hint]").Trim().ToLowerInvariant()
@@ -22,6 +45,72 @@ function Ask-YesNo([string]$question, [bool]$default = $true) {
         if ($answer -in @('n', 'no')) { return $false }
         Write-Host 'Enter Y or N.'
     }
+}
+
+function Read-TimedChoice([string]$question, [string]$default,
+    [string[]]$choices, [int]$seconds = 30) {
+    if ($default -notin $choices) { throw 'Invalid default choice.' }
+    Write-Host "$question [$default] (default in $seconds seconds): " -NoNewline
+    if ([Console]::IsInputRedirected) {
+        Write-Host $default
+        return $default
+    }
+    $inputText = ''
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($watch.Elapsed.TotalSeconds -lt $seconds) {
+            if (-not [Console]::KeyAvailable) {
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+            $key = [Console]::ReadKey($true)
+            $watch.Restart()
+            if ($key.Key -eq [ConsoleKey]::Enter) {
+                Write-Host ''
+                if (-not $inputText) { return $default }
+                if ($inputText -in $choices) { return $inputText }
+                Write-Host 'Choose one of the displayed options.'
+                return Read-TimedChoice $question $default $choices $seconds
+            }
+            if ($key.Key -eq [ConsoleKey]::Backspace) {
+                if ($inputText) {
+                    $inputText = $inputText.Substring(0, $inputText.Length - 1)
+                    Write-Host "`b `b" -NoNewline
+                }
+                continue
+            }
+            if (-not [char]::IsControl($key.KeyChar)) {
+                $inputText += [string]$key.KeyChar
+                Write-Host $key.KeyChar -NoNewline
+            }
+        }
+    } catch {
+        # A detached console or redirected launcher must not block installation.
+        Write-Host $default
+        return $default
+    }
+    Write-Host "`nNo choice entered; using $default."
+    return $default
+}
+
+function Get-InstallPublicUrls([string[]]$items) {
+    $urls = @()
+    foreach ($item in $items) {
+        foreach ($piece in ([string]$item -split ',')) {
+            $value = $piece.Trim()
+            if (-not $value) { continue }
+            $uri = $null
+            if (-not [Uri]::TryCreate($value, [UriKind]::Absolute, [ref]$uri) -or
+                $uri.Scheme -notin @('http', 'https') -or -not $uri.Host -or
+                $uri.UserInfo -or $uri.Query -or $uri.Fragment -or
+                $uri.AbsolutePath -ne '/') {
+                throw "PublicUrl must be an HTTP(S) origin without a path, query or credentials: $value"
+            }
+            $origin = $uri.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
+            if ($origin -notin $urls) { $urls += $origin }
+        }
+    }
+    return $urls
 }
 
 function Convert-WslListBytes([byte[]]$bytes) {
@@ -219,19 +308,6 @@ function Assert-WslVhdSupport {
     }
 }
 
-function Assert-DatabaseTaskSupport {
-    foreach ($name in @('Get-ScheduledTask','Get-ScheduledTaskInfo','Start-ScheduledTask',
-            'New-ScheduledTaskAction','New-ScheduledTaskTrigger',
-            'New-ScheduledTaskPrincipal','New-ScheduledTaskSettingsSet','Register-ScheduledTask')) {
-        if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
-            throw 'Automatic database mounting needs Windows Task Scheduler cmdlets.'
-        }
-    }
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    New-ScheduledTaskTrigger -AtLogOn -User $sid | Out-Null
-    New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Highest | Out-Null
-}
-
 function Select-DatabaseVhd([string]$savedPath, [string]$requestedPath = '') {
     if ($savedPath) {
         $savedPath = Assert-DatabaseVhdPath $savedPath
@@ -250,7 +326,7 @@ function Select-DatabaseVhd([string]$savedPath, [string]$requestedPath = '') {
         $full = Resolve-DatabaseVhdInputPath $answer
     }
     if ((Test-Path -LiteralPath $full) -and
-        -not (Ask-YesNo 'Reuse this existing database VHDX after verifying its CTF Agent marker?' $false)) {
+        -not (Ask-YesNo 'Reuse this existing database VHDX after verifying its CTF Agent marker?' (-not $Interactive))) {
         throw 'Existing VHDX was left untouched. Choose a new file to create a new database.'
     }
     if ((Get-HostVolumeFree $full) -lt $minimumFreeBytes) {
@@ -326,13 +402,21 @@ print(json.dumps({'unsafe':p.is_symlink() or (p.exists() and
         if (Get-DatabaseMountInfo $name) {
             throw 'A database filesystem is already mounted. Unmount it before adopting an existing VHDX without installation settings.'
         }
+        # No database is mounted, so this only releases a bare attach left by
+        # an interrupted run. Windows can hold an attached VHDX exclusively.
+        Invoke-DesktopNative 'wsl.exe' @('--unmount', $vhd) 60 | Out-Null
         Assert-DatabaseVhdHeader $vhd | Out-Null
-        Invoke-ElevatedDatabaseAction 'mount' $vhd
-        $existing = Get-DatabaseMountInfo $name
-        if (-not $existing -or (Read-DatabaseVolumeMarker $name) -ne $existing.Uuid.Replace('-', '')) {
-            throw 'The existing VHDX is not a verified CTF Agent database volume; it was not formatted or changed.'
+        if (Test-DatabaseVhdUnused $vhd) {
+            Write-Host 'Recreating an empty database VHDX left by an interrupted installation.'
+            Invoke-ElevatedDatabaseAction 'remove-unused' $vhd
+        } else {
+            Invoke-ElevatedDatabaseAction 'mount' $vhd
+            $existing = Get-DatabaseMountInfo $name
+            if (-not $existing -or (Read-DatabaseVolumeMarker $name) -ne $existing.Uuid.Replace('-', '')) {
+                throw 'The existing VHDX is not a verified CTF Agent database volume; it was not formatted or changed.'
+            }
+            return $existing.Uuid
         }
-        return $existing.Uuid
     }
     if (Get-DatabaseMountInfo $name) {
         throw 'The CTF Agent database mount point is already in use.'
@@ -480,21 +564,117 @@ function Get-OnlineUbuntu {
 
 function Install-WslDistribution([string]$name) {
     Write-Host "Installing WSL distribution: $name"
-    Write-Host 'A Linux window may open for first-run account setup. After creating the account, type exit in that Linux window to continue this installer.'
-    $process = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wsl.exe') `
-        -ArgumentList @('--install', '--distribution', $name) -Verb RunAs -Wait -PassThru
-    if ($process.ExitCode -ne 0) {
-        throw "WSL installation exited with code $($process.ExitCode). Restart Windows if prompted, then rerun Install.cmd."
+    $wsl = Join-Path $env:WINDIR 'System32\wsl.exe'
+    if ($Interactive) {
+        Write-Host 'A Linux window may open for first-run account setup. After creating the account, type exit in that Linux window to continue this installer.'
+        $process = Start-Process -FilePath $wsl -ArgumentList @('--install', '--distribution', $name) -Verb RunAs -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "WSL installation exited with code $($process.ExitCode). Restart Windows if prompted, then rerun Install.cmd."
+        }
+        Write-Host 'Complete the Linux first-run username setup if prompted.'
+    } else {
+        # --no-launch skips the first-run account prompt. Initialize-WslDistribution
+        # creates the account instead. Elevation is only needed to enable WSL itself.
+        $install = Invoke-DesktopNative 'wsl.exe' @('--install', '--distribution', $name, '--no-launch') 1800
+        if ($install.ExitCode -ne 0) {
+            Write-Host "Requesting administrator access to enable WSL: $($install.Output)"
+            $process = Start-Process -FilePath $wsl -ArgumentList @('--install', '--distribution', $name, '--no-launch') `
+                -Verb RunAs -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+                throw "WSL installation exited with code $($process.ExitCode). Restart Windows if prompted, then rerun Install.cmd."
+            }
+        }
     }
-    Write-Host 'Complete the Linux first-run username setup if prompted.'
-    if ($name -notin @(Get-WslNames)) {
+    $installed = @()
+    try { $installed = @(Get-WslNames) } catch { }
+    if ($name -notin $installed) {
+        if (-not $Interactive) {
+            # Enabling WSL for the first time takes effect after a restart.
+            $command = $resumeCommand
+            New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
+                -Name 'CTF Agent Install' -Value $command -PropertyType String -Force | Out-Null
+            Write-Host 'Installation continues automatically after you restart Windows and sign in.'
+        }
         Write-Host 'Restart Windows, finish WSL setup, and rerun Install.cmd.'
         exit 20
     }
 }
 
+function Initialize-WslDistribution([string]$name) {
+    # Returns $true when Docker Desktop has to reconnect to this distribution.
+    Write-Host "Preparing WSL distribution $name..."
+    $converted = Invoke-DesktopNative 'wsl.exe' @('--distribution', $name, '--user', 'root',
+        '--exec', 'wslpath', '-a', '-u', $wslPreparation) 120
+    $linuxScript = $converted.Stdout.Trim()
+    if ($converted.ExitCode -ne 0 -or -not $linuxScript.StartsWith('/')) {
+        throw "$name cannot read the release folder: $($converted.Output)"
+    }
+    $current = Invoke-DesktopNative 'wsl.exe' @('--distribution', $name, '--exec', 'id', '-un') 60
+    if ($current.ExitCode -ne 0) { throw "$name did not start: $($current.Output)" }
+    $defaultUser = $current.Stdout.Trim()
+    $prepared = Invoke-DesktopNative 'wsl.exe' @('--distribution', $name, '--user', 'root',
+        '--exec', '/bin/sh', $linuxScript, $defaultUser) 900
+    if ($prepared.ExitCode -ne 0 -or $prepared.Stdout -notmatch '(?m)^ready user=(\S+) changed=([01])\s*$') {
+        throw "$name could not be prepared: $($prepared.Output)"
+    }
+    $serviceUser = $Matches[1]
+    $changed = $Matches[2] -eq '1'
+    if ($serviceUser -ne $defaultUser) {
+        # /etc/wsl.conf is read when the distribution starts.
+        Write-Host "CTF Agent cannot run as root. The default Linux user of $name is now $serviceUser; wsl --user root still works."
+        Invoke-DesktopNative 'wsl.exe' @('--terminate', $name) 30 | Out-Null
+    }
+    $verified = Invoke-DesktopNative 'wsl.exe' @('--distribution', $name, '--exec', '/bin/sh', '-c',
+        'test "$(id -u)" != 0 && mkdir -p "$HOME/.docker/run" && id -un') 60
+    if ($verified.ExitCode -ne 0 -or $verified.Stdout.Trim() -ne $serviceUser) {
+        throw "The Linux user of $name is not ready: $($verified.Output)"
+    }
+    return $changed
+}
+
+function Select-PreparedWslDistribution([object[]]$infos, [string]$preferredName) {
+    # Candidates start one at a time so that distributions which are not needed
+    # stay stopped. See the WSL#41084 note in Get-WslCandidateInfo.
+    if ($Distribution) {
+        if ($Distribution -notin @($infos | ForEach-Object { $_.Name })) { Install-WslDistribution $Distribution }
+        return [pscustomobject]@{Name=$Distribution;Reconnect=(Initialize-WslDistribution $Distribution)}
+    }
+    $ordered = @($infos | Where-Object { $_.Score -gt 0 } |
+        Sort-Object @{Expression={ $_.Name -eq $preferredName };Descending=$true},
+            @{Expression='Score';Descending=$true})
+    foreach ($candidate in $ordered) {
+        try {
+            $reconnect = Initialize-WslDistribution $candidate.Name
+            $checked = Get-WslInfo $candidate.Name (Get-WslVersions)
+            if ($checked.Score -gt 0) {
+                return [pscustomobject]@{Name=$candidate.Name;Reconnect=$reconnect}
+            }
+            Write-Warning "Skipping $($candidate.Name): $($checked.Reason)"
+        } catch { Write-Warning "Skipping $($candidate.Name): $($_.Exception.Message)" }
+    }
+    $new = Get-OnlineUbuntu
+    Write-Host "No usable WSL distribution was found. Installing $new."
+    Install-WslDistribution $new
+    return [pscustomobject]@{Name=$new;Reconnect=(Initialize-WslDistribution $new)}
+}
+
 function Select-WslDistribution([object[]]$infos, [string]$savedName) {
     $ordered = @($infos | Sort-Object Score -Descending)
+    if ($Distribution) {
+        $requested = @($ordered | Where-Object { $_.Name -eq $Distribution } |
+            Select-Object -First 1)
+        if ($requested.Count) {
+            if ($requested[0].Score -le 0) {
+                throw "The selected WSL distribution is not usable: $($requested[0].Reason)"
+            }
+            return $requested[0].Name
+        }
+        if ($Distribution -notmatch '^Ubuntu(?:-[0-9]{2}\.[0-9]{2})?$') {
+            throw "Distribution $Distribution is not installed. Choose an installed WSL distribution or a supported Ubuntu release."
+        }
+        Install-WslDistribution $Distribution
+        return $Distribution
+    }
     if ($ordered.Count) {
         Write-Host 'Available WSL distributions:'
         for ($index = 0; $index -lt $ordered.Count; $index++) {
@@ -508,12 +688,28 @@ function Select-WslDistribution([object[]]$infos, [string]$savedName) {
     if (-not $ready.Count) {
         $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         if ($ordered.Count) {
-            throw "Installed WSL distributions are visible for $account, but none passed the checks above. Retry Install.cmd as administrator under this same Windows account; do not install another Ubuntu yet."
+            Write-Warning "Installed WSL distributions are visible for $account, but none passed the checks above."
+            Write-Host '  1. Install a new Ubuntu distribution (default)'
+            Write-Host '  2. Stop and repair an existing distribution'
+            if ((Read-TimedChoice 'Choose WSL setup' '1' @('1','2')) -ne '1') {
+                throw 'No WSL distribution passed the checks. Repair an existing one and rerun Install.cmd.'
+            }
+            $candidate = Get-OnlineUbuntu
+            if ($candidate -in @($ordered | ForEach-Object Name)) {
+                $candidate = if ($candidate -eq 'Ubuntu-24.04') { 'Ubuntu' } else { 'Ubuntu-24.04' }
+            }
+            if ($candidate -in @($ordered | ForEach-Object Name)) {
+                throw 'Both standard Ubuntu distribution names already exist. Repair one or select a usable distribution with -Distribution.'
+            }
+            Install-WslDistribution $candidate
+            return $candidate
         }
         Write-Host "No WSL distributions are visible for Windows account: $account"
         Write-Host 'If they belong to a different Windows account, run Install.cmd while signed in as that account.'
         $candidate = Get-OnlineUbuntu
-        if (-not (Ask-YesNo "Install $candidate for this Windows account now?" $false)) {
+        Write-Host "  1. Install $candidate (default)"
+        Write-Host '  2. Stop without installing WSL'
+        if ((Read-TimedChoice 'Choose WSL setup' '1' @('1','2')) -ne '1') {
             throw 'A WSL 2 distribution with bash and Python 3.10+ is required.'
         }
         Install-WslDistribution $candidate
@@ -528,13 +724,20 @@ function Select-WslDistribution([object[]]$infos, [string]$savedName) {
             }
         }
     }
+    $newUbuntu = Get-OnlineUbuntu
+    if ($newUbuntu -in @($ordered | ForEach-Object Name)) {
+        $newUbuntu = if ($newUbuntu -eq 'Ubuntu-24.04') { 'Ubuntu' } else { 'Ubuntu-24.04' }
+    }
+    if ($newUbuntu -notin @($ordered | ForEach-Object Name)) {
+        Write-Host "  N. Install $newUbuntu as a new distribution"
+    }
     while ($true) {
-        $answer = (Read-Host "Choose distribution [$default], or N for a new Ubuntu").Trim()
-        if (-not $answer) { $answer = [string]$default }
+        $choices = @(1..$ordered.Count | ForEach-Object { [string]$_ })
+        if ($newUbuntu -notin @($ordered | ForEach-Object Name)) { $choices += @('n', 'N') }
+        $answer = Read-TimedChoice 'Choose distribution, or N for a new Ubuntu' ([string]$default) $choices
         if ($answer -in @('n', 'N')) {
-            $candidate = Get-OnlineUbuntu
-            if (Ask-YesNo "Install $candidate now?") { Install-WslDistribution $candidate; return $candidate }
-            continue
+            Install-WslDistribution $newUbuntu
+            return $newUbuntu
         }
         $number = 0
         if ([int]::TryParse($answer, [ref]$number) -and $number -ge 1 -and $number -le $ordered.Count) {
@@ -580,12 +783,28 @@ function Get-DockerDesktopExecutable {
     return $null
 }
 
-function Ensure-DockerDesktop([string]$distro) {
+function Ensure-DockerDesktop([string]$distro, [bool]$reconnect = $false) {
     $desktop = Get-DockerDesktopExecutable
-    if (-not $desktop) {
-        if (-not (Ask-YesNo 'Docker Desktop is not installed. Install it with winget now?')) {
-            throw 'Docker Desktop is required.'
+    $choice = if ($script:SelectedDockerMode) { $script:SelectedDockerMode } else { $DockerMode }
+    if (-not $choice) {
+        if ($desktop) {
+            Write-Host 'Docker Desktop is already installed:'
+            Write-Host '  1. Use the existing installation (default)'
+            Write-Host '  2. Install or update Docker Desktop'
+        } else {
+            Write-Host 'Docker Desktop is not installed:'
+            Write-Host '  1. Install it now (default)'
+            Write-Host '  2. Stop without installing Docker Desktop'
         }
+        $answer = Read-TimedChoice 'Choose Docker Desktop setup' '1' @('1','2')
+        if ($desktop) { $choice = if ($answer -eq '1') { 'Existing' } else { 'Install' } }
+        elseif ($answer -eq '1') { $choice = 'Install' }
+        else { throw 'Docker Desktop is required. The installation stopped before changing Docker.' }
+    }
+    if ($choice -eq 'Existing' -and -not $desktop) {
+        throw 'DockerMode Existing was requested, but Docker Desktop is not installed.'
+    }
+    if ($choice -eq 'Install') {
         if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
             Start-Process 'https://docs.docker.com/desktop/setup/install/windows-install/'
             throw 'winget is unavailable. Install Docker Desktop from the opened official page and rerun Install.cmd.'
@@ -593,21 +812,70 @@ function Ensure-DockerDesktop([string]$distro) {
         $previousPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            & winget.exe install --id Docker.DockerDesktop --exact --source winget `
+            $wingetAction = if ($desktop) { 'upgrade' } else { 'install' }
+            & winget.exe $wingetAction --id Docker.DockerDesktop --exact --source winget `
                 --accept-source-agreements --accept-package-agreements
             $wingetExit = $LASTEXITCODE
         } finally { $ErrorActionPreference = $previousPreference }
-        if ($wingetExit -ne 0) { throw "Docker Desktop installation failed (exit code $wingetExit)." }
+        if ($wingetExit -ne 0) { throw "Docker Desktop installation or update failed (exit code $wingetExit)." }
         $desktop = Get-DockerDesktopExecutable
         if (-not $desktop) { throw 'Finish Docker Desktop installation and rerun Install.cmd.' }
     }
-    if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue)) {
-        Start-Process -FilePath $desktop
-    }
+    Ensure-DockerWslIntegration $distro @(Get-WslNames) $desktop $reconnect
     Write-Host "Checking Docker Desktop in WSL distribution $distro..."
-    Wait-WslDockerReady $distro -AllowRepair
+    $waitSeconds = if ($choice -eq 'Install') { 900 } else { 240 }
+    Wait-WslDockerReady $distro $waitSeconds -AllowRepair
+    $script:SelectedDockerMode = 'Existing'
 }
 
+function Ensure-DockerDiskCapacity([string]$distro, [int64]$imageWorkBytes) {
+    # Running out of room on this drive can freeze the whole WSL VM mid-install,
+    # so the disk moves first when another drive can hold it.
+    $disk = Resolve-DockerDesktopDiskFile
+    $required = [int64]5GB + $imageWorkBytes
+    $folder = $DockerFolder
+    if ($folder) {
+        if ((Split-Path -Parent (Split-Path -Parent $disk)) -ieq $folder.TrimEnd('\', '/')) { return }
+    } else {
+        if ((Get-HostVolumeFree $disk) -ge $required) { return }
+        $folder = Select-DockerDiskFolder $disk $required $requestedDatabaseVhd
+        if (-not $folder) { return }
+    }
+    if ($DockerFolder -or (Ask-YesNo "Move Docker Desktop's disk to ${folder}?" (-not $Interactive))) {
+        Move-DockerDesktopDisk $folder
+        Ensure-DockerDesktop $distro
+    }
+}
+
+function Get-LinuxDataFolderProblem([string]$path) {
+    if ($path.StartsWith('\\')) { return 'Enter a WSL Linux path or a local Windows drive path.' }
+    if (-not $path.StartsWith('/') -or $path -match '[\x00-\x1f]' -or
+        $path -match '(^|/)\.\.(/|$)' -or $path -match '^/mnt/[A-Za-z](/|$)') {
+        return 'Enter an absolute WSL Linux path outside /mnt/<Windows drive>.'
+    }
+    return ''
+}
+
+# Keep caller-supplied choices when Windows needs a restart to enable WSL.
+# Encoding the command avoids losing array arguments or interpreting a path as
+# command syntax in the RunOnce registry value.
+$resumeOptions = @{}
+foreach ($pair in $PSBoundParameters.GetEnumerator()) {
+    $resumeOptions[$pair.Key] = if ($pair.Value -is [System.Management.Automation.SwitchParameter]) {
+        [bool]$pair.Value
+    } else { $pair.Value }
+}
+$resumeData = @{script=(Join-Path $PSScriptRoot 'Install.ps1');options=$resumeOptions} |
+    ConvertTo-Json -Compress -Depth 5
+$resumeData64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($resumeData))
+$resumeCode = @'
+$data = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('PAYLOAD')) | ConvertFrom-Json
+$arguments = @{}
+foreach ($item in $data.options.PSObject.Properties) { $arguments[$item.Name] = $item.Value }
+& ([string]$data.script) @arguments
+'@.Replace('PAYLOAD', $resumeData64)
+$resumeCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ' +
+    [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($resumeCode))
 Write-Host 'CTF Agent local installer'
 if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
     throw 'This Windows version does not provide wsl.exe. Update Windows and rerun Install.cmd.'
@@ -616,8 +884,16 @@ $saved = $null
 if (Test-Path -LiteralPath $stateFile -PathType Leaf) {
     try { $saved = Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $saved = $null }
 }
-$versions = Get-WslVersions
-$names = @(Get-WslNames)
+$versions = @{}
+$names = @()
+try {
+    $versions = Get-WslVersions
+    $names = @(Get-WslNames)
+} catch {
+    # Listing fails until WSL is enabled and has a distribution to list.
+    if ($Interactive) { throw }
+    Write-Host "No WSL distribution is available yet: $($_.Exception.Message)"
+}
 if (-not $names.Count) {
     $names = @($versions.Keys | Where-Object { $_ -notlike 'docker-desktop*' })
     if ($names.Count) { Write-Warning 'WSL quiet listing was empty; checking the registered distribution names.' }
@@ -631,19 +907,46 @@ if (-not $preferredDistro) {
         $preferredDistro = [string](Get-ItemProperty -LiteralPath (Join-Path $registrationRoot $defaultId) -ErrorAction SilentlyContinue).DistributionName
     }
 }
+if (-not $Interactive -and $saved.distro -and [string]$saved.distro -notin $names) {
+    Write-Warning "$($saved.distro) from the previous installation no longer exists. Starting a new installation."
+    if (-not $DatabaseFolder) { $DatabaseFolder = [string]$saved.db_vhd }
+    $saved = $null
+    $preferredDistro = ''
+    $orphanedInstall = $true
+}
 $distro = Select-WslDistribution $infos $preferredDistro
+$dockerReconnect = Initialize-WslDistribution $distro
+Write-Host "Using WSL distribution: $distro"
 if (-not $versions.ContainsKey($distro)) { $versions = Get-WslVersions }
 $selectedInfo = Get-WslInfo $distro $versions
 if ($selectedInfo.Score -le 0) {
-    Write-Host "Selected distribution is not ready: $($selectedInfo.Reason)"
-    exit 20
+    Write-Warning "Selected distribution is not ready: $($selectedInfo.Reason)"
+    if ($Distribution) { throw "The requested WSL distribution $distro is not ready." }
+    foreach ($alternative in @($infos | Where-Object { $_.Name -ne $distro -and $_.Score -gt 0 } |
+            Sort-Object Score -Descending)) {
+        try {
+            $reconnect = Initialize-WslDistribution $alternative.Name
+            $checked = Get-WslInfo $alternative.Name (Get-WslVersions)
+            if ($checked.Score -gt 0) {
+                $distro = $alternative.Name
+                $dockerReconnect = $reconnect
+                $selectedInfo = $checked
+                Write-Host "Using WSL distribution: $distro"
+                break
+            }
+            Write-Warning "Skipping $($alternative.Name): $($checked.Reason)"
+        } catch { Write-Warning "Skipping $($alternative.Name): $($_.Exception.Message)" }
+    }
+    if ($selectedInfo.Score -le 0) {
+        throw 'No selected WSL distribution became ready. Repair WSL or rerun Install.cmd with -Distribution.'
+    }
 }
 $defaultHome = "$($selectedInfo.Home.TrimEnd('/'))/.local/share/ctf-agent"
 if ($saved -and $saved.distro -eq $distro -and $saved.home) { $defaultHome = [string]$saved.home }
 Write-Host "Recommended data folder: $defaultHome"
 Write-Host "Windows Explorer: \\wsl.localhost\$distro\$($defaultHome.TrimStart('/') -replace '/', '\')"
 $requestedDatabaseVhd = ''
-while ($true) {
+while ($Interactive -and -not $DataFolder -and -not $DatabaseFolder) {
     $answer = (Read-Host 'WSL data folder, or Windows folder for DB only [Enter for WSL default]').Trim()
     if ($answer -match '^"[A-Za-z]:[\\/].*"$' -or $answer -match '^[A-Za-z]:[\\/]') {
         $requestedDatabaseVhd = Resolve-DatabaseVhdInputPath $answer
@@ -653,16 +956,18 @@ while ($true) {
         break
     }
     $linuxHome = if ($answer) { $answer } else { $defaultHome }
-    if ($linuxHome.StartsWith('\\')) {
-        Write-Host 'Enter a WSL Linux path or a local Windows drive path.'
-        continue
+    $problem = Get-LinuxDataFolderProblem $linuxHome
+    if (-not $problem) { break }
+    Write-Host $problem
+}
+if (-not $Interactive -or $DataFolder -or $DatabaseFolder) {
+    $linuxHome = if ($DataFolder) { $DataFolder } else { $defaultHome }
+    $problem = Get-LinuxDataFolderProblem $linuxHome
+    if ($problem) { throw $problem }
+    if ($DatabaseFolder) {
+        $requestedDatabaseVhd = Resolve-DatabaseVhdInputPath $DatabaseFolder
+        Write-Host "Database disk on Windows: $requestedDatabaseVhd"
     }
-    if (-not $linuxHome.StartsWith('/') -or $linuxHome -match '[\x00-\x1f]' -or
-        $linuxHome -match '(^|/)\.\.(/|$)' -or $linuxHome -match '^/mnt/[A-Za-z](/|$)') {
-        Write-Host 'Enter an absolute WSL Linux path outside /mnt/<Windows drive>.'
-        continue
-    }
-    break
 }
 if ($saved -and ($saved.distro -ne $distro -or $saved.home -ne $linuxHome) -and
     -not (Ask-YesNo 'This changes the data location. Existing data will not move automatically. Continue?' $false)) {
@@ -671,7 +976,8 @@ if ($saved -and ($saved.distro -ne $distro -or $saved.home -ne $linuxHome) -and
 if ($saved.db_vhd -and ($saved.distro -ne $distro -or $saved.home -ne $linuxHome)) {
     throw 'A separate database VHDX is bound to the original WSL distribution and installation path.'
 }
-Assert-StorageCapacity $distro $linuxHome
+# Unattended runs check after Docker Desktop's disk has moved off a full drive.
+if ($Interactive) { Assert-StorageCapacity $distro $linuxHome }
 $separateDatabase = if ($requestedDatabaseVhd) { $true } else {
     Ask-YesNo 'Store only the database on a separate ext4 VHDX on a Windows drive?' ([bool]$saved.db_vhd)
 }
@@ -715,12 +1021,56 @@ if ($separateDatabase) {
 }
 $autoStartDefault = if ($saved -and $null -ne $saved.autoStart) { [bool]$saved.autoStart }
     elseif ($separateDatabase) { $false } else { $true }
-$autoStart = Ask-YesNo 'Start CTF Agent automatically when you sign in to Windows?' $autoStartDefault
-if ($separateDatabase -and $autoStart) { Assert-DatabaseTaskSupport }
-$loginDefault = -not ($saved -and $saved.authMode -eq 'nologin')
-$requireLogin = Ask-YesNo 'Require account login on this computer?' $loginDefault
+$autoStart = if ($PSBoundParameters.ContainsKey('StartAtSignIn')) { [bool]$StartAtSignIn }
+    else { Ask-YesNo 'Start CTF Agent automatically when you sign in to Windows?' $autoStartDefault }
+$loginDefault = -not ($NoLogin -or ($saved -and $saved.authMode -eq 'nologin'))
+$requireLogin = if ($PSBoundParameters.ContainsKey('NoLogin')) { -not [bool]$NoLogin }
+    else { Ask-YesNo 'Require account login on this computer?' $loginDefault }
 $authMode = if ($requireLogin) { 'password' } else { 'nologin' }
-Ensure-DockerDesktop $distro
+$urlInput = if ($PSBoundParameters.ContainsKey('PublicUrl')) { $PublicUrl }
+    elseif ($saved -and $saved.public_urls) { @($saved.public_urls) } else { @() }
+$publicUrls = @(Get-InstallPublicUrls $urlInput)
+$previousListen = ''
+if ($saved -and -not [string]$saved.listen_address -and -not $ListenAddress -and
+    -not $PSBoundParameters.ContainsKey('PublicUrl')) {
+    # Early installers kept the bind choice only in the Linux configuration.
+    # Preserve it during upgrade, even though the Windows state lacks the key.
+    $readListen = @'
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1])/'.local-config.json'
+if p.is_file() and not p.is_symlink():
+    print(json.loads(p.read_text(encoding='utf-8')).get('listen_address',''))
+'@
+    $prior = Invoke-WslPython $distro $readListen @($linuxHome) -ReadOnly
+    if ($prior.ExitCode -eq 0 -and $prior.Output.Trim() -in @('127.0.0.1','0.0.0.0')) {
+        $previousListen = $prior.Output.Trim()
+    }
+}
+if (-not $ListenAddress) {
+    $ListenAddress = if ($PSBoundParameters.ContainsKey('PublicUrl') -and $publicUrls.Count) {
+        '0.0.0.0'
+    } elseif ($saved -and [string]$saved.listen_address) {
+        [string]$saved.listen_address
+    } elseif ($previousListen) { $previousListen
+    } elseif ($publicUrls.Count) { '0.0.0.0' } else { '127.0.0.1' }
+}
+if ($ListenAddress -notin @('127.0.0.1', '0.0.0.0')) {
+    throw 'ListenAddress must be 127.0.0.1 or 0.0.0.0.'
+}
+$accessMode = if ($PSBoundParameters.ContainsKey('OpenAccess')) {
+    if ($OpenAccess) { 'open' } else { 'link' }
+} elseif ($saved -and [string]$saved.access_mode -eq 'open') { 'open' } else { 'link' }
+if ($accessMode -eq 'open' -and $authMode -ne 'nologin') {
+    throw 'OpenAccess requires NoLogin. Use -NoLogin -OpenAccess together.'
+}
+if ($accessMode -eq 'open') {
+    Write-Warning 'OpenAccess lets anyone who reaches the configured address use this installation without an account.'
+}
+Ensure-DockerDesktop $distro $dockerReconnect
+if ($orphanedInstall) {
+    Remove-OrphanedCtfAgentContainers
+    Ensure-DockerDesktop $distro
+}
 # The second pass budgets application staging, Docker image work and optional
 # database VHDX growth on their actual Windows drives. The initial check only
 # establishes that the selected WSL location is feasible.
@@ -730,6 +1080,7 @@ $releaseRevision = if (Test-Path -LiteralPath $revisionFile -PathType Leaf) {
 } else { '' }
 $imageWorkBytes = Get-EstimatedImageWorkBytes $releaseRevision
 $applicationWorkBytes = [int64]1GB
+Ensure-DockerDiskCapacity $distro $imageWorkBytes
 Assert-StorageCapacity $distro $linuxHome $applicationWorkBytes
 Assert-DockerDesktopImageCapacity $imageWorkBytes
 $dockerImageDisk = Resolve-DockerDesktopDiskFile
@@ -745,18 +1096,19 @@ if ($separateDatabase) {
     New-Item -ItemType Directory -Path $pendingDir -Force | Out-Null
     $dbTaskManaged = ([bool]$saved.db_task_managed -or $validatedPreexistingTask)
     @{distro=$distro;home=$linuxHome;autoStart=$dbTaskManaged;authMode=$authMode;
+        listen_address=$ListenAddress;public_urls=$publicUrls;access_mode=$accessMode;
         db_vhd=$dbVhd;database_mount=$databaseMount;database_path=$databasePath;
         db_uuid=$dbUuid;db_task_managed=$dbTaskManaged;pending_install=$true} |
         ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    if ($autoStart) {
-        Invoke-ElevatedDatabaseAction 'register-task' $dbVhd $sid
-        $dbTaskManaged = $true
-    } elseif ($dbTaskManaged) {
+    # This account owns the VHDX, so Start.cmd can attach it without elevation
+    # at sign-in. Only the logon task from an older release needs removing.
+    if ($dbTaskManaged) {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         Invoke-ElevatedDatabaseAction 'unregister-task' $dbVhd $sid
         $dbTaskManaged = $false
     }
     @{distro=$distro;home=$linuxHome;autoStart=$autoStart;authMode=$authMode;
+        listen_address=$ListenAddress;public_urls=$publicUrls;access_mode=$accessMode;
         db_vhd=$dbVhd;database_mount=$databaseMount;database_path=$databasePath;
         db_uuid=$dbUuid;db_task_managed=$dbTaskManaged;pending_install=$true} |
         ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
@@ -787,15 +1139,19 @@ $installResult = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
     "CTF_LOCAL_HOME=$linuxHome", "CTF_LOCAL_AUTOSTART=$($autoStart.ToString().ToLowerInvariant())",
     "CTF_LOCAL_AUTH_MODE=$authMode", "CTF_LOCAL_DATABASE=$dockerDatabasePath",
     "CTF_LOCAL_FS_DATABASE=$databasePath", "CTF_LOCAL_DB_MOUNT=$databaseMount",
+    "CTF_LOCAL_BIND=$ListenAddress",
+    "CTF_LOCAL_PUBLIC_URLS=$($publicUrls -join ',')", "CTF_LOCAL_ACCESS=$accessMode",
     'bash', $linuxPath[0]) -Visible
 if ($installResult.ExitCode -ne 0) { throw "Local installation failed (exit code $($installResult.ExitCode))." }
 $stateDir = Split-Path -Parent $stateFile
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
-foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1', 'DatabaseDisk.ps1', 'DockerDesktop.ps1', 'DockerDisk.ps1')) {
+foreach ($name in @('Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1', 'RemoteLink.cmd', 'RemoteLink.ps1',
+        'DatabaseDisk.ps1', 'DockerDesktop.ps1', 'DockerDisk.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $stateDir $name) -Force
 }
 $state = @{distro=$distro;home=$linuxHome;autoStart=$autoStart;
-    authMode=$authMode;db_vhd=$dbVhd;database_mount=$databaseMount;database_path=$databasePath;
+    authMode=$authMode;listen_address=$ListenAddress;public_urls=$publicUrls;access_mode=$accessMode;
+    db_vhd=$dbVhd;database_mount=$databaseMount;database_path=$databasePath;
     db_uuid=$dbUuid;db_task_managed=if ($dbVhd) { $dbTaskManaged } else { $false };pending_install=$false}
 $state | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'CTF Agent Local.lnk'
@@ -814,12 +1170,39 @@ if ($autoStart) {
     $shortcut.Save()
 }
 Wait-CtfAgentReady $distro $linuxHome
-if (-not $requireLogin) {
-    Open-CtfAgentLocalBrowser $distro $linuxHome
+$listenAddress = Get-CtfAgentListenAddress $distro $linuxHome
+if ($listenAddress -eq '0.0.0.0') { Ensure-CtfAgentFirewallRule }
+if ($requireLogin -or $accessMode -eq 'open') { Start-Process -FilePath 'http://127.0.0.1:5050' }
+else { Open-CtfAgentLocalBrowser $distro $linuxHome }
+Write-Host ''
+Write-Host 'CTF Agent is ready: http://127.0.0.1:5050'
+if ($listenAddress -eq '0.0.0.0') {
+    Write-Host "Port 5050 accepts connections from this computer's network interfaces."
+    if (-not $publicUrls.Count) { Write-Host 'For access outside your network, configure your own router or tunnel.' }
+    if (-not $requireLogin -and $accessMode -eq 'link') {
+        Write-Host "Other devices need a one-time link: $(Join-Path $stateDir 'RemoteLink.cmd') <public address>"
+    }
 }
+if ($publicUrls.Count) { Write-Host "Public address: $($publicUrls -join ', ')" }
+if ($requireLogin -and ($listenAddress -eq '0.0.0.0' -or $publicUrls.Count)) {
+    $tokenProbe = @'
+import json,pathlib,re,sys
+p=pathlib.Path(sys.argv[1])/'.local-config.json'
+if p.is_symlink() or not p.is_file(): raise SystemExit(2)
+value=json.loads(p.read_text(encoding='utf-8'))
+token=value.get('first_admin_setup_token','')
+if not isinstance(token,str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,}',token): raise SystemExit(2)
+print(token)
+'@
+    $tokenResult = Invoke-WslPython $distro $tokenProbe @($linuxHome)
+    if ($tokenResult.ExitCode -ne 0) { throw 'The first-administrator setup token is missing from the installed configuration.' }
+    Write-Host "First administrator setup token: $($tokenResult.Output.Trim())"
+    Write-Host 'Use this token only when creating the first administrator account.'
+}
+Write-Host ''
 Write-Host "Start: $(Join-Path $stateDir 'Start.cmd')"
 Write-Host "Uninstall: $(Join-Path $stateDir 'Uninstall.cmd')"
-if ($requireLogin) { Write-Host 'Open http://127.0.0.1:5050 to create the first administrator account.' }
+if ($requireLogin) { Write-Host 'The local site was opened in your browser. Create the first administrator account there.' }
 else { Write-Host 'The local site was opened in your browser. Run Start.cmd to connect another browser later.' }
 Write-Host "Files in Explorer: \\wsl.localhost\$distro\$($linuxHome.TrimStart('/') -replace '/', '\')\ctf_agent_data\workspace_files"
 if ($dbVhd) {

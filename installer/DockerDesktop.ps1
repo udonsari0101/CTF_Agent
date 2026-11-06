@@ -193,6 +193,113 @@ function Get-WslDockerState([string]$distro) {
         WindowsDetail=$windows.Output}
 }
 
+function Get-DockerDesktopSettingsFile {
+    foreach ($name in @('settings-store.json', 'settings.json')) {
+        $path = Join-Path $env:APPDATA "Docker\$name"
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+    }
+    return ''
+}
+
+function Get-DockerWslSettings([string]$file, [string]$distro, [string[]]$registered) {
+    # Returns Docker Desktop's settings with the selected distribution enabled
+    # and entries for unregistered distributions dropped, plus whether they differ.
+    $settings = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+    $listName = if ((Split-Path -Leaf $file) -eq 'settings.json') { 'integratedWslDistros' } else { 'IntegratedWslDistros' }
+    $current = @($settings.$listName | Where-Object { $_ })
+    $wanted = @(@($current | Where-Object { $_ -in $registered }) + $distro | Select-Object -Unique)
+    $changed = ($current -join "`n") -ne ($wanted -join "`n")
+    if ($changed) { $settings | Add-Member -NotePropertyName $listName -NotePropertyValue $wanted -Force }
+    # These keys are only present on versions and setups that use them.
+    foreach ($required in @(@{Name='EngineTypeWindows';Value='wsl2'}, @{Name='WslEngineEnabled';Value=$true},
+            @{Name='UseWindowsContainers';Value=$false})) {
+        $property = $settings.PSObject.Properties[$required.Name]
+        if ($property -and $property.Value -ne $required.Value) {
+            $property.Value = $required.Value
+            $changed = $true
+        }
+    }
+    return [pscustomobject]@{Settings=$settings;Changed=$changed}
+}
+
+function Save-DockerDesktopSettings([string]$file, [object]$settings) {
+    $temporary = "$file.ctf-agent"
+    $json = $settings | ConvertTo-Json -Depth 32
+    [IO.File]::WriteAllText($temporary, $json, (New-Object Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $temporary -Destination $file -Force
+}
+
+function Stop-DockerDesktopForSettings {
+    $docker = Get-DesktopDockerCli
+    $active = Invoke-DesktopNative $docker @('--context', 'desktop-linux', 'ps', '-q') 8
+    if ($active.ExitCode -eq 0 -and $active.Output.Trim()) {
+        throw 'Docker Desktop must restart to connect this WSL distribution, but containers are running, so it was not restarted. Stop them when safe, then rerun Install.cmd.'
+    }
+    Write-Host 'Stopping Docker Desktop to apply its WSL integration settings...'
+    $stop = Invoke-DesktopNative $docker @('desktop', 'stop', '--timeout', '60') 70
+    if ($stop.ExitCode -ne 0) { throw "Docker Desktop could not be stopped: $($stop.Output)" }
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Seconds 1
+    }
+    throw 'Docker Desktop did not exit after it was stopped.'
+}
+
+function Ensure-DockerWslIntegration([string]$distro, [string[]]$registered, [string]$desktop,
+    [bool]$reconnect = $false) {
+    # Docker Desktop reads WSL Integration settings when it starts, so changing
+    # them means editing the file while it is stopped.
+    $running = [bool](Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue)
+    $file = Get-DockerDesktopSettingsFile
+    if (-not $file) {
+        if (-not $running) { Start-Process -FilePath $desktop; $running = $true }
+        Write-Host 'Waiting for the first Docker Desktop start. Accept its license window if it appears.'
+        for ($attempt = 0; $attempt -lt 300 -and -not $file; $attempt++) {
+            Start-Sleep -Seconds 1
+            $file = Get-DockerDesktopSettingsFile
+        }
+        if (-not $file) { throw 'Docker Desktop did not finish its first start. Open it once, then rerun Install.cmd.' }
+    }
+    $plan = Get-DockerWslSettings $file $distro $registered
+    if ($running -and -not $reconnect -and (Get-WslDockerState $distro).Ready) {
+        if (-not $plan.Changed) { return }
+        # It works through the default-distribution option, which ends if the
+        # Windows default changes. Listing it is not worth stopping containers.
+        $docker = Get-DesktopDockerCli
+        $active = Invoke-DesktopNative $docker @('--context', 'desktop-linux', 'ps', '-q') 8
+        if ($active.ExitCode -ne 0 -or $active.Output.Trim()) { return }
+    }
+    if ($running -and ($plan.Changed -or $reconnect)) {
+        Stop-DockerDesktopForSettings
+        $running = $false
+        $plan = Get-DockerWslSettings $file $distro $registered
+    }
+    if ($plan.Changed) {
+        Write-Host "Enabling Docker Desktop WSL integration for $distro."
+        Save-DockerDesktopSettings $file $plan.Settings
+    }
+    if (-not $running) { Start-Process -FilePath $desktop }
+}
+
+function Remove-OrphanedCtfAgentContainers {
+    # Docker Desktop keeps the containers of an unregistered distribution, and
+    # installing elsewhere refuses a web container that has a different data
+    # path. Their bind mounts and data went with that distribution.
+    $docker = Get-DesktopDockerCli
+    $ids = @()
+    foreach ($filter in @('label=com.docker.compose.project=ctf_agent_local', 'name=^ctf_agent_local_updater$')) {
+        $listed = Invoke-DesktopNative $docker @('--context', 'desktop-linux', 'ps', '-aq', '--filter', $filter) 15
+        if ($listed.ExitCode -ne 0) { throw "Could not list old CTF Agent containers: $($listed.Output)" }
+        $ids += @($listed.Stdout -split '\s+' | Where-Object { $_ })
+    }
+    if (-not $ids.Count) { return }
+    Write-Host "Removing $($ids.Count) container(s) left by the removed distribution."
+    $removed = Invoke-DesktopNative $docker (@('--context', 'desktop-linux', 'rm', '-f') + $ids) 60
+    if ($removed.ExitCode -ne 0) { throw "Could not remove old CTF Agent containers: $($removed.Output)" }
+    Invoke-DesktopNative $docker @('--context', 'desktop-linux', 'network', 'rm',
+        'ctf_agent_local_solver_egress', 'ctf_agent_local_default') 30 | Out-Null
+}
+
 function Wait-WslDockerReady([string]$distro, [int]$timeoutSeconds = 90,
     [switch]$AllowRepair) {
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -204,14 +311,16 @@ function Wait-WslDockerReady([string]$distro, [int]$timeoutSeconds = 90,
         if ($state.EngineMismatch) {
             throw "The selected WSL distribution is connected to a different Docker Engine. Its existing containers were not changed. Rerun Install.cmd and choose N for a dedicated Ubuntu distribution, then enable Docker Desktop WSL Integration for that distribution."
         }
-        if ($state.EngineReady -and $state.SharedToolsMissing) {
-            if (-not $AllowRepair -or $repaired) { break }
+        # An engine that stays up without reaching this distribution will not
+        # recover alone, for example after "Skip WSL distro integration".
+        $stalled = $state.SharedToolsMissing -or $watch.Elapsed.TotalSeconds -ge 60
+        if ($state.EngineReady -and $stalled -and $AllowRepair -and -not $repaired) {
             $docker = Get-DesktopDockerCli
             $active = Invoke-DesktopNative $docker @('--context', 'desktop-linux', 'ps', '-q') 8
             if ($active.ExitCode -ne 0 -or $active.Output.Trim()) {
-                throw "Docker's shared WSL CLI mount is missing in $distro. Active containers exist or their state is unknown, so Docker Desktop was not restarted. Restart Docker Desktop when safe, then retry. Updating WSL fixes the cross-distribution shutdown issue (microsoft/WSL#41084)."
+                throw "Docker's WSL integration is not working in $distro. Active containers exist or their state is unknown, so Docker Desktop was not restarted. Restart Docker Desktop when safe, then retry. Updating WSL fixes the cross-distribution shutdown issue (microsoft/WSL#41084)."
             }
-            Write-Host 'Docker engine is running, but its shared WSL CLI mount is missing.'
+            Write-Host "Docker engine is running, but its WSL integration is not working in $distro."
             Write-Host 'No containers are running. Restarting Docker Desktop once to restore WSL integration...'
             $repaired = $true
             $restart = Invoke-DesktopNative $docker @('desktop', 'restart', '--timeout', '45') 50
@@ -220,6 +329,7 @@ function Wait-WslDockerReady([string]$distro, [int]$timeoutSeconds = 90,
             }
             continue
         }
+        if ($state.EngineReady -and $state.SharedToolsMissing) { break }
         Start-Sleep -Seconds 2
     }
     $detail = if ($state) { $state.Detail } else { 'Docker readiness check did not complete.' }
@@ -264,7 +374,38 @@ print(json.dumps({'ready':d.get('ready'), 'reason':d.get('reason')}))
     throw 'CTF Agent is configured but /readyz did not return HTTP 200 within the readiness deadline. Installation settings and the database were preserved.'
 }
 
-function Open-CtfAgentLocalBrowser([string]$distro, [string]$linuxHome) {
+function Get-CtfAgentListenAddress([string]$distro, [string]$linuxHome) {
+    $config = Invoke-DesktopNative 'wsl.exe' @('--distribution', $distro, '--exec', 'cat', "$linuxHome/.local-config.json") 15
+    if ($config.ExitCode -ne 0) { return '127.0.0.1' }
+    $address = [string]($config.Stdout | ConvertFrom-Json).listen_address
+    if ($address) { return $address }
+    return '127.0.0.1'
+}
+
+function Ensure-CtfAgentFirewallRule {
+    # A forwarded connection still has to pass Windows Firewall on this computer.
+    $name = 'CTF Agent 5050'
+    if (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue) { return }
+    Write-Host 'Requesting administrator access to allow TCP 5050 through Windows Firewall.'
+    $command = "New-NetFirewallRule -DisplayName '$name' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5050 -Profile Any"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    $failure = 'Windows Firewall still blocks TCP 5050, so other devices cannot connect. Rerun Install.cmd and approve the administrator prompt.'
+    try {
+        $process = Start-Process -FilePath powershell.exe -ArgumentList "-NoProfile -EncodedCommand $encoded" `
+            -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+        if ($process.ExitCode -ne 0) { Write-Warning $failure }
+    } catch { Write-Warning $failure }
+}
+
+function Remove-CtfAgentFirewallRule {
+    $name = 'CTF Agent 5050'
+    if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) { return }
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("Remove-NetFirewallRule -DisplayName '$name'"))
+    try { Start-Process -FilePath powershell.exe -ArgumentList "-NoProfile -EncodedCommand $encoded" -Verb RunAs -WindowStyle Hidden -Wait }
+    catch { Write-Warning "Remove the Windows Firewall rule named $name when convenient." }
+}
+
+function Get-CtfAgentLocalTicket([string]$distro, [string]$linuxHome) {
     # The installation key stays in the POST body. Only a one-use, short-lived
     # ticket appears in the URL fragment, which app.js immediately removes.
     $path = "$linuxHome/ctf_agent_data/config/local-access.key"
@@ -282,6 +423,9 @@ function Open-CtfAgentLocalBrowser([string]$distro, [string]$linuxHome) {
     }
     $ticket = [string]$ticketResponse.ticket
     if ($ticket -notmatch '^[A-Za-z0-9_-]{32}$') { throw 'Local browser access returned an invalid ticket.' }
-    $url = 'http://127.0.0.1:5050/#/local-access/' + $ticket
-    Start-Process -FilePath $url
+    return $ticket
+}
+
+function Open-CtfAgentLocalBrowser([string]$distro, [string]$linuxHome) {
+    Start-Process -FilePath ('http://127.0.0.1:5050/#/local-access/' + (Get-CtfAgentLocalTicket $distro $linuxHome))
 }

@@ -148,6 +148,12 @@ class LocalStoragePolicyTests(unittest.TestCase):
         source = "installer/installer/storage_preflight.py"
         self.assertEqual(package_local_release.INSTALLER_FILES[source],
                          "installer/storage_preflight.py")
+        self.assertEqual(package_local_release.INSTALLER_FILES[
+            "installer/installer/prepare-wsl.sh"], "installer/prepare-wsl.sh")
+        self.assertEqual(package_local_release.INSTALLER_FILES[
+            "installer/RemoteLink.cmd"], "RemoteLink.cmd")
+        self.assertEqual(package_local_release.INSTALLER_FILES[
+            "installer/RemoteLink.ps1"], "RemoteLink.ps1")
         tracked = package_local_release.tracked_files() | {
             source, "installer/DockerDisk.ps1",
         }
@@ -168,6 +174,10 @@ class LocalStoragePolicyTests(unittest.TestCase):
                 self.assertEqual(bundle.read(
                     "CTF_Agent-v0.0.1/Start.ps1"
                 ), (ROOT / "installer/Start.ps1").read_bytes())
+                self.assertIn("CTF_Agent-v0.0.1/RemoteLink.cmd", bundle.namelist())
+                self.assertIn("CTF_Agent-v0.0.1/RemoteLink.ps1", bundle.namelist())
+                prepare = bundle.read("CTF_Agent-v0.0.1/installer/prepare-wsl.sh")
+                self.assertNotIn(b"\r\n", prepare)
 
 
 if __name__ == "__main__":

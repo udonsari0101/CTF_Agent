@@ -1,4 +1,6 @@
 $ErrorActionPreference = 'Stop'
+# Start.cmd retries when PowerShell exits without reaching this line.
+if ($env:CTF_AGENT_START_MARKER) { [IO.File]::WriteAllText($env:CTF_AGENT_START_MARKER, '') }
 $dockerDesktopHelper = Join-Path $PSScriptRoot 'DockerDesktop.ps1'
 if (-not (Test-Path -LiteralPath $dockerDesktopHelper -PathType Leaf)) { throw 'DockerDesktop.ps1 is missing. Reinstall the patched release.' }
 . $dockerDesktopHelper
@@ -23,6 +25,9 @@ if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
 }
 $saved = Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($saved.pending_install) { throw 'Installation is incomplete. Rerun Install.cmd to resume it.' }
+if ([string]$saved.access_mode -eq 'open') {
+    Write-Warning 'Open access is enabled. Anyone who reaches the service address can use it without an account.'
+}
 $distro = [string]$saved.distro
 $linuxHome = [string]$saved.home
 if (-not $distro -or $linuxHome -notmatch '^/[^\x00-\x1f]*$' -or
@@ -106,6 +111,8 @@ $launch = Invoke-WslNative @('--distribution', $distro, '--exec', 'env',
     'bash', $linuxPath) -Visible
 if ($launch.ExitCode -ne 0) { throw "CTF Agent start failed (exit code $($launch.ExitCode))." }
 Wait-CtfAgentReady $distro $linuxHome
-if ([string]$saved.authMode -eq 'nologin') {
+if ([string]$saved.authMode -eq 'nologin' -and [string]$saved.access_mode -eq 'open') {
+    Start-Process -FilePath 'http://127.0.0.1:5050'
+} elseif ([string]$saved.authMode -eq 'nologin') {
     Open-CtfAgentLocalBrowser $distro $linuxHome
 }

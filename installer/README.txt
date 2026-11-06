@@ -1,26 +1,80 @@
 CTF Agent - Windows local installation
 
 1. Extract the entire release ZIP to a local folder.
-2. Run Install.cmd. Choose a WSL 2 distribution and press Enter at the data
-   path prompt for the usual Linux folder.
-   The installer can offer to install WSL or Docker Desktop if needed.
-   To put only the database in a Windows folder, paste a path on any fixed
-   local drive (C:, D:, E:, including the WSL distribution's drive), such as
-   D:\CTF-Agent\data at the data path prompt. The installer stores
-   its ext4 VHDX at
-   D:\CTF-Agent\data\ctf-agent-db.vhdx and leaves challenge files
-   at the usual WSL path. Existing databases are not migrated automatically.
-   Choose whether to start the service at Windows sign-in and require login.
-3. Open http://127.0.0.1:5050. If you chose password login, create the first
-   administrator account. The no-login mode skips this step.
+2. Run Install.cmd. Select a WSL 2 distribution and whether to use or install
+   Docker Desktop. Both questions use the recommended answer after 30 seconds
+   without input, so an unattended installation continues. The installer
+   prepares WSL, enables Docker Desktop integration, creates the containers
+   and opens the local site in your browser.
+3. If you kept password login, create the first administrator account at
+   http://127.0.0.1:5050. The no-login mode skips this step.
 4. Connect a Codex or Claude Code account in Agents.
 
-Requirements: x64 Windows, WSL 2, Docker Desktop with its WSL 2 engine and
-integration enabled for the selected distribution, and internet access.
+Install.cmd accepts these optional arguments:
+  -Distribution <name>    Use this WSL distribution, installing a named Ubuntu
+                          if missing. Skips the timed WSL selection question.
+  -DockerMode <mode>      Existing or Install. Skips the timed Docker question;
+                          Install upgrades Docker Desktop if it is present.
+  -DataFolder <path>      Linux path for application data.
+  -DatabaseFolder <path>  Windows folder, on any fixed local drive, for the
+                          database only. The installer stores its ext4 VHDX at
+                          <path>\ctf-agent-db.vhdx and leaves challenge files
+                          at the usual WSL path. Existing databases are not
+                          migrated automatically.
+  -ListenAddress <addr>   127.0.0.1 (default) accepts this computer only.
+                          0.0.0.0 accepts every address, for port forwarding,
+                          and adds a Windows Firewall rule for TCP 5050 after
+                          one administrator approval. The choice is remembered.
+  -PublicUrl <origins>    One or more comma-separated HTTP(S) origins, such as
+                          https://agent.example.com,https://other.example.com.
+                          Automatically listens on 0.0.0.0 unless an explicit
+                          -ListenAddress is supplied. Origins are remembered.
+  -OpenAccess             With -NoLogin, let every browser reaching the service
+                          use it without a connection ticket. Without this
+                          switch, no-login mode still requires a one-use link
+                          for each new browser. The choice is remembered.
+  -NoLogin                Do not require an account on this computer.
+  -DockerFolder <path>    Move Docker Desktop's disk to this folder.
+  -StartAtSignIn          Start the service when you sign in to Windows.
+  -Interactive            Also ask for optional folder and login settings.
+Rerunning Install.cmd reuses the saved settings of the previous installation.
+
+When password login is enabled on a public address, the installer prints a
+first-administrator setup token. Enter it in the first-account form. Keep it
+private; the token prevents someone who connects first from claiming the
+administrator account. The token is kept across upgrades. Create the first
+administrator before inviting other users.
+
+The containers cannot run as root. When the distribution's default Linux user
+is root, the installer makes an existing regular user the default, or creates
+one named ctfagent. wsl --user root keeps working. A missing home folder is
+created for the same reason: Docker Desktop's integration needs it.
+
+With -ListenAddress 0.0.0.0, no-login mode admits only connected browsers by
+default. To connect another device, run RemoteLink.cmd in the CTF Agent app
+data folder and open the link there within 90 seconds. It uses the first
+-PublicUrl when configured; otherwise pass a host or full origin. Each
+link works once and connects that browser for 30 days. -OpenAccess removes
+that ticket requirement; anyone who can reach the address can use the service.
+Direct HTTP traffic is unencrypted, so use a VPN or TLS proxy over the internet.
+
+Install.cmd stops and restarts Docker Desktop to change its WSL integration
+setting. It refuses to do this while containers are running.
+
+Windows may still ask for you in these cases: enabling WSL for the first time
+(administrator approval and a restart; installation then continues by itself
+after you sign in), installing Docker Desktop (administrator approval and its
+license window), and first using a VHDX or logon task from an older release
+(one administrator approval).
+
+Requirements: x64 Windows, WSL 2, Docker Desktop with its WSL 2 engine, and
+internet access.
 Installation preserves 5 GiB of free space on the WSL application filesystem
 and each Windows backing drive. It plans another 1 GiB for application
-staging, 10 GiB for a cold Docker image pull (2 GiB when the exact image is
-cached), and 1 GiB when creating or growing a separate database VHDX. When
+staging, 18 GiB for a cold Docker image pull and local build (10 GiB when the
+exact image is cached), and 1 GiB when creating or growing a separate database
+VHDX. If Docker Desktop's drive is too full, Install.cmd moves its disk to the
+database drive or the fixed NTFS drive with the most room. When
 these files are on the same Windows drive, the installer adds their planned
 writes before checking that drive; on separate drives it checks each one.
 Docker Desktop's image VHDX location is read from its settings. If the
@@ -34,10 +88,11 @@ database VHDX; the container cannot read that host drive's free space.
 Start.cmd warns when a Windows backing volume falls below 5 GiB but still
 starts an existing installation. New uploads or solver writes may be refused.
 
-If installed WSL distributions are listed but readiness checks fail, read the
-reason shown for each one. Retry Install.cmd as administrator under the same
-Windows account that owns those distributions. WSL registrations are per-user;
-do not install another Ubuntu just because a readiness check failed.
+If a distribution fails its readiness checks, Install.cmd prints the reason and
+tries the next one, and installs a new Ubuntu when none is usable. WSL
+registrations are per-user, so run Install.cmd under the Windows account that
+owns your distributions. With -Interactive, retry as administrator under that
+same account; do not install another Ubuntu just because a check failed.
 
 To upgrade, extract a newer release and run its Install.cmd. The selected
 data directory and database are preserved. The installer remembers the WSL

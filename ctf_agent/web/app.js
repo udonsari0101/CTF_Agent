@@ -1735,7 +1735,7 @@ async function runForm(task, form, button) {
   finally { controls.forEach((node,index) => { node.disabled = previous[index]; }); busyForms.delete(form); form.removeAttribute('aria-busy'); }
 }
 
-function showLogin(expired = false, configured = true, setupAvailable = false) {
+function showLogin(expired = false, configured = true, setupAvailable = false, setupTokenRequired = false) {
   if (solverConsoleDialog?.open) solverConsoleDialog.close();
   clearAccountsReturnTarget();
   ++modalRendering; ++ctfdSubmitRendering; challengeFlags.clear();
@@ -1757,7 +1757,7 @@ function showLogin(expired = false, configured = true, setupAvailable = false) {
     app.innerHTML = `<main class="login-shell"><div class="login-card">${i18n.picker()}
       <div class="brand"><img src="/assets/icon.svg" alt=""><div>CTF Workspace</div></div>
       <h1>관리자 계정 만들기</h1>
-      <form id="setup-form"><label>아이디<input name="username" autocomplete="username" maxlength="100" required autofocus></label><label>비밀번호<input type="password" name="password" autocomplete="new-password" minlength="4" maxlength="1024" required></label><label>비밀번호 확인<input type="password" name="confirmation" autocomplete="new-password" minlength="4" maxlength="1024" required></label><button class="primary">관리자 계정 만들기 <span aria-hidden="true">→</span></button></form>
+      <form id="setup-form"><label>아이디<input name="username" autocomplete="username" maxlength="100" required autofocus></label><label>비밀번호<input type="password" name="password" autocomplete="new-password" minlength="4" maxlength="1024" required></label><label>비밀번호 확인<input type="password" name="confirmation" autocomplete="new-password" minlength="4" maxlength="1024" required></label>${setupTokenRequired ? '<label>설치 확인 코드<input type="password" name="setup_token" autocomplete="off" maxlength="256" required></label>' : ''}<button class="primary">관리자 계정 만들기 <span aria-hidden="true">→</span></button></form>
     </div></main>`;
     return;
   }
@@ -4901,6 +4901,13 @@ const ctfdActiveJobStatuses = new Set(['queued','running']);
 const ctfdVisibleHistoryLimit = 2;
 let ctfdImportBadge = null;
 
+function ctfdReuseMarkup(job) {
+  const labels = [];
+  if (job.reused_without_download) labels.push(i18n.format('사전 파일 재사용 {n}개 · 다운로드 생략', {n:job.reused_without_download}));
+  if (job.downloaded_then_reused) labels.push(i18n.format('사전 파일 재사용 {n}개 · 다운로드 후', {n:job.downloaded_then_reused}));
+  return labels.length ? `<div class="form-hint">${labels.map(esc).join(' · ')}</div>` : '';
+}
+
 function ctfdJobMarkup(job) {
   const operation = job.mode === 'new' ? 'CTFd 새 문제 동기화' : job.mode === 'refresh' ? 'CTFd 문제 새로고침' : 'CTFd 가져오기';
   const progress = i18n.format(job.mode === 'refresh' ? '업데이트 {n}개' : job.mode === 'new' ? '신규 {n}개' : '문제 {n}개',{n:(job.mode === 'refresh' ? job.refreshed : job.imported) || 0});
@@ -4914,7 +4921,7 @@ function ctfdJobMarkup(job) {
       controls = `<button type="button" class="small" data-action="retry-ctfd" data-id="${esc(job.id)}" data-mode="${esc(job.mode || 'import')}">${retryLabel}</button>`;
     }
   }
-  return `<section class="workspace-summary" data-job-id="${esc(job.id)}"><div><strong>${esc(i18n.t(operation))} · ${esc(i18n.t(ctfdJobLabels[job.status] || job.status))}</strong><div class="form-hint">${esc(progress)} · ${esc(i18n.format('첨부 {n}개',{n:job.attachments || 0}))} · ${size(job.downloaded_bytes || 0)}${job.current_file ? ` · <span data-i18n-ignore>${esc(job.current_file)}</span>` : ''}</div>${job.errors?.length ? `<div class="notice error-notice">${importErrors(job.errors)}</div>` : ''}</div><div class="actions">${controls}</div></section>`;
+  return `<section class="workspace-summary" data-job-id="${esc(job.id)}"><div><strong>${esc(i18n.t(operation))} · ${esc(i18n.t(ctfdJobLabels[job.status] || job.status))}</strong><div class="form-hint">${esc(progress)} · ${esc(i18n.format('첨부 {n}개',{n:job.attachments || 0}))} · ${size(job.downloaded_bytes || 0)}${job.current_file ? ` · <span data-i18n-ignore>${esc(job.current_file)}</span>` : ''}</div>${ctfdReuseMarkup(job)}${job.errors?.length ? `<div class="notice error-notice">${importErrors(job.errors)}</div>` : ''}</div><div class="actions">${controls}</div></section>`;
 }
 
 function ctfdJobsMarkup(jobs) {
@@ -5252,7 +5259,7 @@ document.addEventListener('submit', event => {
   runForm(async () => {
     if (form.id === 'setup-form') {
       if (body.password !== body.confirmation) throw new Error(i18n.t('비밀번호 확인이 일치하지 않습니다.'));
-      const result = await api('/api/auth/setup',{method:'POST',body:{username:body.username,password:body.password}});
+      const result = await api('/api/auth/setup',{method:'POST',body:{username:body.username,password:body.password,setup_token:body.setup_token || ''}});
       csrf = result.csrf_token; sessionUser = result.user; sessionPersistent = false; form.reset(); await render();
     } else if (form.id === 'login-form') {
       const result = await api('/api/auth/login',{method:'POST',body:{username:body.username,password:body.password,remember:data.has('remember')}}); csrf = result.csrf_token; if (sessionUser && sessionUser.id !== result.user.id) { noteDrafts.clear(); ctfdDrafts.clear(); clearAccountsReturnTarget(); } sessionUser = result.user; sessionPersistent = result.session_persistent === true; form.reset(); await render();
@@ -5678,4 +5685,4 @@ async function bootstrapLocalBrowser() {
   return true;
 }
 
-run(async () => { const localBrowserInitialized = await bootstrapLocalBrowser(); const state = await api('/api/auth/state'); if (typeof window.setInterval === 'function') window.setInterval(updateSolverElapsedLabels,1000); if (!localBrowserInitialized) await i18n.init(); authMode = state.auth_mode || 'password'; if (state.authenticated) { csrf = state.csrf_token; sessionUser = state.user; sessionPersistent = state.session_persistent === true; await render(); } else if (authMode === 'password') showLogin(false,state.configured,state.setup_available); else app.innerHTML = `<main class="login-shell"><div class="login-card"><h1>${tr('Start.cmd를 실행해 이 브라우저를 연결하세요.')}</h1></div></main>`; });
+run(async () => { const localBrowserInitialized = await bootstrapLocalBrowser(); const state = await api('/api/auth/state'); if (typeof window.setInterval === 'function') window.setInterval(updateSolverElapsedLabels,1000); if (!localBrowserInitialized) await i18n.init(); authMode = state.auth_mode || 'password'; if (state.authenticated) { csrf = state.csrf_token; sessionUser = state.user; sessionPersistent = state.session_persistent === true; await render(); } else if (authMode === 'password') showLogin(false,state.configured,state.setup_available,state.setup_token_required); else app.innerHTML = `<main class="login-shell"><div class="login-card"><h1>${tr('Start.cmd를 실행해 이 브라우저를 연결하세요.')}</h1></div></main>`; });

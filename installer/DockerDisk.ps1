@@ -35,7 +35,10 @@ function Resolve-DockerDesktopDiskFile {
         } catch {
             throw 'Cannot read Docker Desktop disk settings. Check Settings > Resources > Advanced.'
         }
-        $configured = [string]$settings.dataFolder
+        # WSL 2 installs keep a moved disk in CustomWslDistroDir, which is what
+        # Settings > Resources > Advanced > Disk image location writes.
+        $configured = [string]$settings.CustomWslDistroDir
+        if (-not $configured) { $configured = [string]$settings.dataFolder }
         $folder = if ($configured) {
             [Environment]::ExpandEnvironmentVariables($configured)
         } else { $DefaultFolder }
@@ -61,25 +64,69 @@ function Get-EstimatedImageWorkBytes([string]$revision) {
     # Only the digest currently published for this exact revision can be
     # treated as cached. A different local digest can carry the same revision
     # label and would still require a cold pull.
-    if ($revision -notmatch '^[0-9a-f]{40}$') { return [int64]10GB }
+    # A cold install stores the compressed layers, one unpacked copy from the
+    # pull and a second unpacked copy in the build cache of the local overlay.
+    # v0.4.57 grew an empty Docker Desktop disk to 17.2 GB.
+    if ($revision -notmatch '^[0-9a-f]{40}$') { return [int64]18GB }
     $docker = Get-DesktopDockerCli
     $repository = 'ghcr.io/udonsari0101/ctf-agent-public'
     $manifest = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
         'manifest', 'inspect', '--verbose', "$repository`:$revision") 30
-    if ($manifest.ExitCode -ne 0) { return [int64]10GB }
+    if ($manifest.ExitCode -ne 0) { return [int64]18GB }
     try {
         $published = $manifest.Stdout | ConvertFrom-Json -ErrorAction Stop
         $digest = [string]$published.Descriptor.digest
-    } catch { return [int64]10GB }
-    if ($digest -notmatch '^sha256:[0-9a-f]{64}$') { return [int64]10GB }
+    } catch { return [int64]18GB }
+    if ($digest -notmatch '^sha256:[0-9a-f]{64}$') { return [int64]18GB }
     $image = "$repository@$digest"
     $checked = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
         'image', 'inspect', $image,
         '--format={{index .Config.Labels "org.opencontainers.image.revision"}}') 8
     if ($checked.ExitCode -eq 0 -and $checked.Stdout.Trim() -eq $revision) {
-        return [int64]2GB
+        return [int64]10GB
     }
-    return [int64]10GB
+    return [int64]18GB
+}
+
+function Select-DockerDiskFolder([string]$currentDisk, [int64]$requiredBytes, [string]$preferredPath) {
+    # Prefers the drive already chosen for the database, then the fixed NTFS
+    # drive with the most room. Returns '' when no other drive can hold the disk.
+    $needed = $requiredBytes + (Get-Item -LiteralPath $currentDisk).Length
+    $currentDrive = ([IO.Path]::GetPathRoot($currentDisk)).Substring(0, 1)
+    $preferredDrive = if ($preferredPath) { ([IO.Path]::GetPathRoot($preferredPath)).Substring(0, 1) } else { '' }
+    $volume = @(Get-Volume | Where-Object {
+        $_.DriveLetter -and [string]$_.DriveLetter -ine $currentDrive -and $_.DriveType -eq 'Fixed' -and
+        $_.FileSystemType -eq 'NTFS' -and $_.SizeRemaining -ge $needed
+    } | Sort-Object @{Expression={ [string]$_.DriveLetter -ieq $preferredDrive };Descending=$true},
+        @{Expression='SizeRemaining';Descending=$true}) | Select-Object -First 1
+    if (-not $volume) { return '' }
+    return "$($volume.DriveLetter):\DockerDesktopData"
+}
+
+function Move-DockerDesktopDisk([string]$folder) {
+    # Docker Desktop moves its disk only from its Settings window, so this
+    # moves the file while Docker Desktop is stopped and records the new folder.
+    if ($folder -notmatch '^[A-Za-z]:[\\/]') { throw 'The Docker Desktop disk folder must be on a local Windows drive.' }
+    $source = Resolve-DockerDesktopDiskFile
+    $target = Join-Path $folder 'disk\docker_data.vhdx'
+    if (Test-Path -LiteralPath $target) { throw "A Docker Desktop disk already exists at $target." }
+    if (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue) { Stop-DockerDesktopForSettings }
+    for ($attempt = 0; ; $attempt++) {
+        try {
+            [IO.File]::Open($source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None).Dispose()
+            break
+        } catch [System.IO.IOException] {
+            if ($attempt -ge 60) { throw 'WSL did not release the Docker Desktop disk.' }
+            Start-Sleep -Seconds 1
+        }
+    }
+    Write-Host "Moving Docker Desktop's disk to $target..."
+    New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+    Move-Item -LiteralPath $source -Destination $target
+    $file = Get-DockerDesktopSettingsFile
+    $settings = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+    $settings | Add-Member -NotePropertyName 'CustomWslDistroDir' -NotePropertyValue $folder -Force
+    Save-DockerDesktopSettings $file $settings
 }
 
 function Assert-DockerDesktopImageCapacity {
@@ -109,7 +156,7 @@ function Get-LocalInstallVolumeRequirements {
         [Parameter(Mandatory=$true)][string]$DockerDiskPath,
         [string]$DatabaseDiskPath = '',
         [int64]$ApplicationWorkBytes = 1GB,
-        [int64]$ImageWorkBytes = 10GB,
+        [int64]$ImageWorkBytes = 18GB,
         [int64]$DatabaseWorkBytes = 1GB,
         [int64]$MinimumFreeBytes = 5GB
     )
@@ -156,7 +203,7 @@ function Assert-LocalInstallVolumeCapacity {
         [Parameter(Mandatory=$true)][string]$DockerDiskPath,
         [string]$DatabaseDiskPath = '',
         [int64]$ApplicationWorkBytes = 1GB,
-        [int64]$ImageWorkBytes = 10GB,
+        [int64]$ImageWorkBytes = 18GB,
         [int64]$DatabaseWorkBytes = 1GB,
         [int64]$MinimumFreeBytes = 5GB
     )

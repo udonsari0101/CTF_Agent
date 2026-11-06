@@ -71,6 +71,7 @@ class SessionPreference(BaseModel):
 class FirstAdmin(BaseModel):
     username: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)
+    setup_token: str = Field(default="", max_length=256)
     _username = field_validator("username")(username_value)
 
 
@@ -109,6 +110,18 @@ class UserPassword(BaseModel):
 
 def register_auth(app, settings, database, make_hash, verify_hash, user_context):
     credential_work_gate = threading.BoundedSemaphore(2)
+    if (settings.auth_mode == "password" and settings.allow_web_bootstrap
+            and (settings.allowed_origins or settings.require_first_admin_token)
+            and not settings.first_admin_setup_token):
+        # The first administrator must not be claimable by whoever reaches a
+        # newly opened LAN/public port first. Once an administrator exists the
+        # installer may discard this one-time token without breaking restarts.
+        with database() as db:
+            configured = db.execute(
+                "SELECT 1 FROM users WHERE password_hash!='' LIMIT 1"
+            ).fetchone()
+        if not configured:
+            raise RuntimeError("Public first-admin setup requires CTF_FIRST_ADMIN_SETUP_TOKEN")
     automatic_session = None
     local_access_key = None
     local_tickets: dict[str, float] = {}
@@ -146,6 +159,8 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
     def local_session_for(request: Request):
         if automatic_session is None or local_access_key is None:
             return None
+        if settings.local_access == "open":
+            return automatic_session
         return automatic_session if valid_local_cookie(
             local_access_key, request.cookies.get(LOCAL_COOKIE, "")
         ) else None
@@ -186,11 +201,23 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
 
     def origin_check(request):
         origin = request.headers.get("origin")
-        expected = settings.public_origin or str(request.base_url).rstrip("/")
-        if origin and origin.rstrip("/") != expected:
+        allowed = set(settings.allowed_origins)
+        if settings.public_origin:
+            allowed.add(settings.public_origin)
+        allowed.add(str(request.base_url).rstrip("/"))
+        if origin and origin.rstrip("/") not in allowed:
             raise HTTPException(403, "요청 출처를 확인할 수 없습니다.")
         if request.headers.get("sec-fetch-site") == "cross-site":
             raise HTTPException(403, "외부 사이트 요청은 허용하지 않습니다.")
+
+    def cookie_secure_for(request: Request) -> bool:
+        # The local web container runs behind a TLS-terminating tunnel with
+        # --no-proxy-headers. A checked HTTPS Origin describes the browser's
+        # actual transport without trusting arbitrary X-Forwarded headers.
+        origin = request.headers.get("origin", "").rstrip("/")
+        return (settings.cookie_secure or request.url.scheme == "https"
+                or (origin.startswith("https://") and origin in
+                    (set(settings.allowed_origins) | {settings.public_origin})))
 
     def session_for(request):
         token = request.cookies.get(COOKIE, "")
@@ -297,9 +324,10 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
         finally:
             user_context.reset(context_token)
 
-    def issue_session_cookie(response, token, max_age=None):
+    def issue_session_cookie(response, token, request, max_age=None):
         max_age = settings.session_hours * 3600 if max_age is None else max_age
-        response.set_cookie(COOKIE, token, max_age=max_age, httponly=True, secure=settings.cookie_secure, samesite="strict", path="/")
+        response.set_cookie(COOKIE, token, max_age=max_age, httponly=True,
+                            secure=cookie_secure_for(request), samesite="strict", path="/")
 
     @app.get("/api/auth/state")
     def state(request: Request):
@@ -314,6 +342,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
             "authentication_required": settings.auth_mode == "password",
             "configured": configured,
             "setup_available": bool(settings.auth_mode == "password" and settings.allow_web_bootstrap and not configured),
+            "setup_token_required": bool(settings.first_admin_setup_token and not configured),
             "authenticated": bool(session),
             "csrf_token": session["csrf_token"] if session else None,
             "user": safe_user(session) if session else None,
@@ -353,7 +382,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
         response.set_cookie(
             LOCAL_COOKIE, issue_local_cookie(local_access_key),
             max_age=LOCAL_COOKIE_SECONDS, httponly=True,
-            secure=settings.cookie_secure, samesite="strict", path="/",
+            secure=cookie_secure_for(request), samesite="strict", path="/",
         )
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -364,6 +393,11 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
         if settings.auth_mode != "password" or not settings.allow_web_bootstrap:
             raise HTTPException(404, "초기 설정을 사용할 수 없습니다.")
         origin_check(request)
+        setup_token = payload.setup_token or request.headers.get("x-ctf-setup-token", "")
+        if settings.first_admin_setup_token and not hmac.compare_digest(
+            setup_token.encode("utf-8"), settings.first_admin_setup_token.encode("utf-8")
+        ):
+            raise HTTPException(403, "Initial administrator setup token is invalid.")
         with database() as db:
             if db.execute("SELECT 1 FROM users WHERE password_hash!='' LIMIT 1").fetchone():
                 raise HTTPException(409, "관리자 계정이 이미 설정되었습니다. 로그인하세요.")
@@ -397,7 +431,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
                  timestamp + settings.session_hours * 3600, owner_id),
             )
             user = db.execute("SELECT * FROM users WHERE id=?", (owner_id,)).fetchone()
-        issue_session_cookie(response, token)
+        issue_session_cookie(response, token, request)
         return {"authenticated": True, "csrf_token": csrf, "username": user["username"], "user": safe_user(user)}
 
     @app.post("/api/auth/login")
@@ -463,7 +497,7 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
                 user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if raced:
             raise HTTPException(401, "The account credentials changed while signing in. Try again.")
-        issue_session_cookie(response, token, max_age)
+        issue_session_cookie(response, token, request, max_age)
         return {"authenticated": True, "csrf_token": csrf, "username": user["username"], "user": safe_user(user),
                 "session_persistent": payload.remember}
 
@@ -484,14 +518,15 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
             ).rowcount
             if replaced != 1:
                 raise HTTPException(401, "세션이 만료되었습니다. 다시 로그인하세요.")
-        issue_session_cookie(response, token, max_age)
+        issue_session_cookie(response, token, request, max_age)
         return {"ok": True, "csrf_token": csrf, "session_persistent": payload.remember}
 
     @app.post("/api/auth/logout", dependencies=[Depends(require_auth)])
     def logout(request: Request, response: Response):
         with database() as db:
             db.execute("DELETE FROM sessions WHERE token_hash=? AND user_id=?", (request.state.session["token_hash"], request.state.user["id"]))
-        response.delete_cookie(COOKIE, path="/", secure=settings.cookie_secure, httponly=True, samesite="strict")
+        response.delete_cookie(COOKIE, path="/", secure=cookie_secure_for(request),
+                               httponly=True, samesite="strict")
         return {"ok": True}
 
     def verified_current(user_id, password):

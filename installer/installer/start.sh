@@ -67,11 +67,25 @@ else:
 print(mode)
 print("true" if auto else "false")
 print(database)
+listen = value.get("listen_address", "127.0.0.1")
+if listen not in {"127.0.0.1", "0.0.0.0"}:
+    raise SystemExit("Invalid local installation settings")
 print(mount)
 print(volume_id)
+print(listen)
+urls = value.get("public_urls", [])
+access = value.get("access_mode", "link")
+token = value.get("first_admin_setup_token", "")
+if (not isinstance(urls, list) or not all(isinstance(url, str) for url in urls)
+        or access not in {"link", "open"} or not isinstance(token, str)
+        or (access == "open" and mode != "nologin")):
+    raise SystemExit("Invalid local access settings")
+print(",".join(urls))
+print(access)
+print(token)
 PY
 )
-if [[ "${#options[@]}" -ne 5 ]]; then
+if [[ "${#options[@]}" -ne 9 ]]; then
     echo 'Local installation settings are invalid.' >&2
     exit 2
 fi
@@ -143,6 +157,27 @@ fi
 export CTF_LOCAL_UID="$(id -u)"
 export CTF_LOCAL_GID="$(id -g)"
 export CTF_AUTH_MODE="${options[0]}"
+export CTF_LOCAL_BIND="${options[5]}"
+export CTF_LOCAL_PUBLIC_URLS="${options[6]}"
+export CTF_LOCAL_ACCESS="${options[7]}"
+export CTF_ALLOWED_ORIGINS="http://127.0.0.1:5050"
+if [[ -n "${options[6]}" ]]; then
+    export CTF_ALLOWED_ORIGINS="$CTF_ALLOWED_ORIGINS,${options[6]}"
+fi
+if [[ -n "${options[6]}" ]]; then
+    export CTF_LOCAL_ORIGIN="${options[6]%%,*}"
+elif [[ "${options[5]}" == 0.0.0.0 ]]; then
+    export CTF_LOCAL_ORIGIN=
+else
+    export CTF_LOCAL_ORIGIN=http://127.0.0.1:5050
+fi
+if [[ "${options[0]}" == password && ( "${options[5]}" == 0.0.0.0 || -n "${options[6]}" ) && -n "${options[8]}" ]]; then
+    export CTF_REQUIRE_FIRST_ADMIN_TOKEN=true
+    export CTF_FIRST_ADMIN_SETUP_TOKEN="${options[8]}"
+else
+    export CTF_REQUIRE_FIRST_ADMIN_TOKEN=false
+    export CTF_FIRST_ADMIN_SETUP_TOKEN=
+fi
 export CTF_ALLOW_WEB_BOOTSTRAP=true
 if [[ -n "${options[3]}" ]]; then
     # Prevent Docker Desktop from resurrecting the DB container before the
@@ -196,7 +231,8 @@ elif docker image inspect ctf-agent-updater:local >/dev/null 2>&1; then
     docker start ctf_agent_local_updater >/dev/null 2>&1 || true
 fi
 printf 'CTF Agent %s services requested; solver readiness requires /readyz HTTP 200.\n' "$version"
-if [[ "${options[0]}" == nologin && "${CTF_LOCAL_BROWSER_FROM_WINDOWS:-}" != true ]]; then
+if [[ "${options[0]}" == nologin && "${options[7]}" == link &&
+      "${CTF_LOCAL_BROWSER_FROM_WINDOWS:-}" != true ]]; then
     # An in-app update refreshes this WSL launcher but cannot replace an old
     # Windows Start.ps1. That older launcher still calls this script. Pair its
     # browser using a short-lived ticket, keeping the installation key out of

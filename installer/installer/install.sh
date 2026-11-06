@@ -403,6 +403,90 @@ export CTF_LOCAL_DATABASE="$database_path"
 export CTF_LOCAL_FS_DATA="${CTF_LOCAL_FS_DATA:-$home_dir/ctf_agent_data}"
 export CTF_LOCAL_FS_DATABASE="$database_fs_path"
 export CTF_LOCAL_DB_MOUNT="$database_mount"
+# Port forwarding needs every interface, and browsers then arrive on addresses
+# other than 127.0.0.1, so the fixed origin is cleared and same-origin requests
+# are checked against their Host instead. Repairs and web updates keep the choice.
+listen_address="${CTF_LOCAL_BIND:-}"
+if [[ -z "$listen_address" && -f "$home_dir/.local-config.json" ]]; then
+    listen_address="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("listen_address", ""))' "$home_dir/.local-config.json")"
+fi
+listen_address="${listen_address:-127.0.0.1}"
+case "$listen_address" in
+    127.0.0.1|0.0.0.0) ;;
+    *) echo 'CTF_LOCAL_BIND must be 127.0.0.1 or 0.0.0.0.' >&2; exit 2 ;;
+esac
+export CTF_LOCAL_BIND="$listen_address"
+if [[ "${CTF_LOCAL_PUBLIC_URLS+x}" != x && -f "$home_dir/.local-config.json" ]]; then
+    CTF_LOCAL_PUBLIC_URLS="$(python3 - "$home_dir/.local-config.json" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding='utf-8')).get('public_urls',[])
+if not isinstance(value,list) or not all(isinstance(item,str) for item in value):
+    raise SystemExit('Invalid stored public URLs')
+print(','.join(value))
+PY
+)"
+fi
+public_urls="${CTF_LOCAL_PUBLIC_URLS:-}"
+public_urls="$(python3 - "$public_urls" <<'PY'
+import sys,urllib.parse
+result=[]
+for item in filter(None,(piece.strip() for piece in sys.argv[1].split(','))):
+    parsed=urllib.parse.urlsplit(item)
+    try:
+        port=parsed.port
+    except ValueError:
+        raise SystemExit('Public URL has an invalid port')
+    if (parsed.scheme not in ('http','https') or not parsed.netloc or
+            not parsed.hostname or '@' in parsed.netloc or port == 0 or
+            parsed.path not in ('','/') or
+            parsed.query or parsed.fragment or any(c.isspace() for c in item)):
+        raise SystemExit('Public URL must be an HTTP(S) origin')
+    origin=f'{parsed.scheme}://{parsed.netloc.lower()}'
+    if origin not in result: result.append(origin)
+print(','.join(result))
+PY
+)"
+if [[ "${CTF_LOCAL_ACCESS+x}" != x && -f "$home_dir/.local-config.json" ]]; then
+    CTF_LOCAL_ACCESS="$(python3 - "$home_dir/.local-config.json" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1],encoding='utf-8')).get('access_mode','link'))
+PY
+)"
+fi
+access_mode="${CTF_LOCAL_ACCESS:-link}"
+[[ "$access_mode" == link || "$access_mode" == open ]] || { echo 'Invalid local access mode.' >&2; exit 2; }
+[[ "$access_mode" != open || "$CTF_AUTH_MODE" == nologin ]] || {
+    echo 'Open access requires no-login mode.' >&2; exit 2;
+}
+export CTF_LOCAL_ACCESS="$access_mode"
+export CTF_LOCAL_PUBLIC_URLS="$public_urls"
+export CTF_ALLOWED_ORIGINS="http://127.0.0.1:5050${public_urls:+,$public_urls}"
+if [[ -n "$public_urls" ]]; then
+    export CTF_LOCAL_ORIGIN="${public_urls%%,*}"
+elif [[ "$listen_address" == 0.0.0.0 ]]; then
+    export CTF_LOCAL_ORIGIN=
+else
+    export CTF_LOCAL_ORIGIN=http://127.0.0.1:5050
+fi
+setup_token="${CTF_FIRST_ADMIN_SETUP_TOKEN:-}"
+if [[ -z "$setup_token" && -f "$home_dir/.local-config.json" ]]; then
+    setup_token="$(python3 - "$home_dir/.local-config.json" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1],encoding='utf-8')).get('first_admin_setup_token',''))
+PY
+)"
+fi
+if [[ "$CTF_AUTH_MODE" == password && ( "$listen_address" == 0.0.0.0 || -n "$public_urls" ) ]]; then
+    if [[ -z "$setup_token" ]]; then
+        setup_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    fi
+    [[ "$setup_token" =~ ^[A-Za-z0-9_-]{32,}$ ]] || { echo 'Invalid first-administrator setup token.' >&2; exit 2; }
+    export CTF_REQUIRE_FIRST_ADMIN_TOKEN=true
+    export CTF_FIRST_ADMIN_SETUP_TOKEN="$setup_token"
+else
+    export CTF_REQUIRE_FIRST_ADMIN_TOKEN=false
+    export CTF_FIRST_ADMIN_SETUP_TOKEN=
+fi
 export CTF_RELEASE_SHA="$revision"
 export CTF_RELEASE_VERSION="$version"
 cd -- "$target"
@@ -622,12 +706,18 @@ for name in start.sh uninstall.py; do
 done
 local_config_temp="$(mktemp "$home_dir/.local-config.XXXXXXXX")"
 python3 - "$local_config_temp" "$CTF_AUTH_MODE" "${CTF_LOCAL_AUTOSTART:-true}" \
-    "$database_fs_path" "$database_mount" "$database_volume_id" <<'PY'
+    "$database_fs_path" "$database_mount" "$database_volume_id" "$listen_address" \
+    "$public_urls" "$access_mode" "$setup_token" <<'PY'
 import json, sys
-target, auth_mode, auto_start, database_path, database_mount, volume_id = sys.argv[1:]
+target, auth_mode, auto_start, database_path, database_mount, volume_id, listen, \
+    public_urls, access_mode, setup_token = sys.argv[1:]
 value = {"auth_mode": auth_mode, "auto_start": auto_start == "true",
          "database_path": database_path, "database_mount": database_mount,
-         "database_volume_id": volume_id}
+         "database_volume_id": volume_id, "listen_address": listen,
+         "public_urls": public_urls.split(',') if public_urls else [],
+         "access_mode": access_mode}
+if setup_token:
+    value["first_admin_setup_token"] = setup_token
 with open(target, "w", encoding="utf-8") as output:
     json.dump(value, output, separators=(",", ":"))
     output.write("\n")

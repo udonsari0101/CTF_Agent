@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 from ctf_agent.local_capacity import recommended_solver_concurrency
 from ctf_agent.solver_autoscaler import AutoscalerError, validate_slot_container
+from ctf_agent.db import allowed_origin
 
 
 STATIC_SOLVER_COUNT = 6
@@ -36,6 +37,80 @@ def set_local_storage_floor(environment: dict[str, str]) -> None:
 
     environment.setdefault("CTF_STORAGE_MIN_FREE_BYTES", str(LOCAL_MINIMUM_REMAINING_BYTES))
     environment.setdefault("CTF_SOLVER_MIN_FREE_BYTES", str(LOCAL_MINIMUM_REMAINING_BYTES))
+
+
+def apply_local_config(environment: dict[str, str]) -> None:
+    """Apply installed access options on every Compose invocation, including updates."""
+
+    home_value = environment.get("CTF_LOCAL_HOME", "")
+    if not home_value:
+        return
+    path = Path(home_value) / ".local-config.json"
+    if not path.exists() and not path.is_symlink():
+        return  # The first install has not committed its configuration yet.
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 16384:
+        raise RuntimeError("Local installation settings are invalid")
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise RuntimeError("Local installation settings are invalid") from exc
+    if not isinstance(config, dict):
+        raise RuntimeError("Local installation settings are invalid")
+
+    auth_mode = config.get("auth_mode", environment.get("CTF_AUTH_MODE", "nologin"))
+    if auth_mode not in {"password", "nologin"}:
+        raise RuntimeError("Local authentication mode is invalid")
+    environment["CTF_AUTH_MODE"] = auth_mode
+    environment["CTF_ALLOW_WEB_BOOTSTRAP"] = "true" if auth_mode == "password" else "false"
+
+    values = config.get("public_urls", [])
+    if isinstance(values, str):
+        values = [value.strip() for value in values.split(",") if value.strip()]
+    if not isinstance(values, list) or len(values) > 16 or not all(
+        isinstance(value, str) for value in values
+    ):
+        raise RuntimeError("Local public URLs are invalid")
+    try:
+        public_urls = list(dict.fromkeys(allowed_origin(value) for value in values))
+    except ValueError as exc:
+        raise RuntimeError("Local public URLs are invalid") from exc
+
+    listen = config.get("listen_address", "0.0.0.0" if public_urls else "127.0.0.1")
+    if listen not in {"127.0.0.1", "0.0.0.0"}:
+        raise RuntimeError("Local listen address is invalid")
+    access = config.get("access_mode", "link")
+    if access not in {"link", "open"} or (access == "open" and auth_mode != "nologin"):
+        raise RuntimeError("Local access mode is invalid")
+
+    environment["CTF_LOCAL_BIND"] = listen
+    environment["CTF_ALLOWED_ORIGINS"] = ",".join(public_urls)
+    environment["CTF_LOCAL_ACCESS"] = access
+    environment["CTF_LOCAL_ORIGIN"] = next(
+        (url for url in public_urls if url.startswith("https://")),
+        public_urls[0] if public_urls else (
+            f"http://127.0.0.1:{environment.get('CTF_LOCAL_PORT', '5050')}"
+            if listen == "127.0.0.1" else ""
+        ),
+    )
+    environment["CTF_REQUIRE_FIRST_ADMIN_TOKEN"] = (
+        "true" if public_urls or listen == "0.0.0.0" else "false"
+    )
+    setup_token = config.get("first_admin_setup_token", "")
+    if not isinstance(setup_token, str) or len(setup_token) > 256:
+        raise RuntimeError("Local first-admin setup token is invalid")
+    if setup_token:
+        environment["CTF_FIRST_ADMIN_SETUP_TOKEN"] = setup_token
+    else:
+        environment.pop("CTF_FIRST_ADMIN_SETUP_TOKEN", None)
+
+    auto_start = config.get("auto_start")
+    if auto_start is not None:
+        if type(auto_start) is not bool:
+            raise RuntimeError("Local auto-start setting is invalid")
+        environment["CTF_LOCAL_RESTART_POLICY"] = (
+            "no" if config.get("database_mount") else
+            "unless-stopped" if auto_start else "no"
+        )
 
 
 def _compose_base() -> list[str]:
@@ -900,6 +975,7 @@ def main() -> int:
     retained_dynamic: set[int] = set()
     arguments = normalize_arguments(sys.argv[1:] or ["up", "-d", "--build"])
     environment = os.environ.copy()
+    apply_local_config(environment)
     # An external database VHD must be verified by the launcher before web or
     # the autoscaler starts. A solver may still retry an abnormal exit while
     # the daemon is running; on-failure never starts it on daemon restart.

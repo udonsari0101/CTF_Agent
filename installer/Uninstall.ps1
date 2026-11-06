@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+if ($env:CTF_AGENT_LAUNCH_MARKER) { [IO.File]::WriteAllText($env:CTF_AGENT_LAUNCH_MARKER, '') }
 $dockerDesktopHelper = Join-Path $PSScriptRoot 'DockerDesktop.ps1'
 if (-not (Test-Path -LiteralPath $dockerDesktopHelper -PathType Leaf)) { throw 'DockerDesktop.ps1 is missing. Reinstall the patched release.' }
 . $dockerDesktopHelper
@@ -94,4 +95,5 @@ if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
         Remove-Item -LiteralPath $shortcutPath
     }
 }
+Remove-CtfAgentFirewallRule
 Write-Host 'CTF Agent was removed. The selected data and database folders are still available.'

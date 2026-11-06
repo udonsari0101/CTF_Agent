@@ -59,8 +59,9 @@ jobs:
           with ZipFile(archive) as bundle:
               names = set(bundle.namelist())
               required = {'Install.cmd', 'Install.ps1', 'DatabaseDisk.ps1', 'DockerDesktop.ps1', 'DockerDisk.ps1',
-                          'Start.cmd', 'Start.ps1', 'Uninstall.cmd', 'Uninstall.ps1',
-                          'installer/install.sh', 'installer/start.sh',
+                          'Start.cmd', 'Start.ps1', 'RemoteLink.cmd', 'RemoteLink.ps1',
+                          'Uninstall.cmd', 'Uninstall.ps1',
+                          'installer/install.sh', 'installer/prepare-wsl.sh', 'installer/start.sh',
                           'installer/uninstall.py', 'installer/storage_control.py',
                           'installer/storage_preflight.py',
                           'app/Dockerfile.updater', 'app/Dockerfile.local-runtime',
@@ -79,6 +80,7 @@ jobs:
               assert bundle.testzip() is None
           PY
           unzip -p "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" "CTF_Agent-${RELEASE_TAG}/installer/install.sh" | bash -n
+          unzip -p "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" "CTF_Agent-${RELEASE_TAG}/installer/prepare-wsl.sh" | bash -n
           unzip -p "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" "CTF_Agent-${RELEASE_TAG}/installer/start.sh" | bash -n
           unzip -p "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" "CTF_Agent-${RELEASE_TAG}/installer/storage_control.py" | python3 -c 'import sys; compile(sys.stdin.read(), "storage_control.py", "exec")'
           unzip -p "dist/CTF_Agent-${RELEASE_TAG}-local-windows.zip" "CTF_Agent-${RELEASE_TAG}/app/deploy/local-seccomp.json" | python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin)["syscalls"], list)'
