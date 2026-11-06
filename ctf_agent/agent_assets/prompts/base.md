@@ -73,4 +73,4 @@ If a `Dockerfile`/compose/binary/env lets you run the service, read its build st
 
 ## 6. Anti-Patterns
 
-Never fabricate an address/offset/gadget/constant (measure it) · never submit a local/placeholder flag · don't build the full exploit before the primitive is proven · don't trust reasoning over execution · don't grind a blind-repeat retry (§3) · don't widen scope to sibling folders or unrelated services · don't paste whole artifacts into context (summarize; keep the file in `tmp/`).
+Never fabricate an address/offset/gadget/constant (measure it) · never submit an unverified local value or a placeholder flag · don't build the full exploit before the primitive is proven · don't trust reasoning over execution · don't grind a blind-repeat retry (§3) · don't widen scope to sibling folders or unrelated services · don't paste whole artifacts into context (summarize; keep the file in `tmp/`).

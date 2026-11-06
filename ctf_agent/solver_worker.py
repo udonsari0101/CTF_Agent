@@ -2947,6 +2947,8 @@ class CodexAppServer:
         self.stderr_categories: set[str] = set()
         self.safe_startup_stderr: str | None = None
         self.sandbox_checks: dict[str, bool] = {}
+        self._full_canary_verified = False
+        self._full_canary_context: tuple[object, ...] | None = None
         self.pending: dict[int, asyncio.Future] = {}
         self.notifications: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
         self.sequence = 0
@@ -3206,6 +3208,8 @@ class CodexAppServer:
         return {"sandboxPolicy": self._sandbox_policy(challenge, network_access=network_access)}
 
     async def start(self) -> None:
+        self._full_canary_verified = False
+        self._full_canary_context = None
         if not self.executable:
             raise WorkerRefusal("codex_missing", "격리 worker에 Codex CLI가 설치되지 않았습니다.")
         if self.restored_home:
@@ -3428,12 +3432,37 @@ class CodexAppServer:
         finally:
             self.pending.pop(request_id, None)
 
-    async def sandbox_canary(self, worker_pid: int, exchange: Path, scratch: Path, challenge_source: Path) -> None:
+    async def sandbox_canary(
+        self, worker_pid: int, exchange: Path, scratch: Path, challenge_source: Path,
+        *, profile: str = "full",
+    ) -> None:
         """Run deterministic checks under the exact command sandbox used by turns."""
+
+        if profile not in {"full", "post_login_isolation_only"}:
+            raise ValueError("invalid sandbox canary profile")
+        external = os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
+        sandbox_parameters = self._sandbox_parameters(
+            "command/exec", scratch, network_access=True
+        )
+        canary_context = (
+            external, worker_pid, self.pid, str(exchange), str(scratch),
+            str(challenge_source), sys.executable,
+            json.dumps(sandbox_parameters, sort_keys=True),
+        )
+        if profile == "full":
+            # A failed later full probe must not leave an older attestation
+            # available for a post-login shortened check.
+            self._full_canary_verified = False
+            self._full_canary_context = None
+        elif not self._full_canary_verified or self._full_canary_context != canary_context:
+            raise WorkerRefusal(
+                "sandbox_canary_failed", "로그인 전 전체 실행 환경 점검이 현재 실행 환경과 일치하지 않습니다.",
+                requirements=("pre_login_full_canary",),
+            )
 
         script = r'''
 import errno,hashlib,json,mmap,os,secrets,shutil,socket,subprocess,sys
-input_root,input_probe,input_control,input_auth,input_api_key,input_digest,worker,worker_identity,server,server_identity,exchange,scratch,challenge,sandbox_mode=sys.argv[1:]
+input_root,input_probe,input_control,input_auth,input_api_key,input_digest,worker,worker_identity,server,server_identity,exchange,scratch,challenge,sandbox_mode,canary_profile=sys.argv[1:]
 result={}
 mountinfo_readable=True
 try:
@@ -3601,6 +3630,13 @@ def network_sockets_available(family):
 result["network_ipv4_available"]=network_sockets_available(socket.AF_INET)
 result["network_ipv6_available"]=network_sockets_available(socket.AF_INET6)
 
+# The second check runs after credentials have entered protected provider
+# memory. Recheck every isolation boundary, but use the earlier full command
+# probe for toolchain functionality in the same unchanged command profile.
+if canary_profile == "post_login_isolation_only":
+    print(json.dumps(result,separators=(",",":")))
+    sys.exit(0)
+
 # The provider process keeps credentials under its private HOME. Challenge
 # tools use a separate writable runtime below the bounded job scratch. Prove
 # the native modules and parsers inside the exact command profile before any
@@ -3724,7 +3760,6 @@ print(json.dumps(result,separators=(",",":")))
                         pass
                 return "protected"
 
-        external = os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
         input_canary = None
         input_arguments = ["", "", "", "", "", ""]
         if external:
@@ -3793,6 +3828,7 @@ print(json.dumps(result,separators=(",",":")))
                         str(self.pid), proc_identity(self.pid),
                         str(exchange), str(scratch), str(challenge_source),
                         "external" if external else "codex",
+                        profile,
                     ],
                     "cwd": str(scratch),
                     "timeoutMs": 20000,
@@ -3803,7 +3839,7 @@ print(json.dumps(result,separators=(",",":")))
                         "AWS_ACCESS_KEY_ID": None,
                         "AWS_SECRET_ACCESS_KEY": None,
                     },
-                    **self._sandbox_parameters("command/exec", scratch, network_access=True),
+                    **sandbox_parameters,
                 },
                 timeout=25,
             )
@@ -3827,7 +3863,7 @@ print(json.dumps(result,separators=(",",":")))
                 "Codex 실행 격리 결과를 확인할 수 없습니다.",
                 requirements=("invalid_canary_output",),
             ) from exc
-        self.sandbox_checks = {
+        sandbox_checks = {
             "toolchain_browser_functional": bool(
                 isinstance(checks, dict)
                 and checks.get("toolchain_browser_functional") is True
@@ -3870,13 +3906,16 @@ print(json.dumps(result,separators=(",",":")))
                     "input_api_key_read_denied",
                     "input_listing_denied",
                     "shell_profile_enforced",
+                }
+            )
+            if profile == "full":
+                required.update({
                     "toolchain_environment_writable",
                     "toolchain_commands_present",
                     "toolchain_binaries_functional",
                     "toolchain_browser_functional",
                     "toolchain_python_functional",
-                }
-            )
+                })
         else:
             required.add("exchange_inventory_safe")
         if not isinstance(checks, dict) or any(checks.get(name) is not True for name in required):
@@ -3886,6 +3925,10 @@ print(json.dumps(result,separators=(",",":")))
                 "Codex 실행 격리 자체 점검에 실패했습니다: " + ",".join(missing),
                 requirements=tuple(missing),
             )
+        if profile == "full":
+            self.sandbox_checks = sandbox_checks
+            self._full_canary_verified = True
+            self._full_canary_context = canary_context
 
     async def login_memory(self, credential: MemoryCredential) -> None:
         self.chatgpt_preflight_verified = False
@@ -6870,6 +6913,17 @@ async def terminate_job_processes(primary_pid: int | None = None, *, timeout: fl
     raise WorkerRefusal("process_cleanup_failed", "작업 프로세스를 모두 종료하지 못해 다음 작업을 차단했습니다.")
 
 
+def _post_login_canary_profile(driver: CodexDriverProtocol) -> str:
+    """Reuse Codex's full pre-login tool probe unless explicitly disabled."""
+
+    return (
+        "post_login_isolation_only"
+        if type(driver) is CodexAppServer
+        and os.environ.get("CTF_SOLVER_POST_LOGIN_ISOLATION_ONLY", "true") == "true"
+        else "full"
+    )
+
+
 class SolverWorker:
     def __init__(
         self,
@@ -6952,24 +7006,41 @@ class SolverWorker:
         driver: CodexDriverProtocol,
         scratch: Path,
         challenge_source: Path,
+        *,
+        profile: str = "full",
     ) -> None:
         """Repeat only a transient command exit; inventory failures stay terminal."""
+
+        if profile not in {"full", "post_login_isolation_only"}:
+            raise ValueError("invalid sandbox canary profile")
+
+        async def verify_once() -> None:
+            if profile == "full":
+                await driver.sandbox_canary(
+                    os.getpid(), self.exchange, scratch, challenge_source
+                )
+            elif type(driver) is CodexAppServer:
+                await driver.sandbox_canary(
+                    os.getpid(), self.exchange, scratch, challenge_source,
+                    profile=profile,
+                )
+            else:
+                raise WorkerRefusal(
+                    "sandbox_canary_failed", "이 공급자에는 점검 축약을 적용할 수 없습니다.",
+                    requirements=("unsupported_canary_profile",),
+                )
 
         self._canary_in_progress = True
         try:
             try:
-                await driver.sandbox_canary(
-                    os.getpid(), self.exchange, scratch, challenge_source
-                )
+                await verify_once()
             except WorkerRefusal as exc:
                 if exc.error.code != "sandbox_canary_failed" or tuple(exc.error.requirements) not in {
                     ("command_exit",),
                 }:
                     raise
                 await asyncio.sleep(0.2)
-                await driver.sandbox_canary(
-                    os.getpid(), self.exchange, scratch, challenge_source
-                )
+                await verify_once()
         finally:
             self._canary_in_progress = False
 
@@ -7566,8 +7637,10 @@ class SolverWorker:
             # Repeat after login, when the access token exists only in protected
             # worker/app-server memory and any API-key auth file was removed.
             canary_started_ns = time.perf_counter_ns()
+            post_login_profile = _post_login_canary_profile(driver)
             await self._verify_sandbox_canary(
-                driver, scratch, prepared.brief.parent
+                driver, scratch, prepared.brief.parent,
+                profile=post_login_profile,
             )
             _record_startup_timing("canary_post_login", canary_started_ns, startup_run_key)
             cancel_watcher = asyncio.create_task(_watch_cancel(active / "cancel", cancel_event))
