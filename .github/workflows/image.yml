@@ -70,13 +70,18 @@ jobs:
           toolchain_ref="$(docker image inspect --format '{{index .RepoDigests 0}}' "$toolchain_tag")"
           case "$toolchain_ref" in "$toolchain"@sha256:*) ;; *) echo 'Toolchain digest unavailable' >&2; exit 1 ;; esac
 
+          release_version="$(python3 -c 'import tomllib; print("v" + tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          [[ "$release_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+
           if docker manifest inspect "$app_tag" >/dev/null 2>&1; then
             docker pull "$app_tag" >/dev/null
           else
-            retry_once docker build --file Dockerfile --build-arg "TOOLCHAIN_IMAGE=$toolchain_ref" --build-arg "RELEASE_SHA=$BUILD_SHA" --tag "$app_tag" .
+            retry_once docker build --file Dockerfile --build-arg "TOOLCHAIN_IMAGE=$toolchain_ref" --build-arg "RELEASE_SHA=$BUILD_SHA" --build-arg "RELEASE_VERSION=$release_version" --tag "$app_tag" .
           fi
           revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$app_tag")"
           test "$revision" = "$BUILD_SHA"
+          image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$app_tag")"
+          test "$image_version" = "$release_version"
           # Keep stdin attached so Python executes the smoke script. Provide
           # the same writable home/scratch paths the solver has in Compose.
           docker run --rm -i --network none \

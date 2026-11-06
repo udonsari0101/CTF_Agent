@@ -231,16 +231,55 @@ def _current_revision(release_root: Path) -> str:
     return revision
 
 
-def _current_version(control: Path, revision: str, repository: str) -> str:
-    marker = json.loads(_regular_text(control / "current-version.json", 512))
-    if not isinstance(marker, dict) or set(marker) != {"tag", "revision", "repository"}:
-        raise ValueError("Current version marker is invalid")
-    tag = marker["tag"]
+def _running_version(release_root: Path, revision: str, repository: str, image: str) -> str:
+    """Recover a stale host marker only from the exact healthy pinned image."""
+
+    ref = _regular_text(release_root / revision / "image-ref", 300)
+    if not ref.startswith(image + "@") or not HEX64.fullmatch(ref[len(image) + 1:]):
+        raise ValueError("Current image reference is invalid")
+    result = subprocess.run(
+        ["docker", "inspect", "ctf_agent"], capture_output=True, timeout=20, check=False,
+    )
+    if result.returncode or len(result.stdout) > 1024 * 1024:
+        raise RuntimeError("Current container identity is unavailable")
+    inspected = json.loads(result.stdout)
+    if not isinstance(inspected, list) or len(inspected) != 1:
+        raise ValueError("Current container identity is invalid")
+    container = inspected[0]
+    config = container.get("Config") if isinstance(container, dict) else None
+    state = container.get("State") if isinstance(container, dict) else None
+    labels = config.get("Labels") if isinstance(config, dict) else None
     if (
-        not isinstance(tag, str) or _version(tag) is None
-        or marker["revision"] != revision or marker["repository"] != repository
+        not isinstance(config, dict) or not isinstance(labels, dict)
+        or config.get("Image") != ref
+        or not isinstance(state, dict) or not isinstance(state.get("Health"), dict)
+        or state["Health"].get("Status") != "healthy"
+        or labels.get("org.opencontainers.image.revision") != revision
+        or labels.get("org.opencontainers.image.source") != f"https://github.com/{repository}"
     ):
-        raise ValueError("Current version marker is stale")
+        raise ValueError("Current container does not match the active release")
+    tag = labels.get("org.opencontainers.image.version")
+    if not isinstance(tag, str) or _version(tag) is None:
+        raise ValueError("Current image has no valid release version")
+    return tag
+
+
+def _current_version(control: Path, release_root: Path, revision: str, repository: str, image: str) -> str:
+    try:
+        marker = json.loads(_regular_text(control / "current-version.json", 512))
+        if isinstance(marker, dict) and set(marker) == {"tag", "revision", "repository"}:
+            tag = marker["tag"]
+            if (
+                isinstance(tag, str) and _version(tag) is not None
+                and marker["revision"] == revision and marker["repository"] == repository
+            ):
+                return tag
+    except (OSError, ValueError, TypeError, UnicodeError):
+        pass
+    tag = _running_version(release_root, revision, repository, image)
+    _write_json(control, "current-version.json", {
+        "tag": tag, "revision": revision, "repository": repository,
+    })
     return tag
 
 
@@ -447,7 +486,7 @@ def _refresh_host_helper(image_ref: str, rollout: Path) -> bool:
 
 def _apply(control: Path, release_root: Path, rollout: Path, repository: str, image: str, request: dict) -> bool:
     current_revision = _current_revision(release_root)
-    current_tag = _current_version(control, current_revision, repository)
+    current_tag = _current_version(control, release_root, current_revision, repository, image)
     tag = request["tag"]
     if _version(tag) <= _version(current_tag):
         raise ValueError("Requested release is not newer")
@@ -566,6 +605,15 @@ def main() -> None:
             incoming = control / "request.json"
             running = control / "running.json"
             if not incoming.exists():
+                # CI deployments can change release_root/current without going
+                # through this worker. Repair their stale marker from the
+                # running digest-pinned image before the web update screen reads it.
+                try:
+                    _current_version(
+                        control, release_root, _current_revision(release_root), repository, image,
+                    )
+                except (OSError, ValueError, TypeError, UnicodeError, RuntimeError, subprocess.TimeoutExpired):
+                    pass
                 status_path = control / "status.json"
                 try:
                     prior = json.loads(_regular_text(status_path, 2048))

@@ -2,9 +2,11 @@
 ARG TOOLCHAIN_IMAGE
 FROM ${TOOLCHAIN_IMAGE}
 ARG RELEASE_SHA
+ARG RELEASE_VERSION
 ARG LOCAL_INSTALL=false
 LABEL org.opencontainers.image.source="https://github.com/udonsari0101/CTF_Agent" \
       org.opencontainers.image.revision=$RELEASE_SHA \
+      org.opencontainers.image.version=$RELEASE_VERSION \
       io.github.ctf-agent.local-install=$LOCAL_INSTALL
 
 COPY --chown=0:0 --chmod=0555 deploy/submit-flag /usr/local/libexec/ctf-command/submit-flag
@@ -19,7 +21,7 @@ RUN ln -s /usr/local/libexec/ctf-command/submit-flag /usr/local/bin/submit-flag 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     CTF_DATA_DIR=/data CTF_DB_DIR=/database/sqlite \
     CTF_CONFIG_DIR=/data/config CTF_LOG_DIR=/database/logs \
-    CTF_RELEASE_SHA=$RELEASE_SHA \
+    CTF_RELEASE_SHA=$RELEASE_SHA CTF_RELEASE_VERSION=$RELEASE_VERSION \
     HOME=/data/config/home npm_config_cache=/data/runtime/npm-cache \
     SHELL=/usr/local/libexec/ctf-command/bash \
     TZ=Asia/Seoul

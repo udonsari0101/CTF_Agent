@@ -127,3 +127,74 @@ CTF_IMAGE=$image_ref CTF_RELEASE_SHA=$revision docker compose -f "$target_dir/co
     exit 1
 }
 sh "$target_dir/release.sh" "$revision"
+
+# A CI deployment does not pass through the host update worker. Publish the
+# running image's version only after the release script has completed and the
+# exact pinned container is healthy, otherwise its old marker becomes stale.
+python3 - "$release_root" "$revision" "$image_ref" "$source_repo" <<'PY'
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import uuid
+
+root, revision, image_ref, repository = sys.argv[1:]
+if pathlib.Path(root, "current").read_text(encoding="ascii").strip() != revision:
+    raise SystemExit("The deployed revision did not become current")
+result = subprocess.run(
+    ["docker", "inspect", "ctf_agent"], capture_output=True, timeout=20, check=True,
+)
+if len(result.stdout) > 1024 * 1024:
+    raise SystemExit("The deployed container identity is too large")
+containers = json.loads(result.stdout)
+if not isinstance(containers, list) or len(containers) != 1:
+    raise SystemExit("The deployed container identity is invalid")
+container = containers[0]
+config = container.get("Config", {})
+labels = config.get("Labels", {})
+health = container.get("State", {}).get("Health", {})
+version = labels.get("org.opencontainers.image.version")
+if (
+    config.get("Image") != image_ref
+    or health.get("Status") != "healthy"
+    or labels.get("org.opencontainers.image.revision") != revision
+    or labels.get("org.opencontainers.image.source") != "https://github.com/" + repository
+):
+    raise SystemExit("The deployed container does not match its release identity")
+if version is None:
+    # A previously published image may predate the immutable version label.
+    # Its already-completed rollout must not be reported as a failed deploy.
+    print("Deployed legacy image has no embedded version label; preserving the host version marker")
+    raise SystemExit(0)
+if not isinstance(version, str) or not re.fullmatch(
+    r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version,
+):
+    raise SystemExit("The deployed image has an invalid version label")
+control = pathlib.Path(root).parent / "update-control"
+if control.is_symlink():
+    raise SystemExit("The update-control directory is not trusted")
+if control.is_dir():
+    if not stat.S_ISDIR(control.lstat().st_mode):
+        raise SystemExit("The update-control directory is not trusted")
+    target = control / "current-version.json"
+    temporary = control / (".current-version-" + uuid.uuid4().hex + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            os.fchmod(output.fileno(), 0o644)
+            json.dump({"tag": version, "revision": revision, "repository": repository}, output)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+        directory = os.open(control, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+PY

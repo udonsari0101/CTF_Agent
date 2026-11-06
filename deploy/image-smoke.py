@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import secrets
 import shutil
 import stat
@@ -19,6 +20,10 @@ from ctf_agent.codex_native import native_codex_binary
 from ctf_agent.providers.codex import CodexAccount
 from ctf_agent.solver_worker import REQUIRED_CLAUDE_VERSION, REQUIRED_CODEX_VERSION, resolve_codex_command
 from ctf_agent.solver_exchange import _continuation_bundle
+
+
+assert re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", os.environ.get("CTF_RELEASE_VERSION", ""))
+assert re.fullmatch(r"[0-9a-f]{40}", os.environ.get("CTF_RELEASE_SHA", ""))
 
 
 with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
