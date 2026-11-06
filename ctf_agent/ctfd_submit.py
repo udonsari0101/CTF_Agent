@@ -26,7 +26,7 @@ from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .credential_vault import CredentialVault, CredentialVaultError
-from .ctfd import CTFdClient, CTFdError, Limits, normalize_url
+from .ctfd import CTFdClient, CTFdError, Limits, normalize_url, transient_ctfd_failure
 from .process_lock import ProcessFileLock
 
 
@@ -1372,14 +1372,15 @@ class CTFdSubmitService:
     def _handle_error(self, job: dict, message: str) -> None:
         lowered = message.lower()
         if "rate limit" in lowered:
-            self._finish(job["id"], "rate_limited", "rate_limited",
-                         "CTFd가 자동 제출 요청을 제한했습니다. 다시 시도하기 전에 상태를 확인하세요.")
+            if job.get("dispatch_started"):
+                self._finish(job["id"], "rate_limited", "rate_limited",
+                             "CTFd가 자동 제출 요청을 제한했습니다. 다시 시도하기 전에 상태를 확인하세요.")
+            else:
+                self._retry_or_finish(job, "rate_limited")
         elif any(term in lowered for term in ("denied", "login failed", "authentication", "username and password", "access token", "csrf")):
             self._finish(job["id"], "auth_error", "authentication_failed",
                          "CTFd가 저장된 인증 정보를 거부했습니다. 계정을 다시 연결하세요.")
-        elif any(term in lowered for term in (
-                "timed out", "time limit", "could not be resolved", "remote request failed",
-                "response ended", "http 500", "http 502", "http 503", "http 504")):
+        elif transient_ctfd_failure(message):
             if job.get("dispatch_started"):
                 self._mark_outcome_unknown(job["id"])
             else:
@@ -1394,12 +1395,17 @@ class CTFdSubmitService:
     def _retry_or_finish(self, job: dict, code: str) -> None:
         if job["attempts"] < MAX_ATTEMPTS:
             delay = RETRY_DELAYS[min(job["attempts"] - 1, len(RETRY_DELAYS) - 1)]
+            display_message = (
+                "CTFd 요청이 제한되어 자동 제출을 다시 시도합니다."
+                if code == "rate_limited"
+                else "네트워크 오류가 발생해 자동 제출을 다시 시도합니다."
+            )
             with self.db() as db:
                 db.execute(
                     "UPDATE ctfd_submit_jobs SET status='retry',result_code=?,"
-                    "display_message='네트워크 오류가 발생해 자동 제출을 다시 시도합니다.',"
+                    "display_message=?,"
                     "next_attempt_at=?,updated_at=? WHERE id=? AND status='running'",
-                    (code, int(time.time()) + delay, _stamp(), job["id"]),
+                    (code, display_message, int(time.time()) + delay, _stamp(), job["id"]),
                 )
             self.wakeup.set()
         else:

@@ -6,18 +6,66 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from local_test_client import TestClient
 
-from ctf_agent.ctfd import CTFdError
+from ctf_agent.ctfd import CTFdClient, CTFdError
 from ctf_agent.db import Settings
 from ctf_agent.main import create_app
 
 SITE = "https://ctfd.example.test"
 FLAG = "test{offline_dedup_only}"
+
+
+class SubmissionReadinessTests(unittest.TestCase):
+    def test_transient_challenge_listing_failure_is_not_auth_failure(self):
+        client = CTFdClient(SITE, auth_type="token", token="offline-token")
+        with patch.object(client, "validate"), patch.object(client, "_json") as listing:
+            for message in (
+                "The remote request failed or timed out.",
+                "The remote server returned HTTP 503.",
+                "The remote server returned HTTP 520.",
+                "The CTFd site rate limited this request.",
+            ):
+                with self.subTest(message=message):
+                    listing.side_effect = CTFdError(message)
+                    with self.assertRaises(CTFdError):
+                        client.submission_readiness()
+
+            listing.side_effect = CTFdError(
+                "CTFd denied access. Check the selected authentication method."
+            )
+            self.assertEqual(
+                client.submission_readiness(), (False, "challenge_access_unavailable")
+            )
+
+    def test_transient_password_csrf_page_failure_is_not_auth_failure(self):
+        client = CTFdClient(
+            SITE, auth_type="password", username="offline", password="offline-password"
+        )
+        with patch.object(client, "validate"), patch.object(
+            client, "_json", return_value=[]
+        ), patch.object(client, "_get") as page:
+            for message in (
+                "The remote request timed out.",
+                "The remote server returned HTTP 503.",
+                "The remote server returned HTTP 520.",
+                "The CTFd site rate limited this request.",
+            ):
+                with self.subTest(message=message):
+                    page.side_effect = CTFdError(message)
+                    with self.assertRaises(CTFdError):
+                        client.submission_readiness()
+
+            page.side_effect = CTFdError("CTFd denied access.")
+            self.assertEqual(client.submission_readiness(), (False, "csrf_unavailable"))
+            page.side_effect = None
+            page.return_value = b'<script>{"csrfNonce":"1234567890abcdef"}</script>'
+            self.assertEqual(client.submission_readiness(), (True, ""))
 
 
 class FakeRemote:
@@ -168,6 +216,25 @@ class AtMostOnceTests(unittest.TestCase):
         )
         self.service.process_once()
         self.assertEqual(self.job()["status"], "retry")
+        self.assertEqual(self.job()["dispatch_started"], 0)
+        self.assertEqual(self.remote.submit_calls, 0)
+
+    def test_preflight_http_520_can_retry_without_dispatch(self):
+        self.remote.submission_readiness = lambda: (_ for _ in ()).throw(
+            CTFdError("The remote server returned HTTP 520.")
+        )
+        self.service.process_once()
+        self.assertEqual(self.job()["status"], "retry")
+        self.assertEqual(self.job()["dispatch_started"], 0)
+        self.assertEqual(self.remote.submit_calls, 0)
+
+    def test_preflight_rate_limit_can_retry_without_dispatch(self):
+        self.remote.submission_readiness = lambda: (_ for _ in ()).throw(
+            CTFdError("The CTFd site rate limited this request.")
+        )
+        self.service.process_once()
+        self.assertEqual(self.job()["status"], "retry")
+        self.assertEqual(self.job()["result_code"], "rate_limited")
         self.assertEqual(self.job()["dispatch_started"], 0)
         self.assertEqual(self.remote.submit_calls, 0)
 

@@ -48,6 +48,24 @@ class CTFdError(ValueError):
         self.received_bytes = received_bytes
 
 
+def transient_ctfd_failure(error: CTFdError | str) -> bool:
+    """Distinguish a temporary CTFd outage from missing submission access.
+
+    The client emits fixed, credential-safe messages. Keep this classification
+    shared with the durable submitter so a failed *read-only* preflight does
+    not permanently end a job that never sent its flag.
+    """
+
+    message = str(error).lower()
+    return (
+        any(part in message for part in (
+            "rate limit", "timed out", "time limit", "could not be resolved",
+            "remote request failed", "response ended",
+        ))
+        or bool(re.search(r"\bhttp 5\d\d\b", message))
+    )
+
+
 _REMOTE_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MAX_CONNECTION_INFO_CHARS = 2000
 
@@ -595,7 +613,9 @@ class CTFdClient:
         self.validate()
         try:
             listing = self._json(self.url + "/api/v1/challenges")
-        except CTFdError:
+        except CTFdError as exc:
+            if transient_ctfd_failure(exc):
+                raise
             return False, "challenge_access_unavailable"
         if not isinstance(listing, list):
             return False, "challenge_access_unavailable"
@@ -605,7 +625,9 @@ class CTFdClient:
             # the pre-login form nonce as a submission credential.
             try:
                 page = self._get(self.url + "/challenges", self.limits.json_bytes)
-            except CTFdError:
+            except CTFdError as exc:
+                if transient_ctfd_failure(exc):
+                    raise
                 return False, "csrf_unavailable"
             self.csrf_nonce = session_csrf_nonce(page.decode("utf-8", errors="replace"))
         if self.auth_type == "password" and not self.csrf_nonce:
