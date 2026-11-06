@@ -6,10 +6,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -17,6 +19,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from ctf_agent.solver_worker import (  # noqa: E402
+    EXCHANGE_PROTOCOL,
+    EventWriter,
+    JobManifest,
     PlatformAttestation,
     SolverWorker,
     main as worker_main,
@@ -101,6 +106,147 @@ class WorkerFailureStatusTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status["reason"], "worker_task_failed")
             self.assertEqual(status["diagnostic"], "worker_task:RuntimeError")
             self.assertNotIn("secret-from-provider-output", status_text)
+
+    async def test_retired_released_job_does_not_restart_clean_worker(self):
+        for outcome in ("completed", "failed", "flag_found", "cancelled", "needs_input", "refused"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                exchange, scratch = root / "exchange", root / "scratch"
+                active = exchange / "active"
+                active.mkdir(parents=True)
+                scratch.mkdir()
+                job_id = "a" * 32
+                (active / "state.json").write_text(json.dumps({
+                    "protocol": EXCHANGE_PROTOCOL,
+                    "job_id": job_id,
+                    "status": outcome,
+                    "terminal": True,
+                }), encoding="utf-8")
+
+                async def clean(_pid):
+                    return None
+
+                worker = SolverWorker(
+                    exchange=exchange, scratch_root=scratch,
+                    process_cleaner=clean, process_assertion=lambda: None,
+                )
+                worker.attestation = PlatformAttestation(True, {})
+                worker.runtime_ready = worker.sandbox_attested = True
+                manifest = SimpleNamespace(
+                    job_id=job_id, job_mode="solve", resume_flag=False,
+                    deadline_unix=None, configuration=SimpleNamespace(model="test-model"),
+                    challenge_name="test challenge",
+                )
+                with patch("ctf_agent.solver_worker.JobManifest.load", return_value=manifest):
+                    # Release an already durable terminal outcome in this PID.
+                    self.assertTrue(await worker.process_active())
+                    self.assertEqual(worker.last_released_job_id, job_id)
+                    self.assertTrue(worker.clean)
+
+                    def retire_during_next_poll(*_args):
+                        active.rename(root / "retired-audit")
+                        raise FileNotFoundError("coordinator retired active")
+
+                    with patch("ctf_agent.solver_worker.GuidanceMailbox", side_effect=retire_during_next_poll):
+                        self.assertFalse(await worker.process_active())
+
+                status = json.loads((exchange / "worker.json").read_text(encoding="utf-8"))
+                self.assertTrue(worker.clean)
+                self.assertFalse(worker.restart_required)
+                self.assertTrue(status["ready"])
+                self.assertTrue(status["clean"])
+                self.assertFalse(active.exists())
+                recorded = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in (root / "retired-audit" / "events").glob("*.json")
+                ]
+                self.assertEqual([event["kind"] for event in recorded], ["released"])
+
+    async def test_retirement_during_manifest_load_never_writes_a_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exchange, scratch = root / "exchange", root / "scratch"
+            active = exchange / "active"
+            active.mkdir(parents=True)
+            scratch.mkdir()
+            worker = SolverWorker(exchange=exchange, scratch_root=scratch)
+            worker.attestation = PlatformAttestation(True, {})
+            worker.runtime_ready = worker.sandbox_attested = worker.clean = True
+            original_load = JobManifest.load
+
+            def retire_before_manifest_read(path):
+                shutil.rmtree(path)
+                return original_load(path)
+
+            with patch.object(JobManifest, "load", side_effect=retire_before_manifest_read):
+                self.assertTrue(await worker.process_active())
+            self.assertTrue(worker.clean)
+            self.assertFalse(worker.restart_required)
+            self.assertFalse(active.exists())
+            self.assertFalse((exchange / "events").exists())
+
+    async def test_missing_other_job_still_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exchange, scratch = root / "exchange", root / "scratch"
+            active = exchange / "active"
+            active.mkdir(parents=True)
+            scratch.mkdir()
+            worker = SolverWorker(exchange=exchange, scratch_root=scratch, process_assertion=lambda: None)
+            worker.last_released_job_id = "a" * 32
+            manifest = SimpleNamespace(
+                job_id="b" * 32, job_mode="solve", resume_flag=False,
+                deadline_unix=None, configuration=SimpleNamespace(model="test-model"),
+                challenge_name="test challenge",
+            )
+
+            def retire_during_new_job(*_args):
+                shutil.rmtree(active)
+                raise FileNotFoundError("a different active job disappeared")
+
+            with patch("ctf_agent.solver_worker.JobManifest.load", return_value=manifest), patch(
+                "ctf_agent.solver_worker.GuidanceMailbox", side_effect=retire_during_new_job
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    await worker.process_active()
+
+    async def test_missing_active_after_workspace_start_is_not_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exchange, scratch = root / "exchange", root / "scratch"
+            active = exchange / "active"
+            (active / "challenge").mkdir(parents=True)
+            scratch.mkdir()
+            job_id = "a" * 32
+
+            async def clean(_pid):
+                return None
+
+            worker = SolverWorker(
+                exchange=exchange, scratch_root=scratch,
+                process_cleaner=clean, process_assertion=lambda: None,
+            )
+            worker.attestation = PlatformAttestation(True, {})
+            worker.runtime_ready = worker.sandbox_attested = True
+            worker.last_released_job_id = job_id
+            manifest = SimpleNamespace(
+                job_id=job_id, job_mode="solve", resume_flag=False,
+                deadline_unix=None, configuration=SimpleNamespace(model="test-model"),
+                challenge_name="test challenge",
+            )
+            original_emit = EventWriter.emit
+
+            def retire_after_workspace_start(writer, kind, **payload):
+                if kind == "progress" and payload.get("code") == "inspecting_files":
+                    shutil.rmtree(active)
+                    raise FileNotFoundError("active disappeared during a new execution")
+                return original_emit(writer, kind, **payload)
+
+            with patch("ctf_agent.solver_worker.JobManifest.load", return_value=manifest), patch.object(
+                EventWriter, "emit", retire_after_workspace_start
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    await worker.process_active()
 
 
 if __name__ == "__main__":

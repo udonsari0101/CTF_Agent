@@ -6808,6 +6808,10 @@ class SolverWorker:
         self.restart_required = False
         self.restart_reason: str | None = None
         self.startup_diagnostic: str | None = None
+        # The coordinator may retire a released active directory just as the
+        # next poll begins. Only a release emitted by this worker can identify
+        # that narrow race without hiding a missing in-flight job.
+        self.last_released_job_id: str | None = None
         self._canary_in_progress = False
 
     def _new_driver(
@@ -7139,6 +7143,27 @@ class SolverWorker:
         release_status: str | None = None
         release_payload: dict[str, Any] = {}
         needs_credential = False
+
+        def released_active_retired_before_execution() -> bool:
+            if (
+                manifest is None
+                or manifest.job_id != self.last_released_job_id
+                or active.exists()
+                or active.is_symlink()
+                or job_root is not None
+                or scratch is not None
+                or driver is not None
+                or credential is not None
+            ):
+                return False
+            # The previous release already reached the coordinator. Prove this
+            # PID namespace is still clean before restoring idle readiness.
+            self.process_assertion()
+            assert_scratch_root_clean(self.scratch_root)
+            self.clean = True
+            self._publish_worker()
+            return True
+
         try:
             manifest = JobManifest.load(active)
             writer = EventWriter(active, manifest.job_id)
@@ -7743,6 +7768,8 @@ class SolverWorker:
                         release_payload["flag"] = flag
             return True
         except WorkerRefusal as exc:
+            if released_active_retired_before_execution():
+                return False
             if writer:
                 current = _load_optional_state(active, manifest.job_id)
                 preserved_flag = current.get("flag") if isinstance(current.get("flag"), str) else None
@@ -7790,6 +7817,8 @@ class SolverWorker:
                         release_payload["flag"] = preserved_flag
             return True
         except Exception as exc:
+            if released_active_retired_before_execution():
+                return False
             raw = exc.payload if isinstance(exc, AppServerFailure) else exc
             error = normalize_provider_failure(
                 raw,
@@ -7946,6 +7975,8 @@ class SolverWorker:
                     writer.emit("released", status=release_status, terminal=True, **release_payload)
                     self.clean = True
                     self._publish_worker()
+                    if manifest is not None:
+                        self.last_released_job_id = manifest.job_id
             elif self.stopping and driver:
                 try:
                     await self.process_cleaner(getattr(driver, "pid", None))
