@@ -8384,12 +8384,20 @@ async def _watch_live_attachments(
         except (OSError, ValueError) as exc:
             error = str(exc)
             if error != last_error:
-                writer.emit("activity", phase="attachment_sync_failed", summary=error)
+                writer.emit(
+                    "activity", phase="completed", tool="file",
+                    summary="Attachment sync failed; retrying.",
+                    exit_code=1,
+                )
                 last_error = error
         else:
             last_error = None
             if added:
-                writer.emit("activity", phase="attachment_added", summary=f"{added} new attachment(s) available in attachments/")
+                writer.emit(
+                    "activity", phase="completed", tool="file",
+                    summary=f"{added} new attachment(s) available in attachments/",
+                    exit_code=0,
+                )
         await asyncio.sleep(0.5)
 
 

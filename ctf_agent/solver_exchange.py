@@ -4252,7 +4252,10 @@ class SolverExchangeCoordinator:
                 return changed
             raw_event = _read_json_file(path, _MAX_EVENT_BYTES)
             event = _validate_event(
-                _normalize_legacy_activity_bounds(raw_event), job["id"], sequence
+                _normalize_legacy_activity_bounds(
+                    _normalize_legacy_attachment_activity(raw_event)
+                ),
+                job["id"], sequence,
             )
             if event["kind"] == "released":
                 # Persist the bounded handoff before the job becomes terminal
@@ -6395,6 +6398,35 @@ def _normalize_legacy_activity_bounds(value: dict[str, Any]) -> dict[str, Any]:
         prefix = encoded[: maximum - marker_size].decode("utf-8", errors="ignore").rstrip()
         normalized[field] = prefix + marker
     return normalized
+
+
+def _normalize_legacy_attachment_activity(value: dict[str, Any]) -> dict[str, Any]:
+    """Unblock active jobs with attachment events written by older workers.
+
+    The old watcher used private attachment states as activity phases and
+    omitted the required tool. Only its exact event shape is accepted here;
+    diagnostic text from a failed copy is replaced instead of published.
+    """
+
+    expected = {
+        "protocol", "job_id", "sequence", "kind", "created_at", "phase", "summary",
+    }
+    if value.get("kind") != "activity" or set(value) != expected:
+        return value
+    phase = value.get("phase")
+    if phase == "attachment_added":
+        summary = value.get("summary")
+        if not isinstance(summary, str) or not re.fullmatch(
+            r"[1-9][0-9]* new attachment\(s\) available in attachments/", summary
+        ):
+            return value
+        return {**value, "phase": "completed", "tool": "file", "exit_code": 0}
+    if phase == "attachment_sync_failed" and isinstance(value.get("summary"), str):
+        return {
+            **value, "phase": "completed", "tool": "file",
+            "summary": "Attachment sync failed; retrying.", "exit_code": 1,
+        }
+    return value
 
 
 def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[str, Any]:

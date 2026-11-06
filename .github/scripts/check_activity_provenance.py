@@ -12,6 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path.cwd()
 sys.path.insert(0, str(ROOT))
@@ -21,6 +22,7 @@ from ctf_agent.solver_exchange import (  # noqa: E402
     SCHEMA,
     ExchangeError,
     SolverExchangeCoordinator,
+    _normalize_legacy_attachment_activity,
     _validate_event,
 )
 from ctf_agent.solver_worker import (  # noqa: E402
@@ -30,6 +32,7 @@ from ctf_agent.solver_worker import (  # noqa: E402
     MAX_LIVE_ACTIVITY_EVENTS,
     MAX_LIVE_OUTPUT_BYTES,
     _provider_activity_id,
+    _watch_live_attachments,
 )
 
 JOB_ID = "a" * 32
@@ -76,6 +79,107 @@ def create_job_db(db_path):
 
 
 class ActivityProvenanceTests(unittest.TestCase):
+    def test_legacy_live_attachment_events_are_narrowly_recovered(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            active = Path(temp)
+            writer = EventWriter(active, JOB_ID)
+            writer.emit(
+                "activity", phase="attachment_added",
+                summary="1 new attachment(s) available in attachments/",
+            )
+            writer.emit(
+                "activity", phase="attachment_sync_failed",
+                summary="private diagnostic\x00" + "x" * 800,
+            )
+            writer.emit("activity", phase="completed", tool="analysis", summary="next event")
+
+            db_path = active / "ledger.sqlite3"
+            create_job_db(db_path)
+            coordinator = make_coordinator(db_path)
+            coordinator.deliver_global_hooks = False
+            job = {"id": JOB_ID, "workspace_id": "workspace-1", "challenge_id": "challenge-1", "last_event_sequence": 0}
+            self.assertTrue(coordinator._ingest_events(job, active))
+            with contextlib.closing(sqlite3.connect(db_path)) as db:
+                events = [json.loads(row[0]) for row in db.execute(
+                    "SELECT event_json FROM solver_job_events ORDER BY sequence"
+                )]
+            self.assertEqual([event["phase"] for event in events], ["completed"] * 3)
+            self.assertEqual([event["tool"] for event in events], ["file", "file", "analysis"])
+            self.assertEqual([event.get("exit_code") for event in events], [0, 1, None])
+            self.assertEqual(events[1]["summary"], "Attachment sync failed; retrying.")
+            self.assertNotIn("private diagnostic", json.dumps(events))
+
+        legacy = {
+            "protocol": EXCHANGE_PROTOCOL, "job_id": JOB_ID, "sequence": 1,
+            "kind": "activity", "created_at": 1.0, "phase": "attachment_added",
+            "summary": "1 new attachment(s) available in attachments/",
+        }
+        for changed in (
+            {"summary": "unexpected attachment"},
+            {"tool": "shell"},
+            {"command": "untrusted extra field"},
+            {"phase": "other_legacy_phase"},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ExchangeError):
+                _validate_event(
+                    _normalize_legacy_attachment_activity({**legacy, **changed}), JOB_ID, 1
+                )
+
+    def test_live_attachment_events_do_not_block_following_worker_events(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            active = Path(temp)
+            source = active / "incoming"
+            destination = active / "scratch" / "attachments"
+            source.mkdir()
+            destination.parent.mkdir()
+            (source / "live-test_fixture.bin").write_bytes(b"fixture")
+            writer = EventWriter(active, JOB_ID)
+
+            async def collect_one_event(expected_sequence):
+                watcher = asyncio.create_task(
+                    _watch_live_attachments(source, destination, None, writer)
+                )
+                try:
+                    async def wait_for_event():
+                        while writer.sequence < expected_sequence:
+                            if watcher.done():
+                                await watcher
+                            await asyncio.sleep(0.01)
+                    await asyncio.wait_for(wait_for_event(), timeout=2)
+                finally:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
+
+            asyncio.run(collect_one_event(1))
+            self.assertEqual((destination / "live-test_fixture.bin").read_bytes(), b"fixture")
+            with patch(
+                "ctf_agent.solver_worker._install_live_attachments",
+                side_effect=ValueError("temporary attachment error\x00" + "x" * 800),
+            ):
+                asyncio.run(collect_one_event(2))
+            writer.emit("activity", phase="completed", tool="analysis", summary="next event")
+            records = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((active / "events").glob("*.json"))
+            ]
+            self.assertEqual([event["tool"] for event in records[:2]], ["file", "file"])
+            self.assertEqual([event["phase"] for event in records[:2]], ["completed", "completed"])
+            self.assertEqual([event["exit_code"] for event in records[:2]], [0, 1])
+            self.assertLessEqual(len(records[1]["summary"].encode("utf-8")), 400)
+            self.assertNotIn("\x00", records[1]["summary"])
+
+            db_path = active / "ledger.sqlite3"
+            create_job_db(db_path)
+            coordinator = make_coordinator(db_path)
+            coordinator.deliver_global_hooks = False
+            job = {"id": JOB_ID, "workspace_id": "workspace-1", "challenge_id": "challenge-1", "last_event_sequence": 0}
+            self.assertTrue(coordinator._ingest_events(job, active))
+            with contextlib.closing(sqlite3.connect(db_path)) as db:
+                self.assertEqual(
+                    db.execute("SELECT last_event_sequence FROM solver_jobs WHERE id=?", (JOB_ID,)).fetchone()[0],
+                    3,
+                )
+
     def test_provider_identity_is_stable_opaque_and_scoped(self):
         original = _provider_activity_id("codex", "thread-A", "item-1")
         self.assertRegex(original, r"^[0-9a-f]{32}$")
