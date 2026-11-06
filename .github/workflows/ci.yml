@@ -195,7 +195,10 @@ jobs:
       - name: Check workspace staged-file browser flow
         run: |
           python -m pip install playwright
-          python -m playwright install chromium --with-deps
+          # ubuntu-24.04 runners already provide the Chromium runtime libraries.
+          # --with-deps also apt-installs optional fonts and can stall on the
+          # runner's Ubuntu mirror before any application test begins.
+          python -m playwright install chromium
           python .github/scripts/check_staged_files_ui.py
       - name: Check linked challenge evidence API
         run: python .github/scripts/check_related_evidence_api.py
