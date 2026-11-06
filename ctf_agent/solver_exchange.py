@@ -38,6 +38,7 @@ from .solver_continuation import ContinuationInvalid, stage_workspace_only
 from .solver import ModelConfiguration, SelectedAccount, normalize_rate_limit_context
 from .solver_worker import (
     EXCHANGE_PROTOCOL,
+    WORKER_ATTACHMENT_ACTIVITY_SOURCE,
     MAX_AUTH_BYTES,
     MAX_JOB_SECONDS,
     MAX_OUTPUT_TEXT,
@@ -4415,7 +4416,11 @@ class SolverExchangeCoordinator:
             # Only provider-originated activity is a defensible first-output
             # proxy. Progress heartbeats and worker preparation are not model
             # responses; the public metric is deliberately named first activity.
-            if kind in {"activity", "activity_evidence", "agent"} and current["first_activity_at"] is None:
+            if (
+                kind in {"activity", "activity_evidence", "agent"}
+                and current["first_activity_at"] is None
+                and not _is_worker_attachment_activity(event)
+            ):
                 updates["first_activity_at"] = timestamp
             if refinement_error is not None or publication_error is not None:
                 updates.update(
@@ -6420,13 +6425,41 @@ def _normalize_legacy_attachment_activity(value: dict[str, Any]) -> dict[str, An
             r"[1-9][0-9]* new attachment\(s\) available in attachments/", summary
         ):
             return value
-        return {**value, "phase": "completed", "tool": "file", "exit_code": 0}
+        return {
+            **value, "phase": "completed", "tool": "file", "exit_code": 0,
+            "source": WORKER_ATTACHMENT_ACTIVITY_SOURCE,
+        }
     if phase == "attachment_sync_failed" and isinstance(value.get("summary"), str):
         return {
             **value, "phase": "completed", "tool": "file",
             "summary": "Attachment sync failed; retrying.", "exit_code": 1,
+            "source": WORKER_ATTACHMENT_ACTIVITY_SOURCE,
         }
     return value
+
+
+def _is_worker_attachment_activity(value: Mapping[str, Any]) -> bool:
+    """Identify only the two fixed worker-side attachment notifications."""
+
+    if value.get("kind") != "activity" or value.get("source") != WORKER_ATTACHMENT_ACTIVITY_SOURCE:
+        return False
+    if set(value) != {
+        "protocol", "job_id", "sequence", "kind", "created_at",
+        "phase", "tool", "summary", "exit_code", "source",
+    } or value.get("phase") != "completed" or value.get("tool") != "file":
+        return False
+    summary = value.get("summary")
+    exit_code = value.get("exit_code")
+    return bool(
+        isinstance(summary, str)
+        and type(exit_code) is int
+        and (
+            (exit_code == 0 and re.fullmatch(
+                r"[1-9][0-9]* new attachment\(s\) available in attachments/", summary
+            ))
+            or (exit_code == 1 and summary == "Attachment sync failed; retrying.")
+        )
+    )
 
 
 def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[str, Any]:
@@ -6437,7 +6470,7 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
         "activity": common | {
             "phase", "tool", "summary", "command", "output", "message",
             "exit_code", "duration_ms", "agent_id", "activity_id",
-            "command_truncated", "output_truncated",
+            "command_truncated", "output_truncated", "source",
         },
         "activity_evidence": common | {
             "activity_id", "correlatable", "phase", "tool", "agent_id", "command_bytes",
@@ -6496,6 +6529,8 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
         elif present:
             raise ExchangeError("invalid_worker_event", "worker 진행 이벤트 형식을 확인할 수 없습니다.", category="safety")
     if kind == "activity":
+        if "source" in value and not _is_worker_attachment_activity(value):
+            raise ExchangeError("invalid_worker_event", "Invalid worker activity source.", category="safety")
         if (
             value.get("phase") not in {"started", "completed"}
             or value.get("tool") not in {"shell", "web_search", "file", "analysis", "tool", "agent"}

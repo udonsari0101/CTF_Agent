@@ -81,6 +81,7 @@ except ImportError:  # pragma: no cover - Windows development host
 
 
 EXCHANGE_PROTOCOL = 1
+WORKER_ATTACHMENT_ACTIVITY_SOURCE = "worker_attachment"
 REQUIRED_CODEX_VERSION = os.environ.get("CTF_IMAGE_CODEX_VERSION", "0.166.0")
 if not re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", REQUIRED_CODEX_VERSION):
     raise RuntimeError("CTF_IMAGE_CODEX_VERSION must be an exact semantic version")
@@ -8387,7 +8388,7 @@ async def _watch_live_attachments(
                 writer.emit(
                     "activity", phase="completed", tool="file",
                     summary="Attachment sync failed; retrying.",
-                    exit_code=1,
+                    exit_code=1, source=WORKER_ATTACHMENT_ACTIVITY_SOURCE,
                 )
                 last_error = error
         else:
@@ -8396,7 +8397,7 @@ async def _watch_live_attachments(
                 writer.emit(
                     "activity", phase="completed", tool="file",
                     summary=f"{added} new attachment(s) available in attachments/",
-                    exit_code=0,
+                    exit_code=0, source=WORKER_ATTACHMENT_ACTIVITY_SOURCE,
                 )
         await asyncio.sleep(0.5)
 

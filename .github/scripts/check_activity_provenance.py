@@ -91,8 +91,6 @@ class ActivityProvenanceTests(unittest.TestCase):
                 "activity", phase="attachment_sync_failed",
                 summary="private diagnostic\x00" + "x" * 800,
             )
-            writer.emit("activity", phase="completed", tool="analysis", summary="next event")
-
             db_path = active / "ledger.sqlite3"
             create_job_db(db_path)
             coordinator = make_coordinator(db_path)
@@ -100,13 +98,27 @@ class ActivityProvenanceTests(unittest.TestCase):
             job = {"id": JOB_ID, "workspace_id": "workspace-1", "challenge_id": "challenge-1", "last_event_sequence": 0}
             self.assertTrue(coordinator._ingest_events(job, active))
             with contextlib.closing(sqlite3.connect(db_path)) as db:
+                self.assertIsNone(db.execute(
+                    "SELECT first_activity_at FROM solver_jobs WHERE id=?", (JOB_ID,)
+                ).fetchone()[0])
+            writer.emit("activity", phase="completed", tool="analysis", summary="next event")
+            job["last_event_sequence"] = 2
+            self.assertTrue(coordinator._ingest_events(job, active))
+            with contextlib.closing(sqlite3.connect(db_path)) as db:
                 events = [json.loads(row[0]) for row in db.execute(
                     "SELECT event_json FROM solver_job_events ORDER BY sequence"
                 )]
+                self.assertIsNotNone(db.execute(
+                    "SELECT first_activity_at FROM solver_jobs WHERE id=?", (JOB_ID,)
+                ).fetchone()[0])
             self.assertEqual([event["phase"] for event in events], ["completed"] * 3)
             self.assertEqual([event["tool"] for event in events], ["file", "file", "analysis"])
             self.assertEqual([event.get("exit_code") for event in events], [0, 1, None])
             self.assertEqual(events[1]["summary"], "Attachment sync failed; retrying.")
+            self.assertEqual(
+                [event.get("source") for event in events],
+                ["worker_attachment", "worker_attachment", None],
+            )
             self.assertNotIn("private diagnostic", json.dumps(events))
 
         legacy = {
@@ -157,7 +169,6 @@ class ActivityProvenanceTests(unittest.TestCase):
                 side_effect=ValueError("temporary attachment error\x00" + "x" * 800),
             ):
                 asyncio.run(collect_one_event(2))
-            writer.emit("activity", phase="completed", tool="analysis", summary="next event")
             records = [
                 json.loads(path.read_text(encoding="utf-8"))
                 for path in sorted((active / "events").glob("*.json"))
@@ -165,6 +176,7 @@ class ActivityProvenanceTests(unittest.TestCase):
             self.assertEqual([event["tool"] for event in records[:2]], ["file", "file"])
             self.assertEqual([event["phase"] for event in records[:2]], ["completed", "completed"])
             self.assertEqual([event["exit_code"] for event in records[:2]], [0, 1])
+            self.assertEqual([event["source"] for event in records[:2]], ["worker_attachment"] * 2)
             self.assertLessEqual(len(records[1]["summary"].encode("utf-8")), 400)
             self.assertNotIn("\x00", records[1]["summary"])
 
@@ -177,8 +189,49 @@ class ActivityProvenanceTests(unittest.TestCase):
             with contextlib.closing(sqlite3.connect(db_path)) as db:
                 self.assertEqual(
                     db.execute("SELECT last_event_sequence FROM solver_jobs WHERE id=?", (JOB_ID,)).fetchone()[0],
-                    3,
+                    2,
                 )
+                self.assertIsNone(db.execute(
+                    "SELECT first_activity_at FROM solver_jobs WHERE id=?", (JOB_ID,)
+                ).fetchone()[0])
+
+    def test_provider_file_activity_still_sets_first_activity(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            db_path = Path(temp) / "ledger.sqlite3"
+            create_job_db(db_path)
+            coordinator = make_coordinator(db_path)
+            coordinator.deliver_global_hooks = False
+            worker = {
+                "protocol": EXCHANGE_PROTOCOL, "job_id": JOB_ID, "sequence": 1,
+                "kind": "activity", "created_at": 1.0, "phase": "completed",
+                "tool": "file", "summary": "1 new attachment(s) available in attachments/",
+                "exit_code": 0, "source": "worker_attachment",
+            }
+            provider = {
+                "protocol": EXCHANGE_PROTOCOL, "job_id": JOB_ID, "sequence": 2,
+                "kind": "activity", "created_at": 2.0, "phase": "completed",
+                "tool": "file", "summary": "Read challenge source",
+                "exit_code": 0,
+            }
+            job = {"id": JOB_ID, "workspace_id": "workspace-1", "challenge_id": "challenge-1"}
+            coordinator._commit_event(job, _validate_event(worker, JOB_ID, 1))
+            with contextlib.closing(sqlite3.connect(db_path)) as db:
+                self.assertIsNone(db.execute(
+                    "SELECT first_activity_at FROM solver_jobs WHERE id=?", (JOB_ID,)
+                ).fetchone()[0])
+            coordinator._commit_event(job, _validate_event(provider, JOB_ID, 2))
+            with contextlib.closing(sqlite3.connect(db_path)) as db:
+                self.assertIsNotNone(db.execute(
+                    "SELECT first_activity_at FROM solver_jobs WHERE id=?", (JOB_ID,)
+                ).fetchone()[0])
+            for changed in (
+                {"summary": "Read challenge source"},
+                {"tool": "shell"},
+                {"command": "cat challenge.txt"},
+                {"exit_code": 2},
+            ):
+                with self.subTest(changed=changed), self.assertRaises(ExchangeError):
+                    _validate_event({**worker, **changed}, JOB_ID, 1)
 
     def test_provider_identity_is_stable_opaque_and_scoped(self):
         original = _provider_activity_id("codex", "thread-A", "item-1")
