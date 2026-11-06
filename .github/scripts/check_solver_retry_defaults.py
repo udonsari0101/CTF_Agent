@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -49,8 +50,11 @@ def main() -> int:
 const A='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', B='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', C='cccccccccccccccccccccccccccccccc';
 let solverProvider='codex', solverAccounts=[], solverAccountId='', solverModels=[], solverModel='';
 let solverReasoning='', solverServiceTier=null, solverUltracode=false, solverOptionsState='idle', solverOptionsError='';
-let solverUltraEscalationMode='ask', solverRetryIssue='', solverRetryRequiresSelection=false;
+let solverUltraEscalationMode='ask', solverRetryIssues=[], solverRetryRequiresSelection=false;
 let solverConfigurationJobId='', solverOptionsGeneration=0, currentSolverJob=null;
+const tr=value=>value;
+const i18n={t:tr,format:(template,values={})=>Object.entries(values).reduce(
+ (text,[key,value])=>text.replaceAll('{'+key+'}',String(value)),template)};
 const esc=value=>String(value??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 const accounts=[
  {id:A,label:'same label',provider:'codex',selected:true,model:'base',reasoning_effort:'low',snapshot:{status:'authenticated'}},
@@ -93,19 +97,20 @@ const claudeJob={id:'job-2',job_mode:'solve',account_id:C,account_label:'Claude'
  checks.confirm=solverConfigurationReady()&&!document.querySelector('.solver-retry-warning');
  accounts.splice(1,0,{id:B,label:'same label',provider:'codex',model:'base',reasoning_effort:'low',snapshot:{status:'signed_out'}});
  await loadSolverConfiguration('w','c',1,'',codexJob);
- checks.signedOut=solverRetryIssue.includes('다시 로그인')&&!solverConfigurationReady();
+ checks.signedOut=solverRetryIssues.some(([key])=>key.includes('다시 로그인'))&&!solverConfigurationReady();
  accounts.splice(1,1,{id:B,label:'same label',provider:'codex',model:'base',reasoning_effort:'low',snapshot:{status:'authenticated'}});
  catalog[B]=catalog[B].slice(0,1);
  await loadSolverConfiguration('w','c',1,'',codexJob);
- checks.missingModel=solverRetryIssue.includes('이전 모델')&&solverRetryIssue.includes('이전 추론 수준')
-  &&solverRetryIssue.includes('Fast')&&solverRetryIssue.includes('Ultra 전환')&&!solverConfigurationReady();
+ const missingModelIssues=solverRetryIssues.map(([key])=>key).join(' ');
+ checks.missingModel=missingModelIssues.includes('이전 모델')&&missingModelIssues.includes('이전 추론 수준')
+  &&missingModelIssues.includes('Fast')&&missingModelIssues.includes('Ultra 전환')&&!solverConfigurationReady();
  currentSolverJob=claudeJob;
  await loadSolverConfiguration('w','c',1,'',claudeJob);
- checks.claude=solverProvider==='claude'&&solverAccountId===C&&solverRetryIssue.includes('Ultracode')
+ checks.claude=solverProvider==='claude'&&solverAccountId===C&&solverRetryIssues.some(([key])=>key.includes('Ultracode'))
   &&!solverUltracode&&!solverConfigurationReady();
  solverProvider='codex';
  await loadSolverConfiguration('w','c',1,A);
- checks.manual=solverProvider==='codex'&&solverAccountId===A&&!solverRetryIssue&&solverConfigurationReady();
+ checks.manual=solverProvider==='codex'&&solverAccountId===A&&!solverRetryIssues.length&&solverConfigurationReady();
  document.querySelector('#result').textContent=Object.values(checks).every(Boolean)?'PASS':'FAIL '+JSON.stringify(checks);
 })().catch(error=>document.querySelector('#result').textContent='ERROR '+error.stack);
 </script></body></html>"""
@@ -121,6 +126,9 @@ const claudeJob={id:'job-2',job_mode:'solve',account_id:C,account_label:'Claude'
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
                                 encoding="utf-8", errors="replace")
         if result.returncode != 0 or '<pre id="result">PASS</pre>' not in result.stdout:
+            marker = re.search(r'<pre id="result">([^<]*)</pre>', result.stdout)
+            if marker:
+                print("Browser result:", marker.group(1))
             print(result.stdout[-3500:])
             print(result.stderr[-1000:])
             return 1
