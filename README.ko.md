@@ -48,7 +48,7 @@
 
 Windows 로그인 시 자동 실행 여부는 `-Interactive`에서 선택할 수 있고, `-StartAtSignIn`으로 켤 수도 있습니다. 저장된 선택은 다음 설치에 적용됩니다. 자동 실행을 꺼도 사용자 폴더의 Start.cmd를 클릭해 시작할 수 있습니다. 같은 위치의 Uninstall.cmd는 CTF Agent 전용 컨테이너·로컬 이미지 태그·설치 릴리스를 정리합니다. 공유된 공개 이미지 캐시는 남을 수 있습니다. 선택한 데이터·DB 폴더와 WSL 배포판, Docker Desktop은 보존합니다.
 
-Windows 설치본을 LAN이나 HTTPS 터널로 공개하려면 `Install.cmd -PublicUrl "https://ctf.example.com"`을 사용하세요. 서비스가 `0.0.0.0`에 바인딩되며, 설정한 브라우저 출처와 로컬 주소만 허용합니다. 다른 기기용 연결 주소는 `RemoteLink.cmd`로 확인합니다. 비밀번호 로그인 모드에서 공개 주소로 첫 관리자 계정을 만들려면 설치 시 발급된 설정 토큰이 필요합니다. `-OpenAccess -NoLogin`을 지정하면 접속자 모두가 관리자 권한으로 이용하므로 신뢰할 수 없는 네트워크에서는 사용하지 마세요. 옵션과 방화벽 설정은 [Windows 설치 안내](docs/guides/docker-desktop.md)를 참고하세요.
+Windows 설치본을 LAN이나 HTTPS 터널로 공개하려면 `Install.cmd -PublicUrl "https://ctf.example.com"`을 사용하세요. 서비스가 `0.0.0.0`에 바인딩되며, 설정한 브라우저 출처와 로컬 주소만 허용합니다. 로그인 없는 설치에서 외부 접속을 허용하면 새 브라우저에서도 연결 절차 없이 바로 열립니다. 비밀번호 로그인 모드에서는 기존처럼 로그인하며, 공개 주소에서 첫 관리자 계정을 만들 때는 설정 토큰이 필요합니다. 로그인 없는 공개 설치에는 접속자 모두가 관리자 권한으로 접근할 수 있으므로 접속 범위를 의도한 네트워크로 한정하세요. 옵션과 방화벽 설정은 [Windows 설치 안내](docs/guides/docker-desktop.md)를 참고하세요.
 
 Windows 파일 탐색기에서는 `\\wsl.localhost\<배포판>\<Linux 데이터 경로>\ctf_agent_data\workspace_files`로 문제 파일에 접근할 수 있습니다.
 

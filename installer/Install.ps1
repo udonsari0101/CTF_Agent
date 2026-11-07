@@ -1059,6 +1059,8 @@ if ($ListenAddress -notin @('127.0.0.1', '0.0.0.0')) {
 }
 $accessMode = if ($PSBoundParameters.ContainsKey('OpenAccess')) {
     if ($OpenAccess) { 'open' } else { 'link' }
+} elseif ($authMode -eq 'password') { 'link'
+} elseif ($ListenAddress -eq '0.0.0.0' -or $publicUrls.Count -gt 0) { 'open'
 } elseif ($saved -and [string]$saved.access_mode -eq 'open') { 'open' } else { 'link' }
 if ($accessMode -eq 'open' -and $authMode -ne 'nologin') {
     throw 'OpenAccess requires NoLogin. Use -NoLogin -OpenAccess together.'
@@ -1203,6 +1205,7 @@ Write-Host ''
 Write-Host "Start: $(Join-Path $stateDir 'Start.cmd')"
 Write-Host "Uninstall: $(Join-Path $stateDir 'Uninstall.cmd')"
 if ($requireLogin) { Write-Host 'The local site was opened in your browser. Create the first administrator account there.' }
+elseif ($accessMode -eq 'open') { Write-Host 'The site can be opened directly in any browser that can reach it.' }
 else { Write-Host 'The local site was opened in your browser. Run Start.cmd to connect another browser later.' }
 Write-Host "Files in Explorer: \\wsl.localhost\$distro\$($linuxHome.TrimStart('/') -replace '/', '\')\ctf_agent_data\workspace_files"
 if ($dbVhd) {

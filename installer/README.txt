@@ -30,9 +30,10 @@ Install.cmd accepts these optional arguments:
                           Automatically listens on 0.0.0.0 unless an explicit
                           -ListenAddress is supplied. Origins are remembered.
   -OpenAccess             With -NoLogin, let every browser reaching the service
-                          use it without a connection ticket. Without this
-                          switch, no-login mode still requires a one-use link
-                          for each new browser. The choice is remembered.
+                          use it without a connection ticket. This is already
+                          the default when no-login mode listens on 0.0.0.0.
+                          Use -OpenAccess:$false to require one-use links;
+                          repeat that switch when reinstalling or upgrading.
   -NoLogin                Do not require an account on this computer.
   -DockerFolder <path>    Move Docker Desktop's disk to this folder.
   -StartAtSignIn          Start the service when you sign in to Windows.
@@ -50,12 +51,12 @@ is root, the installer makes an existing regular user the default, or creates
 one named ctfagent. wsl --user root keeps working. A missing home folder is
 created for the same reason: Docker Desktop's integration needs it.
 
-With -ListenAddress 0.0.0.0, no-login mode admits only connected browsers by
-default. To connect another device, run RemoteLink.cmd in the CTF Agent app
-data folder and open the link there within 90 seconds. It uses the first
--PublicUrl when configured; otherwise pass a host or full origin. Each
-link works once and connects that browser for 30 days. -OpenAccess removes
-that ticket requirement; anyone who can reach the address can use the service.
+With -ListenAddress 0.0.0.0, no-login mode opens directly in every browser by
+default. If you explicitly select -OpenAccess:$false, run RemoteLink.cmd in
+the CTF Agent app data folder to connect another device. It uses the first
+-PublicUrl when configured; otherwise pass a host or full origin. Each link
+works once and connects that browser for 30 days. Open access means anyone
+who can reach the address can use the service.
 Direct HTTP traffic is unencrypted, so use a VPN or TLS proxy over the internet.
 
 Install.cmd stops and restarts Docker Desktop to change its WSL integration

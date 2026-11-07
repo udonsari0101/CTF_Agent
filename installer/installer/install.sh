@@ -170,6 +170,8 @@ previous_release=""
 previous_revision=""
 previous_base_id=""
 previous_runtime_id=""
+missing_previous_image_recovery=false
+recovery_backup=""
 settings_snapshot=""
 updater_candidate=""
 updater_old_exists=false
@@ -289,6 +291,18 @@ cleanup_install() {
                   -e "$home_dir/ctf_agent_data/update-control/running.json" ||
                   -L "$home_dir/ctf_agent_data/update-control/running.json" ) ]]; then
             echo 'A site update is pending or running; the installer did not restart the service.' >&2
+        elif [[ "$missing_previous_image_recovery" == true ]]; then
+            # The old image was already gone before this install began. No old
+            # container existed to restore, so stop only the new local stack.
+            # Compose down does not remove bind-mounted challenge or DB data.
+            if ! docker compose -f "$target/compose.local.yaml" down --remove-orphans; then
+                echo 'The incomplete replacement service could not be stopped automatically.' >&2
+                status=1
+            fi
+            echo 'The previous release marker, settings, and data were preserved; its Docker image must be restored before it can run.' >&2
+            if [[ -n "$recovery_backup" ]]; then
+                echo "Pre-upgrade SQLite snapshot: $recovery_backup" >&2
+            fi
         elif [[ -n "$previous_release" ]]; then
             if ! restore_previous_service; then
                 echo 'The previous service could not be restored automatically; its release and data were preserved.' >&2
@@ -313,6 +327,70 @@ cleanup_install() {
     exit "$status"
 }
 trap cleanup_install EXIT
+assert_lost_image_recovery_idle() {
+    if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" == true ]]; then
+        echo 'An in-app update cannot recover a missing previous Docker image. Run the Windows release installer.' >&2
+        return 2
+    fi
+    local project_containers container_names name
+    project_containers="$(docker ps --all --quiet --filter label=com.docker.compose.project=ctf_agent_local)" || return 2
+    container_names="$(docker ps --all --format '{{.Names}}')" || return 2
+    if [[ -n "$project_containers" ]]; then
+        echo 'The previous Docker image is missing, but CTF Agent containers still exist; refusing recovery.' >&2
+        return 2
+    fi
+    while IFS= read -r name; do
+        case "$name" in
+            ctf_agent_local|ctf_agent_local_*|ctf_agent_local-*)
+                echo 'The previous Docker image is missing, but CTF Agent containers still exist; refusing recovery.' >&2
+                return 2 ;;
+        esac
+    done <<< "$container_names"
+    if [[ -e "$home_dir/ctf_agent_data/update-control/request.json" ||
+          -L "$home_dir/ctf_agent_data/update-control/request.json" ||
+          -e "$home_dir/ctf_agent_data/update-control/running.json" ||
+          -L "$home_dir/ctf_agent_data/update-control/running.json" ]]; then
+        echo 'An update request is pending; refusing missing-image recovery.' >&2
+        return 2
+    fi
+    python3 - "$home_dir/.local-config.json" "$database_fs_path" \
+        "$database_mount" "$database_volume_id" <<'PY'
+import json, pathlib, sqlite3, sys
+config_path, database_path = map(pathlib.Path, sys.argv[1:3])
+mount, volume_id = sys.argv[3:5]
+if (config_path.is_symlink() or not config_path.is_file()
+        or config_path.stat().st_size > 16384):
+    raise SystemExit('Previous installation settings are unavailable; refusing recovery')
+try:
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+except (OSError, ValueError) as exc:
+    raise SystemExit('Previous installation settings are invalid; refusing recovery') from exc
+if (not isinstance(config, dict)
+        or config.get('auth_mode') not in ('password', 'nologin')
+        or type(config.get('auto_start')) is not bool
+        or config.get('database_path') != str(database_path)
+        or config.get('database_mount', '') != mount
+        or (mount and config.get('database_volume_id') != volume_id)):
+    raise SystemExit('Previous database settings do not match the mounted database; refusing recovery')
+database = database_path / 'sqlite' / 'ctf_agent.sqlite3'
+try:
+    with sqlite3.connect(database.absolute().as_uri() + '?mode=ro', uri=True, timeout=5) as db:
+        db.execute('PRAGMA query_only=ON')
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('solver_slot','solver_slots','solver_jobs')")}
+        occupied = any(db.execute('SELECT 1 FROM ' + table + ' LIMIT 1').fetchone()
+                       for table in ('solver_slot', 'solver_slots') if table in tables)
+        active = ('solver_jobs' in tables and db.execute(
+            "SELECT 1 FROM solver_jobs WHERE status IN "
+            "('staging','running','flag_found','writing','cleanup_blocked') LIMIT 1"
+        ).fetchone())
+except sqlite3.Error as exc:
+    raise SystemExit('Could not verify solver jobs; refusing recovery') from exc
+if occupied or active:
+    raise SystemExit('Active solver work remains in the previous database; refusing recovery')
+PY
+}
 if [[ -e "$home_dir/.current-release" || -L "$home_dir/.current-release" ]]; then
     if [[ ! -f "$home_dir/.current-release" || -L "$home_dir/.current-release" ]]; then
         echo 'Installed release marker is invalid.' >&2
@@ -347,16 +425,70 @@ if [[ -e "$home_dir/.current-release" || -L "$home_dir/.current-release" ]]; the
             exit 2
         fi
     fi
-    previous_base_id="$(docker image inspect --format '{{.Id}}' "$previous_base_ref")"
-    if [[ ! "$previous_base_id" =~ ^sha256:[0-9a-f]{64}$ ||
-          "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$previous_base_id")" != "$previous_revision" ||
-          "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$previous_base_id")" != 'https://github.com/udonsari0101/CTF_Agent' ]]; then
-        echo 'Previous public image identity could not be verified.' >&2
-        exit 2
+    if docker image inspect "$previous_base_ref" >/dev/null 2>&1; then
+        previous_base_id="$(docker image inspect --format '{{.Id}}' "$previous_base_ref")"
+        if [[ ! "$previous_base_id" =~ ^sha256:[0-9a-f]{64}$ ||
+              "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$previous_base_id")" != "$previous_revision" ||
+              "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$previous_base_id")" != 'https://github.com/udonsari0101/CTF_Agent' ]]; then
+            echo 'Previous public image identity could not be verified.' >&2
+            exit 2
+        fi
+    else
+        # A missing pinned base is distinct from a present image with invalid
+        # revision/source labels. Only physical image loss can be recovered.
+        missing_previous_image_recovery=true
     fi
     if [[ -f "$previous_release/deploy/local_runtime.py" ]]; then
-        previous_runtime_id="$(python3 "$previous_release/deploy/local_runtime.py" select)"
-        [[ "$previous_runtime_id" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 2
+        # Validate the saved overlay fingerprint and file hashes before
+        # treating a missing overlay image as recoverable. An altered identity
+        # file or a present image with wrong labels must still fail closed.
+        saved_runtime_id="$(python3 - "$previous_release" "$previous_base_ref" "$previous_base_id" <<'PY'
+import importlib.util, json, pathlib, re, sys
+release = pathlib.Path(sys.argv[1])
+reference, available_base_id = sys.argv[2:4]
+script = release / 'deploy' / 'local_runtime.py'
+spec = importlib.util.spec_from_file_location('previous_local_runtime', script)
+if spec is None or spec.loader is None:
+    raise SystemExit('Previous local runtime metadata is invalid')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+base, fingerprint, hashes = module.identity(release)
+path = release / '.local-runtime.json'
+if path.is_symlink() or not path.is_file() or path.stat().st_size > 16384:
+    raise SystemExit('Previous local runtime metadata is unavailable')
+saved = json.loads(path.read_text(encoding='utf-8'))
+if not isinstance(saved, dict):
+    raise SystemExit('Previous local runtime identity does not match its release')
+runtime_id = saved.get('runtime_id', '')
+base_id = saved.get('base_id', '')
+if (base != reference
+        or saved.get('base_ref') != reference
+        or saved.get('fingerprint') != fingerprint
+        or saved.get('files') != hashes
+        or not isinstance(base_id, str)
+        or not re.fullmatch(r'sha256:[0-9a-f]{64}', base_id)
+        or (available_base_id and base_id != available_base_id)
+        or not isinstance(runtime_id, str)
+        or not re.fullmatch(r'sha256:[0-9a-f]{64}', runtime_id)):
+    raise SystemExit('Previous local runtime identity does not match its release')
+print(runtime_id)
+PY
+)"
+        if [[ "$missing_previous_image_recovery" == false ]]; then
+            if docker image inspect "$saved_runtime_id" >/dev/null 2>&1; then
+                previous_runtime_id="$(python3 "$previous_release/deploy/local_runtime.py" select)"
+                [[ "$previous_runtime_id" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 2
+            else
+                missing_previous_image_recovery=true
+            fi
+        fi
+    fi
+    if [[ "$missing_previous_image_recovery" == true ]]; then
+        # Docker Desktop can lose its image store while the WSL release and
+        # external DB remain intact. Permit a cold replacement only when no
+        # old container or claimed job can still write to that database.
+        assert_lost_image_recovery_idle
+        echo 'Previous Docker images are unavailable; recovering the stopped installation from its verified database.'
     fi
 fi
 if [[ ! -d "$target" ]]; then
@@ -543,6 +675,55 @@ python3 "$bundle_root/installer/storage_preflight.py" after-pull \
 # stopping the existing service. Docker Desktop can retain a stale bind after
 # WSL remounts an external VHD, even when its Mount.Source string is correct.
 python3 deploy/local-compose.py preflight
+if [[ "$missing_previous_image_recovery" == true ]]; then
+    # An old image is unavailable for executable rollback. Keep a consistent
+    # snapshot of the old database (including committed WAL transactions)
+    # outside the release tree before the new web process may migrate it.
+    assert_lost_image_recovery_idle
+    recovery_backup="$(python3 - "$database_fs_path/sqlite/ctf_agent.sqlite3" "$home_dir" "$previous_version" <<'PY'
+import os, pathlib, sqlite3, sys, tempfile, time
+from contextlib import closing
+
+source, home = map(pathlib.Path, sys.argv[1:3])
+version = sys.argv[3]
+backup_dir = home / 'recovery-backups'
+if backup_dir.is_symlink() or (backup_dir.exists() and not backup_dir.is_dir()):
+    raise SystemExit('Recovery backup path is invalid')
+backup_dir.mkdir(mode=0o700, exist_ok=True)
+if backup_dir.stat().st_mode & 0o077:
+    raise SystemExit('Recovery backup directory is accessible to other users')
+descriptor, name = tempfile.mkstemp(prefix=f'before-{version}-', suffix='.sqlite3', dir=backup_dir)
+temporary = pathlib.Path(name)
+try:
+    with closing(sqlite3.connect(source.absolute().as_uri() + '?mode=ro', uri=True, timeout=10)) as original:
+        original.execute('PRAGMA query_only=ON')
+        logical_bytes = original.execute('PRAGMA page_count').fetchone()[0] * original.execute('PRAGMA page_size').fetchone()[0]
+        capacity = os.statvfs(backup_dir)
+        available = capacity.f_bavail * capacity.f_frsize
+        if available < logical_bytes + 5 * 1024**3 + 64 * 1024**2:
+            raise SystemExit('Not enough space to snapshot the previous database while keeping 5 GiB free')
+        os.close(descriptor)
+        descriptor = -1
+        with closing(sqlite3.connect(temporary)) as snapshot:
+            original.backup(snapshot)
+            if snapshot.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                raise SystemExit('Previous database snapshot did not pass SQLite quick_check')
+    with temporary.open('rb') as saved:
+        os.fsync(saved.fileno())
+    os.chmod(temporary, 0o600)
+    if os.geteuid() == 0:
+        os.chown(temporary, int(os.environ['CTF_LOCAL_UID']), int(os.environ['CTF_LOCAL_GID']))
+    final = backup_dir / (temporary.stem + '-' + str(time.time_ns()) + temporary.suffix)
+    os.replace(temporary, final)
+    print(final)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+    temporary.unlink(missing_ok=True)
+PY
+)"
+    echo "Previous database snapshot: $recovery_backup"
+fi
 manage_storage_control() {
     docker run --rm -i --network none --user 0:0 --entrypoint python \
         -v "$CTF_LOCAL_FS_DATA:/data" "$image_ref" - \
@@ -645,6 +826,9 @@ PY
 # Drain old claims first, then stop every local writer before Compose checks a
 # stopped web container. Leaving idle solver containers up made both the new
 # rollout and its rollback refuse the database-bind repair.
+if [[ "$missing_previous_image_recovery" == true ]]; then
+    assert_lost_image_recovery_idle
+fi
 rollout_started=true
 python3 deploy/local-compose.py quiesce
 if [[ -n "$database_mount" && "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then

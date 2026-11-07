@@ -1,6 +1,21 @@
 const sourceText = new WeakMap();
 const sourceAttributes = new WeakMap();
 const excluded = 'script,style,textarea,pre,code,.markdown-preview,[data-i18n-ignore]';
+// The first screen waits this long for a language file. The manifest is optional, so it gets
+// a small part of that. Older browsers have no AbortSignal.timeout and wait as they always did.
+const PACK_LIMIT_MS = 25000, MANIFEST_LIMIT_MS = 5000;
+const within = ms => globalThis.AbortSignal?.timeout?.(ms);
+// The failure page must still read correctly when the pack is what failed. Korean is the source.
+const withoutPack = {en: {
+  '화면을 불러오지 못했습니다.': 'Could not load this page.',
+  '다시 시도': 'Retry',
+  '서버에 연결할 수 없습니다. 연결을 확인하세요.': 'Cannot reach the server. Check the connection.',
+  '서버가 응답하지 않습니다. 잠시 후 다시 시도하세요.': 'The server is not answering. Try again in a moment.',
+  '서버 응답을 확인할 수 없습니다. 잠시 후 다시 시도하세요.': 'Could not read the server response. Try again in a moment.',
+  '요청에 실패했습니다 ({n}).': 'Request failed ({n}).',
+  '서비스 업데이트 중입니다. 완료 후 다시 시도하세요.': 'Service update in progress. Try again when it finishes.',
+  '로컬 접속 링크를 확인할 수 없습니다. Start.cmd를 다시 실행하세요.': 'The local access link is invalid. Run Start.cmd again.',
+}};
 
 function storedLanguage() {
   try {
@@ -13,41 +28,69 @@ function storedLanguage() {
 class Localizer {
   constructor() {
     this.locale = storedLanguage();
+    this.wanted = this.locale;
     this.messages = {};
     this.languages = [{code:'en',name:'English'},{code:'ko',name:'한국어'}];
     this.observer = null;
+    this.loaded = false;
+    this.starting = null;
   }
 
-  async load(locale) {
-    const response = await fetch(new URL(`./${locale}.json`, import.meta.url), {cache: 'force-cache'});
+  async load(locale, signal = within(PACK_LIMIT_MS)) {
+    const response = await fetch(new URL(`./${locale}.json`, import.meta.url), {cache: 'force-cache', signal});
     if (!response.ok) throw new Error(`Language pack unavailable: ${locale}`);
     const pack = await response.json();
     if (pack.locale !== locale || typeof pack.messages !== 'object') throw new Error('Invalid language pack');
     return pack.messages;
   }
 
-  async init() {
+  // Boot runs again on Retry. There is one page observer however often it runs, and a pack
+  // that did not arrive is fetched again.
+  init() {
+    if (this.loaded) return Promise.resolve();
+    this.starting ??= this.start().finally(() => { this.starting = null; });
+    return this.starting;
+  }
+
+  async start() {
+    const deadline = within(PACK_LIMIT_MS);
     try {
-      const response = await fetch(new URL('./manifest.json', import.meta.url), {cache:'force-cache'});
+      const response = await fetch(new URL('./manifest.json', import.meta.url), {cache:'force-cache', signal: within(MANIFEST_LIMIT_MS)});
       const manifest = await response.json();
       if (response.ok && Array.isArray(manifest.languages) && manifest.languages.length) this.languages = manifest.languages;
     } catch { /* Keep the bundled English and Korean choices. */ }
-    if (!this.languages.some(language => language.code === this.locale)) this.locale = 'en';
-    try { this.messages = await this.load(this.locale); }
-    catch { this.locale = 'ko'; this.messages = {}; }
+    if (!this.languages.some(language => language.code === this.wanted)) this.locale = this.wanted = 'en';
+    const wanted = this.wanted;
+    let stalled = null;
+    try {
+      const messages = await this.load(wanted, deadline);
+      // A language picked while this ran has already been loaded and must stay.
+      if (wanted === this.wanted) { this.locale = wanted; this.messages = messages; this.loaded = true; }
+    } catch (error) {
+      if (wanted === this.wanted) {
+        this.messages = withoutPack[wanted] ?? {};
+        // A pack that failed leaves a working page in the source language. One that never
+        // answered is a first load that failed, so the caller shows that and Retry asks again.
+        if (deadline?.aborted) stalled = deadline.reason ?? error;
+        else this.locale = 'ko';
+      }
+    }
     document.documentElement.lang = this.locale;
     this.translate(document.body);
-    this.observer = new MutationObserver(records => {
-      for (const record of records) {
-        if (record.type === 'characterData') this.translateText(record.target);
-        else if (record.type === 'attributes') this.translateAttributes(record.target);
-        else for (const node of record.addedNodes) this.translate(node);
-      }
-    });
-    this.observer.observe(document.body, {
-      subtree: true, childList: true, characterData: true, attributes: true,
-      attributeFilter: ['title', 'aria-label', 'placeholder'],
-    });
+    if (!this.observer) {
+      this.observer = new MutationObserver(records => {
+        for (const record of records) {
+          if (record.type === 'characterData') this.translateText(record.target);
+          else if (record.type === 'attributes') this.translateAttributes(record.target);
+          else for (const node of record.addedNodes) this.translate(node);
+        }
+      });
+      this.observer.observe(document.body, {
+        subtree: true, childList: true, characterData: true, attributes: true,
+        attributeFilter: ['title', 'aria-label', 'placeholder'],
+      });
+    }
+    if (stalled) throw stalled;
   }
 
   // Language packs are plain objects, so a name such as constructor or __proto__
@@ -95,8 +138,9 @@ class Localizer {
   async setLocale(locale) {
     if (!this.languages.some(language => language.code === locale) || locale === this.locale) return;
     const messages = await this.load(locale);
-    this.locale = locale;
+    this.locale = this.wanted = locale;
     this.messages = messages;
+    this.loaded = true;
     try { localStorage.setItem('ctf-language', locale); } catch {}
     document.documentElement.lang = locale;
     this.translate(document.body);

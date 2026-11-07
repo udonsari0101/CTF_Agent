@@ -2034,13 +2034,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     versioned_index = index_document.replace(
         '"/assets/', f'"/assets/{asset_version}/'
     )
+    class NoStoreStaticFiles(StaticFiles):
+        async def get_response(self, path, scope):
+            response = await super().get_response(path, scope)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
     app.mount(
         f"/assets/{asset_version}",
-        StaticFiles(directory=WEB_DIR),
+        # A real SHA is an immutable cache key. The development fallback is not.
+        (StaticFiles if asset_version != "dev" else NoStoreStaticFiles)(directory=WEB_DIR),
         name="release-assets",
     )
-    # Preserve the old paths for bookmarks and in-flight pre-deployment HTML.
-    app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
+    # Old HTML and third-party integrations can still request unversioned paths.
+    # These must never outlive a release in a browser or edge cache.
+    app.mount("/assets", NoStoreStaticFiles(directory=WEB_DIR), name="assets")
 
     @app.get("/")
     def index():

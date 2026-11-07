@@ -42,6 +42,17 @@ const activeCTFdChallengeRefreshes = new Map();
 const watchedCTFdRefreshJobs = new Set();
 let rendering = 0, challengeRendering = 0, listRendering = 0, detailBusy = false;
 let modalRendering = 0, ctfdSubmitRendering = 0;
+// Bumped whenever a session ends or starts. Work that began under an older epoch belongs
+// to a session that is gone: its 401 means nothing and its errors have nobody to reach.
+let authEpoch = 0, signedOut = false, signingOut = false;
+// How long the first screen waits for one answer. A slow server still gets through; a request
+// that never answers ends in the failure page with Retry. The language files use the same limit.
+const PAGE_LOAD_LIMIT_MS = 25000;
+// The last failure or not-found page: its markup for a language change, and what Retry runs.
+let pageNotice = null, pageRetry = null;
+let workspacesListed = false;
+// Only the newest boot may act on its answers. A language switch re-arms a running Retry.
+let bootAttempt = 0;
 let challengeFileDragDepth = 0;
 let transferState = null;
 let transferExportController = null;
@@ -51,6 +62,12 @@ const TRANSFER_CHUNK_BYTES = 8 * 1024 * 1024;
 let solverRendering = 0, solverPollTimer = null, currentSolverJob = null;
 let resourcePollTimer = null, resourceRequestGeneration = 0;
 let challengeListPollTimer = null, challengeListPollGeneration = 0, challengeListSignatures = new Map(), challengeListCategories = '';
+// A healthy server answers the list long before the short limit, and three misses in a row show the notice within 20 s of
+// a hang. A slower server is not a dead one: after the notice, or after an answer that took that long, the long limit
+// applies, so aborting cannot turn slow into never. The rest of this state lives on currentWorkspace (listFailures,
+// listUpdatedAt, listStaleAt, gone), so a new page starts clean.
+const CHALLENGE_LIST_FAILURES_SHOWN = 3, CHALLENGE_LIST_TIMEOUT = 4000, CHALLENGE_LIST_SLOW_TIMEOUT = PAGE_LOAD_LIMIT_MS;
+let challengeListSlow = false;
 let currentSolverEvents = [], currentSolverGuidance = [], solverEventCursor = 0, solverListedFlag = '', solverSyncedWriteup = '', solverGuidanceDraft = '';
 let writeupRefineJob = null, writeupRefineEvents = [], writeupRefineTimer = null;
 let writeupRefineError = null, writeupRefineInstruction = '';
@@ -119,6 +136,28 @@ function stopChallengeListPolling() {
   challengeListPollGeneration++;
 }
 
+function stopCTFdJobsPolling() {
+  if (ctfdJobsPollTimer) clearTimeout(ctfdJobsPollTimer);
+  ctfdJobsPollTimer = null;
+  ctfdJobsRequestGeneration++;
+}
+
+function stopReleaseUpdatePolling() {
+  if (releaseUpdateTimer) clearTimeout(releaseUpdateTimer);
+  releaseUpdateTimer = null;
+  releaseUpdateRequestGeneration++;
+}
+
+// The polls re-check currentWorkspace, so nothing of a page that is gone can come back.
+function leaveWorkspacePage(keepDetail = false) {
+  if (keepDetail) pauseSolverPolling(); else stopSolverPolling();
+  stopResourcePolling();
+  stopChallengeListPolling();
+  stopCTFdJobsPolling();
+  ++listRendering; ++challengeRendering;
+  currentWorkspace = null;
+}
+
 function paintResourceMeter(snapshot) {
   resourceMeterSnapshot = snapshot;
   const meter = document.querySelector('#workspace-resource-meter');
@@ -167,18 +206,27 @@ function toggleResourceMeter(button) {
 }
 
 function markdownInline(value) {
-  const source = String(value ?? '');
+  // Nothing inside a code span is Markdown, so each one waits behind a placeholder while
+  // links and bold run over the text around it. A literal marker character is held the
+  // same way: it stays in the text and cannot pose as a placeholder.
+  const held = [];
+  const hold = html => `\uE000${held.push(html) - 1}\uE001`;
+  // Shield backticks in URL targets before recognizing code spans. A URL can contain
+  // literal backticks, while a standalone `https://...` must still be rendered as code.
+  const source = String(value ?? '')
+    .replace(/[\uE000\uE001\uE002]/g,match => hold(match))
+    .replace(/\]\(https?:\/\/[^\s)\uE000\uE001]+/g,match => match.replace(/`/g,'\uE002'))
+    .replace(/`([^`\n]+)`/g,(_,code) => hold(`<code>${esc(code)}</code>`));
   const format = segment => esc(segment)
-    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
     .replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
   let result = '', cursor = 0;
-  const link = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()]+)/g;
+  const link = /\[([^\]\n]+)\]\((https?:\/\/[^\s)\uE000\uE001]+)\)|(https?:\/\/[^\s<>()\uE000\uE001]+)/g;
   for (const match of source.matchAll(link)) {
     result += format(source.slice(cursor, match.index));
     const raw = match[2] || match[3];
     const suffix = match[3] ? (raw.match(/[.,;:!?]+$/)?.[0] || '') : '';
-    const url = suffix ? raw.slice(0, -suffix.length) : raw;
+    const url = (suffix ? raw.slice(0, -suffix.length) : raw).replace(/\uE002/g,'`');
     let safe = false;
     try { safe = ['http:', 'https:'].includes(new URL(url).protocol); } catch {}
     result += safe
@@ -186,7 +234,7 @@ function markdownInline(value) {
       : format(match[0]);
     cursor = match.index + match[0].length;
   }
-  return result + format(source.slice(cursor));
+  return (result + format(source.slice(cursor))).replace(/\uE000(\d+)\uE001/g,(_,index) => held[index]);
 }
 
 function safeMarkdown(markdown) {
@@ -317,13 +365,18 @@ function returnFromAccounts() {
   if (route) location.hash = `#${route}`;
 }
 
-function stopSolverPolling() {
+// Polls in flight see the new generation and end. What the panel shows, and copies, stays.
+function pauseSolverPolling() {
   ++solverRendering;
   ++solverOptionsGeneration;
   if (solverPollTimer) clearTimeout(solverPollTimer);
   if (writeupRefineTimer) clearTimeout(writeupRefineTimer);
   solverPollTimer = null;
   writeupRefineTimer = null;
+}
+
+function stopSolverPolling() {
+  pauseSolverPolling();
   currentSolverJob = null;
   currentSolverEvents = [];
   currentSolverGuidance = [];
@@ -530,15 +583,19 @@ function solverEventLabel(event) {
 
 let solverTimeFormat = null, solverTimeFormatLocale = '';
 
-function solverEventTime(event) {
-  const timestamp = Number(event?.occurred_at || event?.created_at);
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
+function clockText(milliseconds) {
   const locale = i18n.locale === 'ko' ? 'ko-KR' : 'en-US';
   if (solverTimeFormatLocale !== locale) {
     solverTimeFormat = new Intl.DateTimeFormat(locale,{hour:'numeric',minute:'numeric',second:'numeric',timeZone:'Asia/Seoul'});
     solverTimeFormatLocale = locale;
   }
-  return solverTimeFormat.format(new Date(timestamp * 1000));
+  return solverTimeFormat.format(new Date(milliseconds));
+}
+
+function solverEventTime(event) {
+  const timestamp = Number(event?.occurred_at || event?.created_at);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
+  return clockText(timestamp * 1000);
 }
 
 function solverEventDetail(event) {
@@ -970,7 +1027,7 @@ function solverAgentTreeMarkup(job, events) {
 // Patching in place keeps buttons, forms and open disclosures alive across polls:
 // a replaced node loses keyboard focus and swallows a click spanning the poll.
 function solverMorphKey(node) {
-  return [node.tagName,node.id,node.getAttribute('class')?.split(' ')[0] || '',node.getAttribute('data-job-id') || '',node.getAttribute('data-agent-node') || ''].join('|');
+  return [node.tagName,node.id,node.getAttribute('class')?.split(' ')[0] || '',node.getAttribute('data-job-id') || '',node.getAttribute('data-agent-node') || '',node.getAttribute('data-challenge-id') || '',node.getAttribute('data-action') || ''].join('|');
 }
 
 function solverMorphNode(current, next) {
@@ -1008,7 +1065,16 @@ function solverMorphChildren(parent, next) {
       text.remove();
     }
     if (cursor === current) cursor = cursor.nextSibling;
-    else parent.insertBefore(current,cursor);
+    else if (current.contains(document.activeElement)) {
+      // Moving a node drops its focus and any IME composition, so the others step over it.
+      const after = current.nextSibling;
+      while (cursor && cursor !== current) {
+        const passed = cursor;
+        cursor = cursor.nextSibling;
+        parent.insertBefore(passed,after);
+      }
+      cursor = current.nextSibling;
+    } else parent.insertBefore(current,cursor);
   }
   while (cursor) {
     const leftover = cursor;
@@ -1111,10 +1177,28 @@ function toggleSolverLogSize(button) {
 }
 
 // The tree, stream and upload mirror have their own painters, so a language repaint keeps them.
+// The page, the detail and the solver console each carry this notice: a dialog sits in the top layer and hides what is under it.
+function liveNoticeBody() {
+  const workspace = currentWorkspace;
+  if (workspace?.gone) return tr('작업공간을 찾을 수 없습니다. 노트를 저장할 수 없으니 닫기 전에 복사하세요.');
+  if (!workspace?.listStaleAt) return '';
+  return `<strong>${tr('실시간 갱신이 멈췄습니다.')}</strong> ${esc(i18n.format('마지막 갱신 {time} KST. 서버가 응답하면 자동으로 이어집니다.',{time:clockText(workspace.listUpdatedAt || workspace.listStaleAt)}))}`;
+}
+
+function liveNoticeMarkup() {
+  return `<div class="live-notice notice error-notice" role="status">${liveNoticeBody()}</div>`;
+}
+
+function paintLiveNotices() {
+  for (const notice of document.querySelectorAll('.live-notice')) notice.innerHTML = liveNoticeBody();
+  updateSolverElapsedLabels();
+}
+
 function solverConsoleMarkup(agentTree, timeline) {
   const provider = currentSolverJob.provider || currentSolverJob.configuration?.provider;
   const active = solverIsActive(currentSolverJob) && currentSolverJob.guidance_allowed !== false;
   return `<header class="solver-console-head"><div><strong data-i18n-ignore>${esc(currentChallenge?.name || i18n.t('세션 로그'))}</strong><small data-i18n-ignore>${esc(solverConsoleSubtitle(currentSolverJob))}</small>${solverContextUsageMarkup(currentSolverJob)}</div><div class="solver-console-head-actions"><button type="button" class="small ghost solver-console-bottom hidden" data-action="solver-console-bottom" aria-label="${tr('맨 아래로 이동')}">${tr('↓ 맨 아래')}</button><button type="button" class="small ghost" data-action="close-solver-console" aria-label="${tr('세션 로그 닫기')}">${tr('닫기')}</button></div></header>
+    ${liveNoticeMarkup()}
     <div class="solver-console-body"><aside class="solver-agent-tree${agentTree ? '' : ' hidden'}" aria-label="에이전트 활동" data-morph-keep>${agentTree}</aside><div class="solver-console-stream" role="log" aria-live="polite" data-morph-keep>${timeline}</div></div>
     <div class="solver-console-controls"><form id="solver-console-guidance-form" class="solver-console-guidance${active ? '' : ' hidden'}" data-job-id="${esc(solverJobId(currentSolverJob))}">
       <label for="solver-console-message">${tr('메인 세션 추가 명령')}</label><textarea id="solver-console-message" name="message" maxlength="16384" rows="3" placeholder="${tr('풀이 방향이나 확인할 내용을 입력')}" required>${esc(solverGuidanceDraft)}</textarea>
@@ -1450,13 +1534,26 @@ function solverQueueMarkup(job) {
   return `<p class="form-hint solver-queue-state${updating ? ' solver-queue-state-update' : ''}" role="status">${esc([order,reason].filter(Boolean).join(' · '))}</p>`;
 }
 
+function solverAttachmentHold() {
+  return attachmentsPending(currentChallenge?.workspace_id,currentChallenge?.id);
+}
+
+function solverAttachmentHoldMarkup() {
+  return `<p class="solver-attachment-hold form-hint" role="status">${tr(attachmentHoldReason)}</p>`;
+}
+
+function solverStartAttributes() {
+  return solverAttachmentHold() ? 'data-attachment-hold disabled' : solverConfigurationReady() ? '' : 'disabled';
+}
+
 function solverPanelMarkup(job, events = [], loading = false) {
   if (loading) return '<div class="solver-panel-head"><h3>문제 풀이</h3><span class="connection-state">확인 중</span></div>';
   const writeup = job?.flag_rejected ? '' : solverWriteup(job);
   if (!job) return `<div class="solver-panel-head"><h3>문제 풀이</h3><span class="connection-state">실행 전</span></div>
     ${solverWriteupArtifact(writeup)}
     ${solverProviderSelector()}
-    <button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>풀이 시작</button>`;
+    <button class="primary" data-action="start-solver" ${solverStartAttributes()}>풀이 시작</button>
+    ${solverAttachmentHold() ? solverAttachmentHoldMarkup() : ''}`;
   const active = solverIsActive(job), model = job.model || job.configuration || {};
   const progress = job.progress || {};
   const progressCode = progress.code || job.progress_code;
@@ -1468,14 +1565,14 @@ function solverPanelMarkup(job, events = [], loading = false) {
   const controls = active
     ? `<button class="danger" data-action="cancel-solver" ${job.cancel_requested ? 'disabled' : ''}>${job.cancel_requested ? '중단 처리 중' : '풀이 중단'}</button>`
     : job.error?.code === 'ultra_escalation_requested'
-      ? `${job.ultra_escalation?.started_job_id ? '<span class="form-hint">Ultra 작업으로 이어가는 중</span>' : job.ultra_escalation?.auto_pending ? '<span class="form-hint">Ultra 전환 준비 중</span>' : job.ultra_escalation?.eligible ? '<button class="primary" data-action="approve-ultra-escalation">Ultra로 이어가기</button>' : '<span class="form-hint">이전 Ultra 요청이 만료됐습니다. 현재 설정으로 다시 풀 수 있습니다.</span>'}<button data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>현재 설정으로 다시 풀기</button>`
+      ? `${job.ultra_escalation?.started_job_id ? '<span class="form-hint">Ultra 작업으로 이어가는 중</span>' : job.ultra_escalation?.auto_pending ? '<span class="form-hint">Ultra 전환 준비 중</span>' : job.ultra_escalation?.eligible ? `<button class="primary" data-action="approve-ultra-escalation" ${solverAttachmentHold() ? 'data-attachment-hold disabled' : ''}>Ultra로 이어가기</button>` : '<span class="form-hint">이전 Ultra 요청이 만료됐습니다. 현재 설정으로 다시 풀 수 있습니다.</span>'}<button data-action="start-solver" ${solverStartAttributes()}>현재 설정으로 다시 풀기</button>`
     : job.phase === 'needs_input'
-      ? `<button data-action="edit-challenge">문제 입력 수정</button>${currentChallenge?.remote_mode === 'endpoint' || job.input_ready_to_retry === true ? `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>계속 풀기</button>` : '<span class="form-hint">요청된 접속 정보나 파일을 먼저 추가하세요.</span>'}`
+      ? `<button data-action="edit-challenge">문제 입력 수정</button>${currentChallenge?.remote_mode === 'endpoint' || job.input_ready_to_retry === true ? `<button class="primary" data-action="start-solver" ${solverStartAttributes()}>계속 풀기</button>` : '<span class="form-hint">요청된 접속 정보나 파일을 먼저 추가하세요.</span>'}`
       : job.flag_rejected
-      ? `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>오답을 제외하고 다시 풀기</button>`
+      ? `<button class="primary" data-action="start-solver" ${solverStartAttributes()}>오답을 제외하고 다시 풀기</button>`
       : job.phase === 'completed'
       ? '<p class="form-hint">다시 실행하려면 먼저 위의 완료 취소를 눌러 미완료 상태로 되돌리세요.</p>'
-      : `<button class="primary" data-action="start-solver" ${solverConfigurationReady() ? '' : 'disabled'}>다시 풀기</button>`;
+      : `<button class="primary" data-action="start-solver" ${solverStartAttributes()}>다시 풀기</button>`;
   const elapsed = active ? solverElapsedMarkup(job) : '';
   return `<div class="solver-panel-head"><h3>문제 풀이</h3><div class="solver-panel-state"><span class="solver-phase solver-phase-${esc(job.phase)}">${esc(active && job.cancel_requested ? '중단 요청 중' : (solverPhases[job.phase] || '상태 변경'))}</span>${elapsed}</div></div>
     ${modelText ? `<p class="solver-model" data-i18n-ignore>${esc(modelText)}</p>` : ''}
@@ -1491,7 +1588,8 @@ function solverPanelMarkup(job, events = [], loading = false) {
     ${solverGuidanceMarkup(job,active)}
     ${solverPeerEvidenceButton(job,active)}
     ${active ? '' : solverProviderSelector()}
-    <div class="actions solver-actions">${controls}</div>`;
+    <div class="actions solver-actions">${controls}</div>
+    ${controls.includes('data-attachment-hold') ? solverAttachmentHoldMarkup() : ''}`;
 }
 
 function rememberNotes() {
@@ -1593,10 +1691,14 @@ async function detailAction(task, button) {
   finally {
     controls.forEach((node,index) => { node.disabled = previous[index]; });
     detailBusy = false; detail.removeAttribute('aria-busy');
+    paintSolverStartHold();
   }
 }
 
 async function api(url, options = {}) {
+  // Once a session has ended only the sign-in requests leave the page.
+  if (signedOut && !url.startsWith('/api/auth/')) throw Object.assign(new Error(i18n.t('로그인이 필요합니다.')),{status:401});
+  const epoch = authEpoch;
   const headers = {...options.headers};
   if (csrf) headers['X-CSRF-Token'] = csrf;
   let body = options.body;
@@ -1606,9 +1708,10 @@ async function api(url, options = {}) {
   }
   const response = await fetch(url, {...options, headers, body, credentials:'same-origin'});
   let result;
-  try { result = await response.json(); } catch { result = {}; }
+  // A request given up on has no answer to read. An unreadable answer is an empty one.
+  try { result = await response.json(); } catch (error) { if (options.signal?.aborted) throw error; result = {}; }
   if (!response.ok) {
-    if (response.status === 401 && authMode === 'password' && !url.endsWith('/login')) { csrf = ''; showLogin(true); }
+    if (response.status === 401 && authMode === 'password' && url !== '/api/auth/login' && !signedOut && epoch === authEpoch) showLogin(!signingOut);
     const detail = result.detail;
     const payload = detail && typeof detail === 'object' && !Array.isArray(detail) ? detail : result;
     const message = Array.isArray(detail)
@@ -1621,6 +1724,19 @@ async function api(url, options = {}) {
     throw error;
   }
   return result;
+}
+
+// A request limit fails with the browser's own English text.
+function unanswered(error, signal) {
+  const gaveUp = signal?.aborted || ['TimeoutError','AbortError'].includes(error?.name);
+  return gaveUp ? new Error('서버가 응답하지 않습니다. 잠시 후 다시 시도하세요.') : error;
+}
+
+// What a page needs before it can show anything. It may take long, but not for ever.
+async function pageRequest(url) {
+  const signal = pageLoadSignal();
+  try { return await api(url,{signal}); }
+  catch (error) { throw unanswered(error,signal); }
 }
 
 function toast(message, error = false, duration = error ? 8000 : 4000) {
@@ -1718,12 +1834,13 @@ function copyToast(result, value) {
 async function run(task, button) {
   // Start the action while the click still owns its transient user activation.
   // Clipboard writes can be rejected if the clicked control is disabled first.
+  const epoch = authEpoch;
   try {
     const pending = task();
     if (button) button.disabled = true;
     return await pending;
-  } catch (error) { toast(error.message, true); }
-  finally { if (button) button.disabled = false; }
+  } catch (error) { if (epoch === authEpoch) toast(error.message, true); }
+  finally { if (button) button.disabled = button.hasAttribute('data-attachment-hold'); }
 }
 
 async function runForm(task, form, button) {
@@ -1735,29 +1852,59 @@ async function runForm(task, form, button) {
   finally { controls.forEach((node,index) => { node.disabled = previous[index]; }); busyForms.delete(form); form.removeAttribute('aria-busy'); }
 }
 
+function sessionStarted() {
+  authEpoch++;
+  signedOut = false;
+}
+
+// A sign-in failure stays in the card: on a phone a toast can sit under the keyboard. The
+// notice takes source text, so the page observer translates it now and on a language
+// change. runForm disabled the focused control, so focus returns only after it finishes.
+async function submitCredentials(form, task, button) {
+  const notice = form.querySelector('.login-error');
+  notice.textContent = '';
+  let failure = null;
+  await runForm(async () => { try { await task(); } catch (error) { failure = error; } },form,button);
+  if (!failure) return;
+  if (!form.isConnected) { toast(transferErrorText(failure),true); return; }
+  notice.textContent = failure instanceof TypeError ? '서버에 연결할 수 없습니다. 연결을 확인하세요.' : failure.message;
+  const focusName = form.id === 'setup-form' && failure.status === 403 ? 'setup_token'
+    : form.id === 'setup-form' && failure.status === 409 ? 'username' : 'password';
+  const field = form.querySelector(`[name="${focusName}"]`) || form.querySelector('[name="password"]');
+  field?.focus();
+  field?.select();
+  notice.scrollIntoView({block:'nearest'});
+}
+
 function showLogin(expired = false, configured = true, setupAvailable = false, setupTokenRequired = false) {
+  authEpoch++;
+  signedOut = true;
+  csrf = '';
+  workspacesListed = false;
   if (solverConsoleDialog?.open) solverConsoleDialog.close();
   clearAccountsReturnTarget();
-  ++modalRendering; ++ctfdSubmitRendering; challengeFlags.clear();
+  ++rendering; ++modalRendering; ++ctfdSubmitRendering; challengeFlags.clear();
   writeupPrefetchGeneration++;
   writeupPrefetchObserver?.disconnect(); writeupPrefetchObserver = null;
   writeupPrefetchQueue = []; writeupPrefetchRequested.clear(); writeupPrefetchWorkspace = ''; writeupPrefetchActive = 0;
   writeupCopyCache.clear(); writeupCopyCacheBytes = 0;
   writeupCopyEpoch.clear(); writeupCurrentStamp.clear();
-  stopSolverPolling();
-  stopResourcePolling();
-  stopChallengeListPolling();
-  for (const upload of activeUploads.values()) upload.controller?.abort();
+  leaveWorkspacePage();
+  stopReleaseUpdatePolling();
+  pauseStagedUploads();
+  for (const upload of activeUploads.values()) { upload.paused = true; upload.controller?.abort(); }
   activeUploads.clear(); uploadViews.clear();
+  stopAttachmentWork();
   rememberNotes();
   disposeTelegram?.(); disposeTelegram = null;
   disposeAccounts?.(); disposeAccounts = null;
-  modal.close(); detail.close();
+  // Any dialog left open would keep the login form inert.
+  for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
   if (!configured && setupAvailable) {
     app.innerHTML = `<main class="login-shell"><div class="login-card">${i18n.picker()}
       <div class="brand"><img src="/assets/icon.svg" alt=""><div>CTF Workspace</div></div>
       <h1>관리자 계정 만들기</h1>
-      <form id="setup-form"><label>아이디<input name="username" autocomplete="username" maxlength="100" required autofocus></label><label>비밀번호<input type="password" name="password" autocomplete="new-password" minlength="4" maxlength="1024" required></label><label>비밀번호 확인<input type="password" name="confirmation" autocomplete="new-password" minlength="4" maxlength="1024" required></label>${setupTokenRequired ? '<label>설치 확인 코드<input type="password" name="setup_token" autocomplete="off" maxlength="256" required></label>' : ''}<button class="primary">관리자 계정 만들기 <span aria-hidden="true">→</span></button></form>
+      <form id="setup-form"><label>아이디<input name="username" autocomplete="username" maxlength="100" required autofocus></label><label>비밀번호<input type="password" name="password" autocomplete="new-password" minlength="4" maxlength="1024" required></label><label>비밀번호 확인<input type="password" name="confirmation" autocomplete="new-password" minlength="4" maxlength="1024" required></label>${setupTokenRequired ? '<label>설치 확인 코드<input type="password" name="setup_token" autocomplete="off" maxlength="256" required></label>' : ''}<div class="notice error-notice login-error" role="alert"></div><button class="primary">관리자 계정 만들기 <span aria-hidden="true">→</span></button></form>
     </div></main>`;
     return;
   }
@@ -1765,7 +1912,7 @@ function showLogin(expired = false, configured = true, setupAvailable = false, s
     <div class="brand"><img src="/assets/icon.svg" alt=""><div>CTF Workspace</div></div>
     <h1>로그인</h1>
     ${!configured ? '<p>관리자 초기 비밀번호가 설정되지 않았습니다.</p>' : expired ? '<p>세션이 만료되었습니다.</p>' : ''}
-    <form id="login-form"><label>아이디<input name="username" autocomplete="username" value="${esc(sessionUser?.username || '')}" maxlength="100" required autofocus></label><label>비밀번호<input type="password" name="password" autocomplete="current-password" maxlength="1024" required></label><label class="login-remember"><input type="checkbox" name="remember" value="true">이 기기에서 30일 로그인 유지</label><button class="primary" ${configured ? '' : 'disabled'}>로그인 <span aria-hidden="true">→</span></button></form>
+    <form id="login-form"><label>아이디<input name="username" autocomplete="username" value="${esc(sessionUser?.username || '')}" maxlength="100" required autofocus></label><label>비밀번호<input type="password" name="password" autocomplete="current-password" maxlength="1024" required></label><div class="notice error-notice login-error" role="alert"></div><label class="login-remember"><input type="checkbox" name="remember" value="true">이 기기에서 30일 로그인 유지</label><button class="primary" ${configured ? '' : 'disabled'}>로그인 <span aria-hidden="true">→</span></button></form>
   </div></main>`;
 }
 
@@ -1797,14 +1944,34 @@ function shell(active, breadcrumb = '모든 작업공간', named = false) {
 }
 
 async function render() {
+  // Until a session starts the login form is the whole page.
+  if (signedOut) return;
   const ticket = ++rendering;
   stopResourcePolling();
   stopChallengeListPolling();
   disposeAccounts?.(); disposeAccounts = null;
   disposeTelegram?.(); disposeTelegram = null;
-  const listing = await api('/api/workspaces');
+  try { await renderRoute(ticket); }
+  catch (error) {
+    // In password mode a 401 has already opened the login form. Only no-login mode gets
+    // here with one: it has no form, so Retry goes back through the boot path.
+    if (ticket === rendering) showPageFailure(error,error.status === 401 ? boot : retryRender);
+  }
+}
+
+// A language pack lost in the same outage comes back with the page.
+async function retryRender() {
+  await i18n.init().catch(() => {});
+  await render();
+}
+
+async function renderRoute(ticket) {
+  const listing = await pageRequest('/api/workspaces');
   if (ticket !== rendering) return;
+  // A proxy or portal can answer 200 with a page of its own.
+  if (!Array.isArray(listing?.workspaces)) throw new Error('서버 응답을 확인할 수 없습니다. 잠시 후 다시 시도하세요.');
   workspaces = listing.workspaces;
+  workspacesListed = true;
   const hash = location.hash.slice(1);
   if (hash === 'accounts') {
     currentWorkspace = null;
@@ -1817,15 +1984,84 @@ async function render() {
     return;
   }
   if (hash === 'settings') { currentWorkspace = null; renderSettings(); return; }
-  if (hash === 'admin') { currentWorkspace = null; await renderAdmin(); return; }
+  if (hash === 'admin') { currentWorkspace = null; await renderAdmin(ticket); return; }
   const match = /^w\/([0-9a-f]{32})(?:\/c\/([0-9a-f]{32}))?$/.exec(hash);
   if (match) {
-    const workspace = await api(`/api/workspaces/${match[1]}`);
+    let workspace;
+    try { workspace = await pageRequest(`/api/workspaces/${match[1]}`); }
+    catch (error) {
+      if (error.status !== 404) throw error;
+      if (ticket === rendering) renderWorkspaceNotFound();
+      return;
+    }
     if (ticket !== rendering) return;
     currentWorkspace = workspace;
     await renderWorkspace();
-    if (match[2] && ticket === rendering) await openChallenge(match[2]);
+    // The workspace page works without this challenge, so it stays and only a toast reports it.
+    if (match[2] && ticket === rendering) await openChallenge(match[2]).catch(error => { if (ticket === rendering) toast(transferErrorText(error),true); });
   } else { currentWorkspace = null; renderOverview(); }
+}
+
+function pageFailureMarkup(error) {
+  return `<div class="empty page-failure" role="alert"><div class="empty-icon" aria-hidden="true">!</div><h2>${tr('화면을 불러오지 못했습니다.')}</h2><p>${esc(transferErrorText(error))}</p><button type="button" class="primary" data-action="retry-page">${tr('다시 시도')}</button></div>`;
+}
+
+function workspaceNotFoundMarkup() {
+  return `<div class="empty page-failure" role="alert"><div class="empty-icon" aria-hidden="true">⚑</div><h2>${tr('작업공간을 찾을 수 없습니다.')}</h2><p>${tr('삭제되었거나 이 계정으로 볼 수 없는 작업공간입니다.')}</p><a class="button-link primary" href="#">${tr('모든 작업공간')}</a></div>`;
+}
+
+function repaintPageNotice() {
+  const root = document.querySelector('#content') || app.querySelector('.page-failure-shell');
+  if (root && pageNotice) morphMarkup(root,pageNotice());
+}
+
+function showPageNotice(markup, retry = null) {
+  pageNotice = markup;
+  pageRetry = retry;
+  repaintPageNotice();
+}
+
+const pageTitles = new Map([['accounts','에이전트'],['settings','개인 설정'],['admin','관리자 설정']]);
+
+function showPageFailure(error, retry) {
+  leaveWorkspacePage();
+  const hash = location.hash.slice(1);
+  const title = pageTitles.get(hash);
+  shell(title ? hash : 'workspaces',title);
+  if (!workspacesListed) document.querySelector('.nav-count')?.remove();
+  showPageNotice(() => pageFailureMarkup(error),retry);
+}
+
+// Before a session is known there is no shell, so this one fills #app.
+function showBootFailure(error) {
+  app.innerHTML = '<main class="page-failure-shell"></main>';
+  showPageNotice(() => `${i18n.picker()}${pageFailureMarkup(error)}`,boot);
+}
+
+// Also for a workspace that disappears while it is on screen. The detail stays open, and so
+// does a form with typed input: either may hold the only copy of something. Both sit above
+// the notice, so they say it themselves, and closing the last one finishes leaving the page.
+function renderWorkspaceNotFound() {
+  const workspace = currentWorkspace;
+  rememberNotes();
+  if (solverConsoleDialog?.open) solverConsoleDialog.close();
+  if (modal.open && !modalInputAtRisk() && !(modal.dataset.kind === 'direct-send' && directSendState && directSendActive(directSendState))) modal.close();
+  leaveWorkspacePage(detail.open);
+  if (workspace && (detail.open || modal.open)) {
+    currentWorkspace = workspace;
+    workspace.gone = true;
+    workspace.listStaleAt ||= Date.now();
+  }
+  shell('workspaces');
+  showPageNotice(workspaceNotFoundMarkup);
+  paintLiveNotices();
+  if (modal.open) toast(i18n.t('작업공간을 찾을 수 없습니다.'),true);
+}
+
+function leaveGoneWorkspace() {
+  if (!currentWorkspace?.gone || detail.open || modal.open) return;
+  currentWorkspace = null;
+  document.querySelector('.page-failure a')?.focus();
 }
 
 function renderOverview() {
@@ -1847,7 +2083,7 @@ async function renderWorkspace() {
   stopChallengeListPolling();
   shell('workspaces', w.name, true).innerHTML = workspaceMarkup(w);
   startResourcePolling(w.id);
-  await refreshChallenges();
+  await refreshChallenges(pageRequest);
   startChallengeListPolling(w.id);
   pollCTFdJobs(w.id);
 }
@@ -1855,7 +2091,7 @@ async function renderWorkspace() {
 function workspaceMarkup(w) {
   return `<div class="page-head"><div><div class="eyebrow">CTF WORKSPACE</div><h1 data-i18n-ignore>${esc(w.name)}</h1>${w.description ? `<p data-i18n-ignore>${esc(w.description)}</p>` : ''}</div><div class="head-actions"><button class="ghost icon-action" data-action="edit-workspace" aria-label="작업공간 설정" title="작업공간 설정">⚙</button><button data-action="show-staged-files">${tr('사전 파일')}</button><button data-action="receive-workspace-direct">${tr('직접 받기')}</button><button data-action="import-workspace-transfer">${tr('ZIP 가져오기')}</button><button data-action="ctfd-submit-settings">CTFd 연결</button><button data-action="ctfd-import">CTFd 가져오기 <span class="ctfd-import-badge" hidden></span></button><button data-action="ctfd-sync" title="저장된 CTFd 연결에서 새로 추가된 문제만 확인합니다.">새 문제 동기화</button><button class="primary" data-action="new-challenge">＋ 문제 추가</button></div></div>
     <div class="workspace-summary"><div class="workspace-summary-meta"><span>⚑ Flag 형식 <code>${esc(w.flag_format || i18n.t('미설정'))}</code></span><span>문제 수 <b data-workspace-challenge-count>${w.challenge_count ?? ''}</b></span></div>${resourceMeterMarkup()}</div>
-    <div id="challenge-area" data-morph-keep></div>`;
+    <div id="challenge-area" data-morph-keep></div>${liveNoticeMarkup()}`;
 }
 
 function challengeRunSummary(challenge) {
@@ -1892,14 +2128,19 @@ function challengeElapsedText(run) {
   return minuteRemainder ? `${hours}시간 ${minuteRemainder}분` : `${hours}시간`;
 }
 
-function solverElapsedMarkup(run) {
+// These labels count on the client, so they stop with the data behind them.
+function elapsedClock(freezeOnListStale = false) {
+  return ((currentWorkspace?.gone || freezeOnListStale) && currentWorkspace?.listStaleAt || Date.now()) / 1000;
+}
+
+function solverElapsedMarkup(run, freezeOnListStale = false) {
   const base = run?.solve_elapsed_seconds;
   if (typeof base !== 'number' || !Number.isFinite(base) || base < 0) return '';
   const runningSince = run.solve_elapsed_running_since;
   const ticking = typeof runningSince === 'number' && Number.isFinite(runningSince) && runningSince > 0;
   const label = i18n.t(run.solve_elapsed_includes_queue ? '대기 포함 경과 시간' : '풀이 경과 시간');
-  const elapsed = challengeElapsedText({elapsed_seconds:base + (ticking ? Math.max(0,Date.now() / 1000 - runningSince) : 0)});
-  return `<small class="solver-elapsed" data-elapsed-base="${base}" ${ticking ? `data-running-since="${runningSince}" ` : ''}title="${label}" aria-label="${label} ${esc(elapsed)}">· ${esc(elapsed)}</small>`;
+  const elapsed = challengeElapsedText({elapsed_seconds:base + (ticking ? Math.max(0,elapsedClock(freezeOnListStale) - runningSince) : 0)});
+  return `<small class="solver-elapsed" data-elapsed-base="${base}" ${ticking ? `data-running-since="${runningSince}" ` : ''}${freezeOnListStale ? 'data-freeze-list-stale ' : ''}title="${label}" aria-label="${label} ${esc(elapsed)}">· ${esc(elapsed)}</small>`;
 }
 
 function updateSolverElapsedLabels() {
@@ -1908,7 +2149,7 @@ function updateSolverElapsedLabels() {
     if (!Number.isFinite(base) || base < 0) continue;
     const runningSince = Number(label.dataset.runningSince);
     const ticking = Number.isFinite(runningSince) && runningSince > 0;
-    const elapsed = challengeElapsedText({elapsed_seconds:base + (ticking ? Math.max(0,Date.now() / 1000 - runningSince) : 0)});
+    const elapsed = challengeElapsedText({elapsed_seconds:base + (ticking ? Math.max(0,elapsedClock(label.hasAttribute('data-freeze-list-stale')) - runningSince) : 0)});
     label.textContent = `· ${elapsed}`;
     label.setAttribute('aria-label',`${label.title} ${elapsed}`);
   }
@@ -1918,11 +2159,12 @@ function challengeInputMarkup(challenge, workspaceId) {
   const mode = challenge.remote_mode === 'none' ? 'none' : 'endpoint';
   const inputReady = challenge.latest_solver?.input_ready_to_retry === true;
   const waitingForCorrection = mode === 'none' && !inputReady;
+  const held = attachmentsPending(workspaceId,challenge.id);
   return `<form class="challenge-inline-input" data-workspace-id="${esc(workspaceId)}" data-challenge-id="${esc(challenge.id)}" data-edit-token="${esc(challenge.edit_token || '')}" data-name="${esc(challenge.name)}" data-input-ready="${inputReady}" data-original-remote-mode="${esc(challenge.remote_mode || 'unknown')}">
     <div><strong>추가 입력 필요</strong><small>요청된 접속 정보나 파일을 추가한 뒤 이어서 풉니다.</small></div>
     <label><span class="sr-only">원격 대상</span><select name="remote_mode" aria-label="원격 대상"><option value="endpoint" ${mode === 'endpoint' ? 'selected' : ''}>접속 정보</option><option value="none" ${mode === 'none' ? 'selected' : ''}>원격 대상 없음</option></select></label>
     <label class="challenge-inline-remote${mode === 'none' ? ' is-disabled' : ''}"><span class="sr-only">원격 접속 정보</span><input name="remote" value="${esc(challenge.remote || '')}" maxlength="2000" placeholder="URL 또는 nc host port" aria-label="원격 접속 정보" ${mode === 'endpoint' ? 'required' : 'disabled'}></label>
-    <button type="submit" class="small primary" ${waitingForCorrection ? 'disabled' : ''}>계속 풀기</button>
+    <button type="submit" class="small primary" ${held ? 'data-attachment-hold ' : ''}${held || waitingForCorrection ? 'disabled' : ''}>계속 풀기</button>
   </form>`;
 }
 
@@ -1938,6 +2180,30 @@ function challengeLabel(template, challenge) {
   return esc(i18n.t(template).replace('{name}',() => challenge.name));
 }
 
+// Attachment work per challenge, in memory. POST .../solver stages the attachment set at enqueue, so a
+// solve started now would run without these files and the next upload would get a 409. Start waits.
+// A record exists only while something still has to arrive; paused and failed files leave it.
+const attachmentWork = new Map();
+const attachmentHoldReason = '첨부파일 업로드가 끝나면 시작할 수 있습니다.';
+const attachmentWorkKey = (workspaceId, challengeId) => `${workspaceId}:${challengeId}`;
+
+function attachmentsPending(workspaceId, challengeId) {
+  return attachmentWork.has(attachmentWorkKey(workspaceId,challengeId));
+}
+
+function attachmentWorkBody(work, startable) {
+  const current = work.items.find(item => !item.done) || work.items.at(-1);
+  const total = work.items.reduce((sum,item) => sum + item.size,0);
+  const sent = work.items.reduce((sum,item) => sum + item.offset,0);
+  const percent = total ? Math.floor(sent / total * 100) : 0;
+  const count = work.items.length > 1 ? `${i18n.format('파일 {current}/{total}',{current:work.items.indexOf(current) + 1,total:work.items.length})} · ` : '';
+  return `<div class="challenge-card-upload-head"><strong data-i18n-ignore title="${esc(current.name)}">${esc(count + current.name)}</strong><span data-i18n-ignore>${size(sent)} / ${size(total)} · ${percent}%</span></div><progress max="${Math.max(1,total)}" value="${sent}" aria-label="${esc(i18n.format('{name} 업로드 진행',{name:current.name}))}"></progress>${startable ? `<small>${tr(attachmentHoldReason)}</small>` : ''}`;
+}
+
+function attachmentWorkMarkup(work, startable) {
+  return `<div class="challenge-card-upload" role="status">${attachmentWorkBody(work,startable)}</div>`;
+}
+
 function challengeCardMarkup(challenge, workspaceId) {
   const category = challenge.category || i18n.t('미분류');
   const statusLabel = statuses[challenge.status] || challenge.status;
@@ -1949,12 +2215,13 @@ function challengeCardMarkup(challenge, workspaceId) {
   const runPhase = latestRun?.phase || latestRun?.status;
   const liveSession = latestRun && !solverTerminalPhases.has(runPhase);
   const liveElapsed = liveSession && challenge.status === 'running'
-    ? solverElapsedMarkup(latestRun) : '';
+    ? solverElapsedMarkup(latestRun,true) : '';
   const needsInput = runPhase === 'needs_input';
   const inputRequestKind = latestRun?.input_request_kind;
   const canStart = !needsInput && ['pending','stopped','failed'].includes(challenge.status);
   const startKey = `${workspaceId}:${challenge.id}`;
   const starting = canStart && startingListSolvers.has(startKey);
+  const work = attachmentWork.get(startKey);
   const openLabel = challenge.status === 'solved' ? '결과 보기' : challenge.status === 'running' ? '진행 보기' : challenge.status === 'flag_found' ? 'Flag 확인' : '풀이 설정';
   return `<article class="challenge-card challenge-card-${esc(challenge.status)}" data-challenge-id="${esc(challenge.id)}" role="listitem">
     <div class="challenge-card-top"><span class="challenge-category" data-i18n-ignore>${esc(category)}</span><span class="challenge-card-status"><span class="status-dot" aria-hidden="true"></span>${esc(statusLabel)}${liveElapsed || (elapsed ? `<small title="${latestRun.elapsed_includes_queue ? '대기 포함 소요 시간' : '풀이 시간'}">· ${esc(elapsed)}</small>` : '')}</span></div>
@@ -1965,12 +2232,13 @@ function challengeCardMarkup(challenge, workspaceId) {
     ${needsInput ? inputRequestKind === 'remote_input'
       ? challengeInputMarkup(challenge,workspaceId)
       : challengeAttentionMarkup(challenge,inputRequestKind) : ''}
+    ${work ? attachmentWorkMarkup(work,canStart || (needsInput && inputRequestKind === 'remote_input')) : ''}
     <footer class="challenge-card-footer"><span class="challenge-updated">${esc(date(challenge.updated_at))}</span><div class="challenge-card-actions">
       ${challenge.flag ? `<button type="button" class="small ghost icon-action flag-action" data-action="copy-list-flag" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" aria-label="${challengeLabel('{name} Flag 복사',challenge)}" title="Flag 복사">⚑</button>` : ''}
       ${canCopyWriteup ? `<button type="button" class="small ghost icon-action writeup-action" data-action="copy-list-writeup" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-writeup-stamp="${esc(writeupStamp(challenge))}" aria-label="${challengeLabel('{name} write-up 복사',challenge)}" title="write-up 복사">▤</button>` : ''}
       ${latestRun ? `<button type="button" class="small ghost session-action${liveSession ? ' live' : ''}" data-action="open-solver-session" data-id="${esc(challenge.id)}" data-live="${liveSession}" aria-label="${challengeLabel(liveSession ? '{name} 실시간 풀이 터미널 보기' : '{name} 이전 풀이 터미널 보기',challenge)}" title="${liveSession ? '실시간 풀이 터미널' : '이전 풀이 터미널'}">${liveSession ? '<span class="session-live-dot" aria-hidden="true"></span>LIVE' : '<span aria-hidden="true">&gt;_</span>'}</button>` : ''}
       ${canStart ? `<button type="button" class="small ghost complete-action" data-action="complete-list-challenge" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${challengeLabel('{name} 수동 완료',challenge)}">수동 완료</button>` : ''}
-      ${canStart ? `<button type="button" class="small primary solve-action" data-action="start-list-solver" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${challengeLabel('{name} 기본 설정으로 풀이 시작',challenge)}" title="기본 설정으로 풀이 시작" ${starting ? 'disabled aria-busy="true"' : ''}>${starting ? '시작 중' : '▶ 풀이 시작'}</button>` : ''}
+      ${canStart ? `<button type="button" class="small primary solve-action" data-action="start-list-solver" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${challengeLabel('{name} 기본 설정으로 풀이 시작',challenge)}" title="기본 설정으로 풀이 시작" ${work ? 'data-attachment-hold ' : ''}${starting ? 'disabled aria-busy="true"' : work ? 'disabled' : ''}>${starting ? '시작 중' : '▶ 풀이 시작'}</button>` : ''}
       <button type="button" class="small challenge-open-action" data-action="open-challenge" data-id="${esc(challenge.id)}">${openLabel} <span aria-hidden="true">↗</span></button>
     </div></footer>
   </article>`;
@@ -1980,7 +2248,7 @@ function challengeCardSignature(challenge) {
   return JSON.stringify({
     id:challenge.id,name:challenge.name,category:challenge.category,description:challenge.description,
     status:challenge.status,flag:challenge.flag,completion_source:challenge.completion_source,
-    has_writeup:challenge.has_writeup,updated_at:challenge.updated_at,
+    has_writeup:challenge.has_writeup,updated_at:challenge.updated_at,edit_token:challenge.edit_token,
     writeup_updated_at:challenge.writeup_updated_at,notes_token:challenge.notes_token,
     latest_solver:challenge.latest_solver || challenge.solver || challenge.latest_run || null,
   });
@@ -2121,6 +2389,29 @@ function observeVisibleWriteups(area, workspaceId) {
   for (const button of area.querySelectorAll('[data-action="copy-list-writeup"]')) writeupPrefetchObserver.observe(button);
 }
 
+// A dirty control ignores the value and selected attributes a morph writes. The morph also
+// writes the server's disabled state over a form whose select still shows the user's choice.
+function syncChallengeListControls(area) {
+  const category = area.querySelector('#category-filter');
+  category.value = selectedCategory;
+  if (category.selectedIndex < 0) category.selectedIndex = 0;
+  area.querySelector('#sort-order').value = selectedSort;
+  for (const form of area.querySelectorAll('.challenge-inline-input')) syncInlineInput(form);
+}
+
+function morphChallengeListing(area, listing, workspaceId) {
+  morphMarkup(area,challengeListingMarkup(listing,workspaceId));
+  syncChallengeListControls(area);
+}
+
+function clearChallengeFilters() {
+  selectedStatus = ''; selectedCategory = ''; selectedSort = 'added_desc'; search = '';
+  const area = document.querySelector('#challenge-area');
+  area.querySelector('#search-input').value = '';
+  syncChallengeListControls(area);
+  return refreshChallenges();
+}
+
 function paintChallengeListing(result, workspaceId, patchOnly = false) {
   const area = document.querySelector('#challenge-area');
   if (!area || currentWorkspace?.id !== workspaceId) return false;
@@ -2141,10 +2432,14 @@ function paintChallengeListing(result, workspaceId, patchOnly = false) {
   const signatures = new Map(challenges.map(challenge => [challenge.id,challengeCardSignature(challenge)]));
   const categoryKey = JSON.stringify(categories);
   const grid = area.querySelector?.('.challenge-card-grid');
-  const cards = grid ? [...grid.querySelectorAll('[data-challenge-id]')] : [];
+  // Only the cards: the inline input form inside one carries the same attribute.
+  const cards = grid ? [...grid.querySelectorAll(':scope > .challenge-card')] : [];
   const sameCards = cards.length === challenges.length && cards.every((card,index) => card.dataset.challengeId === challenges[index]?.id);
-  if (!patchOnly || !grid || !sameCards || categoryKey !== challengeListCategories) {
-    area.innerHTML = challengeListingMarkup({challenges,counts,categories},workspaceId);
+  // An empty state that stays the same is patched too: a morph would rewrite translated text on every poll.
+  const emptyState = area.querySelector(':scope > .empty');
+  const sameEmpty = emptyState && !challenges.length && Boolean(emptyState.querySelector('[data-action="clear-filter"]')) === total > 0;
+  if (!patchOnly || !(grid || sameEmpty) || !sameCards || categoryKey !== challengeListCategories) {
+    morphChallengeListing(area,{challenges,counts,categories},workspaceId);
     challengeListSignatures = signatures;
     challengeListCategories = categoryKey;
     observeVisibleWriteups(area,workspaceId);
@@ -2158,7 +2453,7 @@ function paintChallengeListing(result, workspaceId, patchOnly = false) {
     template.innerHTML = challengeCardMarkup(challenge,workspaceId).trim();
     const replacement = template.content?.firstElementChild;
     if (!replacement) return false;
-    card.replaceWith(replacement);
+    solverMorphNode(card,replacement);
     changed++;
   }
   for (const button of area.querySelectorAll?.('[data-action="filter"]') || []) {
@@ -2171,8 +2466,9 @@ function paintChallengeListing(result, workspaceId, patchOnly = false) {
   if (footer) footer.textContent = `${challenges.length}개 문제`;
   challengeListSignatures = signatures;
   challengeListCategories = categoryKey;
-  if (changed) observeVisibleWriteups(area,workspaceId);
   if (changed) {
+    syncChallengeListControls(area);
+    observeVisibleWriteups(area,workspaceId);
     const live = document.querySelector('#challenge-live-state');
     if (live) live.textContent = `문제 ${changed}개의 상태가 갱신되었습니다.`;
   }
@@ -2224,7 +2520,8 @@ async function completeListChallenge(button) {
 async function startListSolver(button) {
   const workspaceId = button.dataset.workspaceId, challengeId = button.dataset.id;
   if (!currentWorkspace || currentWorkspace.id !== workspaceId) throw new Error(i18n.t('문제 목록을 다시 불러와 주세요.'));
-  const key = `${workspaceId}:${challengeId}`;
+  requireNoAttachmentWork(workspaceId,challengeId);
+  const key = `${workspaceId}:${challengeId}`, name = button.dataset.name;
   if (startingListSolvers.has(key)) return;
   startingListSolvers.add(key);
   button.disabled = true;
@@ -2239,12 +2536,12 @@ async function startListSolver(button) {
     started = true;
     if (payload.capacity?.warning && payload.capacity.warning_message) toast(payload.capacity.warning_message);
     if (currentWorkspace?.id === workspaceId) await refreshChallenges().catch(() => {});
-    toast(i18n.t('“{name}” 풀이를 시작했습니다.').replace('{name}',() => button.dataset.name || i18n.t('문제')));
+    toast(i18n.t('“{name}” 풀이를 시작했습니다.').replace('{name}',() => name || i18n.t('문제')));
   } finally {
     startingListSolvers.delete(key);
     if (!started && currentWorkspace?.id === workspaceId) refreshChallenges().catch(() => {});
     if (button.isConnected) {
-      button.disabled = false;
+      button.disabled = button.hasAttribute('data-attachment-hold');
       button.removeAttribute('aria-busy');
       button.textContent = previousText;
     }
@@ -2254,6 +2551,7 @@ async function startListSolver(button) {
 async function continueListSolver(form, data) {
   const workspaceId = form.dataset.workspaceId, challengeId = form.dataset.challengeId;
   if (!currentWorkspace || currentWorkspace.id !== workspaceId) throw new Error(i18n.t('문제 목록을 다시 불러와 주세요.'));
+  requireNoAttachmentWork(workspaceId,challengeId);
   const remoteMode = data.remote_mode === 'none' ? 'none' : 'endpoint';
   const remote = remoteMode === 'endpoint' ? String(data.remote || '').trim() : '';
   if (remoteMode === 'none' && form.dataset.originalRemoteMode === 'none' && form.dataset.inputReady !== 'true') {
@@ -2269,13 +2567,41 @@ async function continueListSolver(form, data) {
   await startListSolver(button);
 }
 
-async function refreshChallenges() {
+async function refreshChallenges(request = api) {
   if (!currentWorkspace || !document.querySelector('#challenge-area')) return;
-  const ticket = ++listRendering, workspaceId = currentWorkspace.id;
+  const ticket = ++listRendering, workspaceId = currentWorkspace.id, startedAt = Date.now();
   const params = challengeListParams();
-  const result = await api(`${path(null,workspaceId)}?${params}`);
+  const result = challengeListResult(await request(`${path(null,workspaceId)}?${params}`));
   if (ticket !== listRendering || currentWorkspace?.id !== workspaceId) return;
   paintChallengeListing(result,workspaceId);
+  challengeListUpdated(startedAt);
+}
+
+// api() answers {} when a body breaks off, and a timeout does exactly that. It is not an empty list.
+function challengeListResult(result) {
+  if (!Object.keys(result).length) throw new Error('문제 목록을 다시 불러와 주세요.');
+  return result;
+}
+
+function challengeListUpdated(startedAt) {
+  const workspace = currentWorkspace, now = Date.now();
+  workspace.listUpdatedAt = now;
+  workspace.listFailures = 0;
+  challengeListSlow = now - startedAt >= CHALLENGE_LIST_TIMEOUT;
+  if (!workspace.listStaleAt) return;
+  workspace.listStaleAt = 0;
+  paintLiveNotices();
+}
+
+function challengeListFailed() {
+  const workspace = currentWorkspace;
+  workspace.listFailures = (workspace.listFailures || 0) + 1;
+  if (workspace.listFailures < CHALLENGE_LIST_FAILURES_SHOWN || workspace.listStaleAt) return;
+  workspace.listStaleAt = Date.now();
+  challengeListSlow = true;
+  paintLiveNotices();
+  // A form has no notice of its own.
+  if (modal.open) toast(i18n.t('실시간 갱신이 멈췄습니다.'),true);
 }
 
 function scheduleChallengeListPoll(workspaceId, generation, delay = 2000) {
@@ -2287,13 +2613,22 @@ function scheduleChallengeListPoll(workspaceId, generation, delay = 2000) {
 async function pollChallengeList(workspaceId, generation) {
   challengeListPollTimer = null;
   if (generation !== challengeListPollGeneration || currentWorkspace?.id !== workspaceId || document.visibilityState === 'hidden') return;
-  const ticket = listRendering, query = challengeListParams().toString();
+  const ticket = listRendering, query = challengeListParams().toString(), startedAt = Date.now();
   try {
-    const result = await api(`${path(null,workspaceId)}?${query}`);
+    // A request that hangs never rejects, so only the timeout lets it count.
+    const signal = AbortSignal.timeout?.(challengeListSlow ? CHALLENGE_LIST_SLOW_TIMEOUT : CHALLENGE_LIST_TIMEOUT);
+    const result = challengeListResult(await api(`${path(null,workspaceId)}?${query}`,{signal}));
     if (generation !== challengeListPollGeneration || ticket !== listRendering || currentWorkspace?.id !== workspaceId) return;
-    if (!paintChallengeListing(result,workspaceId,true)) await refreshChallenges();
-  } catch { /* Keep the last visible state and retry. */ }
-  finally { scheduleChallengeListPoll(workspaceId,generation); }
+    if (paintChallengeListing(result,workspaceId,true)) challengeListUpdated(startedAt);
+    else await refreshChallenges();
+  } catch (error) {
+    // A 401 has already opened the login form, and a hidden tab or a new page bumped the generation.
+    if (generation !== challengeListPollGeneration || currentWorkspace?.id !== workspaceId) return;
+    if (error.status === 404) {
+      workspaces = workspaces.filter(workspace => workspace.id !== workspaceId);
+      renderWorkspaceNotFound();
+    } else challengeListFailed();
+  } finally { scheduleChallengeListPoll(workspaceId,generation); }
 }
 
 function startChallengeListPolling(workspaceId) {
@@ -3071,13 +3406,15 @@ function paintDirectSend(state) {
   const progressText = modal.querySelector('#direct-send-progress-text');
   const start = modal.querySelector('[data-action="start-direct-send"]');
   const cancel = modal.querySelector('[data-action="cancel-direct-send"]');
+  const renew = modal.querySelector('[data-action="new-direct-send"]');
   const active = directSendActive(state);
   if (status) {
     status.textContent = state.error || (state.jobId || state.status !== 'idle'
       ? directSendProgressLabel(state) + (state.cancelRequested && active ? ' · ' + i18n.t('취소 요청 중') : '')
         + (state.status === 'completed' && state.result?.workspace_id ? ' · ' + i18n.t('대상 작업공간 ID') + ': ' + state.result.workspace_id : '')
+        + (state.status === 'completed' && state.reused ? ' · ' + i18n.t('이 초대는 이미 완료되어 다시 전송하지 않았습니다.') : '')
         + (state.reconnecting ? ' · ' + i18n.t('다시 연결하는 중…') : '')
-      : i18n.t('초대 URL과 토큰을 입력한 뒤 전송을 시작하세요.'));
+      : i18n.t(state.renewed ? '완료된 초대는 다시 사용할 수 없습니다. 받는 설치에서 새 초대를 발급한 뒤 URL과 토큰을 입력하세요.' : '초대 URL과 토큰을 입력한 뒤 전송을 시작하세요.'));
     status.classList.toggle('error-text',Boolean(state.error) || ['failed','interrupted'].includes(state.status));
   }
   const total = Number(state.size);
@@ -3095,7 +3432,10 @@ function paintDirectSend(state) {
     start.textContent = i18n.t(['failed','interrupted','cancelled'].includes(state.status) ? '다시 시도' : '전송 시작');
   }
   if (cancel) { cancel.hidden = !active; cancel.disabled = state.busy || state.cancelRequested; }
-  if (state.status === 'completed') {
+  if (renew) renew.hidden = state.status !== 'completed' || state.busy;
+  // Once, for the token this modal submitted: later text is for the next invitation.
+  if (state.status === 'completed' && state.clearToken) {
+    state.clearToken = false;
     const tokenInput = modal.querySelector('#direct-send-token');
     if (tokenInput) tokenInput.value = '';
   }
@@ -3105,9 +3445,11 @@ async function pollDirectSend(state) {
   if (!state.jobId || directSendState !== state) return;
   if (directSendTimer !== null) clearTimeout(directSendTimer);
   directSendTimer = null;
+  // New transfer keeps the state object, so only the id tells a stale answer apart.
+  const jobId = state.jobId;
   try {
-    const result = await api('/api/transfers/direct/sends/' + encodeURIComponent(state.jobId));
-    if (directSendState !== state || modal.dataset.kind !== 'direct-send') return;
+    const result = await api('/api/transfers/direct/sends/' + encodeURIComponent(jobId));
+    if (directSendState !== state || state.jobId !== jobId || modal.dataset.kind !== 'direct-send') return;
     state.reconnecting = false;
     state.status = result.status || state.status;
     state.offset = result.offset || 0;
@@ -3121,7 +3463,7 @@ async function pollDirectSend(state) {
     }
     paintDirectSend(state);
   } catch (error) {
-    if (directSendState !== state) return;
+    if (directSendState !== state || state.jobId !== jobId) return;
     if (error.status === 404) {
       try { localStorage.removeItem(directSendStorageKey(state)); } catch {}
       state.jobId = '';
@@ -3149,21 +3491,58 @@ function showDirectSend(scope) {
     '<progress id="direct-send-progress" hidden></progress><small id="direct-send-progress-text" class="form-hint" hidden></small></div>',
     '<button type="button" data-action="close-modal">' + tr('닫기') + '</button>' +
     '<button type="button" class="danger ghost" data-action="cancel-direct-send" hidden>' + tr('전송 취소') + '</button>' +
+    '<button type="button" class="primary" data-action="new-direct-send" hidden>' + tr('새 전송') + '</button>' +
     '<button type="button" class="primary" data-action="start-direct-send">' + tr('전송 시작') + '</button>');
   modal.dataset.kind = 'direct-send'; modal.dataset.transferScope = scope;
   modal.dataset.workspaceId = workspace.id; modal.dataset.challengeId = challenge?.id || '';
-  const state = {scope,workspaceId:workspace.id,challengeId:challenge?.id || '',jobId:'',status:'idle',offset:0,size:null,result:null,error:'',busy:false,cancelRequested:false,reconnecting:false};
+  const state = {scope,workspaceId:workspace.id,challengeId:challenge?.id || '',jobId:'',status:'idle',offset:0,size:null,result:null,error:'',busy:false,cancelRequested:false,reconnecting:false,reused:false,renewed:false,sentUrl:'',clearToken:false};
   directSendState = state;
   try { state.jobId = localStorage.getItem(directSendStorageKey(state)) || ''; } catch {}
   paintDirectSend(state);
   if (state.jobId) pollDirectSend(state);
 }
 
-async function startDirectSend() {
+// The head, and the foot on a phone, stay pinned over the scrolling modal, and a plain focus()
+// can stop under them. The field must show, then the status, then the field's label. The
+// 8 px keep the focus ring clear of the head, unless the status needs them to fit.
+function focusDirectSendField() {
+  const field = ['#direct-send-url','#direct-send-token'].map(selector => modal.querySelector(selector)).find(input => !input.value.trim());
+  (field || modal.querySelector('[data-action="start-direct-send"]')).focus({preventScroll:true});
+  const head = modal.querySelector('.dialog-head'), foot = modal.querySelector('.dialog-foot');
+  const frame = modal.getBoundingClientRect(), pinned = node => getComputedStyle(node).position === 'sticky';
+  const top = pinned(head) ? head.getBoundingClientRect().bottom : frame.top;
+  const bottom = pinned(foot) ? foot.getBoundingClientRect().top : frame.bottom;
+  const statusBelow = modal.querySelector('#direct-send-status').getBoundingClientRect().bottom - bottom;
+  const fieldRoom = field ? field.getBoundingClientRect().top - top : Infinity;
+  const labelRoom = field ? field.closest('label').getBoundingClientRect().top - top - 8 : 0;
+  modal.scrollTop += Math.min(statusBelow <= fieldRoom ? fieldRoom : fieldRoom - 8,Math.max(statusBelow,Math.min(0,labelRoom)));
+}
+
+// The server answers a repeated invitation with its finished job and sends nothing, so the
+// spent URL goes. Any other text is for the next invitation: the spent token was cleared on
+// completion. The remote option is chosen per send.
+function resetDirectSend() {
+  const state = directSendState;
+  if (!state || modal.dataset.kind !== 'direct-send' || state.busy || state.status !== 'completed') return;
+  if (directSendTimer !== null) clearTimeout(directSendTimer);
+  directSendTimer = null;
+  // Another tab may have started its own job under this key since.
+  try { const key = directSendStorageKey(state); if (localStorage.getItem(key) === state.jobId) localStorage.removeItem(key); } catch {}
+  const url = modal.querySelector('#direct-send-url'), remote = modal.querySelector('#direct-include-remote');
+  if (url?.value.trim() === state.sentUrl) url.value = '';
+  if (remote) remote.checked = false;
+  Object.assign(state,{jobId:'',status:'idle',offset:0,size:null,result:null,error:'',cancelRequested:false,reconnecting:false,reused:false,renewed:true,sentUrl:''});
+  paintDirectSend(state);
+  focusDirectSendField();
+}
+
+async function startDirectSend(clicks = 0) {
   const state = directSendState;
   if (!state || modal.dataset.kind !== 'direct-send' || state.busy || directSendActive(state)) return;
   const invitationUrl = modal.querySelector('#direct-send-url')?.value.trim() || '';
   const token = modal.querySelector('#direct-send-token')?.value.trim() || '';
+  // Start takes New transfer's place under the pointer, so a double click lands here by accident.
+  if (state.renewed && (clicks > 1 || (!invitationUrl && !token))) { focusDirectSendField(); return; }
   let url;
   try { url = new URL(invitationUrl); } catch { throw new Error(i18n.t('올바른 HTTPS 초대 URL을 입력하세요.')); }
   if (url.protocol !== 'https:') throw new Error(i18n.t('올바른 HTTPS 초대 URL을 입력하세요.'));
@@ -3172,6 +3551,7 @@ async function startDirectSend() {
     ? path(state.challengeId,state.workspaceId) + '/transfer/direct'
     : '/api/workspaces/' + state.workspaceId + '/transfer/direct';
   state.busy = true; directSendBusy = true; state.error = i18n.t('전송 작업을 시작하는 중입니다.');
+  Object.assign(state,{renewed:false,sentUrl:invitationUrl,clearToken:true});
   paintDirectSend(state);
   try {
     const result = await api(endpoint,{method:'POST',body:{invitation_url:invitationUrl,token,include_remote:modal.querySelector('#direct-include-remote')?.checked === true}});
@@ -3184,6 +3564,8 @@ async function startDirectSend() {
       state.size = result.size;
       state.result = result.result || null;
       state.cancelRequested = false;
+      // A new job always starts queued, so 'completed' here is the earlier job of this invitation.
+      state.reused = state.status === 'completed';
       try { localStorage.setItem(directSendStorageKey(state),state.jobId); } catch {}
       paintDirectSend(state);
       directSendTimer = setTimeout(() => pollDirectSend(state),1000);
@@ -3264,7 +3646,7 @@ function stagedPickerRow(file, challenge) {
   const linkedCount = Number(file.linked_count || 0);
   const linked = linkedCount ? i18n.t('문제 {count}개에 연결됨').replace('{count}',linkedCount) : i18n.t('문제에 연결 안 됨');
   const here = (challenge.attachments || []).some(item => item.size === file.size && String(item.original_name).normalize('NFC') === file.name.normalize('NFC'));
-  return `<label class="file-item" data-staged-name="${esc(file.name.normalize('NFC').toLocaleLowerCase())}"><input type="checkbox" name="staged_file_ids" value="${esc(file.id)}" data-name="${esc(file.name)}" ${ready ? '' : 'disabled'}><span><strong data-i18n-ignore>${esc(file.name)}</strong><small>${size(file.size)} · ${esc(stored)} · ${esc(linked)}</small>${here ? `<small class="staged-attached">${tr('이 문제에 같은 이름·크기의 첨부가 있습니다.')}</small>` : ''}</span></label>`;
+  return `<label class="file-item" data-staged-name="${esc(file.name.normalize('NFC').toLocaleLowerCase())}"><input type="checkbox" name="staged_file_ids" value="${esc(file.id)}" data-name="${esc(file.name)}" data-size="${Number(file.size) || 0}" ${ready ? '' : 'disabled'}><span><strong data-i18n-ignore>${esc(file.name)}</strong><small>${size(file.size)} · ${esc(stored)} · ${esc(linked)}</small>${here ? `<small class="staged-attached">${tr('이 문제에 같은 이름·크기의 첨부가 있습니다.')}</small>` : ''}</span></label>`;
 }
 
 function stagedPickerMarkup(staged, challenge) {
@@ -3401,6 +3783,7 @@ async function changeRelation(removeId = null) {
 }
 
 async function openChallenge(id, focusSolverSession = false, expandSolverSession = false) {
+  if (!currentWorkspace) return;
   rememberNotes();
   stopSolverPolling();
   if (solverConsoleDialog?.open) solverConsoleDialog.close();
@@ -3417,8 +3800,9 @@ async function openChallenge(id, focusSolverSession = false, expandSolverSession
   detail.innerHTML = challengeDetailMarkup(c,displayedNotes,Boolean(draft));
   if (!detail.open) detail.showModal();
   detail.scrollTop = 0;
-  refreshUploads(c.workspace_id,c.id).catch(error => toast(error.message,true));
-  loadRelatedChallenges(c).catch(error => toast(error.message,true));
+  const report = error => { if (!signedOut) toast(error.message,true); };
+  refreshUploads(c.workspace_id,c.id).catch(report);
+  loadRelatedChallenges(c).catch(report);
   const solverLoad = loadSolver(c.workspace_id,c.id);
   if (focusSolverSession) {
     await solverLoad;
@@ -3444,7 +3828,7 @@ function challengeDetailMarkup(c, displayedNotes, restored) {
   const refreshingFromCTFd = activeCTFdChallengeRefreshes.has(refreshKey);
   const ctfdRefreshButton = c.ctfd_id !== null && c.ctfd_id !== undefined && c.ctfd_url
     ? `<button class="small ghost icon-action" data-action="refresh-ctfd-challenge" aria-label="CTFd 원본에서 문제 새로고침" title="CTFd 원본에서 문제 새로고침" aria-describedby="ctfd-refresh-help" ${refreshingFromCTFd ? 'disabled aria-busy="true"' : ''}>${refreshingFromCTFd ? '…' : '↻'}</button>` : '';
-  return `<div class="dialog-head"><div><div class="eyebrow" data-i18n-ignore>${esc(c.category || 'CHALLENGE')}</div><h2 id="challenge-title" data-i18n-ignore>${esc(c.name)}</h2><p data-i18n-ignore>${esc(currentWorkspace.name)}</p></div><div class="line-actions">${ctfdRefreshButton}<button class="small" data-action="receive-challenge-direct" title="${tr('이 작업공간에 문제 직접 받기')}">${tr('직접 받기')}</button><button class="small" data-action="send-challenge-direct">${tr('직접 보내기')}</button><button class="small" data-action="import-challenge-transfer" title="${tr('이 작업공간에 문제 ZIP 가져오기')}">${tr('ZIP 가져오기')}</button><button class="small" data-action="export-challenge-transfer">${tr('ZIP 내보내기')}</button><button class="small icon-action" data-action="clone-challenge" aria-label="문제 복제" title="문제 복제">⧉</button><button class="small icon-action" data-action="edit-challenge" aria-label="문제 수정" title="문제 수정">✎</button><button class="icon-btn icon-action" data-action="close-detail" aria-label="문제 닫기" title="문제 닫기">×</button></div></div>
+  return `<div class="dialog-head"><div class="detail-heading"><div class="eyebrow" data-i18n-ignore>${esc(c.category || 'CHALLENGE')}</div><h2 id="challenge-title" title="${esc(c.name)}" data-i18n-ignore>${esc(c.name)}</h2><div class="detail-full-name" data-name="${esc(c.name)}" aria-hidden="true"></div><p data-i18n-ignore>${esc(currentWorkspace.name)}</p></div><div class="line-actions"><div class="detail-head-actions">${ctfdRefreshButton}<button class="small" data-action="receive-challenge-direct" title="${tr('이 작업공간에 문제 직접 받기')}">${tr('직접 받기')}</button><button class="small" data-action="send-challenge-direct">${tr('직접 보내기')}</button><button class="small" data-action="import-challenge-transfer" title="${tr('이 작업공간에 문제 ZIP 가져오기')}">${tr('ZIP 가져오기')}</button><button class="small" data-action="export-challenge-transfer">${tr('ZIP 내보내기')}</button><button class="small icon-action" data-action="clone-challenge" aria-label="문제 복제" title="문제 복제">⧉</button><button class="small icon-action" data-action="edit-challenge" aria-label="문제 수정" title="문제 수정">✎</button></div><button class="icon-btn icon-action" data-action="close-detail" aria-label="문제 닫기" title="문제 닫기">×</button></div></div>
     <div class="detail-grid"><div class="detail-main">${c.description ? `<h3>문제 설명</h3><div class="description" data-i18n-ignore>${esc(c.description)}</div>` : ''}
     ${c.remote_mode === 'endpoint' && c.remote ? `<h3>원격 접속 정보</h3><div class="description"><code>${esc(c.remote)}</code></div>` : c.remote_mode === 'none' ? '<span class="tag muted">원격 대상 없음</span>' : '<span class="tag muted">원격 정보 미등록</span>'}
     <div class="section-head"><h3>풀이 노트</h3><span class="tag muted">MARKDOWN</span></div>
@@ -3456,7 +3840,7 @@ function challengeDetailMarkup(c, displayedNotes, restored) {
     ${ctfdRefreshButton ? `<section class="ctfd-source-tools"><div class="section-head"><h3>CTFd 원본</h3></div><p id="ctfd-refresh-help" class="form-hint">CTFd 내용·첨부 갱신 · 로컬 기록 유지</p><div class="actions"><button type="button" class="small ghost" data-action="ctfd-refresh-auth">다시 인증</button><button type="button" class="small ghost" data-action="ctfd-submit-settings">연결 설정</button><button type="button" class="small ghost" data-action="ctfd-job-history">가져오기 기록</button></div></section>` : ''}
     <section id="challenge-relations" data-morph-keep></section>
     <section><h3>첨부파일 <span class="muted">${c.attachments.length}</span></h3><div class="file-list">${attachmentRowsMarkup(c)}</div><div id="upload-progress" data-morph-keep></div><label class="sr-only" for="attachment-files">첨부파일 추가</label><input id="attachment-files" class="file-input" type="file" multiple title="대용량 파일 이어 올리기 지원"></section>
-    <section><button class="danger small ghost icon-action" data-action="delete-challenge" aria-label="문제 삭제" title="문제 삭제">⌫</button></section></aside></div>`;
+    <section><button class="danger small ghost icon-action" data-action="delete-challenge" aria-label="문제 삭제" title="문제 삭제">⌫</button></section></aside></div>${liveNoticeMarkup()}`;
 }
 
 async function cloneChallenge() {
@@ -3749,7 +4133,7 @@ function repaintSolverConfiguration(workspaceId, challengeId, generation) {
   } else if (!focused) current.replaceWith(next);
   // A focused field absent from the new state updates when focus leaves.
   panel.querySelectorAll('[data-action="start-solver"]').forEach(button => {
-    button.disabled = !solverConfigurationReady();
+    button.disabled = !solverConfigurationReady() || button.hasAttribute('data-attachment-hold');
   });
 }
 
@@ -3867,6 +4251,7 @@ async function loadSolver(workspaceId, challengeId) {
 
 async function startSolver() {
   const challenge = currentChallenge, workspaceId = challenge.workspace_id, challengeId = challenge.id;
+  requireNoAttachmentWork(workspaceId,challengeId);
   if (!solverConfigurationReady()) throw new Error(i18n.t('로그인된 계정과 모델·추론 수준을 선택해 주세요.'));
   if (solverPollTimer) clearTimeout(solverPollTimer);
   const generation = ++solverRendering;
@@ -3902,6 +4287,7 @@ async function approveUltraEscalation() {
   const job = currentSolverJob, jobId = solverJobId(job);
   if (!jobId || job?.error?.code !== 'ultra_escalation_requested' || !job?.ultra_escalation?.eligible) return;
   const workspaceId = currentWorkspace?.id, challengeId = currentChallenge?.id, generation = solverRendering;
+  requireNoAttachmentWork(workspaceId,challengeId);
   const payload = await api(`/api/solver/jobs/${encodeURIComponent(jobId)}/ultra-escalate`,{method:'POST'});
   if (!solverContext(workspaceId,challengeId,generation)) return;
   const normalized = normalizeSolverPayload(payload);
@@ -4241,25 +4627,113 @@ async function refreshChallengeAttachmentsInPlace(workspaceId, challengeId) {
   }
 }
 
-async function uploadFile(file, workspaceId, challengeId, resumeId) {
-  const endpoint = path(challengeId,workspaceId);
-  let upload;
-  if (resumeId) upload = await api(`/api/uploads/${resumeId}`);
-  else {
-    const pending = await api(`${endpoint}/uploads`);
-    paintUploads(pending.uploads,workspaceId,challengeId,true);
-    upload = pending.uploads.find(item => item.name === file.name && item.size === file.size && item.last_modified === file.lastModified);
-    if (!upload) upload = await api(`${endpoint}/uploads`,{method:'POST',body:{name:file.name,size:file.size,last_modified:file.lastModified}});
+function queueAttachmentWork(workspaceId, challengeId, sources) {
+  if (!sources.length) return [];
+  const key = attachmentWorkKey(workspaceId,challengeId);
+  const work = attachmentWork.get(key) || {workspaceId,challengeId,items:[],stopped:false};
+  const items = sources.map(source => ({work,source,name:source.name,size:source.size,offset:0,done:false}));
+  work.items.push(...items);
+  attachmentWork.set(key,work);
+  paintAttachmentWork(workspaceId,challengeId);
+  return items;
+}
+
+function finishAttachmentItem(item, saved) {
+  const {work} = item;
+  if (work.stopped) return;
+  if (saved) { item.offset = item.size; item.done = true; }
+  else work.items = work.items.filter(other => other !== item);
+  if (work.items.every(other => other.done)) attachmentWork.delete(attachmentWorkKey(work.workspaceId,work.challengeId));
+  paintAttachmentWork(work.workspaceId,work.challengeId);
+}
+
+function stopAttachmentWork() {
+  for (const work of attachmentWork.values()) work.stopped = true;
+  attachmentWork.clear();
+}
+
+function requireNoAttachmentWork(workspaceId, challengeId) {
+  if (!attachmentsPending(workspaceId,challengeId)) return;
+  paintAttachmentWork(workspaceId,challengeId);
+  throw new Error(i18n.t(attachmentHoldReason));
+}
+
+function inlineInputWaiting(form) {
+  return form.elements.remote_mode.value !== 'endpoint' && form.dataset.originalRemoteMode === 'none' && form.dataset.inputReady !== 'true';
+}
+
+function syncInlineInput(form) {
+  // A form in flight stays locked through a morph. It syncs again once runForm has finished.
+  if (busyForms.has(form)) {
+    form.setAttribute('aria-busy','true');
+    for (const control of form.elements) control.disabled = true;
+    return;
   }
-  if (upload.status === 'completed') return true;
-  if (activeUploads.get(upload.id)?.running) throw new Error(i18n.t('이 파일은 이미 업로드 중입니다.'));
-  const startedAt = Date.now();
-  const active = {file,workspaceId,challengeId,offset:upload.offset,running:true,paused:false,controller:new AbortController(),message:'전송 준비 중',
-    startedAt,sampleAt:startedAt,sampleOffset:upload.offset,bytesPerSecond:0};
-  activeUploads.set(upload.id,active);
-  const paint = () => paintUploads([upload],workspaceId,challengeId);
-  paint();
+  const remote = form.elements.remote, enabled = form.elements.remote_mode.value === 'endpoint';
+  remote.disabled = !enabled; remote.required = enabled;
+  remote.closest('label').classList.toggle('is-disabled',!enabled);
+  const submit = form.querySelector('button[type="submit"]');
+  submit.disabled = submit.hasAttribute('data-attachment-hold') || inlineInputWaiting(form);
+}
+
+// Runs on every chunk, so it patches what is there: a rebuilt card would lose focus.
+function paintCardAttachmentWork(card, work) {
+  const held = Boolean(work), line = card.querySelector(':scope > .challenge-card-upload');
+  const startable = Boolean(card.querySelector('[data-action="start-list-solver"],.challenge-inline-input'));
+  if (!work) line?.remove();
+  else if (line) morphMarkup(line,attachmentWorkBody(work,startable));
+  else card.querySelector(':scope > .challenge-card-footer')?.insertAdjacentHTML('beforebegin',attachmentWorkMarkup(work,startable));
+  const start = card.querySelector('[data-action="start-list-solver"]');
+  if (start) { start.toggleAttribute('data-attachment-hold',held); start.disabled = held || start.hasAttribute('aria-busy'); }
+  const submit = card.querySelector('.challenge-inline-input button[type="submit"]');
+  if (submit) { submit.toggleAttribute('data-attachment-hold',held); submit.disabled = held || inlineInputWaiting(submit.form); }
+}
+
+function paintSolverStartHold() {
+  const panel = detail.querySelector('#solver-panel');
+  if (!panel) return;
+  const held = solverAttachmentHold();
+  const controls = [...panel.querySelectorAll('[data-action="start-solver"],[data-action="approve-ultra-escalation"]')];
+  for (const control of controls) {
+    control.toggleAttribute('data-attachment-hold',held);
+    control.disabled = held || (control.dataset.action === 'start-solver' && !solverConfigurationReady());
+  }
+  const hint = panel.querySelector(':scope > .solver-attachment-hold');
+  if (!held || !controls.length) hint?.remove();
+  else if (!hint) panel.insertAdjacentHTML('beforeend',solverAttachmentHoldMarkup());
+}
+
+function paintAttachmentWork(workspaceId, challengeId) {
+  const card = currentWorkspace?.id === workspaceId
+    ? document.querySelector(`#challenge-area [data-challenge-id="${CSS.escape(challengeId)}"]`) : null;
+  if (card) paintCardAttachmentWork(card,attachmentWork.get(attachmentWorkKey(workspaceId,challengeId)));
+  if (detail.open && currentChallenge?.workspace_id === workspaceId && currentChallenge.id === challengeId) paintSolverStartHold();
+}
+
+async function uploadFile(file, workspaceId, challengeId, resumeId, item = queueAttachmentWork(workspaceId,challengeId,[file])[0]) {
+  const endpoint = path(challengeId,workspaceId);
+  let upload, active = null, saved = false;
+  const paint = () => {
+    item.offset = active.offset;
+    paintUploads([upload],workspaceId,challengeId);
+    paintAttachmentWork(workspaceId,challengeId);
+  };
   try {
+    if (resumeId) upload = await api(`/api/uploads/${resumeId}`);
+    else {
+      const pending = await api(`${endpoint}/uploads`);
+      paintUploads(pending.uploads,workspaceId,challengeId,true);
+      upload = pending.uploads.find(entry => entry.name === file.name && entry.size === file.size && entry.last_modified === file.lastModified);
+      if (!upload) upload = await api(`${endpoint}/uploads`,{method:'POST',body:{name:file.name,size:file.size,last_modified:file.lastModified}});
+    }
+    if (item.work.stopped) return false;
+    if (upload.status === 'completed') return saved = true;
+    if (activeUploads.get(upload.id)?.running) throw new Error('이 파일은 이미 업로드 중입니다.');
+    const startedAt = Date.now();
+    active = {file,workspaceId,challengeId,offset:upload.offset,running:true,paused:false,controller:new AbortController(),message:'전송 준비 중',
+      startedAt,sampleAt:startedAt,sampleOffset:upload.offset,bytesPerSecond:0};
+    activeUploads.set(upload.id,active);
+    paint();
     // Read/hash only already committed chunks to ensure the selected resume file
     // really matches; previously uploaded bytes are not retransmitted.
     if (upload.offset) {
@@ -4269,10 +4743,10 @@ async function uploadFile(file, workspaceId, challengeId, resumeId) {
         const manifest = await api(`/api/uploads/${upload.id}/chunks?start=${start}`);
         for (const chunk of manifest.chunks) {
           if (active.paused) return false;
-          if (!crypto.subtle) throw new Error(i18n.t('이어 올리기 검증에는 HTTPS 연결이 필요합니다.'));
+          if (!crypto.subtle) throw new Error('이어 올리기 검증에는 HTTPS 연결이 필요합니다.');
           const bytes = await file.slice(chunk.offset,chunk.offset + chunk.size).arrayBuffer();
           const checksum = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),value => value.toString(16).padStart(2,'0')).join('');
-          if (checksum !== chunk.sha256) throw new Error(i18n.t('선택한 파일이 이전 원본과 다릅니다. 원본을 선택하거나 이 업로드를 취소하세요.'));
+          if (checksum !== chunk.sha256) throw new Error('선택한 파일이 이전 원본과 다릅니다. 원본을 선택하거나 이 업로드를 취소하세요.');
         }
         start = manifest.next_offset;
       } while (start !== null);
@@ -4296,15 +4770,33 @@ async function uploadFile(file, workspaceId, challengeId, resumeId) {
     activeUploads.delete(upload.id);
     uploadViews.delete(upload.id);
     paintUploads([],workspaceId,challengeId);
-    return true;
+    return saved = true;
   } catch (error) {
-    if (error.name !== 'AbortError') { active.message = error.message; throw error; }
-    return false;
+    if (error.name === 'AbortError') return false;
+    // The row keeps source text and paintUploads translates it, so it follows a language switch.
+    if (active) active.message = error instanceof TypeError ? '서버에 연결할 수 없습니다. 연결을 확인하세요.' : error.message;
+    // Callers show this text as it is, and fetch's own message is a browser English string.
+    throw new Error(transferErrorText(error));
   } finally {
-    active.running = false;
-    if (active.paused) active.message = '일시 중지됨 · 이어서 올릴 수 있습니다.';
-    if (activeUploads.has(upload.id)) paint();
+    if (active) {
+      active.running = false;
+      if (active.paused) active.message = '일시 중지됨 · 이어서 올릴 수 있습니다.';
+      if (activeUploads.has(upload.id)) paint();
+    }
+    finishAttachmentItem(item,saved);
   }
+}
+
+// One after another. A sign-out stops the batch: the next file would only meet a 401.
+async function uploadQueuedAttachments(items, workspaceId, challengeId) {
+  const failures = [];
+  let saved = 0;
+  for (const item of items) {
+    if (item.work.stopped) break;
+    try { if (await uploadFile(item.source,workspaceId,challengeId,undefined,item)) saved++; }
+    catch (error) { failures.push(`${item.name}: ${error.message}`); }
+  }
+  return {saved,failures};
 }
 
 async function reloadNotes() {
@@ -4338,7 +4830,7 @@ function renderSettings() {
   content.innerHTML = `<div class="page-head"><div><div class="eyebrow">PERSONAL SETTINGS</div><h1>개인 설정</h1></div></div>
     ${credentialSettings}<section id="telegram-settings"></section>`;
   const container = document.querySelector('#telegram-settings');
-  import('/assets/telegram.js').then(async module => { const dispose = await module.renderTelegram(container,api,{user:sessionUser}); if (container.isConnected) disposeTelegram = dispose; else dispose?.(); }).catch(() => { if (container.isConnected) container.textContent = '알림 설정을 불러올 수 없습니다. 잠시 후 다시 시도하세요.'; });
+  import(new URL('./telegram.js', import.meta.url)).then(async module => { const dispose = await module.renderTelegram(container,api,{user:sessionUser}); if (container.isConnected) disposeTelegram = dispose; else dispose?.(); }).catch(() => { if (container.isConnected) container.textContent = '알림 설정을 불러올 수 없습니다. 잠시 후 다시 시도하세요.'; });
 }
 
 async function refreshReleaseUpdatePanel(force = false) {
@@ -4414,9 +4906,10 @@ function solverCapacityAdminMarkup(capacity) {
   </section>`;
 }
 
-async function renderAdmin() {
+async function renderAdmin(ticket = rendering) {
   if (sessionUser?.role !== 'admin') { location.hash = 'settings'; toast('관리자 권한이 필요합니다.',true); return; }
-  const capacity = await api('/api/admin/solver-capacity');
+  const capacity = await pageRequest('/api/admin/solver-capacity');
+  if (ticket !== rendering) return;
   if (authMode === 'nologin') {
     adminView = {capacity,users:null};
     shell('admin','관리자 설정').innerHTML = adminMarkup(adminView);
@@ -4424,7 +4917,9 @@ async function renderAdmin() {
     refreshReleaseUpdatePanel();
     return;
   }
-  adminView = {capacity,users:(await api('/api/admin/users')).users};
+  const {users} = await pageRequest('/api/admin/users');
+  if (ticket !== rendering) return;
+  adminView = {capacity,users};
   shell('admin','관리자 설정').innerHTML = adminMarkup(adminView);
   renderAdminCliVersions(document.querySelector('#admin-cli-version-panel'), api, {scope:sessionUser.id, locale:i18n.locale});
   refreshReleaseUpdatePanel();
@@ -5007,7 +5502,7 @@ function reflectActiveCTFdRefreshes(jobs, workspaceId) {
 
 async function pollCTFdJobs(workspaceId) {
   if (ctfdJobsPollTimer) { clearTimeout(ctfdJobsPollTimer); ctfdJobsPollTimer = null; }
-  if (currentWorkspace?.id !== workspaceId) return;
+  if (!workspaceId || currentWorkspace?.id !== workspaceId || currentWorkspace.gone) return;
   const generation = ++ctfdJobsRequestGeneration;
   try {
     const result = await api(`/api/workspaces/${workspaceId}/ctfd/jobs`);
@@ -5068,14 +5563,28 @@ async function freshCTFdRefreshFromJob(button) {
 }
 
 document.addEventListener('click', event => {
+  // A link to the failed route itself fires no hashchange, so it would do nothing.
+  const link = event.target.closest('a[href^="#"]');
+  if (link?.getAttribute('href') === (location.hash || '#') && document.querySelector('[data-action="retry-page"]')) { run(pageRetry); return; }
   const button = event.target.closest('[data-action]');
   if (!button || button.disabled) return;
   const action = button.dataset.action;
   const actions = {
-    'logout': async () => { if (authMode !== 'password') return; await api('/api/auth/logout',{method:'POST'}); csrf = ''; sessionPersistent = false; showLogin(); noteDrafts.clear(); ctfdDrafts.clear(); detail.innerHTML = ''; modal.innerHTML = ''; },
+    'logout': async () => {
+      if (authMode !== 'password') return;
+      signingOut = true;
+      try { await api('/api/auth/logout',{method:'POST'}); }
+      catch (error) { if (!signedOut) throw error; }
+      finally { signingOut = false; }
+      // A poll can see the session end first. The form it opened may already hold typed text.
+      sessionPersistent = false; if (!signedOut) showLogin(); noteDrafts.clear(); ctfdDrafts.clear(); detail.innerHTML = ''; modal.innerHTML = '';
+    },
+    'retry-page': async () => { await pageRetry?.(); document.querySelector('[data-action="retry-page"]')?.focus(); },
     'toggle-session-persistence': async () => {
       if (authMode !== 'password') return;
+      const epoch = authEpoch;
       const result = await api('/api/auth/session/refresh',{method:'POST',body:{remember:!sessionPersistent}});
+      if (epoch !== authEpoch) return;
       csrf = result.csrf_token;
       sessionPersistent = result.session_persistent === true;
       button.textContent = sessionPersistent ? '30일 로그인 해제' : '이 기기에서 30일 로그인 유지';
@@ -5128,8 +5637,9 @@ document.addEventListener('click', event => {
     'copy-direct-url': async () => { const value = directInviteState?.url; if (!value) return; const result = await copyText(value); copyToast(result,value); },
     'copy-direct-token': async () => { const value = directInviteState?.token; if (!value) return; const result = await copyText(value); copyToast(result,value); },
     'open-direct-result': () => openDirectResult(),
-    'start-direct-send': () => startDirectSend(),
+    'start-direct-send': () => startDirectSend(event.detail),
     'cancel-direct-send': () => cancelDirectSend(),
+    'new-direct-send': () => resetDirectSend(),
     'download-transfer': () => downloadTransfer(),
     'start-transfer-upload': () => startTransferUpload(),
     'pause-transfer-upload': () => { if (transferState?.running) { transferState.paused = true; transferState.controller?.abort(); } },
@@ -5178,7 +5688,7 @@ document.addEventListener('click', event => {
     'complete-list-challenge': () => completeListChallenge(button),
     'start-list-solver': () => startListSolver(button),
     'filter': async () => { selectedStatus = button.dataset.status; await refreshChallenges(); },
-    'clear-filter': async () => { selectedStatus = ''; selectedCategory = ''; search = ''; await refreshChallenges(); },
+    'clear-filter': () => clearChallengeFilters(),
     'save-notes': () => saveNotes(),
     'copy-notes': async () => { const notes = document.querySelector('#notes-editor').value; const result = await copyText(notes); copyToast(result, notes); },
     'copy-flag': async () => { const flag = currentChallenge.flag || ''; const result = await copyText(flag); copyToast(result, flag); },
@@ -5202,7 +5712,7 @@ document.addEventListener('click', event => {
     'complete': () => changeCompletion('complete'),
     'reopen': () => changeCompletion('reopen'),
     'delete-challenge': async () => { const c = currentChallenge; if (!confirm(i18n.format('“{name}” 문제와 첨부파일, 노트를 삭제할까요? 되돌릴 수 없습니다.',{name:c.name}))) return; await api(path(c.id,c.workspace_id),{method:'DELETE'}); noteDrafts.delete(noteKey(c)); if (currentChallenge === c) { stopSolverPolling(); detail.close(); } await refreshChallenges(); toast('문제를 삭제했습니다.'); },
-    'delete-workspace': async () => { const w = currentWorkspace; if (!confirm(i18n.format('“{name}” 작업공간의 모든 문제와 자료를 삭제할까요? 되돌릴 수 없습니다.',{name:w.name}))) return; await api(`/api/workspaces/${w.id}`,{method:'DELETE'}); ctfdDrafts.delete(w.id); if (currentWorkspace?.id === w.id) { modal.close(); location.hash = ''; } toast('작업공간을 삭제했습니다.'); },
+    'delete-workspace': async () => { const w = currentWorkspace; if (!confirm(i18n.format('“{name}” 작업공간의 모든 문제와 자료를 삭제할까요? 되돌릴 수 없습니다.',{name:w.name}))) return; stopChallengeListPolling(); try { await api(`/api/workspaces/${w.id}`,{method:'DELETE'}); } catch (error) { if (currentWorkspace?.id === w.id) startChallengeListPolling(w.id); throw error; } ctfdDrafts.delete(w.id); if (currentWorkspace?.id === w.id) { modal.close(); location.hash = ''; } toast('작업공간을 삭제했습니다.'); },
     'delete-attachment': async () => { const c = currentChallenge; if (!confirm(i18n.t('첨부파일을 삭제할까요?'))) return; await saveNotes(true); await api(`${path(c.id,c.workspace_id)}/attachments/${button.dataset.id}`,{method:'DELETE'}); if (currentChallenge === c) await openChallenge(c.id); },
     'ctfd-import': () => { ctfdRetryId = null; return importForm(); },
     'refresh-ctfd-jobs': () => pollCTFdJobs(currentWorkspace?.id),
@@ -5219,7 +5729,7 @@ document.addEventListener('click', event => {
     'ctfd-submit-settings': () => ctfdSubmitSettings(),
     'refresh-ctfd-submit': () => refreshCTFdSubmit(),
     'disconnect-ctfd-submit': () => disconnectCTFdSubmit(),
-    'cancel-ctfd': async () => { await api(`/api/workspaces/${currentWorkspace.id}/ctfd/jobs/${button.dataset.id}/cancel`,{method:'POST'}); await pollCTFdJobs(currentWorkspace.id); },
+    'cancel-ctfd': async () => { await api(`/api/workspaces/${currentWorkspace.id}/ctfd/jobs/${button.dataset.id}/cancel`,{method:'POST'}); await pollCTFdJobs(currentWorkspace?.id); },
     'retry-ctfd': () => retryCTFdJob(button),
     'fresh-refresh-ctfd': () => freshCTFdRefreshFromJob(button),
     'new-user': () => newUserForm(),
@@ -5227,15 +5737,20 @@ document.addEventListener('click', event => {
     'user-password': () => { openModal('비밀번호 초기화',i18n.format('{name} 사용자의 로그인 비밀번호를 바꿉니다.',{name:button.dataset.name}),'<label>새 비밀번호<input type="password" name="password" autocomplete="new-password" minlength="4" maxlength="1024" required><span class="form-hint">4자 이상 · 조합 조건 없음</span></label>','<button type="button" data-action="close-modal">취소</button><button class="primary" type="submit">비밀번호 변경</button>','reset-user-form'); modal.querySelector('form').dataset.userId = button.dataset.id; },
     'cleanup-uploads': async () => { const result = await api('/api/admin/uploads/cleanup',{method:'POST'}); toast(`만료된 업로드 ${result.removed}개를 정리했습니다.`); },
     'pause-upload': () => { const active = activeUploads.get(button.dataset.id); if (active) { active.paused = true; active.controller.abort(); } },
-    'resume-upload': async () => { const active = activeUploads.get(button.dataset.id); if (active) { await uploadFile(active.file,active.workspaceId,active.challengeId,button.dataset.id); if (currentChallenge?.id === active.challengeId) await openChallenge(active.challengeId); } },
-    'cancel-upload': async () => { if (!confirm(i18n.t('이 미완료 업로드와 임시 파일을 삭제할까요?'))) return; const active = activeUploads.get(button.dataset.id); if (active) { active.paused = true; active.controller.abort(); } await api(`/api/uploads/${button.dataset.id}`,{method:'DELETE'}); activeUploads.delete(button.dataset.id); await refreshUploads(currentWorkspace.id,currentChallenge.id); },
+    'resume-upload': async () => { const active = activeUploads.get(button.dataset.id); if (active) { await uploadFile(active.file,active.workspaceId,active.challengeId,button.dataset.id); if (detail.open && currentChallenge?.id === active.challengeId) await openChallenge(active.challengeId); } },
+    'cancel-upload': async () => { if (!confirm(i18n.t('이 미완료 업로드와 임시 파일을 삭제할까요?'))) return; const active = activeUploads.get(button.dataset.id); if (active) { active.paused = true; active.controller.abort(); } await api(`/api/uploads/${button.dataset.id}`,{method:'DELETE'}); activeUploads.delete(button.dataset.id); if (currentWorkspace && currentChallenge) await refreshUploads(currentWorkspace.id,currentChallenge.id); },
   };
   if (actions[action]) {
     event.preventDefault();
     if (['save-notes','reload-notes','complete','reopen','reject-solver-flag','delete-challenge','delete-attachment','edit-challenge','clone-challenge'].includes(action)) detailAction(actions[action],button);
-    else if (['refresh-ctfd-submit','disconnect-ctfd-submit','cancel-solver'].includes(action)) run(actions[action]);
+    else if (['refresh-ctfd-submit','disconnect-ctfd-submit','cancel-solver','filter'].includes(action)) run(actions[action]);
     else run(actions[action], button);
   }
+});
+
+// A status filter sits beside the search box: clicking one leaves the caret where it was.
+document.addEventListener('mousedown', event => {
+  if (document.activeElement?.id === 'search-input' && event.target.closest?.('[data-action="filter"]')) event.preventDefault();
 });
 
 document.addEventListener('submit', event => {
@@ -5243,7 +5758,7 @@ document.addEventListener('submit', event => {
   if (form.matches?.('.challenge-inline-input')) {
     event.preventDefault();
     const body = Object.fromEntries(new FormData(form));
-    runForm(() => continueListSolver(form,body),form,form.querySelector('button[type="submit"]'));
+    runForm(() => continueListSolver(form,body),form,form.querySelector('button[type="submit"]')).then(() => syncInlineInput(form));
     return;
   }
   if (!form.id) return;
@@ -5253,16 +5768,15 @@ document.addEventListener('submit', event => {
   const challengeFiles = form.id === 'new-challenge-form' ? [...selectedChallengeFiles(form)] : [];
   const data = new FormData(form);
   const body = Object.fromEntries(data);
-  const stagedFileIds = data.getAll('staged_file_ids');
-  const stagedFileNames = new Map([...form.querySelectorAll('input[name="staged_file_ids"]')].map(input => [input.value,input.dataset.name]));
+  const stagedFiles = [...form.querySelectorAll('input[name="staged_file_ids"]:checked')].map(input => ({id:input.value,name:input.dataset.name,size:Number(input.dataset.size) || 0}));
   if (form.id === 'ctfd-submit-connection-form') { run(() => saveCTFdSubmitConnection(form,body)); return; }
-  runForm(async () => {
+  const submitForm = async () => {
     if (form.id === 'setup-form') {
-      if (body.password !== body.confirmation) throw new Error(i18n.t('비밀번호 확인이 일치하지 않습니다.'));
+      if (body.password !== body.confirmation) throw new Error('비밀번호 확인이 일치하지 않습니다.');
       const result = await api('/api/auth/setup',{method:'POST',body:{username:body.username,password:body.password,setup_token:body.setup_token || ''}});
-      csrf = result.csrf_token; sessionUser = result.user; sessionPersistent = false; form.reset(); await render();
+      sessionStarted(); csrf = result.csrf_token; sessionUser = result.user; sessionPersistent = false; form.reset(); await render();
     } else if (form.id === 'login-form') {
-      const result = await api('/api/auth/login',{method:'POST',body:{username:body.username,password:body.password,remember:data.has('remember')}}); csrf = result.csrf_token; if (sessionUser && sessionUser.id !== result.user.id) { noteDrafts.clear(); ctfdDrafts.clear(); clearAccountsReturnTarget(); } sessionUser = result.user; sessionPersistent = result.session_persistent === true; form.reset(); await render();
+      const result = await api('/api/auth/login',{method:'POST',body:{username:body.username,password:body.password,remember:data.has('remember')}}); sessionStarted(); csrf = result.csrf_token; if (sessionUser && sessionUser.id !== result.user.id) { noteDrafts.clear(); ctfdDrafts.clear(); clearAccountsReturnTarget(); } sessionUser = result.user; sessionPersistent = result.session_persistent === true; form.reset(); await render();
     } else if (form.id === 'related-evidence-form') {
       const target = currentChallenge;
       if (!target || target.id !== form.dataset.challengeId || target.workspace_id !== form.dataset.workspaceId) throw new Error(i18n.t('문제를 다시 선택하세요.'));
@@ -5277,6 +5791,7 @@ document.addEventListener('submit', event => {
       const edit = form.id === 'edit-workspace-form';
       body.open_challenge_after_create = data.has('open_challenge_after_create');
       const w = await api(edit ? `/api/workspaces/${form.dataset.workspaceId}` : '/api/workspaces',{method:edit?'PATCH':'POST',headers:edit ? conditional(form.dataset.editToken) : {},body}); modal.close();
+      if (signedOut) return;
       if (location.hash === `#w/${w.id}`) { currentWorkspace = w; await renderWorkspace(); } else { selectedStatus='';selectedCategory='';selectedSort='added_desc';search='';location.hash = `w/${w.id}`; }
       toast(edit ? '작업공간 설정을 저장했습니다.' : '작업공간을 만들었습니다.');
     } else if (form.id === 'new-challenge-form' || form.id === 'edit-challenge-form') {
@@ -5284,29 +5799,47 @@ document.addEventListener('submit', event => {
       if (body.remote_mode !== 'endpoint') body.remote = '';
       const workspaceId = form.dataset.workspaceId;
       const c = await api(edit ? path(form.dataset.challengeId,workspaceId) : path(null,workspaceId),{method:edit?'PATCH':'POST',headers:edit ? conditional(form.dataset.editToken) : {},body});
-      let failures = [];
+      // Nothing awaits before this: the list poll can paint the card from now on.
+      const items = queueAttachmentWork(workspaceId,c.id,[...stagedFiles,...challengeFiles]);
+      const linking = items.slice(0,stagedFiles.length), uploading = items.slice(stagedFiles.length);
+      const attachmentsStopped = () => items[0]?.work.stopped === true;
+      const failures = [];
       modal.close();
       let attached = 0;
-      for (const fileId of stagedFileIds) {
+      for (const item of linking) {
+        if (attachmentsStopped()) break;
+        let linked = false;
         try {
-          await stagedRequest(`/api/workspaces/${workspaceId}/challenges/${c.id}/staged-files/${encodeURIComponent(fileId)}/attach`,{method:'POST'});
-          attached++;
-        } catch (error) { failures.push(`${stagedFileNames.get(fileId) || fileId}: ${transferErrorText(error)}`); }
+          await stagedRequest(`/api/workspaces/${workspaceId}/challenges/${c.id}/staged-files/${encodeURIComponent(item.source.id)}/attach`,{method:'POST'});
+          linked = true; attached++;
+        } catch (error) { failures.push(`${item.name || item.source.id}: ${transferErrorText(error)}`); }
+        finishAttachmentItem(item,linked);
       }
-      if (currentWorkspace?.id === workspaceId) {
-        await refreshChallenges();
-        if (edit || currentWorkspace.open_challenge_after_create) await openChallenge(c.id);
+      // The files are queued and Start is held, so a failed repaint must not skip them.
+      try {
+        if (currentWorkspace?.id === workspaceId) {
+          await refreshChallenges();
+          if (edit || currentWorkspace?.open_challenge_after_create) await openChallenge(c.id);
+        }
+      } catch (error) { failures.push(transferErrorText(error)); }
+      if (!attachmentsStopped()) {
+        toast('문제를 저장했습니다.');
+        if (attached) toast(i18n.t('사전 파일 {count}개를 문제에 연결했습니다.').replace('{count}',attached));
       }
-      toast('문제를 저장했습니다.');
-      if (attached) toast(i18n.t('사전 파일 {count}개를 문제에 연결했습니다.').replace('{count}',attached));
-      let uploaded = 0;
-      if (!edit) for (const file of challengeFiles) { try { if (await uploadFile(file,workspaceId,c.id)) uploaded++; } catch (error) { failures.push(`${file.name}: ${error.message}`); } }
-      if (!edit && currentWorkspace?.id === workspaceId && challengeFiles.length) await refreshChallenges();
-      if (uploaded) toast(`첨부파일 ${uploaded}개를 저장했습니다.`);
+      const uploads = await uploadQueuedAttachments(uploading,workspaceId,c.id);
+      failures.push(...uploads.failures);
+      if (uploading.length) {
+        try {
+          if (detail.open && currentChallenge?.id === c.id) await refreshChallengeAttachmentsInPlace(workspaceId,c.id);
+          if (currentWorkspace?.id === workspaceId) await refreshChallenges();
+        } catch (error) { failures.push(transferErrorText(error)); }
+      }
+      if (attachmentsStopped()) return;
+      if (uploads.saved) toast(`첨부파일 ${uploads.saved}개를 저장했습니다.`);
       if (failures.length) toast(failures.join(' / '),true);
     } else if (form.id === 'search-form') { search = body.q; selectedCategory = document.querySelector('#category-filter').value; selectedSort = document.querySelector('#sort-order').value; await refreshChallenges(); }
-    else if (form.id === 'password-form') { if (body.new_password !== body.confirmation) throw new Error(i18n.t('새 비밀번호 확인이 일치하지 않습니다.')); delete body.confirmation; const result = await api('/api/auth/password',{method:'POST',body}); csrf = result.csrf_token; form.reset(); toast('비밀번호를 변경했습니다.'); }
-    else if (form.id === 'username-form') { const result = await api('/api/auth/username',{method:'POST',body}); sessionUser.username = result.username; csrf = result.csrf_token; renderSettings(); toast('아이디를 변경했습니다.'); }
+    else if (form.id === 'password-form') { if (body.new_password !== body.confirmation) throw new Error(i18n.t('새 비밀번호 확인이 일치하지 않습니다.')); delete body.confirmation; const epoch = authEpoch; const result = await api('/api/auth/password',{method:'POST',body}); if (epoch !== authEpoch) return; csrf = result.csrf_token; form.reset(); toast('비밀번호를 변경했습니다.'); }
+    else if (form.id === 'username-form') { const epoch = authEpoch; const result = await api('/api/auth/username',{method:'POST',body}); if (epoch !== authEpoch) return; sessionUser.username = result.username; csrf = result.csrf_token; renderSettings(); toast('아이디를 변경했습니다.'); }
     else if (form.id === 'new-user-form') { await api('/api/admin/users',{method:'POST',body}); form.reset(); modal.close(); await renderAdmin(); toast('사용자를 추가했습니다.'); }
     else if (form.id === 'reset-user-form') { await api(`/api/admin/users/${form.dataset.userId}/password`,{method:'POST',body}); form.reset(); modal.close(); toast('비밀번호를 변경했습니다.'); }
     else if (form.id === 'solver-capacity-form') { const maximum = String(body.maximum || '').trim(); await api('/api/admin/solver-capacity',{method:'PUT',body:{maximum:maximum ? Number(maximum) : null}}); await renderAdmin(); toast('솔버 최대 수를 저장했습니다.'); }
@@ -5363,7 +5896,10 @@ document.addEventListener('submit', event => {
     } else if (form.id === 'ctfd-refresh-auth-form') {
       await startAuthenticatedCTFdRefresh(form,body);
     }
-  }, form, form.querySelector('button[type="submit"],button:not([type])'));
+  };
+  const submitButton = form.querySelector('button[type="submit"],button:not([type])');
+  if (form.id === 'login-form' || form.id === 'setup-form') submitCredentials(form,submitForm,submitButton);
+  else runForm(submitForm,form,submitButton);
 });
 
 document.addEventListener('change', event => {
@@ -5391,17 +5927,7 @@ document.addEventListener('change', event => {
     const file = input.files[0]; input.value = '';
     await uploadStagedFile(file,workspaceId,fileId);
   },input);
-  if (input.matches?.('.challenge-inline-input select[name="remote_mode"]')) {
-    const form = input.closest('form');
-    const remote = form?.querySelector('input[name="remote"]');
-    if (remote) {
-      const enabled = input.value === 'endpoint';
-      remote.disabled = !enabled; remote.required = enabled;
-      remote.closest('label')?.classList.toggle('is-disabled',!enabled);
-      const submit = form.querySelector('button[type="submit"]');
-      if (submit) submit.disabled = !enabled && form.dataset.originalRemoteMode === 'none' && form.dataset.inputReady !== 'true';
-    }
-  }
+  if (input.matches?.('.challenge-inline-input select[name="remote_mode"]')) syncInlineInput(input.form);
   if (input.id === 'solver-provider-select') {
     solverProvider = input.value === 'claude' ? 'claude' : 'codex';
     try { localStorage.setItem('ctf-solver-provider',solverProvider); } catch {}
@@ -5478,21 +6004,19 @@ document.addEventListener('change', event => {
     catch (error) { input.value = c.status; throw error; }
   });
   if (input.id === 'attachment-files') run(async () => {
-    const c = currentChallenge, failures = [];
-    let completed = 0;
-    for (const file of input.files) { try { if (await uploadFile(file,c.workspace_id,c.id)) completed++; } catch(error) { failures.push(`${file.name}: ${error.message}`); } }
-    if (currentChallenge?.id === c.id) await openChallenge(c.id); input.value = '';
-    if (failures.length) throw new Error(failures.join(' / ')); if (completed) toast(`첨부파일 ${completed}개를 저장했습니다.`);
+    const c = currentChallenge, items = queueAttachmentWork(c.workspace_id,c.id,[...input.files]);
+    const {saved,failures} = await uploadQueuedAttachments(items,c.workspace_id,c.id);
+    if (items[0]?.work.stopped) return;
+    if (detail.open && currentChallenge?.id === c.id) await openChallenge(c.id); input.value = '';
+    if (failures.length) throw new Error(failures.join(' / ')); if (saved) toast(`첨부파일 ${saved}개를 저장했습니다.`);
   },input);
   if (input.id === 'solver-console-files') run(async () => {
-    const challenge = currentChallenge, files = [...input.files], failures = [];
+    const challenge = currentChallenge, files = [...input.files];
     if (!challenge) return;
-    let completed = 0;
+    const items = queueAttachmentWork(challenge.workspace_id,challenge.id,files);
     try {
-      for (const file of files) {
-        try { if (await uploadFile(file,challenge.workspace_id,challenge.id)) completed++; }
-        catch (error) { failures.push(`${file.name}: ${error.message}`); }
-      }
+      const {saved:completed,failures} = await uploadQueuedAttachments(items,challenge.workspace_id,challenge.id);
+      if (items[0]?.work.stopped) return;
       await refreshChallengeAttachmentsInPlace(challenge.workspace_id,challenge.id);
       if (completed && currentChallenge?.id === challenge.id && solverIsActive(currentSolverJob) && currentSolverJob.guidance_allowed !== false) {
         const names = files.filter(file => file?.name).map(file => file.name).slice(0, 20);
@@ -5518,6 +6042,14 @@ document.addEventListener('change', event => {
       rememberNotes(); await openChallenge(c.id); toast('Markdown 노트를 불러왔습니다.');
     } finally { input.value = ''; }
   },input);
+});
+
+// Focus only reveals the caret line, and a tap reveals nothing, so at phone width the
+// editor could stay a thin strip at the bottom of the dialog while the user types.
+document.addEventListener('focusin', event => {
+  const editor = event.target;
+  if (editor.id !== 'notes-editor' || !window.matchMedia?.('(max-width: 500px)').matches) return;
+  requestAnimationFrame(() => editor.scrollIntoView({block:'nearest'}));
 });
 
 document.addEventListener('focusout', event => {
@@ -5589,7 +6121,7 @@ detail.addEventListener('cancel', event => {
   if (detailBusy || (notesDirty() && !confirm(i18n.t('저장하지 않은 노트가 있습니다. 닫을까요?')))) event.preventDefault();
   else { rememberNotes(); stopSolverPolling(); ++challengeRendering; }
 });
-detail.addEventListener('close', () => { if (!detail.open) stopSolverPolling(); });
+detail.addEventListener('close', () => { if (!detail.open) stopSolverPolling(); leaveGoneWorkspace(); });
 modal.addEventListener('cancel', event => { if (busyForms.has(modal.querySelector('form')) || transferState?.importing || directSendBusy || (modalInputAtRisk() && !confirm(i18n.t('작성 중인 변경 내용을 버리고 닫을까요?')))) event.preventDefault(); else { pauseStagedUploads(); ++modalRendering; } });
 modal.addEventListener('close', () => {
   resetChallengeFileDrag(); modal.classList.remove('staged-dragover'); pauseStagedUploads();
@@ -5607,6 +6139,7 @@ modal.addEventListener('close', () => {
     ++modalRendering; modal.removeAttribute('aria-busy'); modal.dataset.kind = '';
   }
   importPreview = null;
+  leaveGoneWorkspace();
 });
 window.addEventListener('hashchange', event => {
   if ((modalInputAtRisk() || notesDirty() || detailBusy || transferState?.running || transferState?.importing || directSendBusy || [...stagedActiveUploads.values()].some(upload => upload.running) || (modal.open && busyForms.has(modal.querySelector('form')))) && !confirm(i18n.t('저장하지 않은 내용이나 진행 중인 요청이 있습니다. 다른 화면으로 이동할까요?'))) { if (accountsReturnPending) clearAccountsReturnTarget(); history.replaceState(null,'',event.oldURL); return; }
@@ -5649,7 +6182,7 @@ function repaintWorkspace(content) {
   const workspace = currentWorkspace;
   morphMarkup(content,workspaceMarkup(workspace));
   const area = content.querySelector('#challenge-area');
-  if (area && challengeListing?.workspaceId === workspace.id) morphMarkup(area,challengeListingMarkup(challengeListing.result,workspace.id));
+  if (area && challengeListing?.workspaceId === workspace.id) morphChallengeListing(area,challengeListing.result,workspace.id);
   if (resourceMeterSnapshot) paintResourceMeter(resourceMeterSnapshot);
   if (ctfdImportBadge) updateCTFdImportButton(ctfdImportBadge.jobs,ctfdImportBadge.workspaceId);
 }
@@ -5661,28 +6194,66 @@ function repaintWorkspace(content) {
 // picker changes language and showModal() makes it inert.
 document.addEventListener('ctf-language-changed',() => {
   const content = document.querySelector('#content'), hash = location.hash.slice(1);
-  if (content && hash === 'admin') {
+  if (document.querySelector('.page-failure')) repaintPageNotice();
+  else if (content && hash === 'admin') {
     if (adminView) morphMarkup(content,adminMarkup(adminView));
     refreshReleaseUpdatePanel();
   } else if (content && currentWorkspace) repaintWorkspace(content);
   else if (content && !['accounts','settings'].includes(hash)) morphMarkup(content,overviewMarkup());
   if (detail.open) repaintChallengeDetail();
 });
-window.addEventListener('beforeunload', event => { if (notesDirty() || formDirty() || transferState?.running || transferState?.importing || directSendBusy || [...activeUploads.values()].some(upload => upload.running) || [...stagedActiveUploads.values()].some(upload => upload.running)) { event.preventDefault(); event.returnValue = ''; } });
+window.addEventListener('beforeunload', event => { if (notesDirty() || formDirty() || transferState?.running || transferState?.importing || directSendBusy || attachmentWork.size || [...stagedActiveUploads.values()].some(upload => upload.running)) { event.preventDefault(); event.returnValue = ''; } });
+async function boot() {
+  const attempt = ++bootAttempt;
+  // Started first, so its limit runs beside the other steps and not after them.
+  const language = i18n.init();
+  language.catch(() => {});
+  try {
+    let state = await pageRequest('/api/auth/state');
+    if (state?.authenticated) {
+      // Open local access and an existing local cookie need no one-use ticket.
+      // Start.cmd may still have supplied a fragment; do not leave it in the route.
+      if (/^#\/local-access\/[A-Za-z0-9_-]{32}$/.test(window.location.hash))
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      pendingLocalTicket = '';
+    } else if (await bootstrapLocalBrowser()) state = await pageRequest('/api/auth/state');
+    await language;
+    if (attempt !== bootAttempt) return;
+    if (typeof state?.auth_mode !== 'string') throw new Error('서버 응답을 확인할 수 없습니다. 잠시 후 다시 시도하세요.');
+    authMode = state.auth_mode;
+    if (state.authenticated) { sessionStarted(); csrf = state.csrf_token; sessionUser = state.user; sessionPersistent = state.session_persistent === true; await render(); }
+    else if (authMode === 'password') showLogin(false,state.configured,state.setup_available,state.setup_token_required);
+    else app.innerHTML = `<main class="login-shell"><div class="login-card"><h1>${tr('Start.cmd를 실행해 이 브라우저를 연결하세요.')}</h1></div></main>`;
+  } catch (error) {
+    await language.catch(() => {});
+    if (attempt === bootAttempt && !signedOut) showBootFailure(unanswered(error));
+  }
+}
+
 async function bootstrapLocalBrowser() {
   const match = /^#\/local-access\/([A-Za-z0-9_-]{32})$/.exec(window.location.hash);
-  if (!match) return false;
-  // The fragment never enters the HTTP request or access log. Remove it from
-  // browser history before exchanging the single-use ticket for a cookie.
-  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  if (match) {
+    // The fragment never enters the HTTP request or access log. Remove it from
+    // browser history before exchanging the single-use ticket for a cookie.
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    pendingLocalTicket = match[1];
+  }
+  if (!pendingLocalTicket) return false;
   await i18n.init();
   const response = await fetch('/api/auth/local/bootstrap', {
     method: 'POST', credentials: 'same-origin',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ticket: match[1]}),
+    body: JSON.stringify({ticket: pendingLocalTicket}),
+    signal: pageLoadSignal(),
   });
-  if (!response.ok) throw new Error(i18n.t('로컬 접속 링크를 확인할 수 없습니다. Start.cmd를 다시 실행하세요.'));
+  // The server answered, so the ticket is spent. A request that never arrived keeps it for Retry.
+  pendingLocalTicket = '';
+  if (!response.ok) throw new Error('로컬 접속 링크를 확인할 수 없습니다. Start.cmd를 다시 실행하세요.');
   return true;
 }
+function pageLoadSignal() {
+  return window.AbortSignal?.timeout?.(PAGE_LOAD_LIMIT_MS);
+}
+let pendingLocalTicket = '';
 
-run(async () => { const localBrowserInitialized = await bootstrapLocalBrowser(); const state = await api('/api/auth/state'); if (typeof window.setInterval === 'function') window.setInterval(updateSolverElapsedLabels,1000); if (!localBrowserInitialized) await i18n.init(); authMode = state.auth_mode || 'password'; if (state.authenticated) { csrf = state.csrf_token; sessionUser = state.user; sessionPersistent = state.session_persistent === true; await render(); } else if (authMode === 'password') showLogin(false,state.configured,state.setup_available,state.setup_token_required); else app.innerHTML = `<main class="login-shell"><div class="login-card"><h1>${tr('Start.cmd를 실행해 이 브라우저를 연결하세요.')}</h1></div></main>`; });
+run(async () => { if (typeof window.setInterval === 'function') window.setInterval(updateSolverElapsedLabels,1000); await boot(); });

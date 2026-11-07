@@ -264,6 +264,11 @@ input:focus, textarea:focus, select:focus {
 .challenge-staged-picker strong, .challenge-staged-picker small { overflow-wrap: anywhere; }
 .challenge-staged-picker .staged-attached { color: #e6c27d; }
 .detail-dialog > .dialog-head .line-actions { flex-wrap: wrap; justify-content: flex-end; }
+/* A single-word name keeps its width and the actions wrap. It breaks only past the point where
+   the three icon buttons would lose their shared row: 125 px plus the head's gap. */
+.detail-heading { max-width: calc(100% - 140px); overflow-wrap: break-word; }
+.detail-head-actions { display: contents; }
+.detail-full-name { display: none; }
 .challenge-file-picker {
   display: grid;
   gap: 10px;
@@ -403,6 +408,20 @@ input:focus, textarea:focus, select:focus {
 .challenge-inline-attention strong { color: #a4ddf5; font: 700 10px ui-monospace,"Cascadia Code",Consolas,monospace; }
 .challenge-inline-attention small { color: #91aab4; font-size: 10px; }
 .challenge-inline-attention button { min-height: 34px; white-space: nowrap; }
+.challenge-card-upload {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  border: 1px solid #315366;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #0b1821;
+}
+.challenge-card-upload-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; color: #91aab4; font: 600 10px ui-monospace,"Cascadia Code",Consolas,monospace; }
+.challenge-card-upload-head strong { min-width: 0; overflow: hidden; color: #a4ddf5; font: inherit; text-overflow: ellipsis; white-space: nowrap; }
+.challenge-card-upload-head span { flex: 0 0 auto; }
+.challenge-card-upload progress { display: block; width: 100%; height: 6px; margin: 0; }
+.challenge-card-upload small { color: #91aab4; font-size: 10px; }
 
 .challenge-table th { background: #04090d; color: #7994a0; }
 .challenge-table td { border-color: #14242d; }
@@ -420,6 +439,7 @@ input:focus, textarea:focus, select:focus {
 .error-notice { background: #1a090d; border-color: #65313b; color: #ffc2c9; }
 
 .login-shell {
+  grid-template-columns: minmax(0, 1fr);
   background:
     radial-gradient(circle at 50% 15%, rgba(35, 196, 170, .12), transparent 36%),
     repeating-linear-gradient(90deg, transparent 0 59px, rgba(82, 245, 189, .018) 60px),
@@ -717,6 +737,7 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, #20b88c, #65ffd
   .dialog-head { position: sticky; top: 0; z-index: 3; background: #070d12; }
   .dialog-head > div { min-width: 0; }
   .dialog-head h2, .dialog-head p { overflow-wrap: anywhere; }
+  .detail-heading { max-width: none; overflow-wrap: anywhere; }
   #telegram-settings { max-width: 100%; padding: 20px; }
 }
 
@@ -764,6 +785,25 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, #20b88c, #65ffd
   .challenge-inline-attention { align-items: stretch; flex-direction: column; }
   .challenge-inline-attention button { width: 100%; }
 }
+/* Only the title row stays pinned. The dialog is the flex container so that the title and
+   close stick to it for the whole scroll; a sticky child of the head would stop at the head. */
+@media (max-width: 500px) {
+  .detail-dialog { scroll-padding-top: 72px; }
+  .detail-dialog[open] { display: flex; flex-wrap: wrap; align-content: flex-start; }
+  .detail-dialog > .dialog-head, .detail-dialog > .dialog-head .line-actions, .detail-heading { display: contents; }
+  .detail-heading h2 { order: 1; flex: 0 0 100%; position: sticky; top: 0; z-index: 3; height: 49px; margin: 0; padding: 11px 60px 11px 20px; overflow: hidden; line-height: 26px; white-space: nowrap; text-overflow: ellipsis; background: #070d12; border-bottom: 1px solid var(--border); }
+  /* Pinned inside the scroll padding above: the negative margin keeps focus on it from scrolling the dialog. */
+  .detail-dialog [data-action="close-detail"] { order: 2; flex: 0 0 44px; position: sticky; top: 2px; z-index: 4; align-self: flex-start; margin: 2px 8px 0 -52px; scroll-margin-top: -72px; }
+  /* The first line hides behind the pinned title, so a long name continues under it. One ellipsis
+     narrower than the title, so that hidden line never holds a character the title's ellipsis replaced. */
+  .detail-full-name { display: block; order: 3; flex: 0 0 100%; min-width: 0; margin-top: -26px; padding: 0 72px 0 20px; font: 700 20px/26px ui-monospace, "Cascadia Code", Consolas, monospace; letter-spacing: -.4px; }
+  .detail-full-name::before { content: attr(data-name); }
+  .detail-heading .eyebrow { order: 4; flex: 0 0 calc(100% - 40px); min-width: 0; margin: 12px 20px 4px; }
+  .detail-heading p { order: 5; flex: 0 0 calc(100% - 40px); min-width: 0; margin: 0 20px 12px; }
+  .detail-head-actions { order: 6; flex: 0 0 calc(100% - 40px); display: flex; flex-wrap: wrap; gap: 8px; margin: 0 20px 16px; }
+  .detail-head-actions > * { flex: 1 1 120px; justify-content: center; }
+  .detail-grid { order: 7; flex: 0 0 100%; min-width: 0; border-top: 1px solid var(--border); }
+}
 .account-login-spinner { display: inline-block; width: 13px; height: 13px; margin-right: 7px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -2px; animation: account-login-spin .75s linear infinite; }
 .claude-login-progress { margin: 8px 0 0; font-size: 12px; }
 @keyframes account-login-spin { to { transform: rotate(360deg); } }
@@ -776,6 +816,19 @@ progress::-moz-progress-bar { background: linear-gradient(90deg, #20b88c, #65ffd
 .language-picker { display: inline-flex; align-items: center; margin: 0; }
 .language-picker select { min-height: 34px; padding: 5px 26px 5px 9px; font-size: 12px; color: var(--text); background: var(--surface2); }
 .login-card > .language-picker { display: flex; justify-content: flex-end; margin-bottom: 16px; }
+/* Pinned to the bottom edge: the mobile header owns the top, and at the end of the page the
+   notice rests below the last card instead of covering it. */
+.live-notice { position: sticky; bottom: 12px; z-index: 5; margin-top: 16px; overflow-wrap: anywhere; box-shadow: 0 8px 28px #000c; }
+.detail-dialog > .live-notice { bottom: 0; margin-top: 0; border-width: 1px 0 0; border-radius: 0; }
+.solver-console-dialog > .live-notice { position: static; flex: 0 0 auto; margin: 0; border-width: 0 0 1px; border-radius: 0; box-shadow: none; }
+html:has(#content > .live-notice:not(:empty)) { scroll-padding-bottom: 112px; }
+.detail-dialog:has(> .live-notice:not(:empty)) { scroll-padding-bottom: 100px; }
+@media (max-width: 500px) { .detail-dialog > .live-notice { order: 99; flex: 0 0 100%; min-width: 0; } }
+.page-failure { overflow-wrap: anywhere; }
+.page-failure-shell { min-height: 100vh; display: grid; align-content: center; justify-items: center; gap: 14px; padding: 24px 16px; }
+.page-failure-shell > * { width: min(460px, 100%); }
+.page-failure-shell > .language-picker { display: flex; justify-content: flex-end; }
+@media (max-width: 800px) { .shell:has(.page-failure) { align-content: start; } }
 @media (max-width: 600px) { .topbar-meta .language-picker select { max-width: 104px; } }
 @media (max-width: 500px) {
   .topbar-meta { display: flex; flex: none; }
@@ -892,6 +945,7 @@ details.solver-console-card[open] > summary::after { content:'▾'; }
 .ctfd-source-status button { flex:0 0 auto; }
 .login-card .login-remember { display:flex; align-items:center; gap:9px; margin:0 0 20px; color:var(--muted); font-size:12px; font-weight:500; }
 .login-card .login-remember input { width:auto; margin:0; }
+.login-card .login-error { margin:-8px 0 20px; overflow-wrap:anywhere; }
 .related-item { flex-wrap:wrap; }
 .related-item > div { min-width:0; flex:1 1 200px; }
 .related-item > div button { max-width:100%; overflow-wrap:anywhere; text-align:left; }
