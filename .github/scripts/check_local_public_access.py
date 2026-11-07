@@ -124,6 +124,30 @@ class LocalPublicAccessTest(unittest.TestCase):
             self.assertEqual(environment["CTF_ALLOWED_ORIGINS"],
                              "http://192.0.2.10:5050,https://ctf.example.test")
 
+            # During a reinstall, Compose runs before the new config is
+            # committed. Its containers must receive the candidate settings,
+            # while an ordinary restart still uses the installed settings.
+            candidate = {
+                **environment,
+                "CTF_AUTH_MODE": "nologin",
+                "CTF_LOCAL_BIND": "0.0.0.0",
+                "CTF_LOCAL_PUBLIC_URLS": "",
+                "CTF_LOCAL_ACCESS": "open",
+                "CTF_LOCAL_AUTOSTART": "false",
+                "CTF_FIRST_ADMIN_SETUP_TOKEN": "",
+            }
+            compose.apply_local_config(candidate, installer_override=True)
+            self.assertEqual(candidate["CTF_AUTH_MODE"], "nologin")
+            self.assertEqual(candidate["CTF_LOCAL_ACCESS"], "open")
+            self.assertEqual(candidate["CTF_LOCAL_ORIGIN"], "")
+            self.assertEqual(candidate["CTF_ALLOWED_ORIGINS"], "")
+            self.assertNotIn("CTF_FIRST_ADMIN_SETUP_TOKEN", candidate)
+            compose.apply_local_config(candidate)
+            self.assertEqual(candidate["CTF_AUTH_MODE"], "password")
+            self.assertEqual(candidate["CTF_LOCAL_ACCESS"], "link")
+            with self.assertRaises(RuntimeError):
+                compose.apply_local_config({"CTF_LOCAL_HOME": str(home)}, installer_override=True)
+
             config["access_mode"] = "open"
             (home / ".local-config.json").write_text(json.dumps(config), encoding="utf-8")
             with self.assertRaises(RuntimeError):

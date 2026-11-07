@@ -853,7 +853,7 @@ fi
 docker image tag "$image_ref" ctf-agent-local:latest
 manage_storage_control release "$drain_token" >/dev/null
 drain_token=""
-python3 deploy/local-compose.py up -d --no-build
+CTF_LOCAL_INSTALLER_OVERRIDE=1 python3 deploy/local-compose.py up -d --no-build
 if [[ "${CTF_UPDATE_IN_PROGRESS:-false}" != true ]]; then
     if ! wait_service_healthy "$CTF_LOCAL_RUNTIME_IMAGE" 180; then
         echo 'The new solver did not pass /readyz before the installation deadline.' >&2

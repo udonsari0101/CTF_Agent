@@ -39,7 +39,9 @@ def set_local_storage_floor(environment: dict[str, str]) -> None:
     environment.setdefault("CTF_SOLVER_MIN_FREE_BYTES", str(LOCAL_MINIMUM_REMAINING_BYTES))
 
 
-def apply_local_config(environment: dict[str, str]) -> None:
+def apply_local_config(
+    environment: dict[str, str], *, installer_override: bool = False
+) -> None:
     """Apply installed access options on every Compose invocation, including updates."""
 
     home_value = environment.get("CTF_LOCAL_HOME", "")
@@ -56,6 +58,30 @@ def apply_local_config(environment: dict[str, str]) -> None:
         raise RuntimeError("Local installation settings are invalid") from exc
     if not isinstance(config, dict):
         raise RuntimeError("Local installation settings are invalid")
+
+    if installer_override:
+        # The installer recreates containers before committing its new config.
+        # On a reinstall, the saved config still describes the old service, so
+        # it must not silently replace the options chosen for this rollout.
+        required = (
+            "CTF_AUTH_MODE", "CTF_LOCAL_BIND", "CTF_LOCAL_PUBLIC_URLS",
+            "CTF_LOCAL_ACCESS", "CTF_LOCAL_AUTOSTART",
+            "CTF_FIRST_ADMIN_SETUP_TOKEN",
+        )
+        if any(key not in environment for key in required):
+            raise RuntimeError("Installer access settings are incomplete")
+        auto_start = environment["CTF_LOCAL_AUTOSTART"]
+        if auto_start not in {"true", "false"}:
+            raise RuntimeError("Installer auto-start setting is invalid")
+        config = {
+            **config,
+            "auth_mode": environment["CTF_AUTH_MODE"],
+            "listen_address": environment["CTF_LOCAL_BIND"],
+            "public_urls": [value for value in environment["CTF_LOCAL_PUBLIC_URLS"].split(",") if value],
+            "access_mode": environment["CTF_LOCAL_ACCESS"],
+            "auto_start": auto_start == "true",
+            "first_admin_setup_token": environment["CTF_FIRST_ADMIN_SETUP_TOKEN"],
+        }
 
     auth_mode = config.get("auth_mode", environment.get("CTF_AUTH_MODE", "nologin"))
     if auth_mode not in {"password", "nologin"}:
@@ -975,7 +1001,8 @@ def main() -> int:
     retained_dynamic: set[int] = set()
     arguments = normalize_arguments(sys.argv[1:] or ["up", "-d", "--build"])
     environment = os.environ.copy()
-    apply_local_config(environment)
+    installer_override = environment.pop("CTF_LOCAL_INSTALLER_OVERRIDE", "") == "1"
+    apply_local_config(environment, installer_override=installer_override)
     # An external database VHD must be verified by the launcher before web or
     # the autoscaler starts. A solver may still retry an abnormal exit while
     # the daemon is running; on-failure never starts it on daemon restart.
