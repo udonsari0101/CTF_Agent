@@ -715,6 +715,11 @@ try:
         os.chown(temporary, int(os.environ['CTF_LOCAL_UID']), int(os.environ['CTF_LOCAL_GID']))
     final = backup_dir / (temporary.stem + '-' + str(time.time_ns()) + temporary.suffix)
     os.replace(temporary, final)
+    directory_descriptor = os.open(backup_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
     print(final)
 finally:
     if descriptor >= 0:

@@ -210,6 +210,19 @@ class MissingImageRecoveryTest(unittest.TestCase):
             self.assertEqual(db.execute("PRAGMA quick_check").fetchone()[0], "ok")
             self.assertEqual(db.execute("SELECT count(*) FROM workspaces").fetchone()[0], 1)
 
+    def inject_backup_directory_fsync_failure(self) -> None:
+        installer = self.bundle / "installer" / "install.sh"
+        source = installer.read_text(encoding="utf-8")
+        expected = "        os.fsync(directory_descriptor)\n"
+        self.assertEqual(source.count(expected), 1)
+        installer.write_text(
+            source.replace(
+                expected,
+                "        raise OSError('simulated backup directory fsync failure')\n",
+            ),
+            encoding="utf-8",
+        )
+
     def test_missing_image_health_failure_preserves_database_and_stops_new_stack(self) -> None:
         result = self.run_installer()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -243,6 +256,16 @@ class MissingImageRecoveryTest(unittest.TestCase):
         result = self.run_installer(pull_failure=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("down --remove-orphans", self.log.read_text(encoding="utf-8"))
+        self.assert_original_preserved()
+
+    def test_backup_directory_fsync_failure_stops_before_new_service(self) -> None:
+        self.inject_backup_directory_fsync_failure()
+        result = self.run_installer(health_success=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("simulated backup directory fsync failure", result.stderr)
+        docker_log = self.log.read_text(encoding="utf-8")
+        self.assertNotIn("image tag", docker_log)
+        self.assertNotIn("down --remove-orphans", docker_log)
         self.assert_original_preserved()
 
     def test_missing_runtime_image_with_valid_metadata_uses_guarded_recovery(self) -> None:
