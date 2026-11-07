@@ -355,6 +355,28 @@ def _healthy_image(image_ref: str) -> bool:
     return result.returncode == 0 and result.stdout.strip() == image_ref + "|healthy"
 
 
+def _verified_target_release(
+    release_root: Path, revision: str, image_ref: str, repository: str, image: str, tag: str,
+) -> bool:
+    """Confirm a committed rollout, even if a post-deployment command timed out."""
+
+    for attempt in range(3):
+        try:
+            if _current_revision(release_root) != revision:
+                return False
+            if (
+                _regular_text(release_root / revision / "image-ref", 300) == image_ref
+                and _running_version(release_root, revision, repository, image) == tag
+                and _ready_web()
+            ):
+                return True
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+            pass
+        if attempt < 2:
+            time.sleep(3 * (attempt + 1))
+    return False
+
+
 def _ready_web() -> bool:
     try:
         result = subprocess.run(
@@ -497,15 +519,14 @@ def _apply(control: Path, release_root: Path, rollout: Path, repository: str, im
     if revision == current_revision:
         raise ValueError("Release already runs on this host")
     image_ref = _image_ref(image, revision)
-    rollout_ok = _run_rollout(
+    _run_rollout(
         ["sh", str(rollout), revision, image_ref, str(release_root)],
         control, request, image, repository,
     )
-    try:
-        verified = (rollout_ok and _current_revision(release_root) == revision
-                    and _healthy_image(image_ref) and _ready_web())
-    except Exception:
-        verified = False
+    # The release script can finish and commit the new image before a later
+    # diagnostics/marker command fails. Judge the deployed state rather than
+    # treating that post-commit process exit as the deployment outcome.
+    verified = _verified_target_release(release_root, revision, image_ref, repository, image, tag)
     if not verified:
         try:
             restored = _restore_previous(

@@ -139,14 +139,25 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import uuid
 
 root, revision, image_ref, repository = sys.argv[1:]
 if pathlib.Path(root, "current").read_text(encoding="ascii").strip() != revision:
     raise SystemExit("The deployed revision did not become current")
-result = subprocess.run(
-    ["docker", "inspect", "ctf_agent"], capture_output=True, timeout=20, check=True,
-)
+# The release script has already made the new container current. Docker may
+# briefly stop answering while Compose settles; a single inspect timeout must
+# not turn a healthy completed deployment into a reported failure.
+for attempt in range(3):
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "ctf_agent"], capture_output=True, timeout=20, check=True,
+        )
+        break
+    except (OSError, subprocess.SubprocessError) as exc:
+        if attempt == 2:
+            raise SystemExit("The deployed container identity is unavailable") from exc
+        time.sleep(3 * (attempt + 1))
 if len(result.stdout) > 1024 * 1024:
     raise SystemExit("The deployed container identity is too large")
 containers = json.loads(result.stdout)

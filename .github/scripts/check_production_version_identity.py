@@ -113,6 +113,45 @@ class VersionIdentityTest(unittest.TestCase):
                         exec(compile(code, "remote-rollout-marker", "exec"), {})
                     self.assertFalse((self.control / "current-version.json").exists())
 
+    def test_ci_rollout_retries_transient_inspect_failure(self) -> None:
+        shell = (ROOT / ".github" / "scripts" / "remote-rollout.sh").read_text(encoding="utf-8")
+        opening = 'python3 - "$release_root" "$revision" "$image_ref" "$source_repo" <<\'PY\'\n'
+        code = shell.split(opening, 1)[1].split("\nPY", 1)[0]
+        (self.releases / "current").write_text(REVISION + "\n", encoding="ascii")
+        arguments = ["rollout", str(self.releases), REVISION, REF, REPOSITORY]
+        transient_errors = (
+            subprocess.TimeoutExpired(["docker", "inspect", "ctf_agent"], 20),
+            subprocess.CalledProcessError(1, ["docker", "inspect", "ctf_agent"]),
+            OSError("Docker socket is unavailable"),
+        )
+        for error in transient_errors:
+            (self.control / "current-version.json").unlink(missing_ok=True)
+            with self.subTest(error=type(error).__name__), mock.patch.object(sys, "argv", arguments), mock.patch(
+                "subprocess.run", side_effect=[error, run_result(container())],
+            ) as inspect, mock.patch("time.sleep") as sleep:
+                exec(compile(code, "remote-rollout-marker", "exec"), {})
+                self.assertEqual(inspect.call_count, 2)
+                sleep.assert_called_once_with(3)
+                self.assertEqual(self.marker(), {
+                    "tag": VERSION, "revision": REVISION, "repository": REPOSITORY,
+                })
+
+    def test_ci_rollout_does_not_publish_marker_after_inspect_retries_exhausted(self) -> None:
+        shell = (ROOT / ".github" / "scripts" / "remote-rollout.sh").read_text(encoding="utf-8")
+        opening = 'python3 - "$release_root" "$revision" "$image_ref" "$source_repo" <<\'PY\'\n'
+        code = shell.split(opening, 1)[1].split("\nPY", 1)[0]
+        (self.releases / "current").write_text(REVISION + "\n", encoding="ascii")
+        arguments = ["rollout", str(self.releases), REVISION, REF, REPOSITORY]
+        error = subprocess.TimeoutExpired(["docker", "inspect", "ctf_agent"], 20)
+        with mock.patch.object(sys, "argv", arguments), mock.patch(
+            "subprocess.run", side_effect=error,
+        ) as inspect, mock.patch("time.sleep") as sleep:
+            with self.assertRaisesRegex(SystemExit, "identity is unavailable"):
+                exec(compile(code, "remote-rollout-marker", "exec"), {})
+        self.assertEqual(inspect.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [3, 6])
+        self.assertFalse((self.control / "current-version.json").exists())
+
     def test_legacy_image_rollout_preserves_missing_marker_without_failing(self) -> None:
         shell = (ROOT / ".github" / "scripts" / "remote-rollout.sh").read_text(encoding="utf-8")
         opening = 'python3 - "$release_root" "$revision" "$image_ref" "$source_repo" <<\'PY\'\n'
