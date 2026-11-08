@@ -128,19 +128,26 @@ def description_connection_info(description: str, site_url: str = "") -> tuple[s
     if not isinstance(description, str):
         return "", False
     source = html.unescape(description)
-    source_host = (urlsplit(site_url).hostname or "").lower()
+    site = urlsplit(site_url)
+    source_host = (site.hostname or "").lower()
+    source_port = site.port or (443 if site.scheme == "https" else 80)
     candidates: set[str] = set()
     possible = False
     for match in _DESCRIPTION_NC.finditer(source):
         host, port = match.group("host"), int(match.group("port"))
-        if 0 < port <= 65535 and ("." in host or host.lower() == "localhost"):
+        if 0 < port <= 65535:
             candidates.add(f"nc {host} {port}")
             possible = True
     for match in _DESCRIPTION_URL.finditer(source):
         url = match.group().rstrip(".,;:!?)]}")
         parsed = urlsplit(url)
         host = (parsed.hostname or "").lower()
-        if not host or host == source_host or host in {"github.com", "www.github.com"}:
+        try:
+            target_port = parsed.port or (443 if parsed.scheme in {"https", "wss"} else 80)
+        except ValueError:
+            possible = True
+            continue
+        if not host or (host == source_host and target_port == source_port) or host in {"github.com", "www.github.com"}:
             continue
         if _NON_SERVICE_PATH.search(parsed.path):
             continue
@@ -150,7 +157,7 @@ def description_connection_info(description: str, site_url: str = "") -> tuple[s
         candidates.add(url)
     for match in _DESCRIPTION_HOST_PORT.finditer(source):
         host, port = match.group("host"), int(match.group("port"))
-        if 0 < port <= 65535 and host.lower() != source_host:
+        if 0 < port <= 65535 and (host.lower() != source_host or port != source_port):
             possible = True
             candidates.add(f"{host}:{port}")
     if len(candidates) == 1:
