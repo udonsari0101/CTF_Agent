@@ -88,13 +88,33 @@ try {
     $script:publishedDigest = ''
     $script:cachedDigest = ''
     $script:localRevision = ''
+    $script:installedDigest = ''
+    $baseLayer = @{digest=('sha256:' + ('1' * 64));size=[int64]2GB + 1}
+    $oldAppLayer = @{digest=('sha256:' + ('2' * 64));size=[int64]1MB}
+    $newAppLayer = @{digest=('sha256:' + ('3' * 64));size=[int64]2MB}
+    $script:newManifest = @{SchemaV2Manifest=@{layers=@($baseLayer,$newAppLayer)}}
+    $script:oldManifest = @{SchemaV2Manifest=@{layers=@(@{digest=$baseLayer.digest;size=$baseLayer.size},$oldAppLayer)}}
     function Invoke-DesktopNative([string]$file, [string[]]$arguments, [int]$timeoutSeconds) {
         if ($arguments -contains 'manifest') {
             if (-not $script:publishedDigest) {
                 return [pscustomobject]@{ExitCode=1;Stdout=''}
             }
-            $manifest = @{Descriptor=@{digest=$script:publishedDigest}} | ConvertTo-Json -Compress
+            $oldRef = 'ghcr.io/udonsari0101/ctf-agent-public@' + $script:installedDigest
+            $digest = if ($script:installedDigest -and $arguments -contains $oldRef) {
+                $script:installedDigest
+            } else { $script:publishedDigest }
+            $body = if ($script:installedDigest -and $arguments -contains $oldRef) {
+                $script:oldManifest.SchemaV2Manifest
+            } else { $script:newManifest.SchemaV2Manifest }
+            $manifest = @{Descriptor=@{digest=$digest};SchemaV2Manifest=$body} |
+                ConvertTo-Json -Compress -Depth 10
             return [pscustomobject]@{ExitCode=0;Stdout=$manifest}
+        }
+        if ($arguments -contains 'ctf-agent-local:latest') {
+            if (-not $script:installedDigest) { return [pscustomobject]@{ExitCode=1;Stdout=''} }
+            $reference = 'ghcr.io/udonsari0101/ctf-agent-public@' + $script:installedDigest
+            $image = @(@{RepoDigests=@($reference)}) | ConvertTo-Json -Compress -Depth 5
+            return [pscustomobject]@{ExitCode=0;Stdout=$image}
         }
         $reference = 'ghcr.io/udonsari0101/ctf-agent-public@' + $script:cachedDigest
         if ($script:cachedDigest -and $arguments -contains $reference) {
@@ -112,6 +132,20 @@ try {
     if ((Get-EstimatedImageWorkBytes $revision) -ne 18GB) {
         throw 'A stale local digest carrying the same revision was treated as the published image'
     }
+    $script:installedDigest = $script:cachedDigest
+    if ((Get-EstimatedImageWorkBytes $revision) -ne 2GB) {
+        throw 'An upgrade reusing more than 2 GiB of identical layers was treated as a cold pull'
+    }
+    $script:oldManifest.SchemaV2Manifest.layers[0].digest = 'sha256:' + ('4' * 64)
+    if ((Get-EstimatedImageWorkBytes $revision) -ne 18GB) {
+        throw 'A changed large base layer was treated as a warm pull'
+    }
+    $script:oldManifest.SchemaV2Manifest.layers[0].digest = $baseLayer.digest
+    $script:newManifest.SchemaV2Manifest.layers[1].size = [int64]129MB
+    if ((Get-EstimatedImageWorkBytes $revision) -ne 18GB) {
+        throw 'A large changed image tail was treated as a small application update'
+    }
+    $script:newManifest.SchemaV2Manifest.layers[1].size = [int64]2MB
     $script:cachedDigest = $script:publishedDigest
     if ((Get-EstimatedImageWorkBytes $revision) -ne 1GB) {
         throw 'The exact published image digest was treated as a cold pull'

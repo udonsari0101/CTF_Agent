@@ -28,6 +28,8 @@ LABEL org.opencontainers.image.source="https://github.com/udonsari0101/CTF_Agent
 
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+# Pwndbg's packaged Python includes optional ziglang. Its official lite
+# installation omits this compiler; GCC remains available for CTF builds.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         apktool apparmor bash binutils binwalk build-essential ca-certificates chromium cpio curl \
@@ -82,6 +84,10 @@ RUN apt-get update \
     && seccomp-tools --version | grep -F "Version ${SECCOMP_TOOLS_VERSION}" \
     && GoReSym /usr/local/bin/GoReSym > /tmp/goresym-self.json \
     && python3 -c 'import json; assert json.load(open("/tmp/goresym-self.json", encoding="utf-8")).get("Arch") == "amd64"' \
+    && pwndbg_site="$(find /usr/lib/pwndbg-gdb/lib -maxdepth 2 -type d -name site-packages -print -quit)" \
+    && test -n "$pwndbg_site" \
+    && test -d "$pwndbg_site/ziglang" \
+    && rm -rf "$pwndbg_site/ziglang" "$pwndbg_site"/ziglang-*.dist-info \
     && apt-get purge --yes ruby-dev ruby3.1-dev \
     && apt-get autoremove --yes --purge \
     && rm -f /tmp/radare2.deb /tmp/ffuf.tar.gz /tmp/ffuf /tmp/LICENSE /tmp/stegseek.deb /tmp/pwndbg.deb /tmp/websocat /tmp/goresym.zip /tmp/GoReSym /tmp/goresym-self.json /tmp/os.gem /tmp/seccomp-tools.gem \

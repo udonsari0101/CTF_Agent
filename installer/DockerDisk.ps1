@@ -60,10 +60,45 @@ function Resolve-DockerDesktopDiskFile {
     throw ('Cannot locate Docker Desktop image disk under {0}. Check Settings > Resources > Advanced, or set CTF_AGENT_DOCKER_DATA_ROOT to its disk image folder.' -f $folder)
 }
 
+function Get-ReusedImageWorkBytes($publishedManifest, $installedManifest) {
+    # Registry layer digests identify compressed blobs shared by two images.
+    # Only a large, identical prefix plus a small new tail qualifies for the
+    # warm-upgrade budget. Unexpected manifests retain the cold-install budget.
+    $cold = [int64]18GB
+    $publishedLayers = @($publishedManifest.SchemaV2Manifest.layers)
+    $installedLayers = @($installedManifest.SchemaV2Manifest.layers)
+    if ($publishedLayers.Count -lt 2 -or $installedLayers.Count -lt 2) { return $cold }
+    $sharedBytes = [int64]0
+    $sharedCount = 0
+    while ($sharedCount -lt [Math]::Min($publishedLayers.Count, $installedLayers.Count)) {
+        $new = $publishedLayers[$sharedCount]
+        $old = $installedLayers[$sharedCount]
+        if ([string]$new.digest -notmatch '^sha256:[0-9a-f]{64}$' -or
+            [string]$old.digest -notmatch '^sha256:[0-9a-f]{64}$' -or
+            [int64]$new.size -le 0 -or [int64]$old.size -le 0) { return $cold }
+        if ($new.digest -ne $old.digest -or [int64]$new.size -ne [int64]$old.size) { break }
+        $sharedBytes += [int64]$new.size
+        $sharedCount++
+    }
+    if ($sharedBytes -lt [int64]2GB -or $sharedCount -eq $publishedLayers.Count) { return $cold }
+    $newBytes = [int64]0
+    for ($i = $sharedCount; $i -lt $publishedLayers.Count; $i++) {
+        $layer = $publishedLayers[$i]
+        if ([string]$layer.digest -notmatch '^sha256:[0-9a-f]{64}$' -or
+            [int64]$layer.size -le 0) { return $cold }
+        $newBytes += [int64]$layer.size
+    }
+    if ($newBytes -gt [int64]128MB) { return $cold }
+    # Leave headroom for unpacking, Docker metadata and release staging. This
+    # is deliberately larger than the compressed tail; a 5 GiB free reserve
+    # is added separately by the volume preflight.
+    return [int64][Math]::Max(2GB, [Math]::Ceiling((1GB + 10 * $newBytes) / 1GB) * 1GB)
+}
+
 function Get-EstimatedImageWorkBytes([string]$revision) {
-    # Only the digest currently published for this exact revision can be
-    # treated as cached. A different local digest can carry the same revision
-    # label and would still require a cold pull.
+    # Resolve the published digest before trusting any local image. An exact
+    # cached digest needs little space; an older digest may still share the
+    # large toolchain layers and need only the new application tail.
     # A cold install stores compressed and unpacked layers. The historical
     # v0.4.57 local overlay also populated BuildKit cache; new releases no
     # longer build that redundant overlay. Keep the observed 18 GiB cold
@@ -89,6 +124,26 @@ function Get-EstimatedImageWorkBytes([string]$revision) {
         # here blocked upgrades on otherwise healthy disks.
         return [int64]1GB
     }
+    $installed = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
+        'image', 'inspect', 'ctf-agent-local:latest') 8
+    if ($installed.ExitCode -ne 0) { return [int64]18GB }
+    try {
+        $localImage = @($installed.Stdout | ConvertFrom-Json -ErrorAction Stop)[0]
+        $knownDigest = @($localImage.RepoDigests | Where-Object {
+            $_ -match '^ghcr\.io/udonsari0101/ctf-agent-public@sha256:[0-9a-f]{64}$'
+        } | Select-Object -First 1)[0]
+    } catch { return [int64]18GB }
+    if (-not $knownDigest) { return [int64]18GB }
+    $known = Invoke-DesktopNative $docker @('--context', 'desktop-linux',
+        'manifest', 'inspect', '--verbose', $knownDigest) 30
+    if ($known.ExitCode -ne 0) { return [int64]18GB }
+    try {
+        $knownManifest = $known.Stdout | ConvertFrom-Json -ErrorAction Stop
+        if ($knownManifest.Descriptor.digest -ne ($knownDigest -split '@', 2)[1]) {
+            return [int64]18GB
+        }
+        return Get-ReusedImageWorkBytes $published $knownManifest
+    } catch { return [int64]18GB }
     return [int64]18GB
 }
 
