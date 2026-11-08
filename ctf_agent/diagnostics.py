@@ -73,9 +73,11 @@ def _safe_event(raw: str) -> dict:
     return result
 
 
-def _where(hours: int, workspace_id: str | None, challenge_id: str | None) -> tuple[str, list]:
+def _where(hours: int, workspace_id: str | None, challenge_id: str | None,
+           *, iso_time: bool = False) -> tuple[str, list]:
     terms = ["created_at>=?"]
-    values: list = [time.time() - hours * 3600]
+    cutoff = time.time() - hours * 3600
+    values: list = [datetime.fromtimestamp(cutoff, timezone.utc).isoformat() if iso_time else cutoff]
     if workspace_id:
         terms.append("workspace_id=?")
         values.append(workspace_id)
@@ -88,6 +90,7 @@ def _where(hours: int, workspace_id: str | None, challenge_id: str | None) -> tu
 def preview(database: Callable, log_dir: Path, *, hours: int,
             workspace_id: str | None = None, challenge_id: str | None = None) -> dict:
     where, values = _where(hours, workspace_id, challenge_id)
+    ctfd_where, ctfd_values = _where(hours, workspace_id, challenge_id, iso_time=True)
     with database() as db:
         job_count = db.execute(f"SELECT COUNT(*) FROM solver_jobs WHERE {where}", values).fetchone()[0]
         event_count, event_bytes = db.execute(
@@ -97,13 +100,13 @@ def preview(database: Callable, log_dir: Path, *, hours: int,
             values,
         ).fetchone()
         submit_count = db.execute(
-            f"SELECT COUNT(*) FROM ctfd_submit_jobs WHERE {where}", values
+            f"SELECT COUNT(*) FROM ctfd_submit_jobs WHERE {ctfd_where}", ctfd_values
         ).fetchone()[0]
         import_count = db.execute(
             "SELECT COUNT(*) FROM ctfd_jobs WHERE created_at>=?"
             + (" AND workspace_id=?" if workspace_id else "")
             + (" AND target_challenge_id=?" if challenge_id else ""),
-            [values[0], *([workspace_id] if workspace_id else []),
+            [ctfd_values[0], *([workspace_id] if workspace_id else []),
              *([challenge_id] if challenge_id else [])],
         ).fetchone()[0]
     log_bytes = 0
@@ -129,6 +132,7 @@ def build_archive(database: Callable, log_dir: Path, *, hours: int,
         summary = preview(database, log_dir, hours=hours, workspace_id=workspace_id,
                           challenge_id=challenge_id)
         where, values = _where(hours, workspace_id, challenge_id)
+        ctfd_where, ctfd_values = _where(hours, workspace_id, challenge_id, iso_time=True)
         with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
             with database() as db:
                 jobs = [dict(row) for row in db.execute(
@@ -161,15 +165,15 @@ def build_archive(database: Callable, log_dir: Path, *, hours: int,
                 submit_rows = [dict(row) for row in db.execute(
                     f"""SELECT id,workspace_id,challenge_id,status,attempts,result_code,
                                created_at,updated_at,completed_at,source_solver_job_id
-                        FROM ctfd_submit_jobs WHERE {where} ORDER BY created_at DESC LIMIT ?""",
-                    [*values, MAX_JOBS],
+                        FROM ctfd_submit_jobs WHERE {ctfd_where} ORDER BY created_at DESC LIMIT ?""",
+                    [*ctfd_values, MAX_JOBS],
                 )]
                 archive.writestr("ctfd-submissions.json", json.dumps(submit_rows, ensure_ascii=False))
 
                 import_where = "created_at>=?" + (" AND workspace_id=?" if workspace_id else "") + (
                     " AND target_challenge_id=?" if challenge_id else ""
                 )
-                import_values = [values[0], *([workspace_id] if workspace_id else []),
+                import_values = [ctfd_values[0], *([workspace_id] if workspace_id else []),
                                  *([challenge_id] if challenge_id else [])]
                 import_rows = [dict(row) for row in db.execute(
                     f"""SELECT id,workspace_id,status,mode,target_challenge_id,imported,

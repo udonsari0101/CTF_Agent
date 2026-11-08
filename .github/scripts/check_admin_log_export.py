@@ -61,8 +61,21 @@ def main() -> None:
                         'flag':'FLAG{hidden}', 'sequence':1,
                     }),now),
                 )
+                db.execute("""INSERT INTO ctfd_submit_jobs
+                    (id,workspace_id,challenge_id,owner_user_id,connection_generation,
+                     ctfd_id,flag_digest,completion_source,status,next_attempt_at,
+                     created_at,updated_at)
+                    VALUES(?,?,?,?,?,7,?,'agent','incorrect',0,?,?)""",
+                    (uuid.uuid4().hex,workspace,challenge,owner,'test','a'*64,
+                     '2000-01-01T00:00:00+00:00','2000-01-01T00:00:00+00:00'))
+                db.execute("""INSERT INTO ctfd_jobs
+                    (id,owner_user_id,workspace_id,source_url,auth_type,status,created_at,updated_at)
+                    VALUES(?,?,?,'https://ctf.example.org','token','completed',?,?)""",
+                    (uuid.uuid4().hex,owner,workspace,
+                     '2000-01-01T00:00:00+00:00','2000-01-01T00:00:00+00:00'))
             estimate = client.get(f'/api/admin/logs/preview?workspace_id={workspace}')
             assert estimate.status_code == 200 and estimate.json()['solver_events'] == 1
+            assert estimate.json()['ctfd_submissions'] == 0 and estimate.json()['ctfd_imports'] == 0
             archive_response = client.get(
                 f'/api/admin/logs/export?workspace_id={workspace}&challenge_id={challenge}'
             )

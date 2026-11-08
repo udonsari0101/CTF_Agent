@@ -44,6 +44,7 @@ def main() -> int:
         "const workspaces=[{id:'one'}],authMode='password';"
         "let sidebarCollapsed=false;"
         "const esc=value=>String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;');"
+        "const avatarMarkup=()=>'<span>U</span>';"
         "const i18n={picker:()=>'<label class=\"language-picker\"><select data-language-picker "
         "aria-label=\"Language / 언어\"><option value=\"en\">English</option>"
         "<option value=\"ko\">한국어</option></select></label>'};"

@@ -60,7 +60,7 @@ def make_coordinator(db_path):
 def create_job_db(db_path):
     with contextlib.closing(sqlite3.connect(db_path)) as db, db:
         db.execute(
-            "CREATE TABLE challenges(id TEXT,workspace_id TEXT,name TEXT,status TEXT,"
+            "CREATE TABLE challenges(id TEXT,workspace_id TEXT,name TEXT,canonical_name TEXT,status TEXT,"
             "completion_source TEXT,flag TEXT,notes TEXT)"
         )
         db.executescript(SCHEMA)
