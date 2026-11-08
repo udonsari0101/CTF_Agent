@@ -77,7 +77,10 @@ def main() -> None:
                         with page.expect_response(lambda response: response.url.endswith('/api/auth/avatar/refresh')) as rotated:
                             page.locator('[data-action="refresh-profile-avatar"]').click()
                         assert rotated.value.status == 200, rotated.value.text()
-                        assert page.locator('#profile-avatar-preview').inner_html() != before_avatar
+                        page.wait_for_function(
+                            "old => document.querySelector('#profile-avatar-preview')?.innerHTML !== old",
+                            arg=before_avatar, timeout=5000,
+                        )
                         assert page.request.get(f"http://127.0.0.1:{port}/api/auth/state").json()['user']['ultra_escalation_default'] == 'auto'
                         assert not errors, errors
                         page.close()
