@@ -72,8 +72,9 @@ Requirements: x64 Windows, WSL 2, Docker Desktop with its WSL 2 engine, and
 internet access.
 Installation preserves 5 GiB of free space on the WSL application filesystem
 and each Windows backing drive. It plans another 1 GiB for application
-staging, 18 GiB for a cold Docker image pull and local build (10 GiB when the
-exact image is cached), and 1 GiB when creating or growing a separate database
+staging, 18 GiB for a cold Docker image pull, 2 GiB for a verified small
+upgrade reusing the installed toolchain layers, 1 GiB when the exact image is
+cached, and 1 GiB when creating or growing a separate database
 VHDX. If Docker Desktop's drive is too full, Install.cmd moves its disk to the
 database drive or the fixed NTFS drive with the most room. When
 these files are on the same Windows drive, the installer adds their planned
