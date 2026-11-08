@@ -953,3 +953,12 @@ details.solver-console-card[open] > summary::after { content:'▾'; }
 .related-evidence-flag { display:flex; align-items:center; gap:9px; }
 .related-evidence-flag input { width:auto!important; margin:0; }
 @media(max-width:500px) { .workspace-ctfd-setting { align-items:stretch; flex-direction:column; } }
+.topbar-meta .avatar svg { display: block; border-radius: 8px; }
+.profile-avatar-control { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+#profile-avatar-preview svg { display: block; width: 64px; height: 64px; border-radius: 12px; }
+.clone-group + .clone-group { margin-top: 16px; }
+.clone-member .actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.clone-member select { min-width: 150px; max-width: 220px; }
+.account-more { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+.account-more summary { cursor: pointer; color: var(--muted); font-size: 13px; font-weight: 600; }
+.account-more .actions { margin-top: 12px; flex-wrap: wrap; }

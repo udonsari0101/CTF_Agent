@@ -115,6 +115,8 @@ CREATE TABLE IF NOT EXISTS challenges (
     previous_status TEXT, completion_source TEXT CHECK(completion_source IN ('manual','agent') OR completion_source IS NULL),
     flag TEXT, notes TEXT NOT NULL DEFAULT '', remote TEXT NOT NULL DEFAULT '',
     remote_mode TEXT NOT NULL DEFAULT 'unknown' CHECK(remote_mode IN ('unknown','none','endpoint')),
+    canonical_name TEXT,
+    deleted_at TEXT,
     ctfd_id INTEGER, ctfd_url TEXT,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
@@ -188,6 +190,24 @@ def initialize(settings: Settings) -> None:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(SCHEMA)
         connection.execute("BEGIN IMMEDIATE")
+        challenge_columns = {row[1] for row in connection.execute("PRAGMA table_info(challenges)")}
+        if "deleted_at" not in challenge_columns:
+            connection.execute("ALTER TABLE challenges ADD COLUMN deleted_at TEXT")
+        if "canonical_name" not in challenge_columns:
+            connection.execute("ALTER TABLE challenges ADD COLUMN canonical_name TEXT")
+            # Older clone families still know their root while it exists.
+            connection.execute(
+                """UPDATE challenges SET canonical_name=(
+                       SELECT root.name FROM challenge_clone_members member
+                       JOIN challenges root ON root.id=member.family_id
+                       WHERE member.challenge_id=challenges.id
+                         AND member.workspace_id=challenges.workspace_id
+                         AND member.challenge_id<>member.family_id
+                   ) WHERE id IN (
+                       SELECT challenge_id FROM challenge_clone_members
+                       WHERE challenge_id<>family_id
+                   )"""
+            )
         metadata = dict(connection.execute("SELECT key,value FROM meta").fetchall())
         session_columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
         if "persistent" not in session_columns:
@@ -215,6 +235,13 @@ def initialize(settings: Settings) -> None:
                                (owner_id, username, legacy_hash, datetime.now(timezone.utc).isoformat()))
             connection.execute("INSERT INTO meta(key,value) VALUES('legacy_owner_id',?)", (owner_id,))
             connection.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('admin_username',?)", (username,))
+        user_columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
+        if "ultra_escalation_default" not in user_columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN ultra_escalation_default TEXT NOT NULL DEFAULT 'ask'"
+            )
+        if "avatar_seed" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN avatar_seed TEXT NOT NULL DEFAULT ''")
         for table, column in (("sessions", "user_id"), ("workspaces", "owner_user_id")):
             columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
             if column not in columns:

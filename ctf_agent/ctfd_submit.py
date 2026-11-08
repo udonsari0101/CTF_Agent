@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from .credential_vault import CredentialVault, CredentialVaultError
 from .ctfd import CTFdClient, CTFdError, Limits, normalize_url, transient_ctfd_failure
 from .process_lock import ProcessFileLock
+from .solver_exchange import ExchangeError
 
 
 MAX_ATTEMPTS = 3
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS ctfd_submit_jobs (
     flag_digest TEXT NOT NULL,
     completion_source TEXT NOT NULL CHECK(completion_source IN ('manual','agent')),
     source_solver_job_id TEXT,
+    solver_rejection_state TEXT CHECK(solver_rejection_state IN ('applied','skipped') OR solver_rejection_state IS NULL),
     status TEXT NOT NULL CHECK(status IN (
         'queued','running','retry','correct','already_solved','incorrect',
         'rate_limited','auth_error','network_error','paused','partial','failed',
@@ -236,6 +238,8 @@ class CTFdSubmitService:
                 )
             if "source_solver_job_id" not in job_columns:
                 db.execute("ALTER TABLE ctfd_submit_jobs ADD COLUMN source_solver_job_id TEXT")
+            if "solver_rejection_state" not in job_columns:
+                db.execute("ALTER TABLE ctfd_submit_jobs ADD COLUMN solver_rejection_state TEXT")
             db.execute(
                 "UPDATE ctfd_submit_jobs SET status='network_error',result_code='retry_limit',"
                 "display_message='자동 제출 재시도 한도에 도달했습니다.',completed_at=?,updated_at=? "
@@ -1277,7 +1281,7 @@ class CTFdSubmitService:
     def _process_once_locked(self) -> bool:
         job = self._claim()
         if not job:
-            return self._reconcile_unknown_once()
+            return self._reconcile_unknown_once() or self._reconcile_incorrect_candidate_once()
         try:
             return self._process_claimed(job)
         finally:
@@ -1290,6 +1294,60 @@ class CTFdSubmitService:
                     "DELETE FROM ctfd_submit_worker_claim WHERE singleton=1 AND job_id=?",
                     (job["id"],),
                 )
+
+    def _reconcile_incorrect_candidate_once(self) -> bool:
+        """Discard a wrong solver flag after the isolated worker has released.
+
+        A CTFd response can arrive while the worker is writing its draft. Stop
+        that job immediately and retry the durable rejection after release.
+        """
+
+        with self.db() as db:
+            if not db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='solver_jobs'"
+            ).fetchone():
+                return False
+            row = db.execute(
+                """SELECT j.id,j.owner_user_id,j.source_solver_job_id,
+                          s.released_ingested,s.flag_rejected_at
+                   FROM ctfd_submit_jobs j
+                   LEFT JOIN solver_jobs s ON s.id=j.source_solver_job_id
+                   WHERE j.status='incorrect' AND j.completion_source='agent'
+                     AND j.source_solver_job_id IS NOT NULL
+                     AND j.solver_rejection_state IS NULL
+                   ORDER BY j.completed_at,j.id LIMIT 1"""
+            ).fetchone()
+        if row is None:
+            return False
+        coordinator = getattr(self.app.state, "solver_jobs", None)
+        if coordinator is None:
+            return False
+        if row["flag_rejected_at"] is not None:
+            outcome = "applied"
+        elif row["released_ingested"] is None:
+            outcome = "skipped"
+        elif not row["released_ingested"]:
+            try:
+                coordinator.cancel(row["source_solver_job_id"], row["owner_user_id"])
+            except ExchangeError:
+                pass
+            return False
+        else:
+            try:
+                coordinator.reject_candidate(row["source_solver_job_id"], row["owner_user_id"])
+            except ExchangeError as exc:
+                if exc.code == "candidate_still_active":
+                    return False
+                outcome = "skipped"
+            else:
+                outcome = "applied"
+        with self.db() as db:
+            db.execute(
+                "UPDATE ctfd_submit_jobs SET solver_rejection_state=?,updated_at=? "
+                "WHERE id=? AND status='incorrect' AND solver_rejection_state IS NULL",
+                (outcome, _stamp(), row["id"]),
+            )
+        return True
 
     def _process_claimed(self, job: dict) -> bool:
         if self.stop_event.is_set():
@@ -1436,6 +1494,14 @@ class CTFdSubmitService:
             return
         self._finish(job["id"], local_status, code, message,
                      solve=local_status in {"correct", "already_solved"}, job=job)
+        if local_status == "incorrect" and job.get("source_solver_job_id"):
+            coordinator = getattr(self.app.state, "solver_jobs", None)
+            if coordinator is not None:
+                try:
+                    coordinator.cancel(job["source_solver_job_id"], job["owner_user_id"])
+                except ExchangeError:
+                    pass
+            self.wakeup.set()
 
     def _finish(self, job_id: str, status: str, code: str, message: str, *,
                 solve: bool = False, job: dict | None = None) -> None:

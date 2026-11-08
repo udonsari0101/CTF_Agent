@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 import httpx
 
@@ -1211,6 +1211,38 @@ def register_accounts(app, require_auth, settings):
             return await manager.import_auth(account_id, raw, user["id"])
         finally:
             await file.close()
+
+    @router.post("/accounts/{account_id}/auth-file/export")
+    async def download_auth(account_id: str, user=Depends(current_user)):
+        account = manager.get(account_id, user["id"])
+        if account["provider"] != "codex" or not re.fullmatch(r"[0-9a-f]{32}", account_id):
+            raise HTTPException(404, "Codex auth.json is unavailable for this account.")
+        home = manager.home / account_id
+        directory = home / "codex"
+        target = directory / "auth.json"
+        if (home.is_symlink() or directory.is_symlink() or target.is_symlink()
+                or home.resolve().parent != manager.home.resolve()
+                or directory.resolve().parent != home.resolve()):
+            raise HTTPException(409, "The account credential path could not be verified.")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(target, flags)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_AUTH_BYTES:
+                    raise HTTPException(409, "The account credential file could not be verified.")
+                content = os.read(descriptor, MAX_AUTH_BYTES + 1)
+            finally:
+                os.close(descriptor)
+        except FileNotFoundError:
+            raise HTTPException(404, "No auth.json is saved for this account.") from None
+        if len(content) > MAX_AUTH_BYTES:
+            raise HTTPException(409, "The account credential file is too large.")
+        return Response(content=content, media_type="application/json", headers={
+            "Content-Disposition": 'attachment; filename="auth.json"',
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        })
 
     @router.get("/providers/codex/runtime")
     async def runtime_status(user=Depends(current_user)):

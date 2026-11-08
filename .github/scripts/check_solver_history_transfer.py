@@ -83,7 +83,7 @@ def main():
         exported = export_workspace(settings, layout, owner, ws, whole)
         assert exported["solver_job_count"] == 2 and exported["solver_event_count"] == 1
         preview = preview_bundle(whole, settings=settings, owner_user_id=owner)
-        assert preview["version"] == 3 and preview["solver_job_count"] == 2
+        assert preview["version"] == 4 and preview["solver_job_count"] == 2
         real_disk_usage = shutil.disk_usage
         with patch("ctf_agent.workspace_transfer.shutil.disk_usage",
                    side_effect=lambda path: SimpleNamespace(free=0) if Path(path) == settings.db_dir else real_disk_usage(path)):
@@ -137,6 +137,9 @@ def main():
             manifest = json.loads(source.read("manifest.json"))
             manifest["version"] = 1
             manifest.pop("solver_history")
+            for challenge in manifest["challenges"]:
+                challenge.pop("canonical_name", None)
+                challenge.pop("deleted_at", None)
             for name in source.namelist():
                 if name == "solver-history.jsonl":
                     continue

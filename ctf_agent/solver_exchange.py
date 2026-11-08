@@ -1274,7 +1274,8 @@ class SolverExchangeCoordinator:
                               FROM challenges c
                        JOIN workspaces w ON w.id=c.workspace_id
                        JOIN users u ON u.id=w.owner_user_id
-                       WHERE c.id=? AND c.workspace_id=? AND w.owner_user_id=? AND u.active=1""",
+                       WHERE c.id=? AND c.workspace_id=? AND c.deleted_at IS NULL
+                         AND w.owner_user_id=? AND u.active=1""",
                     (challenge_id, workspace_id, owner_user_id),
                 ).fetchone()
                 if not challenge:
@@ -2230,9 +2231,10 @@ class SolverExchangeCoordinator:
     def reject_candidate(self, job_id: str, owner_user_id: str) -> dict[str, Any]:
         """Record one agent candidate as wrong for the next isolated job.
 
-        Only a released result belonging to the current owner can become a
-        checkpoint.  The challenge and its agent write-up are reset in the
-        same write transaction; manual completion is never changed here.
+        An active result can be excluded immediately. Its worker is asked to
+        stop and later events cannot publish that candidate or its write-up.
+        The challenge and its agent write-up are reset in the same transaction;
+        manual completion is never changed here.
         """
 
         if not _JOB_ID.fullmatch(job_id):
@@ -2263,7 +2265,8 @@ class SolverExchangeCoordinator:
                 )
             if row["flag_rejected_at"] is not None:
                 raise ExchangeError("candidate_already_rejected", "이미 오답으로 처리한 Flag입니다.")
-            if (
+            active_candidate = row["status"] in _OPEN_STATUSES and not row["released_ingested"]
+            if not active_candidate and (
                 not row["released_ingested"]
                 or row["released_at"] is None
                 or row["status"] not in _TERMINAL_STATUSES
@@ -2289,12 +2292,13 @@ class SolverExchangeCoordinator:
                 )
             if db.execute(
                 "SELECT 1 FROM solver_jobs WHERE owner_user_id=? AND workspace_id=? "
-                "AND challenge_id=? AND status IN (%s) LIMIT 1"
+                "AND challenge_id=? AND id<>? AND status IN (%s) LIMIT 1"
                 % ",".join("?" for _ in _OPEN_STATUSES),
                 (
                     owner_user_id,
                     row["workspace_id"],
                     row["challenge_id"],
+                    job_id,
                     *_OPEN_STATUSES,
                 ),
             ).fetchone():
@@ -2392,8 +2396,9 @@ class SolverExchangeCoordinator:
             )
             db.execute(
                 """UPDATE solver_jobs SET flag_rejected_at=?,flag_hooked=1,
-                     writeup_hooked=1,updated_at=? WHERE id=?""",
-                (timestamp, timestamp, job_id),
+                     writeup_hooked=1,cancel_requested=CASE WHEN ? THEN 1 ELSE cancel_requested END,
+                     updated_at=? WHERE id=?""",
+                (timestamp, int(active_candidate), timestamp, job_id),
             )
             db.execute("DELETE FROM challenge_writeups WHERE challenge_id=?", (row["challenge_id"],))
             retained_notes = remove_generated_writeup(
@@ -3957,7 +3962,7 @@ class SolverExchangeCoordinator:
                     "job_id": job["id"],
                     "job_mode": job["job_mode"],
                     "writeup_locale": job["writeup_locale"],
-                    "challenge_name": record["name"],
+                    "challenge_name": record.get("canonical_name") or record["name"],
                     "challenge_text": record["description"],
                     "related_context": related_context,
                     "category": record.get("category") or "",
@@ -4072,7 +4077,8 @@ class SolverExchangeCoordinator:
             db.execute("BEGIN")
             record = db.execute(
                 """SELECT c.*,w.flag_format AS workspace_flag_format FROM challenges c JOIN workspaces w ON w.id=c.workspace_id
-                   WHERE c.id=? AND c.workspace_id=? AND w.owner_user_id=?""",
+                   WHERE c.id=? AND c.workspace_id=? AND c.deleted_at IS NULL
+                     AND w.owner_user_id=?""",
                 (job["challenge_id"], job["workspace_id"], job["owner_user_id"]),
             ).fetchone()
             account = db.execute(
@@ -4442,7 +4448,7 @@ class SolverExchangeCoordinator:
                         "invalid_worker_event", "Activity refers to an unknown subagent.", category="safety"
                     )
             challenge = db.execute(
-                "SELECT name,status,completion_source,flag,notes FROM challenges WHERE id=? AND workspace_id=?",
+                "SELECT name,canonical_name,status,completion_source,flag,notes FROM challenges WHERE id=? AND workspace_id=?",
                 (job["challenge_id"], job["workspace_id"]),
             ).fetchone()
             is_refinement = current["job_mode"] == "writeup_refine"
@@ -4525,7 +4531,7 @@ class SolverExchangeCoordinator:
                         and isinstance(current["flag"], str)
                         and not contains_internal_operation(event["writeup_markdown"])
                         and valid_writeup(
-                            event["writeup_markdown"], challenge["name"], current["flag"], current["writeup_locale"]
+                            event["writeup_markdown"], challenge["canonical_name"] or challenge["name"], current["flag"], current["writeup_locale"]
                         )
                     )
                     if not source_matches:
@@ -4641,6 +4647,11 @@ class SolverExchangeCoordinator:
                 elif state == "interrupted":
                     updates["status"] = "awaiting_credential"
             elif kind == "flag":
+                if current["flag_rejected_at"] is not None:
+                    # A late worker event must not re-publish a candidate that
+                    # the operator or CTFd has already ruled out.
+                    manual_override = True
+                    updates.update(cancel_requested=1, flag_hooked=1, writeup_hooked=1)
                 candidate_changed = current["flag"] != event["flag"]
                 already_delivered = False
                 if candidate_changed:
@@ -4666,6 +4677,9 @@ class SolverExchangeCoordinator:
             elif kind == "writeup":
                 if current["flag"] != event["flag"]:
                     raise ExchangeError("worker_result_mismatch", "write-up의 flag가 먼저 저장된 결과와 일치하지 않습니다.", category="safety")
+                if current["flag_rejected_at"] is not None:
+                    manual_override = True
+                    updates.update(cancel_requested=1, writeup_hooked=1)
                 if is_refinement:
                     # Keep the candidate private to the durable job until the
                     # worker has published a successful terminal release.  A
@@ -4788,6 +4802,9 @@ class SolverExchangeCoordinator:
                 # Keep the challenge at flag_found while making the job itself
                 # terminal so a later retry is possible.
                 final_status = "failed" if status_value == "flag_found" else status_value
+                if current["flag_rejected_at"] is not None:
+                    final_status = "cancelled"
+                    updates.update(writeup_markdown=None, writeup_hooked=1)
                 if (
                     release_publication_error is not None
                     or isinstance(prior_writeup_error, dict)
@@ -4869,7 +4886,7 @@ class SolverExchangeCoordinator:
                             and isinstance(current["flag"], str)
                             and not contains_internal_operation(candidate)
                             and valid_writeup(
-                                candidate, challenge["name"], current["flag"], current["writeup_locale"]
+                                candidate, challenge["canonical_name"] or challenge["name"], current["flag"], current["writeup_locale"]
                             )
                         )
                         if not source_matches:
@@ -4969,7 +4986,7 @@ class SolverExchangeCoordinator:
                         "UPDATE challenges SET status=?,updated_at=? WHERE id=? AND workspace_id=? AND status!='solved'",
                         (challenge_status, _utc_stamp(timestamp), job["challenge_id"], job["workspace_id"]),
                     )
-                elif current["flag"] and status_value != "completed":
+                elif current["flag"] and current["flag_rejected_at"] is None and status_value != "completed":
                     db.execute(
                         "UPDATE challenges SET status='flag_found',updated_at=? WHERE id=? AND workspace_id=? AND status!='solved'",
                         (_utc_stamp(timestamp), job["challenge_id"], job["workspace_id"]),

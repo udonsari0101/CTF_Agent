@@ -27,7 +27,7 @@ from logging.handlers import RotatingFileHandler
 
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
@@ -486,6 +486,10 @@ class StatusInput(BaseModel):
         return value
 
 
+class CloneGroupInput(BaseModel):
+    target_challenge_id: str | None = None
+
+
 class NotesInput(BaseModel):
     content: str = Field(max_length=2_000_000)
 
@@ -603,7 +607,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                  LEFT JOIN challenge_evidence_shares s
                    ON s.workspace_id=r.workspace_id
                   AND s.target_challenge_id=? AND s.source_challenge_id=c.id
-                WHERE r.workspace_id=? AND (r.prerequisite_id=? OR r.dependent_id=?)
+                WHERE r.workspace_id=? AND c.deleted_at IS NULL
+                  AND (r.prerequisite_id=? OR r.dependent_id=?)
                 ORDER BY r.created_at,c.id""",
             (owner_id(), challenge_id, challenge_id, workspace_id, challenge_id, challenge_id),
         ).fetchall()
@@ -716,6 +721,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from .auth import register_auth
     require_auth, require_admin = register_auth(app, settings, database, password_hash, password_matches, CURRENT_USER)
+
+    from .diagnostics import build_archive, preview as diagnostic_preview
+
+    def diagnostic_filters(hours: int, workspace_id: str | None,
+                           challenge_id: str | None) -> dict:
+        if not 1 <= hours <= 720:
+            raise HTTPException(422, "진단 기간은 1~720시간이어야 합니다.")
+        if workspace_id and not re.fullmatch(r"[0-9a-f]{32}", workspace_id):
+            raise HTTPException(422, "작업공간 ID가 올바르지 않습니다.")
+        if challenge_id and not re.fullmatch(r"[0-9a-f]{32}", challenge_id):
+            raise HTTPException(422, "문제 ID가 올바르지 않습니다.")
+        return {"hours": hours, "workspace_id": workspace_id,
+                "challenge_id": challenge_id}
+
+    @app.get("/api/admin/logs/preview", dependencies=[Depends(require_admin)])
+    def preview_admin_logs(hours: int = 72, workspace_id: str | None = None,
+                           challenge_id: str | None = None):
+        filters = diagnostic_filters(hours, workspace_id, challenge_id)
+        return diagnostic_preview(database, settings.log_dir, **filters)
+
+    @app.get("/api/admin/logs/export", dependencies=[Depends(require_admin)])
+    def export_admin_logs(hours: int = 72, workspace_id: str | None = None,
+                          challenge_id: str | None = None):
+        """Stream redacted activity, CTFd outcomes, and service logs."""
+        filters = diagnostic_filters(hours, workspace_id, challenge_id)
+        log_handler.flush()
+        archive = build_archive(database, settings.log_dir, **filters)
+
+        def chunks():
+            try:
+                while chunk := archive.read(1024 * 1024):
+                    yield chunk
+            finally:
+                archive.close()
+
+        return StreamingResponse(chunks(), media_type="application/zip", headers={
+            "Content-Disposition": 'attachment; filename="ctf-agent-diagnostics.zip"',
+            "Cache-Control": "no-store",
+        })
 
     from .release_updates import (
         REPOSITORY, control_root, invalidate_release_cache, latest_release, production_release_profile,
@@ -901,10 +945,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "작업공간을 찾을 수 없습니다.")
         return row
 
-    def challenge_row(db, workspace_id: str, challenge_id: str):
+    def challenge_row(db, workspace_id: str, challenge_id: str, *, include_deleted: bool = False):
         workspace_row(db, workspace_id)
         row = db.execute("SELECT * FROM challenges WHERE id=? AND workspace_id=?", (challenge_id, workspace_id)).fetchone()
-        if not row:
+        if not row or (row["deleted_at"] and not include_deleted):
             raise HTTPException(404, "이 작업공간에서 문제를 찾을 수 없습니다.")
         return row
 
@@ -996,7 +1040,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             rows = db.execute("""SELECT w.*, COUNT(c.id) AS challenge_count,
                 SUM(CASE WHEN c.status='solved' THEN 1 ELSE 0 END) AS solved_count,
                 SUM(CASE WHEN c.status='running' THEN 1 ELSE 0 END) AS running_count
-                FROM workspaces w LEFT JOIN challenges c ON c.workspace_id=w.id
+                FROM workspaces w LEFT JOIN challenges c ON c.workspace_id=w.id AND c.deleted_at IS NULL
                 WHERE w.owner_user_id=?
                 GROUP BY w.id ORDER BY w.updated_at DESC,w.id DESC""", (owner_id(),)).fetchall()
         return {"workspaces": [workspace_result(row) for row in rows]}
@@ -1130,7 +1174,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if order_by is None:
             raise HTTPException(400, "잘못된 문제 정렬 방식입니다.")
         current_owner = owner_id()
-        conditions, filter_params = ["c.workspace_id=?"], [workspace_id]
+        conditions, filter_params = ["c.workspace_id=?", "c.deleted_at IS NULL"], [workspace_id]
         if status:
             conditions.append("c.status=?")
             filter_params.append(status)
@@ -1158,9 +1202,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 [current_owner, workspace_id, *filter_params],
             ).fetchall()
             counts = {key: 0 for key in STATUSES}
-            for row in db.execute("SELECT status,COUNT(*) AS total FROM challenges WHERE workspace_id=? GROUP BY status", (workspace_id,)):
+            for row in db.execute("SELECT status,COUNT(*) AS total FROM challenges WHERE workspace_id=? AND deleted_at IS NULL GROUP BY status", (workspace_id,)):
                 counts[row["status"]] = row["total"]
-            categories = [row[0] for row in db.execute("SELECT DISTINCT category FROM challenges WHERE workspace_id=? AND category!='' ORDER BY category", (workspace_id,))]
+            categories = [row[0] for row in db.execute("SELECT DISTINCT category FROM challenges WHERE workspace_id=? AND deleted_at IS NULL AND category!='' ORDER BY category", (workspace_id,))]
             results = [challenge_response(db, row, include_writeup=False) for row in rows]
             for result in results:
                 result["latest_solver"] = latest_solver_summary(
@@ -1308,8 +1352,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             connection.execute(
                 """INSERT INTO challenges(
                        id,workspace_id,name,category,description,remote,remote_mode,
-                       created_at,updated_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                       canonical_name,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (
                     clone_id,
                     workspace_id,
@@ -1318,6 +1362,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     current_source["description"],
                     current_source["remote"],
                     current_source["remote_mode"],
+                    current_source["canonical_name"] or current_source["name"],
                     timestamp,
                     timestamp,
                 ),
@@ -1434,6 +1479,63 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ]
         return result
 
+    @app.get("/api/workspaces/{workspace_id}/clone-groups", dependencies=[Depends(require_auth)])
+    def list_clone_groups(workspace_id: str):
+        with database() as db:
+            workspace_row(db, workspace_id)
+            rows = db.execute(
+                """SELECT m.family_id,c.id,c.name,c.canonical_name,c.category,
+                          c.status,c.deleted_at
+                   FROM challenge_clone_members m
+                   JOIN challenges c ON c.id=m.challenge_id AND c.workspace_id=m.workspace_id
+                   WHERE m.workspace_id=?
+                   ORDER BY m.family_id,c.created_at,c.id""",
+                (workspace_id,),
+            ).fetchall()
+        groups: dict[str, list[dict]] = {}
+        for row in rows:
+            member = dict(row)
+            family_id = member.pop("family_id")
+            groups.setdefault(family_id, []).append(member)
+        return {"groups": [{"id": family_id, "members": members}
+                           for family_id, members in groups.items()]}
+
+    @app.put("/api/workspaces/{workspace_id}/challenges/{challenge_id}/clone-group", dependencies=[Depends(require_auth)])
+    def change_clone_group(workspace_id: str, challenge_id: str, payload: CloneGroupInput):
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            challenge_row(db, workspace_id, challenge_id)
+            reject_active_solver(db, workspace_id, challenge_id)
+            target_id = payload.target_challenge_id
+            if target_id == challenge_id:
+                raise HTTPException(400, "Select a different challenge as the group target.")
+            if target_id is None:
+                db.execute(
+                    "DELETE FROM challenge_clone_members WHERE workspace_id=? AND challenge_id=?",
+                    (workspace_id, challenge_id),
+                )
+                return {"family_id": None, "challenge_id": challenge_id}
+            else:
+                challenge_row(db, workspace_id, target_id)
+                reject_active_solver(db, workspace_id, target_id)
+                target = db.execute(
+                    "SELECT family_id FROM challenge_clone_members WHERE workspace_id=? AND challenge_id=?",
+                    (workspace_id, target_id),
+                ).fetchone()
+                family_id = target["family_id"] if target else target_id
+                if not target:
+                    db.execute(
+                        "INSERT INTO challenge_clone_members(workspace_id,challenge_id,family_id,created_at) VALUES(?,?,?,?)",
+                        (workspace_id, target_id, family_id, now()),
+                    )
+            db.execute(
+                """INSERT INTO challenge_clone_members(workspace_id,challenge_id,family_id,created_at)
+                   VALUES(?,?,?,?) ON CONFLICT(workspace_id,challenge_id)
+                   DO UPDATE SET family_id=excluded.family_id""",
+                (workspace_id, challenge_id, family_id, now()),
+            )
+        return {"family_id": family_id, "challenge_id": challenge_id}
+
     @app.get("/api/workspaces/{workspace_id}/challenges/{challenge_id}", dependencies=[Depends(require_auth)])
     def get_challenge(workspace_id: str, challenge_id: str):
         with database() as db:
@@ -1454,7 +1556,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             challenge_row(db, workspace_id, challenge_id)
             return {"challenges": [dict(row) for row in db.execute(
                 """SELECT id,name,category,status,ctfd_id,ctfd_url
-                     FROM challenges WHERE workspace_id=? AND id<>?
+                     FROM challenges WHERE workspace_id=? AND id<>? AND deleted_at IS NULL
                      ORDER BY name COLLATE NOCASE,id""", (workspace_id, challenge_id),
             )]}
 
@@ -1594,11 +1696,73 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             flag_committed(owner_id(), workspace_id, challenge_id, values["flag"], "manual")
         return result
 
+    @app.get("/api/workspaces/{workspace_id}/trash", dependencies=[Depends(require_auth)])
+    def list_challenge_trash(workspace_id: str):
+        with database() as db:
+            workspace_row(db, workspace_id)
+            rows = db.execute(
+                """SELECT id,name,canonical_name,category,status,deleted_at
+                   FROM challenges WHERE workspace_id=? AND deleted_at IS NOT NULL
+                   ORDER BY deleted_at DESC,id DESC""",
+                (workspace_id,),
+            ).fetchall()
+        return {"challenges": [dict(row) for row in rows]}
+
+    @app.post("/api/workspaces/{workspace_id}/trash/{challenge_id}/restore", dependencies=[Depends(require_auth)])
+    @workspace_writer_lock
+    def restore_challenge(workspace_id: str, challenge_id: str):
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = challenge_row(db, workspace_id, challenge_id, include_deleted=True)
+            if not row["deleted_at"]:
+                raise HTTPException(409, "This challenge is not in the trash.")
+            db.execute(
+                "UPDATE challenges SET deleted_at=NULL,updated_at=? WHERE id=? AND workspace_id=?",
+                (now(), challenge_id, workspace_id),
+            )
+            db.execute(
+                "DELETE FROM ctfd_submit_blocks WHERE workspace_id=? AND challenge_id=? AND owner_user_id=?",
+                (workspace_id, challenge_id, owner_id()),
+            )
+            return challenge_response(db, challenge_row(db, workspace_id, challenge_id))
+
     @app.delete("/api/workspaces/{workspace_id}/challenges/{challenge_id}", dependencies=[Depends(require_auth)])
     @workspace_writer_lock
     def delete_challenge(workspace_id: str, challenge_id: str):
         with database() as db:
             challenge_row(db, workspace_id, challenge_id)
+        solver_jobs = getattr(app.state, "solver_jobs", None)
+        if solver_jobs and not solver_jobs.cancel_challenge(workspace_id, challenge_id, owner_id()):
+            raise HTTPException(409, "The solver is stopping. Try moving the challenge to trash again shortly.")
+        jobs = getattr(app.state, "ctfd_jobs", None)
+        if jobs and not jobs.cancel_workspace(workspace_id):
+            raise HTTPException(409, "The CTFd import is stopping. Try again shortly.")
+        if not app.state.uploads.cancel_challenge(workspace_id, challenge_id, CURRENT_USER.get()):
+            raise HTTPException(409, "The file upload is stopping. Try again shortly.")
+        submit_jobs = getattr(app.state, "ctfd_submit", None)
+        if submit_jobs and not submit_jobs.cancel_challenge(workspace_id, challenge_id, CURRENT_USER.get()):
+            submit_jobs.release_delete_block(workspace_id, CURRENT_USER.get(), challenge_id=challenge_id)
+            raise HTTPException(409, "The CTFd submission is stopping. Try again shortly.")
+        with delete_transaction(submit_jobs, workspace_id, challenge_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            challenge_row(db, workspace_id, challenge_id)
+            reject_active_ctfd_import(db, workspace_id)
+            reject_active_solver(db, workspace_id, challenge_id)
+            db.execute(
+                """UPDATE challenges SET deleted_at=?,updated_at=?,
+                     status=CASE WHEN status='running' THEN 'stopped' ELSE status END
+                   WHERE workspace_id=? AND id=? AND deleted_at IS NULL""",
+                (now(), now(), workspace_id, challenge_id),
+            )
+        return {"ok": True, "in_trash": True}
+
+    @app.delete("/api/workspaces/{workspace_id}/trash/{challenge_id}", dependencies=[Depends(require_auth)])
+    @workspace_writer_lock
+    def purge_challenge(workspace_id: str, challenge_id: str):
+        with database() as db:
+            row = challenge_row(db, workspace_id, challenge_id, include_deleted=True)
+            if not row["deleted_at"]:
+                raise HTTPException(409, "Move the challenge to trash before deleting it permanently.")
         solver_jobs = getattr(app.state, "solver_jobs", None)
         if solver_jobs and not solver_jobs.cancel_challenge(workspace_id, challenge_id, owner_id()):
             raise HTTPException(409, "풀이를 중단하고 격리 정리 중입니다. 잠시 후 다시 삭제하세요.")
@@ -1620,7 +1784,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(409, "자동 제출을 중단하고 있습니다. 잠시 후 다시 삭제하세요.")
         with delete_transaction(submit_jobs, workspace_id, challenge_id) as db:
             db.execute("BEGIN IMMEDIATE")
-            challenge_row(db, workspace_id, challenge_id)
+            challenge_row(db, workspace_id, challenge_id, include_deleted=True)
             reject_active_ctfd_import(db, workspace_id)
             reject_active_solver(db, workspace_id, challenge_id)
             target = challenge_directory(workspace_id, challenge_id)

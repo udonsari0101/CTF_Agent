@@ -34,7 +34,7 @@ from .storage_layout import StorageLayout
 
 
 FORMAT = "ctf-agent-workspace"
-VERSION = 3
+VERSION = 4
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_ENTRIES = 50_000
 CHUNK = 1024 * 1024
@@ -45,6 +45,7 @@ _CHALLENGE_FIELDS = (
     "id", "name", "category", "description", "status", "previous_status",
     "completion_source", "flag", "notes", "created_at", "updated_at",
     "remote_mode", "remote",
+    "canonical_name", "deleted_at",
 )
 _WORKSPACE_FIELDS = (
     "id", "name", "description", "flag_format",
@@ -440,7 +441,7 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
             zipfile.BadZipFile) as exc:
         raise TransferError("Bundle manifest is not valid JSON.") from exc
     if (not isinstance(manifest, dict) or manifest.get("format") != FORMAT
-            or manifest.get("version") not in (1, 2, VERSION)):
+            or manifest.get("version") not in (1, 2, 3, VERSION)):
         raise TransferError("Unsupported workspace bundle version.")
     mandatory = {
         "format", "version", "scope", "exported_at", "included_remote",
@@ -493,8 +494,13 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
     for item in challenges:
         if not isinstance(item, dict):
             raise TransferError("Invalid challenge in bundle.")
-        if set(item) != set(_CHALLENGE_FIELDS) | {"writeup_markdown"}:
+        legacy_fields = set(_CHALLENGE_FIELDS) - {"canonical_name", "deleted_at"}
+        expected_fields = set(_CHALLENGE_FIELDS) if manifest["version"] >= 4 else legacy_fields
+        if set(item) != expected_fields | {"writeup_markdown"}:
             raise TransferError("Challenge metadata has unknown fields.")
+        if manifest["version"] < 4:
+            item["canonical_name"] = None
+            item["deleted_at"] = None
         challenge_id = _identifier(item.get("id"), "challenge ID")
         if challenge_id in ids:
             raise TransferError("Duplicate challenge ID in bundle.")
@@ -502,6 +508,8 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
         for field in ("name", "category", "description", "notes", "created_at", "updated_at", "remote"):
             _string(item.get(field), f"challenge {field}")
         for field in ("flag", "previous_status", "completion_source", "writeup_markdown"):
+            _string(item.get(field), f"challenge {field}", optional=True)
+        for field in ("canonical_name", "deleted_at"):
             _string(item.get(field), f"challenge {field}", optional=True)
         if item.get("status") not in {"pending", "running", "stopped", "failed", "flag_found", "solved"}:
             raise TransferError("Invalid challenge status in bundle.")
@@ -806,13 +814,14 @@ def import_workspace(settings: Settings, layout: StorageLayout, owner_user_id: s
                         """INSERT INTO challenges(
                            id,workspace_id,name,category,description,status,
                            previous_status,completion_source,flag,notes,remote,remote_mode,
-                           created_at,updated_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           canonical_name,deleted_at,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (new_id, workspace_id, item["name"], item["category"],
                          item["description"], status,
                          None if item["status"] == "running" else item["previous_status"],
                          item["completion_source"], item["flag"], item["notes"],
-                         item["remote"], item["remote_mode"], item["created_at"],
+                         item["remote"], item["remote_mode"], item["canonical_name"],
+                         item["deleted_at"], item["created_at"],
                          item["updated_at"]),
                     )
                     if item["writeup_markdown"] is not None:
@@ -1002,13 +1011,14 @@ def import_challenge(settings: Settings, layout: StorageLayout, owner_user_id: s
                     """INSERT INTO challenges(
                        id,workspace_id,name,category,description,status,
                        previous_status,completion_source,flag,notes,remote,remote_mode,
-                       created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       canonical_name,deleted_at,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (new_id, workspace_id, item["name"], item["category"],
                      item["description"], status,
                      None if item["status"] == "running" else item["previous_status"],
                      item["completion_source"], item["flag"], item["notes"],
-                     item["remote"], item["remote_mode"], item["created_at"],
+                     item["remote"], item["remote_mode"], item["canonical_name"],
+                     item["deleted_at"], item["created_at"],
                      item["updated_at"]),
                 )
                 if item["writeup_markdown"] is not None:

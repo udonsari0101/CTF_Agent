@@ -4771,7 +4771,10 @@ indispensable external resource absent from the inputs, record that evidence,
 the completed local verification, and the exact missing input in notes/NEXT.md.
 Then run `request-remote` once and stop this attempt. Do not request input just
 because the flag is missing, a hypothesis failed, or a generic prompt says
-flags are remote. Do not invent an endpoint or loop over the same local work.
+flags are remote. A device absent from a locally emulated VM proves only that
+the emulator differs from the intended environment; first determine whether
+the supplied files contain the verifier or another offline route. Do not invent
+an endpoint or loop over the same local work.
 """
         elif remote_mode == "endpoint":
             remote_instruction = """

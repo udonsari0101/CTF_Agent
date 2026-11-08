@@ -266,6 +266,9 @@ class WorkspaceTransferTests(unittest.TestCase):
                     manifest = json.loads(content)
                     manifest["version"] = 2
                     manifest.pop("clone_members")
+                    for challenge in manifest["challenges"]:
+                        challenge.pop("canonical_name", None)
+                        challenge.pop("deleted_at", None)
                     content = json.dumps(manifest).encode("utf-8")
                 target.writestr(item, content)
         imported = import_workspace(self.settings, self.layout, self.owner, legacy)

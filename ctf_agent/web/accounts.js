@@ -618,22 +618,37 @@ export async function renderAccounts(container, api, options = {}) {
       // API-key or file field would drop what the user already entered.
       const keep = [notice.node, login, models, upload, apiKey, rename];
       const slots = keep.map(() => el('div'));
-      const controls = el('div', undefined, 'actions');
+      const controls = el('div', undefined, 'actions account-primary-actions');
+      const more = el('details', undefined, 'account-more');
+      more.open = existingCards.get(account.id)?.querySelector('.account-more')?.open === true;
+      const moreTitle = el('summary', localized('계정 관리', 'Manage account'));
+      const secondary = el('div', undefined, 'actions');
+      more.append(moreTitle, secondary);
       const accountButton = (key, text, task) => button(text, task, notice, `${account.id}:${key}`);
-      const select = accountButton('select', account.selected ? '선택됨' : '이 계정 선택', async () => { await api(`/api/accounts/${account.id}/select`, {method: 'POST'}); await load(); });
+      const select = accountButton('select', account.selected ? localized('선택됨', 'Selected') : localized('이 계정 선택', 'Select account'), async () => { await api(`/api/accounts/${account.id}/select`, {method: 'POST'}); await load(); });
       select.disabled = account.selected;
-      controls.append(select, accountButton('refresh', '사용량 새로고침', async () => { await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }));
-      if (account.auth_kind !== 'api_key') controls.append(accountButton('login', snapshot.status === 'authenticated' ? '다시 로그인' : '로그인', () => showLogin(account, login, true)));
-      controls.append(accountButton('rename', '이름 변경', () => showRename(account, rename)),
-        accountButton('api-key', 'API 키 연결', () => showApiKey(account, apiKey)), accountButton('models', '모델·속도 설정', () => showModels(account, models)),
-        accountButton('logout', '로그아웃', async () => { await api(`/api/accounts/${account.id}/logout`, {method: 'POST'}); modelTargets.delete(account.id); login.replaceChildren(); await load(); }),
-        accountButton('delete', '계정 삭제', async () => {
+      controls.append(select, accountButton('refresh', localized('사용량 새로고침', 'Refresh usage'), async () => { await api(`/api/accounts/${account.id}/refresh`, {method: 'POST'}); await load(); }),
+        accountButton('models', localized('모델·속도 설정', 'Model and speed'), () => showModels(account, models)));
+      if (account.auth_kind !== 'api_key') secondary.append(accountButton('login', snapshot.status === 'authenticated' ? localized('다시 로그인', 'Sign in again') : localized('로그인', 'Sign in'), () => showLogin(account, login, true)));
+      secondary.append(accountButton('rename', localized('이름 변경', 'Rename'), () => showRename(account, rename)),
+        accountButton('api-key', localized('API 키 연결', 'Connect API key'), () => showApiKey(account, apiKey)),
+        accountButton('logout', localized('로그아웃', 'Sign out'), async () => { await api(`/api/accounts/${account.id}/logout`, {method: 'POST'}); modelTargets.delete(account.id); login.replaceChildren(); await load(); }),
+        accountButton('delete', localized('계정 삭제', 'Remove account'), async () => {
           if (!window.confirm(localized(`${account.label} 계정 등록과 서버에 저장된 로그인 정보를 삭제할까요?`, `Remove ${account.label} and the sign-in saved on the server?`))) return;
           await api(`/api/accounts/${account.id}`, {method: 'DELETE'});
           await load();
         }));
-      if (account.provider === 'codex') controls.append(accountButton('upload', 'auth.json 업로드', () => authUpload(account, upload)));
-      card.append(controls, ...slots);
+      if (account.provider === 'codex') {
+        secondary.append(accountButton('upload', localized('auth.json 업로드', 'Upload auth.json'), () => authUpload(account, upload)));
+        secondary.append(accountButton('download-auth', localized('auth.json 다운로드', 'Download auth.json'), async () => {
+          const blob = await api(`/api/accounts/${account.id}/auth-file/export`, {method:'POST',responseType:'blob'});
+          const url = URL.createObjectURL(blob);
+          const link = el('a'); link.href = url; link.download = 'auth.json';
+          document.body.append(link); link.click(); link.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 60000);
+        }));
+      }
+      card.append(controls, more, ...slots);
       const existing = existingCards.get(account.id);
       existingCards.delete(account.id);
       if (existing && keep.every(node => existing.contains(node))) {

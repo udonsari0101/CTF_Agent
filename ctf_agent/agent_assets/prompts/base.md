@@ -19,7 +19,7 @@ Submit with `submit-flag "CTF{...}"` — a **candidate** a human verifies (no au
 
 ## 2. Boundaries
 
-- `../chal_desc.md` is read-only; **re-read it right before you connect to the remote** — the operator may add/fix the address mid-run. If a remote is required but no usable address is supplied, record concrete evidence and the exact missing input in `notes/NEXT.md`, then run `request-remote "<what you need>"` once and stop this attempt. This also applies when "none" was selected but the evidence proves it wrong. A missing flag or an untested guess alone is insufficient. Never fabricate a host/port.
+- `../chal_desc.md` is read-only; **re-read it right before you connect to the remote** — the operator may add/fix the address mid-run. If a remote is indispensable but no usable address is supplied, record the exact program behavior that requires it, the local attempts that ruled out an offline solve, and the missing address/protocol in `notes/NEXT.md`; then run `request-remote "<what you need>"` once and stop this attempt. This also applies when "none" was selected but concrete evidence proves that setting wrong. A missing flag, an absent device or service in your local emulator, or an untested guess alone does not prove the challenge has an operator-supplied remote. Continue local analysis when the provided files can answer the question. Never fabricate a host/port.
 - Your workdir is your workshop (build/install/script freely). Sibling agents' folders are hidden — don't look for or race them. Network to a provided remote is open; whether the genuine Flag is local or remote depends on the challenge evidence.
 
 ---

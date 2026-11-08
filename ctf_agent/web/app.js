@@ -93,6 +93,21 @@ const ctfdJobMarkupCache = new WeakMap();
 const challengeReturnRoute = /^w\/[0-9a-f]{32}\/c\/[0-9a-f]{32}$/;
 let accountsReturnTarget = null, accountsReturnPending = false;
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function avatarMarkup(user) {
+  const seed = String(user?.avatar_seed || user?.id || 'local');
+  let state = 2166136261;
+  for (const char of seed) state = Math.imul(state ^ char.charCodeAt(0), 16777619) >>> 0;
+  const hue = state % 360;
+  let cells = '';
+  for (let row = 0; row < 5; row++) for (let column = 0; column < 3; column++) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    if ((state & 0x80000000) || (row === 2 && column === 2)) {
+      cells += `<rect x="${column}" y="${row}" width="1" height="1"/>`;
+      if (column !== 2) cells += `<rect x="${4-column}" y="${row}" width="1" height="1"/>`;
+    }
+  }
+  return `<svg viewBox="0 0 5 5" width="32" height="32" role="img" aria-label="${tr('Profile image')}"><rect width="5" height="5" fill="hsl(${hue} 35% 94%)"/><g fill="hsl(${hue} 65% 36%)">${cells}</g></svg>`;
+}
 const tr = value => esc(i18n.t(value));
 const date = value => new Date(value).toLocaleDateString(i18n.locale === 'ko' ? 'ko-KR' : 'en-US', {month:'short',day:'numeric',timeZone:'Asia/Seoul'});
 const size = value => value < 1024 ? `${value} B` : value < 1024**2 ? `${(value/1024).toFixed(1)} KB` : value < 1024**3 ? `${(value/1024**2).toFixed(1)} MB` : value < 1024**4 ? `${(value/1024**3).toFixed(2)} GB` : `${(value/1024**4).toFixed(2)} TB`;
@@ -387,7 +402,8 @@ function stopSolverPolling() {
   solverSyncedWriteup = '';
   solverAccounts = []; solverAccountId = ''; solverModels = []; solverModel = '';
   solverReasoning = ''; solverServiceTier = null; solverUltracode = false; solverOptionsState = 'idle'; solverOptionsError = '';
-  solverUltraEscalationMode = 'ask';
+  solverUltraEscalationMode = ['ask','auto','off'].includes(sessionUser?.ultra_escalation_default)
+    ? sessionUser.ultra_escalation_default : 'ask';
   solverRetryIssues = []; solverRetryRequiresSelection = false;
   solverConfigurationJobId = '';
   writeupRefineJob = null; writeupRefineEvents = []; writeupRefineError = null; writeupRefineInstruction = '';
@@ -1580,7 +1596,7 @@ function solverPanelMarkup(job, events = [], loading = false) {
     ${solverContinuationMarkup(job)}
     ${solverQueueMarkup(job)}
     ${progressText ? `<div class="solver-progress"><span>${esc(progressText)}</span>${Number.isFinite(percent) ? `<progress max="100" value="${Math.max(0,Math.min(100,percent))}" aria-label="${esc(i18n.format('{label} 진행률',{label:progressText}))}"></progress>` : ''}</div>` : ''}
-    ${usableFlag ? `<div class="solver-artifact solver-flag-found" role="status" aria-live="assertive"><strong>Flag를 발견했습니다</strong><code>${esc(flag)}</code><div class="actions"><button type="button" class="small ghost icon-action" data-action="copy-solver-flag" aria-label="Flag 복사" title="Flag 복사">⚑</button>${!active && currentChallenge?.completion_source !== 'manual' ? '<button type="button" class="small danger ghost" data-action="reject-solver-flag">오답으로 제외</button>' : ''}</div></div>` : ''}
+    ${usableFlag ? `<div class="solver-artifact solver-flag-found" role="status" aria-live="assertive"><strong>Flag를 발견했습니다</strong><code>${esc(flag)}</code><div class="actions"><button type="button" class="small ghost icon-action" data-action="copy-solver-flag" aria-label="Flag 복사" title="Flag 복사">⚑</button>${currentChallenge?.completion_source !== 'manual' ? '<button type="button" class="small danger ghost" data-action="reject-solver-flag">오답으로 제외</button>' : ''}</div></div>` : ''}
     ${job.flag_rejected ? `<div class="solver-artifact solver-flag-rejected" role="status"><strong>제외한 Flag</strong><code>${esc(flag)}</code></div>` : ''}
     ${solverWriteupArtifact(writeup)}
     ${solverErrorMarkup(job.error)}
@@ -1707,6 +1723,7 @@ async function api(url, options = {}) {
     body = JSON.stringify(body);
   }
   const response = await fetch(url, {...options, headers, body, credentials:'same-origin'});
+  if (response.ok && options.responseType === 'blob') return response.blob();
   let result;
   // A request given up on has no answer to read. An unreadable answer is an empty one.
   try { result = await response.json(); } catch (error) { if (options.signal?.aborted) throw error; result = {}; }
@@ -1849,7 +1866,13 @@ async function runForm(task, form, button) {
   const controls = [...form.querySelectorAll('input,select,textarea,button')], previous = controls.map(node => node.disabled);
   controls.forEach(node => { node.disabled = true; });
   try { await run(task,button); }
-  finally { controls.forEach((node,index) => { node.disabled = previous[index]; }); busyForms.delete(form); form.removeAttribute('aria-busy'); }
+  finally {
+    controls.forEach((node,index) => { node.disabled = previous[index]; });
+    if (form.id === 'admin-log-export-form' && form.dataset.previewReady === 'true') {
+      form.querySelector('[data-action="download-admin-logs"]').disabled = false;
+    }
+    busyForms.delete(form); form.removeAttribute('aria-busy');
+  }
 }
 
 function sessionStarted() {
@@ -1939,7 +1962,7 @@ function shell(active, breadcrumb = '모든 작업공간', named = false) {
     <a class="nav-item ${active === 'settings' ? 'active' : ''}" href="#settings" aria-label="개인 설정" ${active === 'settings' ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-text">개인 설정</span></a>
     ${sessionUser?.role === 'admin' ? `<a class="nav-item ${active === 'admin' ? 'active' : ''}" href="#admin" aria-label="관리자 설정" ${active === 'admin' ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">◇</span><span class="nav-text">관리자 설정</span></a>` : ''}</nav>
     ${authMode === 'password' ? '<div class="sidebar-foot"><button class="ghost small" data-action="logout">로그아웃</button></div>' : ''}
-    </aside><main class="main"><header class="topbar"><div class="breadcrumb"><a href="#">작업공간</a><span>/</span><span${named ? ' data-i18n-ignore' : ''}>${esc(breadcrumb)}</span></div><div class="topbar-meta">${i18n.picker()}<span data-i18n-ignore>${esc(sessionUser?.username || '')}</span><div class="avatar" data-i18n-ignore title="${esc(sessionUser?.username || '')}">${esc((sessionUser?.username || 'U').slice(0,1).toUpperCase())}</div></div></header><div id="content" class="content"></div></main></div>`;
+    </aside><main class="main"><header class="topbar"><div class="breadcrumb"><a href="#">작업공간</a><span>/</span><span${named ? ' data-i18n-ignore' : ''}>${esc(breadcrumb)}</span></div><div class="topbar-meta">${i18n.picker()}<span data-i18n-ignore>${esc(sessionUser?.username || '')}</span><div class="avatar" data-i18n-ignore title="${esc(sessionUser?.username || '')}">${avatarMarkup(sessionUser)}</div></div></header><div id="content" class="content"></div></main></div>`;
   return document.querySelector('#content');
 }
 
@@ -2078,6 +2101,52 @@ function overviewMarkup() {
     ${workspaces.length ? `<div class="cards">${workspaces.map(w => `<a class="workspace-card" href="#w/${w.id}"><div class="card-top"><span class="folder-icon">⚑</span><span class="tag ${w.running_count ? '' : 'muted'}">${w.running_count ? i18n.format('{n}개 작업 중',{n:w.running_count}) : 'WORKSPACE'}</span></div><h3 data-i18n-ignore>${esc(w.name)}</h3>${w.description ? `<p data-i18n-ignore>${esc(w.description)}</p>` : ''}<div class="card-bottom"><span>${i18n.format('문제 {n}',{n:w.challenge_count})}</span><span>${i18n.t('완료')} ${w.solved_count}</span><span class="card-arrow">↗</span></div></a>`).join('')}</div>` : `<div class="empty"><div class="empty-icon">⚑</div><h2>작업공간이 없습니다.</h2><button class="primary" data-action="new-workspace">＋ 새 작업공간</button></div>`}`;
 }
 
+async function showChallengeTrash() {
+  const workspaceId = currentWorkspace?.id;
+  if (!workspaceId) return;
+  const result = await api(`/api/workspaces/${workspaceId}/trash`);
+  if (currentWorkspace?.id !== workspaceId) return;
+  const rows = result.challenges || [];
+  const body = rows.length ? `<div class="file-list">${rows.map(item => `<div class="file-item"><div><strong data-i18n-ignore>${esc(item.name)}</strong><small>${esc(item.category || '')} · ${esc(item.deleted_at || '')}</small></div><div class="actions"><button type="button" class="small" data-action="restore-trash-challenge" data-id="${esc(item.id)}">${tr('Restore')}</button><button type="button" class="small danger" data-action="purge-trash-challenge" data-id="${esc(item.id)}">${tr('Delete permanently')}</button></div></div>`).join('')}</div>` : `<p class="muted">${tr('The trash is empty.')}</p>`;
+  openModal(tr('Trash'), '', body, `<button type="button" data-action="close-modal">${tr('Close')}</button>`);
+  modal.dataset.kind = 'challenge-trash';
+  modal.dataset.workspaceId = workspaceId;
+}
+
+async function showCloneGroups() {
+  const workspaceId = currentWorkspace?.id;
+  if (!workspaceId) return;
+  const [groupResult, listResult] = await Promise.all([
+    api(`/api/workspaces/${workspaceId}/clone-groups`),
+    api(`/api/workspaces/${workspaceId}/challenges`),
+  ]);
+  if (currentWorkspace?.id !== workspaceId) return;
+  const groups = groupResult.groups || [];
+  const active = listResult.challenges || [];
+  const grouped = new Set(groups.flatMap(group => group.members.map(member => member.id)));
+  const standalone = active.filter(item => !grouped.has(item.id));
+  const options = id => active.filter(item => item.id !== id).map(item =>
+    `<option value="${esc(item.id)}" data-i18n-ignore>${esc(item.name)}</option>`).join('');
+  const member = item => `<div class="file-item clone-member"><div><strong data-i18n-ignore>${esc(item.name)}</strong><small>${esc(item.status)}${item.deleted_at ? ` · ${tr('Trash')}` : ''}</small></div>${item.deleted_at ? '' : `<div class="actions"><select aria-label="${tr('Group with challenge')}" data-member-id="${esc(item.id)}"><option value="">${tr('Group with challenge')}</option>${options(item.id)}</select><button type="button" class="small" data-action="move-clone-group" data-id="${esc(item.id)}">${tr('Group')}</button><button type="button" class="small ghost" data-action="split-clone-group" data-id="${esc(item.id)}">${tr('Separate')}</button></div>`}</div>`;
+  const body = `${groups.map(group => {
+    const label = group.members.find(item => item.id === group.id)?.name || group.members[0]?.canonical_name || group.members[0]?.name || '';
+    return `<section class="clone-group"><h3 data-i18n-ignore>${esc(label)} · ${group.members.length}</h3><div class="file-list">${group.members.map(member).join('')}</div></section>`;
+  }).join('')}${standalone.length ? `<section class="clone-group"><h3>${tr('Ungrouped')}</h3><div class="file-list">${standalone.map(member).join('')}</div></section>` : ''}${!groups.length && !standalone.length ? `<p class="muted">${tr('No challenges.')}</p>` : ''}`;
+  openModal(tr('Clone groups'), '', body, `<button type="button" data-action="close-modal">${tr('Close')}</button>`);
+  modal.dataset.kind = 'clone-groups';
+  modal.dataset.workspaceId = workspaceId;
+}
+
+async function changeCloneGroup(button, split = false) {
+  const workspaceId = modal.dataset.workspaceId, challengeId = button.dataset.id;
+  if (!workspaceId || currentWorkspace?.id !== workspaceId) return;
+  const target = split ? null : button.closest('.clone-member')?.querySelector('select')?.value;
+  if (!split && !target) throw new Error(i18n.t('Choose a challenge to group with.'));
+  await api(`/api/workspaces/${workspaceId}/challenges/${challengeId}/clone-group`,
+    {method:'PUT',body:{target_challenge_id:target}});
+  await showCloneGroups();
+}
+
 async function renderWorkspace() {
   const w = currentWorkspace;
   stopChallengeListPolling();
@@ -2089,7 +2158,7 @@ async function renderWorkspace() {
 }
 
 function workspaceMarkup(w) {
-  return `<div class="page-head"><div><div class="eyebrow">CTF WORKSPACE</div><h1 data-i18n-ignore>${esc(w.name)}</h1>${w.description ? `<p data-i18n-ignore>${esc(w.description)}</p>` : ''}</div><div class="head-actions"><button class="ghost icon-action" data-action="edit-workspace" aria-label="작업공간 설정" title="작업공간 설정">⚙</button><button data-action="show-staged-files">${tr('사전 파일')}</button><button data-action="receive-workspace-direct">${tr('직접 받기')}</button><button data-action="import-workspace-transfer">${tr('ZIP 가져오기')}</button><button data-action="ctfd-submit-settings">CTFd 연결</button><button data-action="ctfd-import">CTFd 가져오기 <span class="ctfd-import-badge" hidden></span></button><button data-action="ctfd-sync" title="저장된 CTFd 연결에서 새로 추가된 문제만 확인합니다.">새 문제 동기화</button><button class="primary" data-action="new-challenge">＋ 문제 추가</button></div></div>
+  return `<div class="page-head"><div><div class="eyebrow">CTF WORKSPACE</div><h1 data-i18n-ignore>${esc(w.name)}</h1>${w.description ? `<p data-i18n-ignore>${esc(w.description)}</p>` : ''}</div><div class="head-actions"><button class="ghost icon-action" data-action="edit-workspace" aria-label="작업공간 설정" title="작업공간 설정">⚙</button><button data-action="show-challenge-trash">${tr("Trash")}</button><button data-action="show-clone-groups">${tr("Clone groups")}</button><button data-action="show-staged-files">${tr('사전 파일')}</button><button data-action="receive-workspace-direct">${tr('직접 받기')}</button><button data-action="import-workspace-transfer">${tr('ZIP 가져오기')}</button><button data-action="ctfd-submit-settings">CTFd 연결</button><button data-action="ctfd-import">CTFd 가져오기 <span class="ctfd-import-badge" hidden></span></button><button data-action="ctfd-sync" title="저장된 CTFd 연결에서 새로 추가된 문제만 확인합니다.">새 문제 동기화</button><button class="primary" data-action="new-challenge">＋ 문제 추가</button></div></div>
     <div class="workspace-summary"><div class="workspace-summary-meta"><span>⚑ Flag 형식 <code>${esc(w.flag_format || i18n.t('미설정'))}</code></span><span>문제 수 <b data-workspace-challenge-count>${w.challenge_count ?? ''}</b></span></div>${resourceMeterMarkup()}</div>
     <div id="challenge-area" data-morph-keep></div>${liveNoticeMarkup()}`;
 }
@@ -4531,7 +4600,7 @@ async function sendSolverPeerEvidence(form, body) {
 
 async function rejectSolverFlag() {
   const job = currentSolverJob, jobId = solverJobId(job);
-  if (!jobId || !job?.flag || job.flag_rejected || solverIsActive(job)) return;
+  if (!jobId || !job?.flag || job.flag_rejected) return;
   if (!confirm(i18n.t('이 Flag를 오답으로 제외할까요? 기존 write-up 원본은 실행 기록에 보존되고, 문제는 미완료 상태로 돌아갑니다.'))) return;
   const workspaceId = currentWorkspace.id, challengeId = currentChallenge.id, generation = solverRendering;
   const challenge = currentChallenge, notesBefore = currentChallenge.notes;
@@ -4828,7 +4897,17 @@ function renderSettings() {
     <section class="settings-card"><h2>로그인 아이디 변경</h2><form id="username-form"><label>아이디<input name="new_username" value="${esc(sessionUser?.username)}" autocomplete="username" maxlength="100" required></label><label>현재 비밀번호<input type="password" name="current_password" autocomplete="current-password" maxlength="1024" required></label><div><button class="primary">아이디 변경</button></div></form></section>
     <div class="divider"></div><section class="settings-card"><h2>비밀번호 변경</h2><form id="password-form"><label>현재 비밀번호<input type="password" name="current_password" autocomplete="current-password" maxlength="1024" required></label><label>새 비밀번호<input type="password" name="new_password" autocomplete="new-password" minlength="4" maxlength="1024" required><span class="form-hint">최소 4자</span></label><label>새 비밀번호 확인<input type="password" name="confirmation" autocomplete="new-password" minlength="4" maxlength="1024" required></label><div><button class="primary">비밀번호 변경</button></div></form><div class="divider"></div><div class="actions"><button class="ghost" data-action="toggle-session-persistence">${sessionPersistent ? '30일 로그인 해제' : '이 기기에서 30일 로그인 유지'}</button><button class="ghost" data-action="logout">로그아웃</button></div></section><div class="divider"></div>` : '';
   content.innerHTML = `<div class="page-head"><div><div class="eyebrow">PERSONAL SETTINGS</div><h1>개인 설정</h1></div></div>
-    ${credentialSettings}<section id="telegram-settings"></section>`;
+    ${credentialSettings}<section class="settings-card"><h2>${tr('Solve defaults')}</h2>
+    <form id="solver-preferences-form"><label>${tr('Escalate to Ultra when stuck')}
+      <select name="ultra_escalation_default">
+        <option value="ask" ${sessionUser?.ultra_escalation_default === 'ask' ? 'selected' : ''}>${tr('Ask first')}</option>
+        <option value="auto" ${sessionUser?.ultra_escalation_default === 'auto' ? 'selected' : ''}>${tr('Automatic when eligible')}</option>
+        <option value="off" ${sessionUser?.ultra_escalation_default === 'off' ? 'selected' : ''}>${tr('Disabled')}</option>
+      </select></label><div><button class="primary">${tr('Save')}</button></div></form></section>
+    <div class="divider"></div><section class="settings-card"><h2>${tr('Profile image')}</h2>
+      <div class="profile-avatar-control"><div id="profile-avatar-preview">${avatarMarkup(sessionUser)}</div>
+      <button type="button" data-action="refresh-profile-avatar">${tr('Generate another')}</button></div></section>
+    <div class="divider"></div><section id="telegram-settings"></section>`;
   const container = document.querySelector('#telegram-settings');
   import(new URL('./telegram.js', import.meta.url)).then(async module => { const dispose = await module.renderTelegram(container,api,{user:sessionUser}); if (container.isConnected) disposeTelegram = dispose; else dispose?.(); }).catch(() => { if (container.isConnected) container.textContent = '알림 설정을 불러올 수 없습니다. 잠시 후 다시 시도하세요.'; });
 }
@@ -4926,7 +5005,7 @@ async function renderAdmin(ticket = rendering) {
 }
 
 function adminMarkup({capacity,users}) {
-  const panels = '<section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section id="admin-cli-version-panel" class="settings-card" data-morph-keep></section><div class="divider"></div><section id="release-update-panel" class="settings-card" data-morph-keep></section>';
+  const panels = `<section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section class="settings-card"><h2>${tr("Service logs")}</h2><p class="form-hint">${tr("Download rotated service logs and recent solver job states for debugging.")}</p><button data-action="open-admin-log-export">${tr("Download logs")}</button></section><div class="divider"></div><section id="admin-cli-version-panel" class="settings-card" data-morph-keep></section><div class="divider"></div><section id="release-update-panel" class="settings-card" data-morph-keep></section>`;
   if (!users) return `<div class="page-head"><div><div class="eyebrow">ADMIN SETTINGS</div><h1>관리자 설정</h1></div></div>
       ${solverCapacityAdminMarkup(capacity)}<div class="divider"></div>
       ${panels}`;
@@ -4935,6 +5014,47 @@ function adminMarkup({capacity,users}) {
     <div class="table-wrap"><table class="challenge-table admin-user-table"><thead><tr><th>아이디</th><th>권한</th><th>상태</th><th>최근 로그인</th><th>작업공간 / 계정</th><th>Telegram</th><th>관리</th></tr></thead><tbody>${users.map(user => `<tr><td class="challenge-title"><span data-i18n-ignore>${esc(user.username)}</span>${user.id === sessionUser.id ? ' <span class="tag">나</span>' : ''}</td><td><select data-action="user-role" data-id="${user.id}" aria-label="${esc(user.username)} ${tr('권한')}"><option value="user" ${user.role === 'user' ? 'selected' : ''}>일반 사용자</option><option value="admin" ${user.role === 'admin' ? 'selected' : ''}>관리자</option></select></td><td>${user.active ? '활성' : '비활성'}</td><td>${user.last_login_at ? date(user.last_login_at) : '기록 없음'}</td><td>${user.workspace_count} / ${user.account_count}</td><td>${user.telegram_linked ? (user.telegram_enabled ? '알림 켜짐' : '연결됨 · 알림 꺼짐') : '미연결'}${user.telegram_last_failure_at ? '<br><small>최근 전송 오류 기록</small>' : ''}</td><td><div class="actions">${adminUserActiveButton(user,activeAdminCount)}<button class="small" data-action="user-password" data-id="${user.id}" data-name="${esc(user.username)}">비밀번호 초기화</button></div></td></tr>`).join('')}</tbody></table></div>
     <div class="divider"></div>${solverCapacityAdminMarkup(capacity)}
     <div class="divider"></div>${panels}`;
+}
+
+function adminLogParams(form) {
+  const params = new URLSearchParams({hours:form.elements.hours.value});
+  if (form.elements.workspace_id.value) params.set('workspace_id',form.elements.workspace_id.value);
+  if (form.elements.challenge_id.value) params.set('challenge_id',form.elements.challenge_id.value);
+  return params;
+}
+
+async function adminLogChallenges(workspaceId) {
+  const form = modal.querySelector('#admin-log-export-form');
+  if (!form) return;
+  const select = form.elements.challenge_id;
+  select.innerHTML = `<option value="">${tr('All challenges')}</option>`;
+  select.disabled = !workspaceId;
+  if (!workspaceId) return;
+  const [result, trash] = await Promise.all([
+    api(`/api/workspaces/${workspaceId}/challenges`),
+    api(`/api/workspaces/${workspaceId}/trash`),
+  ]);
+  if (form !== modal.querySelector('#admin-log-export-form') || form.elements.workspace_id.value !== workspaceId) return;
+  const challenges = [...(result.challenges || []), ...(trash.challenges || [])];
+  select.innerHTML += challenges.map(item =>
+    `<option value="${esc(item.id)}" data-i18n-ignore>${esc(item.name)}${item.deleted_at ? ` (${tr('Trash')})` : ''}</option>`).join('');
+}
+
+function showAdminLogExport() {
+  const body = `<label>${tr('Period')}<select name="hours"><option value="24">24 ${tr('hours')}</option><option value="72" selected>72 ${tr('hours')}</option><option value="168">7 ${tr('days')}</option><option value="720">30 ${tr('days')}</option></select></label>
+    <label>${tr('Workspace')}<select name="workspace_id" id="admin-log-workspace"><option value="">${tr('All workspaces')}</option>${workspaces.map(item => `<option value="${esc(item.id)}" data-i18n-ignore>${esc(item.name)}</option>`).join('')}</select></label>
+    <label>${tr('Challenge')}<select name="challenge_id" disabled><option value="">${tr('All challenges')}</option></select></label>
+    <div id="admin-log-preview" class="form-hint" aria-live="polite">${tr('Preview before downloading.')}</div>`;
+  const footer = `<button type="button" data-action="close-modal">${tr('Cancel')}</button><button type="submit">${tr('Preview')}</button><button type="button" class="primary" data-action="download-admin-logs" disabled>${tr('Download logs')}</button>`;
+  openModal(tr('Service logs'),'',body,footer,'admin-log-export-form');
+}
+
+async function previewAdminLogs(form) {
+  const result = await api(`/api/admin/logs/preview?${adminLogParams(form)}`);
+  const target = form.querySelector('#admin-log-preview');
+  target.textContent = `${tr('Estimated size before compression')}: ${size(result.estimated_uncompressed_bytes)} · ${tr('Solve jobs')}: ${result.solver_jobs} · ${tr('Events')}: ${result.solver_events} · CTFd: ${result.ctfd_imports + result.ctfd_submissions}${result.truncated ? ` · ${tr('Older records are omitted by the export limit.')}` : ''}`;
+  form.dataset.previewReady = 'true';
+  form.querySelector('[data-action="download-admin-logs"]').disabled = false;
 }
 
 function newUserForm() {
@@ -5599,6 +5719,24 @@ document.addEventListener('click', event => {
     'close-solver-console': () => solverConsoleDialog?.close(),
     'open-solver-accounts': () => openSolverAccounts(),
     'new-workspace': () => workspaceForm(), 'edit-workspace': () => workspaceForm(true),
+    'show-challenge-trash': () => showChallengeTrash(),
+    'show-clone-groups': () => showCloneGroups(),
+    'move-clone-group': () => changeCloneGroup(button),
+    'split-clone-group': () => changeCloneGroup(button, true),
+    'restore-trash-challenge': async () => {
+      const workspaceId = modal.dataset.workspaceId;
+      if (!workspaceId || currentWorkspace?.id !== workspaceId) return;
+      await api(`/api/workspaces/${workspaceId}/trash/${button.dataset.id}/restore`, {method:'POST'});
+      await showChallengeTrash();
+      await refreshChallenges();
+    },
+    'purge-trash-challenge': async () => {
+      const workspaceId = modal.dataset.workspaceId;
+      if (!workspaceId || currentWorkspace?.id !== workspaceId) return;
+      if (!confirm(tr('Delete this challenge permanently?'))) return;
+      await api(`/api/workspaces/${workspaceId}/trash/${button.dataset.id}`, {method:'DELETE'});
+      await showChallengeTrash();
+    },
     'show-staged-files': () => showStagedFiles(),
     'pause-staged-upload': () => {
       const active = stagedActiveUploads.get(button.dataset.id);
@@ -5654,6 +5792,27 @@ document.addEventListener('click', event => {
     'add-relation': () => changeRelation(),
     'install-release-update': () => installReleaseUpdate(button),
     'refresh-release-update': () => refreshReleaseUpdatePanel(true),
+    'open-admin-log-export': () => showAdminLogExport(),
+    'download-admin-logs': async () => {
+      const form = modal.querySelector('#admin-log-export-form');
+      if (!form) return;
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/admin/logs/export?${adminLogParams(form)}`, {credentials:'same-origin'});
+        if (!response.ok) throw new Error(i18n.t('Could not export service logs.'));
+        downloadBlob(await response.blob(), 'ctf-agent-diagnostics.zip');
+        modal.close();
+      } finally {
+        button.disabled = false;
+      }
+    },
+    'refresh-profile-avatar': async () => {
+      sessionUser = await api('/api/auth/avatar/refresh', {method:'POST'});
+      const topAvatar = document.querySelector('.topbar .avatar');
+      if (topAvatar) topAvatar.innerHTML = avatarMarkup(sessionUser);
+      const preview = document.querySelector('#profile-avatar-preview');
+      if (preview) preview.innerHTML = avatarMarkup(sessionUser);
+    },
     'remove-relation': () => changeRelation(button.dataset.id),
     'open-related-challenge': () => openChallenge(button.dataset.id),
     'edit-related-evidence': () => editRelatedEvidence(button.dataset.id),
@@ -5711,7 +5870,7 @@ document.addEventListener('click', event => {
     'upload-notes': () => document.querySelector('#notes-file').click(),
     'complete': () => changeCompletion('complete'),
     'reopen': () => changeCompletion('reopen'),
-    'delete-challenge': async () => { const c = currentChallenge; if (!confirm(i18n.format('“{name}” 문제와 첨부파일, 노트를 삭제할까요? 되돌릴 수 없습니다.',{name:c.name}))) return; await api(path(c.id,c.workspace_id),{method:'DELETE'}); noteDrafts.delete(noteKey(c)); if (currentChallenge === c) { stopSolverPolling(); detail.close(); } await refreshChallenges(); toast('문제를 삭제했습니다.'); },
+    'delete-challenge': async () => { const c = currentChallenge; if (!confirm(i18n.format('Move {name} to the trash?',{name:c.name}))) return; await api(path(c.id,c.workspace_id),{method:'DELETE'}); noteDrafts.delete(noteKey(c)); if (currentChallenge === c) { stopSolverPolling(); detail.close(); } await refreshChallenges(); toast(i18n.t('Moved to trash.')); },
     'delete-workspace': async () => { const w = currentWorkspace; if (!confirm(i18n.format('“{name}” 작업공간의 모든 문제와 자료를 삭제할까요? 되돌릴 수 없습니다.',{name:w.name}))) return; stopChallengeListPolling(); try { await api(`/api/workspaces/${w.id}`,{method:'DELETE'}); } catch (error) { if (currentWorkspace?.id === w.id) startChallengeListPolling(w.id); throw error; } ctfdDrafts.delete(w.id); if (currentWorkspace?.id === w.id) { modal.close(); location.hash = ''; } toast('작업공간을 삭제했습니다.'); },
     'delete-attachment': async () => { const c = currentChallenge; if (!confirm(i18n.t('첨부파일을 삭제할까요?'))) return; await saveNotes(true); await api(`${path(c.id,c.workspace_id)}/attachments/${button.dataset.id}`,{method:'DELETE'}); if (currentChallenge === c) await openChallenge(c.id); },
     'ctfd-import': () => { ctfdRetryId = null; return importForm(); },
@@ -5762,7 +5921,7 @@ document.addEventListener('submit', event => {
     return;
   }
   if (!form.id) return;
-  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-guidance-form','solver-console-guidance-form','solver-peer-evidence-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-preview-form','ctfd-refresh-auth-form','ctfd-submit-connection-form','related-evidence-form'];
+  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-preferences-form','admin-log-export-form','solver-guidance-form','solver-console-guidance-form','solver-peer-evidence-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-preview-form','ctfd-refresh-auth-form','ctfd-submit-connection-form','related-evidence-form'];
   if (!known.includes(form.id)) return;
   event.preventDefault();
   const challengeFiles = form.id === 'new-challenge-form' ? [...selectedChallengeFiles(form)] : [];
@@ -5838,11 +5997,17 @@ document.addEventListener('submit', event => {
       if (uploads.saved) toast(`첨부파일 ${uploads.saved}개를 저장했습니다.`);
       if (failures.length) toast(failures.join(' / '),true);
     } else if (form.id === 'search-form') { search = body.q; selectedCategory = document.querySelector('#category-filter').value; selectedSort = document.querySelector('#sort-order').value; await refreshChallenges(); }
+    else if (form.id === 'solver-preferences-form') {
+      sessionUser = await api('/api/auth/preferences', {method:'PATCH',body:{ultra_escalation_default:body.ultra_escalation_default}});
+      solverUltraEscalationMode = sessionUser.ultra_escalation_default;
+      toast(i18n.t('Solver preference saved.'));
+    }
     else if (form.id === 'password-form') { if (body.new_password !== body.confirmation) throw new Error(i18n.t('새 비밀번호 확인이 일치하지 않습니다.')); delete body.confirmation; const epoch = authEpoch; const result = await api('/api/auth/password',{method:'POST',body}); if (epoch !== authEpoch) return; csrf = result.csrf_token; form.reset(); toast('비밀번호를 변경했습니다.'); }
     else if (form.id === 'username-form') { const epoch = authEpoch; const result = await api('/api/auth/username',{method:'POST',body}); if (epoch !== authEpoch) return; sessionUser.username = result.username; csrf = result.csrf_token; renderSettings(); toast('아이디를 변경했습니다.'); }
     else if (form.id === 'new-user-form') { await api('/api/admin/users',{method:'POST',body}); form.reset(); modal.close(); await renderAdmin(); toast('사용자를 추가했습니다.'); }
     else if (form.id === 'reset-user-form') { await api(`/api/admin/users/${form.dataset.userId}/password`,{method:'POST',body}); form.reset(); modal.close(); toast('비밀번호를 변경했습니다.'); }
     else if (form.id === 'solver-capacity-form') { const maximum = String(body.maximum || '').trim(); await api('/api/admin/solver-capacity',{method:'PUT',body:{maximum:maximum ? Number(maximum) : null}}); await renderAdmin(); toast('솔버 최대 수를 저장했습니다.'); }
+    else if (form.id === 'admin-log-export-form') { await previewAdminLogs(form); }
     else if (form.id === 'solver-guidance-form') { await sendSolverGuidance(body.message,'same_turn',{expectedJobId:form.dataset.jobId}); }
     else if (form.id === 'solver-console-guidance-form') { await sendSolverGuidance(body.message,body.requested_delivery || 'next_turn',{expectedJobId:form.dataset.jobId}); }
     else if (form.id === 'solver-peer-evidence-form') { await sendSolverPeerEvidence(form,body); }
@@ -5904,6 +6069,13 @@ document.addEventListener('submit', event => {
 
 document.addEventListener('change', event => {
   const input = event.target;
+  if (input.id === 'admin-log-workspace') run(() => adminLogChallenges(input.value));
+  if (input.closest?.('#admin-log-export-form')) {
+    const form = input.closest('form');
+    form.dataset.previewReady = 'false';
+    form.querySelector('[data-action="download-admin-logs"]').disabled = true;
+    form.querySelector('#admin-log-preview').textContent = tr('Preview before downloading.');
+  }
   if (input.id === 'transfer-archive' && transferState?.kind === 'import') {
     const state = transferState;
     if (state.running || state.importing) return;

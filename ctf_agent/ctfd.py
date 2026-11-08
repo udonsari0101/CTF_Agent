@@ -11,6 +11,7 @@ unpacked.
 from __future__ import annotations
 
 import hashlib
+import html
 import http.client
 import http.cookiejar
 import ipaddress
@@ -97,6 +98,80 @@ def connection_info(value) -> str:
     lines = [" ".join(line.split()) for line in value.split("\n")]
     value = " ; ".join(line for line in lines if line).replace("`", "'")
     return value[:MAX_CONNECTION_INFO_CHARS].rstrip()
+
+
+_DESCRIPTION_URL = re.compile(r"(?<![\w@])(?:https?|wss?)://[^\s<>\"'`]+", re.I)
+_DESCRIPTION_NC = re.compile(
+    r"(?<![\w-])(?:nc|ncat|netcat)\s+(?P<host>[A-Za-z0-9][A-Za-z0-9.:-]{0,253})\s+(?P<port>\d{1,5})(?!\d)",
+    re.I,
+)
+_DESCRIPTION_HOST_PORT = re.compile(
+    r"(?<![\w./@-])(?P<host>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+|(?:\d{1,3}\.){3}\d{1,3}):(?P<port>\d{1,5})(?!\d)",
+    re.I,
+)
+_NON_SERVICE_PATH = re.compile(r"\.(?:zip|7z|tar|gz|pdf|md|txt|png|jpe?g|gif|svg)(?:$|[?#])", re.I)
+_EXPLICITLY_OFFLINE = re.compile(
+    r"(?i)(?:\b(?:no|without)\s+(?:remote|network|server|service)\b|"
+    r"\b(?:offline|local[- ]only)\b|원격\s*(?:대상|서버|접속)?\s*(?:은|가|이)?\s*"
+    r"(?:없음|없습니다|존재하지\s*않습니다))"
+)
+
+
+def description_connection_info(description: str, site_url: str = "") -> tuple[str, bool]:
+    """Find an unambiguous service address in a CTFd description, without I/O.
+
+    The boolean reports whether connection-like text was present even if the
+    candidate was ambiguous. Such a challenge must not be labelled offline.
+    Reference URLs and attachment links are intentionally not promoted.
+    """
+
+    if not isinstance(description, str):
+        return "", False
+    source = html.unescape(description)
+    source_host = (urlsplit(site_url).hostname or "").lower()
+    candidates: set[str] = set()
+    possible = False
+    for match in _DESCRIPTION_NC.finditer(source):
+        host, port = match.group("host"), int(match.group("port"))
+        if 0 < port <= 65535 and ("." in host or host.lower() == "localhost"):
+            candidates.add(f"nc {host} {port}")
+            possible = True
+    for match in _DESCRIPTION_URL.finditer(source):
+        url = match.group().rstrip(".,;:!?)]}")
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        if not host or host == source_host or host in {"github.com", "www.github.com"}:
+            continue
+        if _NON_SERVICE_PATH.search(parsed.path):
+            continue
+        possible = True
+        # A port or a connection cue is strong evidence. A single bare URL is
+        # also common CTFd challenge text, but multiple URLs are ambiguous.
+        candidates.add(url)
+    for match in _DESCRIPTION_HOST_PORT.finditer(source):
+        host, port = match.group("host"), int(match.group("port"))
+        if 0 < port <= 65535 and host.lower() != source_host:
+            possible = True
+            candidates.add(f"{host}:{port}")
+    if len(candidates) == 1:
+        return connection_info(next(iter(candidates))), True
+    return "", possible
+
+
+def ctfd_remote_state(connection: str, description: str, site_url: str) -> tuple[str, str]:
+    """Prefer CTFd's dedicated field, then an unambiguous body endpoint."""
+
+    explicit = connection_info(connection)
+    if explicit:
+        return explicit, "endpoint"
+    inferred, possible = description_connection_info(description, site_url)
+    if inferred:
+        return inferred, "endpoint"
+    # CTFd's absent connection field is not a declaration that the task is
+    # offline. Only an explicit statement in the brief can establish that.
+    if not possible and isinstance(description, str) and _EXPLICITLY_OFFLINE.search(description):
+        return "", "none"
+    return "", "unknown"
 
 
 @dataclass(frozen=True)
@@ -896,7 +971,9 @@ class CTFdClient:
                                    "name": str(detail.get("name") or f"Challenge {challenge_id}")[:200],
                                    "category": str(detail.get("category") or "")[:100],
                                    "description": description,
-                                   "remote": connection_info(detail.get("connection_info")),
+                                   "remote": ctfd_remote_state(
+                                       detail.get("connection_info"), description, self.url
+                                   )[0],
                                    "files": attachments})
             except CTFdError as exc:
                 errors.append({"challenge_id": challenge_id, "message": str(exc)})
@@ -1564,13 +1641,14 @@ class ImportJobs:
         ):
             baseline = None
         incoming = {field: remote[field] for field in ("name", "category", "description")}
-        incoming["remote"] = remote.get("remote") or ""
+        incoming["remote"], incoming_mode = ctfd_remote_state(
+            remote.get("remote"), remote.get("description"), source
+        )
         result = []
         for field in ("name", "category", "description", "remote"):
             current_value = current[field]
             incoming_value = incoming[field]
             if field == "remote":
-                incoming_mode = "endpoint" if incoming_value else "none"
                 overridden = baseline is None or (
                     current_value != baseline["remote"]
                     or current["remote_mode"] != baseline["remote_mode"]
@@ -2115,14 +2193,9 @@ class ImportJobs:
 
     def challenge(self, job_id, workspace_id, owner, source, remote, *, mode="import",
                   target_challenge_id=None):
-        connection = remote.get("remote") or ""
-        # A CTFd detail response is authoritative for its connection_info
-        # field.  An empty value therefore describes an offline challenge,
-        # unlike a manually-created challenge where an omitted endpoint still
-        # means that the user has not supplied one yet.  Keeping those states
-        # distinct prevents the original solver goal's remote-only warning
-        # from overriding a CTFd attachment challenge.
-        remote_mode = "endpoint" if connection else "none"
+        connection, remote_mode = ctfd_remote_state(
+            remote.get("remote"), remote.get("description"), source
+        )
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             active = db.execute(
@@ -2504,8 +2577,9 @@ class ImportJobs:
 
         if cancel.is_set():
             raise CTFdError("Import cancelled.")
-        connection = remote.get("remote") or ""
-        remote_mode = "endpoint" if connection else "none"
+        connection, remote_mode = ctfd_remote_state(
+            remote.get("remote"), remote.get("description"), source
+        )
         with self.db() as db:
             staged = [
                 dict(row)

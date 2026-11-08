@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -155,6 +156,102 @@ class AtMostOnceTests(unittest.TestCase):
                 "SELECT status,result_code,attempts,dispatch_started,source_solver_job_id "
                 "FROM ctfd_submit_jobs WHERE challenge_id=?", (self.challenge_id,),
             ).fetchone())
+
+    def test_incorrect_agent_flag_cancels_writeup_and_rejects_after_release(self):
+        source_id = uuid.uuid4().hex
+        coordinator = self.app.state.solver_jobs
+        with self.service.db() as db:
+            db.execute(
+                """INSERT INTO solver_jobs
+                   (id,owner_user_id,workspace_id,challenge_id,account_id,
+                    provider,model,reasoning_effort,status,flag,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'codex','test-model','medium','writing',?,?,?)""",
+                (source_id, self.owner_id, self.workspace_id, self.challenge_id,
+                 uuid.uuid4().hex, FLAG, 1.0, 1.0),
+            )
+            db.execute(
+                "UPDATE ctfd_submit_jobs SET source_solver_job_id=? WHERE challenge_id=?",
+                (source_id, self.challenge_id),
+            )
+        self.remote.submit_mode = "incorrect"
+        with patch.object(coordinator, "cancel") as cancel, patch.object(
+            coordinator, "reject_candidate"
+        ) as reject:
+            self.assertTrue(self.service.process_once())
+            cancel.assert_called_once_with(source_id, self.owner_id)
+            reject.assert_not_called()
+            with self.service.db() as db:
+                db.execute(
+                    "UPDATE solver_jobs SET released_ingested=1,status='completed',released_at=2 "
+                    "WHERE id=?", (source_id,),
+                )
+            self.assertTrue(self.service.process_once())
+            reject.assert_called_once_with(source_id, self.owner_id)
+        with self.service.db() as db:
+            state = db.execute(
+                "SELECT solver_rejection_state FROM ctfd_submit_jobs WHERE challenge_id=?",
+                (self.challenge_id,),
+            ).fetchone()[0]
+        self.assertEqual(state, "applied")
+        self.assertEqual(self.remote.submit_calls, 1)
+
+    def test_operator_can_reject_active_candidate_before_writeup(self):
+        source_id = uuid.uuid4().hex
+        with self.service.db() as db:
+            db.execute(
+                """INSERT INTO solver_jobs
+                   (id,owner_user_id,workspace_id,challenge_id,account_id,
+                    provider,model,reasoning_effort,status,flag,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'codex','test-model','medium','writing',?,?,?)""",
+                (source_id, self.owner_id, self.workspace_id, self.challenge_id,
+                 uuid.uuid4().hex, FLAG, 1.0, 1.0),
+            )
+        response = self.http.post(f"/api/solver/jobs/{source_id}/reject-flag")
+        self.assertEqual(response.status_code, 200, response.text)
+        with self.service.db() as db:
+            job = db.execute(
+                "SELECT flag_rejected_at,cancel_requested FROM solver_jobs WHERE id=?",
+                (source_id,),
+            ).fetchone()
+            challenge = db.execute(
+                "SELECT flag,status FROM challenges WHERE id=?", (self.challenge_id,)
+            ).fetchone()
+            checkpoint = db.execute(
+                "SELECT source_job_id FROM solver_retry_checkpoints WHERE challenge_id=?",
+                (self.challenge_id,),
+            ).fetchone()
+        self.assertIsNotNone(job["flag_rejected_at"])
+        self.assertEqual(job["cancel_requested"], 1)
+        self.assertIsNone(challenge["flag"])
+        self.assertEqual(challenge["status"], "pending")
+        self.assertEqual(checkpoint["source_job_id"], source_id)
+        coordinator = self.app.state.solver_jobs
+        job_ref = {"id": source_id, "workspace_id": self.workspace_id,
+                   "challenge_id": self.challenge_id}
+        for sequence, kind, extra in (
+            (1, "flag", {"flag": FLAG}),
+            (2, "writeup", {"flag": FLAG, "writeup_markdown": "# wrong candidate"}),
+            (3, "released", {"status": "completed", "flag": FLAG}),
+        ):
+            coordinator._commit_event(job_ref, {
+                "protocol": 1, "job_id": source_id, "sequence": sequence,
+                "kind": kind, "created_at": float(sequence), **extra,
+            })
+        with self.service.db() as db:
+            challenge = db.execute(
+                "SELECT flag,status FROM challenges WHERE id=?", (self.challenge_id,)
+            ).fetchone()
+            stored = db.execute(
+                "SELECT markdown FROM challenge_writeups WHERE challenge_id=?",
+                (self.challenge_id,),
+            ).fetchone()
+            job = db.execute(
+                "SELECT status FROM solver_jobs WHERE id=?", (source_id,)
+            ).fetchone()
+        self.assertIsNone(challenge["flag"])
+        self.assertEqual(challenge["status"], "pending")
+        self.assertIsNone(stored)
+        self.assertEqual(job["status"], "cancelled")
 
     def test_lost_response_never_reposts_even_when_remote_unsolved(self):
         self.remote.submit_mode = "response_lost"

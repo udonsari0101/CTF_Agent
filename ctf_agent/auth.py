@@ -37,7 +37,10 @@ def stamp():
 
 
 def safe_user(row):
-    return {key: row[key] for key in ("id", "username", "role", "active", "created_at", "last_login_at")}
+    return {key: row[key] for key in (
+        "id", "username", "role", "active", "created_at", "last_login_at",
+        "ultra_escalation_default", "avatar_seed",
+    )}
 
 
 def username_value(value):
@@ -66,6 +69,10 @@ class LocalTicketRequest(BaseModel):
 
 class SessionPreference(BaseModel):
     remember: bool
+
+
+class SolverPreference(BaseModel):
+    ultra_escalation_default: Literal["ask", "auto", "off"]
 
 
 class FirstAdmin(BaseModel):
@@ -332,6 +339,11 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
     @app.get("/api/auth/state")
     def state(request: Request):
         session = local_session_for(request) if automatic_session else session_for(request)
+        if session and automatic_session:
+            with database() as db:
+                current = db.execute("SELECT * FROM users WHERE id=?", (session["id"],)).fetchone()
+            if current:
+                session = {**session, **safe_user(current)}
         if automatic_session:
             configured = True
         else:
@@ -349,6 +361,23 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
             "username": session["username"] if session else None,
             "session_persistent": bool(session["persistent"]) if session and not automatic_session else False,
         }
+
+    @app.patch("/api/auth/preferences")
+    def update_solver_preference(payload: SolverPreference, user=Depends(require_auth)):
+        with database() as db:
+            db.execute(
+                "UPDATE users SET ultra_escalation_default=? WHERE id=?",
+                (payload.ultra_escalation_default, user["id"]),
+            )
+            current = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        return safe_user(current)
+
+    @app.post("/api/auth/avatar/refresh")
+    def refresh_avatar(user=Depends(require_auth)):
+        with database() as db:
+            db.execute("UPDATE users SET avatar_seed=? WHERE id=?", (uuid.uuid4().hex, user["id"]))
+            current = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        return safe_user(current)
 
     @app.post("/api/auth/local/ticket")
     def local_ticket(payload: LocalTicketRequest, request: Request, response: Response):
@@ -598,7 +627,8 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
         user_id = uuid.uuid4().hex
         try:
             with database() as db:
-                db.execute("INSERT INTO users VALUES(?,?,?,?,1,?,NULL)", (user_id, payload.username, encoded, payload.role, stamp()))
+                db.execute("INSERT INTO users(id,username,password_hash,role,active,created_at,last_login_at) VALUES(?,?,?,?,1,?,NULL)",
+                           (user_id, payload.username, encoded, payload.role, stamp()))
                 result = safe_user(db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
         except sqlite3.IntegrityError:
             raise HTTPException(409, "이미 사용 중인 아이디입니다.") from None
