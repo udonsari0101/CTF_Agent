@@ -317,6 +317,12 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         assert result.returncode == 0, (
             executable + " failed its runtime check: " + result.stderr.strip()
         )
+    apktool_version = subprocess.run(
+        ["apktool", "--version"], capture_output=True, text=True,
+        timeout=15, cwd=temporary, env=tool_env,
+    )
+    assert apktool_version.returncode == 0 and apktool_version.stdout.strip() == "2.12.1"
+    assert not Path("/usr/lib/jvm/java-17-openjdk-amd64").exists()
     binary_fixture = b"\x00CTF\x01\xfe\xff\n"
     hex_dump = subprocess.run(
         ["xxd", "-p"], input=binary_fixture, capture_output=True,
