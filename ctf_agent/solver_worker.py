@@ -2411,6 +2411,21 @@ def provider_retry_is_terminal(payload: object) -> bool:
     } or status in {400, 401, 403}
 
 
+def resumable_discovery_failure(payload: object) -> bool:
+    """Allow one same-thread continuation for a transient failed solve turn.
+
+    Quota, authentication, policy, and a dead CLI stream need their existing
+    failure paths. An unknown free-form provider message is never inspected.
+    """
+
+    error = normalize_provider_failure(payload, stage="solve")
+    return (
+        error.category == "temporary"
+        and error.retryable
+        and error.code in {"provider_error", "provider_unavailable"}
+    )
+
+
 def safe_rate_limit_snapshot(value: object) -> dict[str, Any] | None:
     """Reduce one app-server quota snapshot to reviewed scalar fields."""
 
@@ -4910,6 +4925,8 @@ is a fresh isolated job; do not repeat completed work.
         attempt = 0
         last_allowed_attempt = MAX_SOLVE_NUDGES
         progress_nudges = 0
+        transient_resume_attempted = False
+        recovery_prompt = ""
         while MAX_SOLVE_NUDGES == 0 or attempt <= last_allowed_attempt:
             current_attempt = attempt
             attempt += 1
@@ -4917,16 +4934,53 @@ is a fresh isolated job; do not repeat completed work.
             prior_tool_count = self._solve_tool_count
             prior_written_notes = _solver_notes(challenge)
             prior_private_notes = private_notes
-            prompt = (
+            prompt = (recovery_prompt or (
                 phase_first_prompt if current_attempt == 0 else NUDGE
-            ) + result_bridge
-            result = await self._turn(
-                effective_manifest,
-                prompt,
-                schema if self.structured_discovery else None,
-                cancelled,
-                progress,
-            )
+            )) + result_bridge
+            recovery_prompt = ""
+            try:
+                result = await self._turn(
+                    effective_manifest,
+                    prompt,
+                    schema if self.structured_discovery else None,
+                    cancelled,
+                    progress,
+                )
+            except AppServerFailure as exc:
+                if cancelled.is_set() or not resumable_discovery_failure(exc.payload):
+                    raise
+                # submit-flag may have completed just before the provider's
+                # final turn notification failed. Its private handoff is more
+                # authoritative than the missing final assistant response.
+                submitted = _validated_flag_candidate(challenge / ".flag-candidate")
+                if submitted is not None and submitted not in rejected_flags:
+                    written_notes = _solver_notes(challenge)
+                    return {
+                        "flag": submitted,
+                        "private_notes": bounded_checkpoint_notes(
+                            f"{private_notes}\n\n{written_notes}" if private_notes else written_notes
+                        ),
+                    }
+                if (
+                    transient_resume_attempted
+                    or cancelled.is_set()
+                    or not getattr(self, "thread_id", None)
+                    or self._solve_tool_count == 0
+                ):
+                    raise
+                # The failed turn may already have run many tools. A new turn
+                # in this exact thread can use their files and observations;
+                # repeating the original solve prompt would waste that work.
+                transient_resume_attempted = True
+                attempt -= 1
+                recovery_prompt = (
+                    "The previous turn ended with a temporary provider error. "
+                    "Continue this same solve in the existing session and working "
+                    "directory. Inspect notes and existing artifacts, avoid repeating "
+                    "completed experiments, and execute the next necessary step."
+                )
+                await progress("provider_retrying")
+                continue
             returned = ""
             interrupted_candidate = ""
             if self.structured_discovery:
