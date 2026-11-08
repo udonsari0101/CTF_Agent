@@ -24,6 +24,10 @@ ARG GHIDRA_VERSION=12.1.4
 ARG GHIDRA_SHA256=ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db
 ARG JADX_VERSION=1.5.6
 ARG JADX_SHA256=545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974
+
+ARG APKTOOL_VERSION=2.12.1
+
+ARG APKTOOL_SHA256=66cf4524a4a45a7f56567d08b2c9b6ec237bcdd78cee69fd4a59c8a0243aeafa
 LABEL org.opencontainers.image.source="https://github.com/udonsari0101/CTF_Agent"
 
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
@@ -32,7 +36,7 @@ COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 # installation omits this compiler; GCC remains available for CTF builds.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-        apktool apparmor bash binutils binwalk build-essential ca-certificates chromium cpio curl \
+        apparmor bash binutils binwalk build-essential ca-certificates chromium cpio curl \
         dnsutils ffmpeg file fonts-liberation fonts-noto-cjk foremost gdb gdb-multiarch gdbserver git john jq \
         libffi-dev libgmp-dev libimage-exiftool-perl libmagic1 \
         libmpfr-dev libssl-dev ltrace mediainfo multimon-ng netcat-openbsd nmap openssl p7zip-full pari-gp patchelf \
@@ -117,6 +121,14 @@ RUN curl --fail --silent --show-error --location --retry 3 \
     && tar --extract --gzip --file /tmp/jdk-21.tar.gz --directory /opt \
     && mv /opt/jdk-21.0.13+9 /opt/jdk-21 \
     && curl --fail --silent --show-error --location --retry 3 \
+        --output /tmp/apktool.jar \
+        "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" \
+    && echo "${APKTOOL_SHA256}  /tmp/apktool.jar" | sha256sum --check --strict \
+    && install -D -o root -g root -m 0444 /tmp/apktool.jar /opt/apktool/apktool.jar \
+    && printf '#!/bin/sh\nexec /opt/jdk-21/bin/java -jar /opt/apktool/apktool.jar "$@"\n' > /usr/local/bin/apktool \
+    && chmod 0555 /usr/local/bin/apktool \
+    && /usr/local/bin/apktool --version | grep -Fx "${APKTOOL_VERSION}" \
+    && curl --fail --silent --show-error --location --retry 3 \
         --output /tmp/ghidra.zip \
         "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_20260921.zip" \
     && echo "${GHIDRA_SHA256}  /tmp/ghidra.zip" | sha256sum --check --strict \
@@ -132,7 +144,7 @@ RUN curl --fail --silent --show-error --location --retry 3 \
     && unzip -q /tmp/jadx.zip -d /opt/jadx \
     && chmod 0555 /opt/jadx/bin/jadx \
     && ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx \
-    && rm -f /tmp/jdk-21.tar.gz /tmp/ghidra.zip /tmp/jadx.zip
+    && rm -f /tmp/jdk-21.tar.gz /tmp/apktool.jar /tmp/ghidra.zip /tmp/jadx.zip
 
 ENV JAVA_HOME=/opt/jdk-21 GHIDRA=/opt/ghidra GHIDRA_INSTALL_DIR=/opt/ghidra GHIDRA_HEADLESS_MAXMEM=4G \
     PATH="/opt/jdk-21/bin:${PATH}"
