@@ -43,7 +43,7 @@ def main() -> None:
                     headless=True,
                 )
                 try:
-                    for locale, width in (("ko", 390), ("en", 1440)):
+                    for locale, width in (("ko", 390), ("ko", 1440), ("en", 390), ("en", 1440)):
                         page = browser.new_page(viewport={"width": width, "height": 844}, accept_downloads=True)
                         page.add_init_script(f"localStorage.setItem('ctf-language', '{locale}')")
                         errors = []
@@ -90,7 +90,7 @@ def main() -> None:
             server.should_exit = True
             worker.join(timeout=10)
             sock.close()
-    print("PASS: diagnostic ZIP, Ultra default and avatar controls in Korean/mobile and English/desktop Chrome")
+    print("PASS: diagnostic ZIP, Ultra default and avatar controls in Korean/English mobile/desktop Chrome")
 
 
 if __name__ == "__main__":
