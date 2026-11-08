@@ -111,6 +111,89 @@ class ProgressNudgeTests(unittest.TestCase):
         self.assertEqual(error, "flag_not_submitted")
         self.assertEqual(calls, 4)  # initial + one ordinary + two progress nudges
 
+    def test_transient_provider_failure_resumes_once_in_same_thread(self) -> None:
+        self.driver.thread_id = "existing-thread"
+        prompts: list[str] = []
+
+        async def turn(_manifest, prompt, _schema, _cancelled, _progress):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                self.driver._solve_tool_count += 1
+                raise worker.AppServerFailure({"code": "provider_error"})
+            return {"flag": "CTF{verified}"}
+
+        result, error = self._run(turn, nudges=0)
+        self.assertIsNone(error)
+        self.assertEqual(result["flag"], "CTF{verified}")
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("existing session", prompts[1])
+        self.assertEqual(self.progress_codes.count("provider_retrying"), 1)
+
+    def test_verified_handoff_survives_failed_final_turn(self) -> None:
+        self.driver.thread_id = "existing-thread"
+        calls = 0
+
+        async def turn(_manifest, _prompt, _schema, _cancelled, _progress):
+            nonlocal calls
+            calls += 1
+            (self.challenge / ".flag-candidate").write_text("CTF{verified}", encoding="utf-8")
+            (self.challenge / "notes" / "ANALYSIS.md").write_text(
+                "The candidate was checked against the supplied artifact.", encoding="utf-8",
+            )
+            raise worker.AppServerFailure({"code": "provider_error"})
+
+        result, error = self._run(turn, nudges=0)
+        self.assertIsNone(error)
+        self.assertEqual(result["flag"], "CTF{verified}")
+        self.assertIn("supplied artifact", result["private_notes"])
+        self.assertEqual(calls, 1)
+
+    def test_transient_resume_is_bounded_and_requires_work(self) -> None:
+        self.driver.thread_id = "existing-thread"
+        for has_work in (False, True):
+            with self.subTest(has_work=has_work):
+                calls = 0
+
+                async def turn(_manifest, _prompt, _schema, _cancelled, _progress):
+                    nonlocal calls
+                    calls += 1
+                    if has_work:
+                        self.driver._solve_tool_count += 1
+                    raise worker.AppServerFailure({"code": "provider_error"})
+
+                self.driver._turn = turn
+                with patch.object(worker, "MAX_SOLVE_NUDGES", 0):
+                    with self.assertRaises(worker.AppServerFailure):
+                        asyncio.run(self.driver.run_discovery(
+                            self.manifest, self.challenge, asyncio.Event(), self._progress,
+                        ))
+                self.assertEqual(calls, 2 if has_work else 1)
+
+    def test_quota_and_auth_failures_never_auto_resume(self) -> None:
+        self.driver.thread_id = "existing-thread"
+        for payload in (
+            {"codexErrorInfo": "usageLimitExceeded"},
+            {"code": "auth_required"},
+            {"codexErrorInfo": "cyberPolicy"},
+            {"code": "provider_error", "retryable": False},
+        ):
+            with self.subTest(payload=payload):
+                calls = 0
+
+                async def turn(_manifest, _prompt, _schema, _cancelled, _progress):
+                    nonlocal calls
+                    calls += 1
+                    self.driver._solve_tool_count += 1
+                    raise worker.AppServerFailure(payload)
+
+                self.driver._turn = turn
+                with patch.object(worker, "MAX_SOLVE_NUDGES", 0):
+                    with self.assertRaises(worker.AppServerFailure):
+                        asyncio.run(self.driver.run_discovery(
+                            self.manifest, self.challenge, asyncio.Event(), self._progress,
+                        ))
+                self.assertEqual(calls, 1)
+
     def test_explicit_unlimited_setting_keeps_existing_behavior(self) -> None:
         calls = 0
 
