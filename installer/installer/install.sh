@@ -504,8 +504,8 @@ elif [[ "$(cat -- "$target/.release-revision" 2>/dev/null || true)" != "$revisio
     exit 2
 fi
 
-# Refresh only the reviewed local runtime overlay when repairing the same
-# release. Application data and the verified public base image stay separate.
+# Refresh the verified local runtime metadata and policy files when repairing
+# the same release. Application data and the public image stay separate.
 for name in Dockerfile.local-runtime compose.local.yaml ctf_agent/solver_worker.py \
     deploy/local_runtime.py deploy/local-compose.py deploy/local-seccomp.json \
     deploy/local-seccomp.README.md deploy/moby-profiles-LICENSE; do

@@ -296,6 +296,7 @@ class MissingImageRecoveryTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM users").fetchone()[0], 1)
         log = self.log.read_text(encoding="utf-8")
         self.assertIn("pull ", log)
+        self.assertNotIn("build --file Dockerfile.local-runtime", log)
         self.assertNotIn("down --remove-orphans", log)
 
 

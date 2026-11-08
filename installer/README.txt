@@ -110,9 +110,9 @@ filesystem for Docker performance.
 
 The ZIP contains source and an installer. The installer pulls the public
 release image, including the CTF toolchain, by verified GHCR digest. A small
-local worker-policy overlay and update controller are built from that verified
-image; the toolchain is not rebuilt. The public base identity and local image
-identity are checked again when the service starts. Cached images may remain
+solver worker bytes are checked against the release, then the verified public
+image is used directly. Only the small update controller is built locally.
+The public image identity is checked again when the service starts. Cached images may remain
 after uninstall.
 
 Installation and Start.cmd check /readyz before reporting the service ready.

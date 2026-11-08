@@ -1,4 +1,4 @@
-"""Build and verify the local policy overlay without misidentifying it as GHCR."""
+"""Verify the pinned public image for a local installation without rebuilding it."""
 from __future__ import annotations
 
 import hashlib
@@ -15,6 +15,7 @@ FILES = ('Dockerfile.local-runtime', 'ctf_agent/solver_worker.py',
          'compose.local.yaml', 'deploy/local-seccomp.json', 'deploy/local_runtime.py',
          'deploy/local-compose.py')
 LABEL = 'io.github.ctf-agent.local-runtime'
+SOURCE = 'https://github.com/udonsari0101/CTF_Agent'
 
 
 def inspect(image: str) -> dict:
@@ -57,34 +58,43 @@ def select_image(root: Path = ROOT) -> str:
     labels = upstream['Config'].get('Labels') or {}
     if (upstream['Id'] != saved.get('base_id')
             or labels.get('org.opencontainers.image.revision') != revision
-            or labels.get('org.opencontainers.image.source') != 'https://github.com/udonsari0101/CTF_Agent'):
+            or labels.get('org.opencontainers.image.source') != SOURCE):
         raise RuntimeError('Public runtime base identity does not match this release')
-    runtime = inspect(runtime_id)
-    labels = runtime['Config'].get('Labels') or {}
-    if (runtime['Id'] != runtime_id or labels.get(LABEL) != fingerprint
-            or labels.get('org.opencontainers.image.revision') != revision):
-        raise RuntimeError('Local runtime image identity does not match this installation')
+    if runtime_id != upstream['Id']:
+        # Metadata written by older local installers can still be selected
+        # during a rollback. New installations use the verified public image
+        # directly and do not create an otherwise identical overlay layer.
+        runtime = inspect(runtime_id)
+        labels = runtime['Config'].get('Labels') or {}
+        if (runtime['Id'] != runtime_id or labels.get(LABEL) != fingerprint
+                or labels.get('org.opencontainers.image.revision') != revision):
+            raise RuntimeError('Local runtime image identity does not match this installation')
     return runtime_id
 
 
 def build_image(root: Path = ROOT) -> str:
     base, fingerprint, hashes = identity(root)
-    tag = 'ctf-agent-local-runtime:' + fingerprint
-    try:
-        existing = inspect(tag)
-    except subprocess.CalledProcessError:
-        existing = None
-    if existing is None or (existing['Config'].get('Labels') or {}).get(LABEL) != fingerprint:
-        # The pinned base is public. Isolate the anonymous build's registry
-        # configuration from the Windows credential helper and user credentials.
-        with tempfile.TemporaryDirectory(prefix='ctf-agent-public-runtime-') as config:
-            env = dict(os.environ, DOCKER_CONFIG=config)
-            subprocess.run(['docker', 'build', '--pull=false', '--file', 'Dockerfile.local-runtime',
-                '--build-arg', 'BASE_IMAGE=' + base,
-                '--build-arg', 'LOCAL_RUNTIME_FINGERPRINT=' + fingerprint,
-                '--tag', tag, '.'], cwd=root, env=env, stdout=sys.stderr, check=True)
-    upstream, runtime = inspect(base), inspect(tag)
-    saved = {'base_ref': base, 'base_id': upstream['Id'], 'runtime_id': runtime['Id'],
+    upstream = inspect(base)
+    revision = (root / '.release-revision').read_text(encoding='ascii').strip()
+    labels = upstream['Config'].get('Labels') or {}
+    if (labels.get('org.opencontainers.image.revision') != revision
+            or labels.get('org.opencontainers.image.source') != SOURCE):
+        raise RuntimeError('Public runtime base identity does not match this release')
+    # The released worker is already inside the commit-pinned image. Verify
+    # its bytes before storing the installation identity, so a mismatched ZIP
+    # cannot silently replace the reviewed solver code or force a local build.
+    checked = subprocess.run(
+        ['docker', 'run', '--rm', '--pull=never', '--network', 'none',
+         '--read-only', '--entrypoint', 'sha256sum', base,
+         '/app/ctf_agent/solver_worker.py'],
+        check=True, capture_output=True, text=True,
+    )
+    output = checked.stdout.split(maxsplit=1)
+    image_worker_hash = output[0].lower() if output else ''
+    if (not re.fullmatch(r'[0-9a-f]{64}', image_worker_hash)
+            or image_worker_hash != hashes['ctf_agent/solver_worker.py']):
+        raise RuntimeError('Public image solver worker differs from this release')
+    saved = {'base_ref': base, 'base_id': upstream['Id'], 'runtime_id': upstream['Id'],
              'fingerprint': fingerprint, 'files': hashes}
     fd, name = tempfile.mkstemp(prefix='.local-runtime.', dir=root)
     temporary = Path(name)

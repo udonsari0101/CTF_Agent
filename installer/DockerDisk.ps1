@@ -64,9 +64,10 @@ function Get-EstimatedImageWorkBytes([string]$revision) {
     # Only the digest currently published for this exact revision can be
     # treated as cached. A different local digest can carry the same revision
     # label and would still require a cold pull.
-    # A cold install stores the compressed layers, one unpacked copy from the
-    # pull and a second unpacked copy in the build cache of the local overlay.
-    # v0.4.57 grew an empty Docker Desktop disk to 17.2 GB.
+    # A cold install stores compressed and unpacked layers. The historical
+    # v0.4.57 local overlay also populated BuildKit cache; new releases no
+    # longer build that redundant overlay. Keep the observed 18 GiB cold
+    # budget until a fresh-install measurement justifies reducing it.
     if ($revision -notmatch '^[0-9a-f]{40}$') { return [int64]18GB }
     $docker = Get-DesktopDockerCli
     $repository = 'ghcr.io/udonsari0101/ctf-agent-public'
@@ -83,9 +84,9 @@ function Get-EstimatedImageWorkBytes([string]$revision) {
         'image', 'inspect', $image,
         '--format={{index .Config.Labels "org.opencontainers.image.revision"}}') 8
     if ($checked.ExitCode -eq 0 -and $checked.Stdout.Trim() -eq $revision) {
-        # The exact immutable image is already unpacked locally. Only the
-        # single-file local policy overlay and release staging need headroom.
-        # Reserving 10 GiB here blocked upgrades on otherwise healthy disks.
+        # The exact immutable image is already unpacked locally. Only its
+        # identity check and release staging need headroom. Reserving 10 GiB
+        # here blocked upgrades on otherwise healthy disks.
         return [int64]1GB
     }
     return [int64]18GB
