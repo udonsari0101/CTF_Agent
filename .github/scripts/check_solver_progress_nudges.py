@@ -136,7 +136,9 @@ class ProgressNudgeTests(unittest.TestCase):
         async def turn(_manifest, _prompt, _schema, _cancelled, _progress):
             nonlocal calls
             calls += 1
-            (self.challenge / ".flag-candidate").write_text("CTF{verified}", encoding="utf-8")
+            candidate_path = self.challenge / ".flag-candidate"
+            candidate_path.write_text("CTF{verified}", encoding="utf-8")
+            candidate_path.chmod(0o600)
             (self.challenge / "notes" / "ANALYSIS.md").write_text(
                 "The candidate was checked against the supplied artifact.", encoding="utf-8",
             )
