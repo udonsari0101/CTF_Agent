@@ -83,7 +83,10 @@ function Get-EstimatedImageWorkBytes([string]$revision) {
         'image', 'inspect', $image,
         '--format={{index .Config.Labels "org.opencontainers.image.revision"}}') 8
     if ($checked.ExitCode -eq 0 -and $checked.Stdout.Trim() -eq $revision) {
-        return [int64]10GB
+        # The exact immutable image is already unpacked locally. Only the
+        # single-file local policy overlay and release staging need headroom.
+        # Reserving 10 GiB here blocked upgrades on otherwise healthy disks.
+        return [int64]1GB
     }
     return [int64]18GB
 }

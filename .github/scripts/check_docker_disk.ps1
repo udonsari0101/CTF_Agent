@@ -113,7 +113,7 @@ try {
         throw 'A stale local digest carrying the same revision was treated as the published image'
     }
     $script:cachedDigest = $script:publishedDigest
-    if ((Get-EstimatedImageWorkBytes $revision) -ne 10GB) {
+    if ((Get-EstimatedImageWorkBytes $revision) -ne 1GB) {
         throw 'The exact published image digest was treated as a cold pull'
     }
     Remove-Item -LiteralPath $customDisk
