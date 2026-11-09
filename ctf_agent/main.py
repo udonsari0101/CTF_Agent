@@ -1713,6 +1713,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 if row["remote_origin"] == "description" or (
                     row["remote_origin"] == "legacy"
+                    and row["ctfd_id"] is None
                     and old_inferred and row["remote"] == old_inferred
                 ):
                     # This stored endpoint came from the old brief. Re-evaluate
