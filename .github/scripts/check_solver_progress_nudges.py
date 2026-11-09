@@ -10,13 +10,14 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from ctf_agent import solver_worker as worker  # noqa: E402
 from ctf_agent.solver import ModelConfiguration  # noqa: E402
+from ctf_agent.request_remote import record_request  # noqa: E402
 
 
 class ProgressNudgeTests(unittest.TestCase):
@@ -56,6 +57,108 @@ class ProgressNudgeTests(unittest.TestCase):
             arguments = self.driver.command_arguments()
         self.assertNotIn("agents.max_concurrent_threads_per_session=2", arguments)
         self.assertEqual(arguments[arguments.index("multi_agent") - 1], "--disable")
+
+    def test_ultra_thread_start_uses_the_same_child_limit_as_launch(self) -> None:
+        self.driver.thread_id = None
+        self.driver.resume_thread_id = None
+        self.driver.challenge = self.challenge
+        self.driver.rate_limit_context = None
+        self.manifest.configuration = ModelConfiguration("codex", "gpt-6-sol", "ultra")
+        request = AsyncMock(return_value={"thread": {"id": "new-thread"}})
+        with (
+            patch.object(worker, "CODEX_ULTRA_MAX_SUBAGENTS", 2),
+            patch.object(self.driver, "_provider_model", return_value="gpt-6-sol"),
+            patch.object(self.driver, "_sandbox_parameters", return_value={}),
+        ):
+            self.driver.request = request
+            self.assertEqual(asyncio.run(self.driver._thread(self.manifest)), "new-thread")
+        params = request.await_args.args[1]
+        self.assertEqual(params["config"]["agents"], {
+            "enabled": True,
+            "max_concurrent_threads_per_session": 2,
+        })
+
+    def test_offline_remote_request_gets_one_same_session_review(self) -> None:
+        self.manifest.remote_mode = "none"
+        self.driver.thread_id = "existing-thread"
+        self.driver.remote_request_reviewed = asyncio.Event()
+        prompts: list[str] = []
+
+        async def turn(_manifest, prompt, _schema, _cancelled, _progress):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                record_request("A local emulator lacks a device.", self.challenge)
+                return {}
+            self.assertTrue(self.driver.remote_request_reviewed.is_set())
+            self.assertFalse((self.challenge / ".remote-request").exists())
+            return {"flag": "CTF{verified}"}
+
+        result, error = self._run(turn, nudges=0)
+        self.assertIsNone(error)
+        self.assertEqual(result["flag"], "CTF{verified}")
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("provisional", prompts[1])
+
+    def test_second_offline_remote_request_stops_the_watcher(self) -> None:
+        async def scenario() -> tuple[bool, bool, str]:
+            requested, cancelled, reviewed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            result: dict[str, object] = {}
+            request_path = self.challenge / ".remote-request"
+            watcher = asyncio.create_task(worker._watch_remote_request(
+                request_path, requested, cancelled, result, reviewed,
+            ))
+            try:
+                record_request("First unverified request", self.challenge)
+                await asyncio.sleep(0.06)
+                self.assertFalse(requested.is_set())
+                request_path.unlink()
+                reviewed.set()
+                record_request("Verified missing endpoint", self.challenge)
+                await asyncio.wait_for(requested.wait(), 1)
+                await watcher
+                return requested.is_set(), cancelled.is_set(), result["note"]
+            finally:
+                watcher.cancel()
+
+        self.assertEqual(
+            asyncio.run(scenario()),
+            (True, True, "Verified missing endpoint"),
+        )
+
+    def test_offline_remote_confirmation_reaches_terminal_handoff(self) -> None:
+        async def scenario() -> tuple[int, str]:
+            self.manifest.remote_mode = "none"
+            self.driver.remote_request_reviewed = asyncio.Event()
+            requested, cancelled = asyncio.Event(), asyncio.Event()
+            result: dict[str, object] = {}
+            watcher = asyncio.create_task(worker._watch_remote_request(
+                self.challenge / ".remote-request",
+                requested, cancelled, result, self.driver.remote_request_reviewed,
+            ))
+            calls = 0
+
+            async def turn(_manifest, _prompt, _schema, _cancelled, _progress):
+                nonlocal calls
+                calls += 1
+                record_request(f"Missing endpoint check {calls}", self.challenge)
+                if calls == 1:
+                    return {}
+                await cancelled.wait()
+                raise asyncio.CancelledError
+
+            self.driver._turn = turn
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(self.driver.run_discovery(
+                        self.manifest, self.challenge, cancelled, self._progress,
+                    ), 2)
+                self.assertTrue(requested.is_set())
+                return calls, result["note"]
+            finally:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+
+        self.assertEqual(asyncio.run(scenario()), (2, "Missing endpoint check 2"))
 
     def _run(self, turn, *, nudges: int = 1, extra: int = 2) -> tuple[dict[str, str] | None, str | None]:
         self.driver._turn = turn

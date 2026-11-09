@@ -1957,6 +1957,7 @@ async def _watch_remote_request(
     requested: asyncio.Event,
     cancelled: asyncio.Event,
     result: dict[str, Any],
+    reviewed: asyncio.Event,
 ) -> None:
     while not cancelled.is_set():
         try:
@@ -1966,7 +1967,7 @@ async def _watch_remote_request(
             requested.set()
             cancelled.set()
             return
-        if note is not None:
+        if note is not None and reviewed.is_set():
             result["note"] = note
             requested.set()
             cancelled.set()
@@ -2353,8 +2354,9 @@ def safe_codex_failure(payload: object) -> dict[str, Any]:
     """Discard provider prose and retain only reviewed Codex error fields."""
 
     result: dict[str, Any] = {}
-    if isinstance(payload, Mapping) and payload.get("code") in _SAFE_CODEX_WORKER_FAILURE_CODES:
-        result["code"] = payload["code"]
+    code = payload.get("code") if isinstance(payload, Mapping) else None
+    if isinstance(code, str) and code in _SAFE_CODEX_WORKER_FAILURE_CODES:
+        result["code"] = code
     info = payload.get("codexErrorInfo") if isinstance(payload, Mapping) else None
     kind, status = codex_error_kind(payload)
     if kind in _CODEX_SCALAR_ERROR_KINDS and isinstance(info, str):
@@ -2363,7 +2365,34 @@ def safe_codex_failure(payload: object) -> dict[str, Any]:
         result["codexErrorInfo"] = {kind: {"httpStatusCode": status}}
     if not result:
         result["code"] = "provider_error"
+    if isinstance(payload, Mapping) and type(payload.get("retryable")) is bool:
+        result["retryable"] = payload["retryable"]
     return result
+
+
+def safe_provider_failure_diagnostic(payload: object, driver: object) -> dict[str, Any]:
+    """Summarize a failed Codex turn without retaining provider prose or tokens."""
+
+    diagnostic: dict[str, Any] = {}
+    phase = getattr(driver, "provider_failure_phase", None)
+    if isinstance(phase, str) and phase in {"startup", "thread_start", "thread_resume", "turn_start", "turn_stream"}:
+        diagnostic["phase"] = phase
+    kind, status = codex_error_kind(payload)
+    if kind is not None:
+        diagnostic["kind"] = kind
+    if status is not None:
+        diagnostic["http_status"] = status
+    retries = getattr(driver, "provider_retry_events", None)
+    if type(retries) is int and 0 <= retries <= 32:
+        diagnostic["retry_events"] = retries
+    same_session_retry = getattr(driver, "same_session_retry_attempted", None)
+    if type(same_session_retry) is bool:
+        diagnostic["same_session_retry"] = same_session_retry
+    process = getattr(driver, "process", None)
+    exit_code = getattr(process, "returncode", None)
+    if type(exit_code) is int and -255 <= exit_code <= 255:
+        diagnostic["cli_exit_code"] = exit_code
+    return diagnostic
 
 
 def provider_retry_progress(
@@ -2972,6 +3001,9 @@ class CodexAppServer:
         self.reader_task = None
         self.reader_stopped = asyncio.Event()
         self.reader_failure_code = "provider_stream_closed"
+        self.provider_failure_phase = "startup"
+        self.provider_retry_events = 0
+        self.same_session_retry_attempted = False
         self.stderr_task = None
         self.stderr_categories: set[str] = set()
         self.safe_startup_stderr: str | None = None
@@ -4071,6 +4103,7 @@ print(json.dumps(result,separators=(",",":")))
         if self.resume_thread_id:
             original_id = self.resume_thread_id
             try:
+                self.provider_failure_phase = "thread_resume"
                 restored = await self.request(
                     "thread/resume", {"threadId": original_id, "excludeTurns": True,
                         **self._sandbox_parameters("thread/resume", self.challenge,
@@ -4115,7 +4148,7 @@ print(json.dumps(result,separators=(",",":")))
                 "features": {"multi_agent": manifest.configuration.reasoning_effort == "ultra" and not is_refinement},
                 "agents": {
                     "enabled": manifest.configuration.reasoning_effort == "ultra" and not is_refinement,
-                    "max_concurrent_threads_per_session": 4,
+                    "max_concurrent_threads_per_session": CODEX_ULTRA_MAX_SUBAGENTS,
                 },
             },
         }
@@ -4128,6 +4161,7 @@ print(json.dumps(result,separators=(",",":")))
         if manifest.configuration.service_tier:
             params["serviceTier"] = manifest.configuration.service_tier
         try:
+            self.provider_failure_phase = "thread_start"
             result = await self.request("thread/start", params)
         except AppServerFailure as exc:
             raise AppServerFailure(
@@ -4325,6 +4359,7 @@ print(json.dumps(result,separators=(",",":")))
             params["serviceTier"] = manifest.configuration.service_tier
             params["serviceTierForTurn"] = manifest.configuration.service_tier
         try:
+            self.provider_failure_phase = "turn_start"
             response = await self.request("turn/start", params)
         except AppServerFailure as exc:
             if self.guidance_mailbox is not None:
@@ -4349,6 +4384,8 @@ print(json.dumps(result,separators=(",",":")))
         next_heartbeat = loop.time() + MODEL_WAIT_HEARTBEAT_SECONDS
         provider_retry_started = None
         provider_retry_events = 0
+        self.provider_retry_events = 0
+        self.provider_failure_phase = "turn_stream"
         last_provider_error: object = {"code": "provider_unavailable"}
         latest_rate_limit = self.rate_limit_context
         while True:
@@ -4681,6 +4718,7 @@ print(json.dumps(result,separators=(",",":")))
                 if will_retry is not True:
                     raise AppServerFailure({"code": "invalid_response"})
                 provider_retry_events += 1
+                self.provider_retry_events = provider_retry_events
                 provider_retry_started = provider_retry_started or loop.time()
                 last_provider_error = failure_with_rate_limit(failure, latest_rate_limit)
                 await progress(provider_retry_progress(
@@ -4933,7 +4971,12 @@ is a fresh isolated job; do not repeat completed work.
         last_allowed_attempt = MAX_SOLVE_NUDGES
         progress_nudges = 0
         transient_resume_attempted = False
+        self.same_session_retry_attempted = False
         recovery_prompt = ""
+        remote_request_reviewed = getattr(self, "remote_request_reviewed", None)
+        if remote_mode == "none" and remote_request_reviewed is None:
+            remote_request_reviewed = asyncio.Event()
+            self.remote_request_reviewed = remote_request_reviewed
         while MAX_SOLVE_NUDGES == 0 or attempt <= last_allowed_attempt:
             current_attempt = attempt
             attempt += 1
@@ -4979,6 +5022,7 @@ is a fresh isolated job; do not repeat completed work.
                 # in this exact thread can use their files and observations;
                 # repeating the original solve prompt would waste that work.
                 transient_resume_attempted = True
+                self.same_session_retry_attempted = True
                 attempt -= 1
                 recovery_prompt = (
                     "The previous turn ended with a temporary provider error. "
@@ -5029,6 +5073,33 @@ is a fresh isolated job; do not repeat completed work.
                 challenge / ".flag-candidate"
             )
             if candidate is None:
+                request_path = challenge / ".remote-request"
+                if (
+                    remote_mode == "none"
+                    and remote_request_reviewed is not None
+                    and not remote_request_reviewed.is_set()
+                    and _validated_remote_request(request_path) is not None
+                ):
+                    # A first request contradicts the user's explicit offline
+                    # setting. Keep this exact provider session and require one
+                    # independent check before a request can stop the job.
+                    request_path.unlink(missing_ok=True)
+                    remote_request_reviewed.set()
+                    attempt -= 1
+                    recovery_prompt = (
+                        "Your request for missing remote input is provisional: "
+                        "this challenge is explicitly configured without a remote. "
+                        "Before requesting it again, verify a concrete behavior "
+                        "in the supplied files that makes an external resource "
+                        "indispensable, and test one plausible offline path. "
+                        "A missing device in local emulation, an absent flag, "
+                        "or an untested guess is insufficient. Record the observed "
+                        "behavior, the local test and the exact missing input "
+                        "in notes/NEXT.md. If that evidence holds, run "
+                        "request-remote once more; otherwise continue solving "
+                        "locally without repeating the previous work."
+                    )
+                    continue
                 # Additional model turns alone do not prove the agent has
                 # tested anything. Only a completed root tool can authorize
                 # MAX_REQUIRED after the agent records its blocker in NEXT.md.
@@ -7872,12 +7943,17 @@ class SolverWorker:
                     )
                 flag = manifest.verified_flag
             if not flag:
+                remote_request_reviewed = asyncio.Event()
+                if manifest.remote_mode != "none":
+                    remote_request_reviewed.set()
+                driver.remote_request_reviewed = remote_request_reviewed
                 remote_request_watcher = asyncio.create_task(
                     _watch_remote_request(
                         scratch / ".remote-request",
                         remote_requested,
                         cancel_event,
                         remote_request_result,
+                        remote_request_reviewed,
                     )
                 )
                 writer.emit("status", status="running")
@@ -8196,6 +8272,16 @@ class SolverWorker:
                     and getattr(driver, "chatgpt_preflight_verified", False)
                 ),
             )
+            if (
+                isinstance(exc, AppServerFailure)
+                and manifest is not None
+                and manifest.configuration.provider == "codex"
+                and driver is not None
+            ):
+                error = replace(
+                    error,
+                    diagnostic=safe_provider_failure_diagnostic(raw, driver),
+                )
             if writer:
                 current = _load_optional_state(active, manifest.job_id)
                 flag = current.get("flag") if isinstance(current.get("flag"), str) else None
