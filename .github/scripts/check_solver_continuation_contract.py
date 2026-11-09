@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -231,6 +232,39 @@ class ContinuationContractTests(unittest.TestCase):
         self.assertEqual((new_root / WORKDIR_REL / "solver.py").read_text(), "print('candidate')")
         self.assertFalse((new_root / "home" / "sessions").exists())
         self.assertFalse((new_root / "home" / "claude").exists())
+
+    def test_small_derived_tmp_files_survive_retry_but_caches_and_secrets_do_not(self) -> None:
+        derived = self.workdir / "tmp" / "gate-models"
+        derived.mkdir(parents=True)
+        (derived / "events.bin").write_bytes(b"reusable-analysis-data")
+        (self.workdir / "solver.py").write_text(
+            "from pathlib import Path\nprint((Path(__file__).parent / 'tmp/gate-models/events.bin').read_text())\n",
+            encoding="utf-8",
+        )
+        (derived / ".env").write_text("secret", encoding="utf-8")
+        try:
+            (derived / "link.bin").symlink_to(derived / "events.bin")
+        except OSError:  # Windows without Developer Mode cannot create links.
+            pass
+        cache = self.workdir / "tmp" / "cache"
+        cache.mkdir()
+        (cache / "large.bin").write_bytes(b"cache")
+        (self.workdir / "tmp" / "oversize.bin").write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+        meta = self._capture("codex")
+        staged = self._stage(meta, "workspace", "codex")
+        new_root = self._new_root()
+        self.assertTrue(restore_snapshot(staged, new_root, read_input(staged, "claude")))
+        retained = new_root / WORKDIR_REL / "tmp"
+        self.assertEqual((retained / "gate-models" / "events.bin").read_bytes(), b"reusable-analysis-data")
+        replay = subprocess.run(
+            [sys.executable, "solver.py"], cwd=new_root / WORKDIR_REL,
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(replay.stdout.strip(), "reusable-analysis-data")
+        self.assertFalse((retained / "gate-models" / ".env").exists())
+        self.assertFalse((retained / "gate-models" / "link.bin").exists())
+        self.assertFalse((retained / "cache" / "large.bin").exists())
+        self.assertFalse((retained / "oversize.bin").exists())
 
     def test_claude_native_resume_restores_project_session(self) -> None:
         meta = self._capture("claude")

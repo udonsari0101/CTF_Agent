@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS challenges (
     previous_status TEXT, completion_source TEXT CHECK(completion_source IN ('manual','agent') OR completion_source IS NULL),
     flag TEXT, notes TEXT NOT NULL DEFAULT '', remote TEXT NOT NULL DEFAULT '',
     remote_mode TEXT NOT NULL DEFAULT 'unknown' CHECK(remote_mode IN ('unknown','none','endpoint')),
+    remote_origin TEXT NOT NULL DEFAULT 'legacy' CHECK(remote_origin IN ('legacy','description','explicit')),
     canonical_name TEXT,
     deleted_at TEXT,
     ctfd_id INTEGER, ctfd_url TEXT,
@@ -272,6 +273,10 @@ def initialize(settings: Settings) -> None:
             )
             connection.execute(
                 "UPDATE challenges SET remote_mode='endpoint' WHERE TRIM(remote)<>''"
+            )
+        if "remote_origin" not in challenge_columns:
+            connection.execute(
+                "ALTER TABLE challenges ADD COLUMN remote_origin TEXT NOT NULL DEFAULT 'legacy'"
             )
         # Before this marker was introduced, CTFd imports with an explicitly
         # empty connection_info were stored as ``unknown``.  That value is

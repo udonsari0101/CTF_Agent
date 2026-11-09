@@ -1,5 +1,7 @@
 # Skill Module: rev (reverse engineering)
 
+When a derived event table or gate model is needed for a later inverse step, store the small reusable result in `artifacts/`, not only in an ephemeral tool cache. Keep the generation script and a command to rebuild larger data. Before funding another broad trace or symbolic lift after a retry, check the restored artifacts and `notes/NEXT.md` so the same expensive extraction is not repeated.
+
 Field manual for cracking a checker binary/artifact. The win condition is **inverting the check to produce the flag** — keygen / constraint-solve, not reading every instruction. Locate the decision point, model it, solve it, then feed the candidate back through the real binary.
 
 **Time-to-first-evidence:** if the artifact produces a deterministic trace, capture, or checksum for an input, run it on a control input and one changed-byte input *before* broad decompilation. Record the first changed output and the input-dependent state or branch nearest it. A stripped/static binary can spend minutes in Ghidra's import analysis even when only one function was requested; use a quick targeted disassembly or concrete trace to decide which function merits that cost. Give one agent ownership of any large decompiler/symbolic run and give another agent a genuinely different experiment, not a second copy of the same import.

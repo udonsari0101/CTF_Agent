@@ -136,6 +136,7 @@ RUN curl --fail --silent --show-error --location --retry 3 \
     && mv /opt/ghidra_${GHIDRA_VERSION}_PUBLIC /opt/ghidra \
     && chmod 0555 /opt/ghidra/support/analyzeHeadless \
     && ln -s /opt/ghidra/support/analyzeHeadless /usr/local/bin/ghidra_headless \
+    && rm -rf /opt/ghidra/docs /opt/jdk-21/jmods \
     && curl --fail --silent --show-error --location --retry 3 \
         --output /tmp/jadx.zip \
         "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
@@ -153,7 +154,8 @@ COPY --chown=0:0 --chmod=0444 deploy/DecompileAll.java deploy/DecompileFn.java /
 
 WORKDIR /app
 COPY requirements.txt requirements-ctf.txt ./
-RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-ctf.txt
+RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-ctf.txt \
+    && find /usr/local/lib/python3.12/site-packages -type d -name __pycache__ -prune -exec rm -rf {} +
 
 # Keep model CLIs last: changing them must not invalidate the large system,
 # Ghidra/JDK/JADX or Python dependency layers.

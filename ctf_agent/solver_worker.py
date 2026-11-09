@@ -1958,6 +1958,7 @@ async def _watch_remote_request(
     cancelled: asyncio.Event,
     result: dict[str, Any],
     reviewed: asyncio.Event,
+    evidence_ready: Callable[[], bool] = lambda: True,
 ) -> None:
     while not cancelled.is_set():
         try:
@@ -1967,12 +1968,32 @@ async def _watch_remote_request(
             requested.set()
             cancelled.set()
             return
-        if note is not None and reviewed.is_set():
+        if note is not None and reviewed.is_set() and evidence_ready():
             result["note"] = note
             requested.set()
             cancelled.set()
             return
         await asyncio.sleep(FLAG_WATCH_INTERVAL_SECONDS)
+
+
+def _offline_remote_review_has_new_evidence(driver: object, challenge: Path) -> bool:
+    """A repeat request needs a new local probe and a changed handoff note.
+
+    The request-remote command itself is counted as a tool, hence the +2.
+    This does not prove that an endpoint exists; it prevents an unchanged
+    missing-device assumption from immediately ending an offline solve.
+    """
+
+    previous = getattr(driver, "remote_request_review_tool_count", None)
+    if type(previous) is not int:
+        return False
+    if getattr(driver, "_solve_tool_count", 0) < previous + 2:
+        return False
+    try:
+        current = _solver_notes(challenge)
+    except (OSError, WorkerRefusal):
+        return False
+    return bool(current and current != getattr(driver, "remote_request_review_notes", ""))
 
 
 async def _watch_flag_candidate(
@@ -4970,6 +4991,7 @@ is a fresh isolated job; do not repeat completed work.
         attempt = 0
         last_allowed_attempt = MAX_SOLVE_NUDGES
         progress_nudges = 0
+        unsupported_remote_repeats = 0
         transient_resume_attempted = False
         self.same_session_retry_attempted = False
         recovery_prompt = ""
@@ -5085,6 +5107,8 @@ is a fresh isolated job; do not repeat completed work.
                     # independent check before a request can stop the job.
                     request_path.unlink(missing_ok=True)
                     remote_request_reviewed.set()
+                    self.remote_request_review_tool_count = self._solve_tool_count
+                    self.remote_request_review_notes = written_notes
                     attempt -= 1
                     recovery_prompt = (
                         "Your request for missing remote input is provisional: "
@@ -5098,6 +5122,31 @@ is a fresh isolated job; do not repeat completed work.
                         "in notes/NEXT.md. If that evidence holds, run "
                         "request-remote once more; otherwise continue solving "
                         "locally without repeating the previous work."
+                    )
+                    continue
+                if (
+                    remote_mode == "none"
+                    and remote_request_reviewed is not None
+                    and remote_request_reviewed.is_set()
+                    and _validated_remote_request(request_path) is not None
+                    and not _offline_remote_review_has_new_evidence(self, challenge)
+                ):
+                    request_path.unlink(missing_ok=True)
+                    unsupported_remote_repeats += 1
+                    if unsupported_remote_repeats >= 3:
+                        raise WorkerRefusal(
+                            "unsupported_remote_request",
+                            "원격 대상이 없는 문제에서 추가 입력이 반드시 필요하다는 새 근거를 확인하지 못했습니다.",
+                            category="solver", retryable=False, stage="solve",
+                        )
+                    attempt -= 1
+                    recovery_prompt = (
+                        "The repeated request still has no new local test and "
+                        "updated evidence in notes/NEXT.md. The missing local "
+                        "device or emulator behavior alone does not establish "
+                        "an indispensable external endpoint. Continue from "
+                        "the existing analysis, run a distinct offline test, "
+                        "and record its observation before requesting input."
                     )
                     continue
                 # Additional model turns alone do not prove the agent has
@@ -7954,6 +8003,10 @@ class SolverWorker:
                         cancel_event,
                         remote_request_result,
                         remote_request_reviewed,
+                        lambda: (
+                            manifest.remote_mode != "none"
+                            or _offline_remote_review_has_new_evidence(driver, scratch)
+                        ),
                     )
                 )
                 writer.emit("status", status="running")

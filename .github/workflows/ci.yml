@@ -219,6 +219,8 @@ jobs:
         run: python .github/scripts/check_ctfd_sync_provenance.py
       - name: Check CTFd remote addresses in challenge descriptions
         run: python .github/scripts/check_ctfd_body_remote.py
+      - name: Check manually entered remote addresses in challenge descriptions
+        run: python .github/scripts/check_manual_body_remote.py
       - name: Check CTFd staged-file reuse
         run: python .github/scripts/check_ctfd_staged_reuse.py
       - name: Check write-up publication boundaries
