@@ -52,7 +52,7 @@ Run this loop, **branching selectively** — take the steps the challenge needs,
 **Meta-cognition — interleave this throughout (it's how a CTF player actually thinks):**
 - Question your assumptions: something you dismissed as "this surely won't work" — *test it*; something you assumed "will obviously work" — *verify it actually does*.
 - **Re-scan the primitives you already hold** for one you overlooked, then **re-chain** them a different way into an exploit. Often the missing step is combining two primitives you already have, not finding a new bug.
-- If ~2–3 attempts or ~20 min pass with no progress: write 3 concrete hypotheses for *why* in `notes/NEXT.md` and test each with a specific experiment (ask the debugger a precise question — "did we reach line X?", "what's in `$rdi`?" — never "why doesn't this work?"). Then switch tactic (grep→script, reason→run/fuzz, local→remote).
+- After two inconclusive expensive experiments or roughly 8–10 minutes without a new verified observation, pause briefly and compare the shortest remaining paths to the flag. Record the current result, one falsifying test for each leading hypothesis, and the next chosen experiment in `notes/NEXT.md`. Stop duplicate branches and switch tactics if the current path is no longer the cheapest. Continue a path that is producing new evidence; this is a review point, not a hard solve timeout.
 
 ---
 

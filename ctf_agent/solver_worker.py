@@ -120,6 +120,9 @@ MAX_TERMINAL_PROVIDER_SIGNAL_EVENTS = 32
 # completed tools and updated work notes; zero remains unlimited.
 MAX_SOLVE_NUDGES = _nonnegative_int_setting("CTF_SOLVER_MAX_NUDGES", 3)
 MAX_PROGRESS_NUDGES = _nonnegative_int_setting("CTF_SOLVER_PROGRESS_NUDGES", 2)
+CODEX_ULTRA_MAX_SUBAGENTS = _nonnegative_int_setting("CTF_CODEX_ULTRA_MAX_SUBAGENTS", 2)
+if not 1 <= CODEX_ULTRA_MAX_SUBAGENTS <= 16:
+    raise RuntimeError("CTF_CODEX_ULTRA_MAX_SUBAGENTS must be between 1 and 16")
 MAX_SOFT_MESSAGE_BYTES = 64 * 1024
 FLAG_WATCH_INTERVAL_SECONDS = 0.025
 CODEX_LAUNCHER = Path("/usr/local/libexec/ctf-agent-codex-launcher")
@@ -3204,7 +3207,7 @@ class CodexAppServer:
             ))
         if multi_agent:
             command.extend((
-                "-c", "agents.max_concurrent_threads_per_session=4",
+                "-c", f"agents.max_concurrent_threads_per_session={CODEX_ULTRA_MAX_SUBAGENTS}",
                 "--enable", "multi_agent",
             ))
         else:
@@ -4836,9 +4839,13 @@ if it is contradicted. Do not write the final write-up in this turn.
             result_bridge += """
 
 Ultra is enabled. Delegate independent analysis or verification to Codex
-subagents when that can reduce wall-clock time. Keep a single owner for each
-file or remote action, collect the results, and continue the solve in this
-same workspace. Submit the verified flag through submit-flag yourself.
+subagents only when that can reduce wall-clock time. First identify the
+smallest observable path to a verified flag; do not split a still-unknown
+single chain across agents. Give each child a distinct question, an expected
+artifact or test, and a stop condition. Keep one owner for each file or remote
+action, collect results before opening another branch, and stop parallel
+branches that repeat the same evidence. Continue in this same workspace and
+submit the verified flag through submit-flag yourself.
 """
         elif getattr(configuration, "provider", None) == "claude" and getattr(configuration, "ultracode", False):
             result_bridge += """
