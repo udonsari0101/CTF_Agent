@@ -2,6 +2,8 @@
 
 Field manual for cracking a checker binary/artifact. The win condition is **inverting the check to produce the flag** — keygen / constraint-solve, not reading every instruction. Locate the decision point, model it, solve it, then feed the candidate back through the real binary.
 
+**Time-to-first-evidence:** if the artifact produces a deterministic trace, capture, or checksum for an input, run it on a control input and one changed-byte input *before* broad decompilation. Record the first changed output and the input-dependent state or branch nearest it. A stripped/static binary can spend minutes in Ghidra's import analysis even when only one function was requested; use a quick targeted disassembly or concrete trace to decide which function merits that cost. Give one agent ownership of any large decompiler/symbolic run and give another agent a genuinely different experiment, not a second copy of the same import.
+
 ## Triage: fingerprint before opening a decompiler
 ```
 file ./chal
@@ -43,12 +45,18 @@ pdf @ sym.main
 ```
 The comparison just before the win branch is your target. Capture the **good addr** (prints "Correct") and **bad addr** (prints "Wrong") — angr needs both. Record the two addrs + the check-fn entry in **`notes/VULN.md`** (they *are* the recovered check/key-condition); keep "what the binary does" in `notes/ANALYSIS.md` and tried-tools/dead-ends in `notes/NEXT.md`.
 
-Ghidra headless when you want the algorithm as C (script it; don't camp in the GUI):
+Ghidra headless when a *specific* function needs C. Find its name or Ghidra entry address first; keep the project in `tmp/` so later functions reuse the completed import. An exploratory import has a bounded wall-clock trial, and a timeout is **not** evidence that the function is irrelevant. Record the partial log and switch to a concrete trace or targeted disassembly unless there is a reason to fund a longer import:
 ```
-$GHIDRA/support/analyzeHeadless /tmp/proj rev -import ./chal \
-  -postScript DecompileAll.java -deleteProject
+mkdir -p tmp/ghidra-project
+timeout -k 5s 90s ghidra_headless tmp/ghidra-project rev -import ./chal \
+  -analysisTimeoutPerFile 60 -max-cpu 2 \
+  -postScript DecompileFn.java <ghidra-function-name-or-entry-address> tmp/check.c \
+  >tmp/ghidra-import.log 2>&1
+# Only after the import completed successfully; do not reuse a partial/locked project:
+ghidra_headless tmp/ghidra-project rev -process chal -noanalysis \
+  -postScript DecompileFn.java <next-function> tmp/next.c
 ```
-`objdump -d -M intel ./chal` for a quick linear pass.
+Use the actual Ghidra entry address, which can differ from the ELF file offset. A timeout returns 124; check the exit code and output file before reading C. `DecompileAll.java` is a deliberate later choice for a small target, not the default first pass. `r2 -q -c 's entry0; af; pdf' ./chal` or a bounded `objdump -d -M intel ./chal` is a quicker first look at a static binary.
 
 ## Pick the cheapest tool that fits (do NOT read every instruction)
 Classify the check, then solve at the lowest tier that works:

@@ -359,13 +359,25 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     )
     assert go_symbols.returncode == 0, go_symbols.stderr.strip()[-3000:]
     assert json.loads(go_symbols.stdout).get("Arch") == "amd64"
+    ghidra_project = tool_tmp / "ghidra-project"
+    ghidra_project.mkdir()
+    ghidra_output = tool_tmp / "tmp" / "main.c"
     ghidra_result = subprocess.run(
-        ["ghidra_headless", str(tool_tmp), "smoke-project", "-import", str(native_binary),
-         "-postScript", "DecompileAll.java", "-deleteProject"],
+        ["ghidra_headless", str(ghidra_project), "smoke-project", "-import", str(native_binary),
+         "-analysisTimeoutPerFile", "60", "-max-cpu", "2",
+         "-postScript", "DecompileFn.java", "main", str(ghidra_output)],
         capture_output=True, text=True, timeout=180, cwd=tool_tmp, env=tool_env,
     )
-    assert ghidra_result.returncode == 0, ghidra_result.stderr[-3000:]
-    assert "main(" in (tool_tmp / "tmp" / "decompiled.c").read_text(encoding="utf-8")
+    assert ghidra_result.returncode == 0, (ghidra_result.stdout + ghidra_result.stderr)[-3000:]
+    assert "main(" in ghidra_output.read_text(encoding="utf-8")
+    reused_output = tool_tmp / "tmp" / "main-reused.c"
+    reused_result = subprocess.run(
+        ["ghidra_headless", str(ghidra_project), "smoke-project", "-process", native_binary.name,
+         "-noanalysis", "-postScript", "DecompileFn.java", "main", str(reused_output)],
+        capture_output=True, text=True, timeout=90, cwd=tool_tmp, env=tool_env,
+    )
+    assert reused_result.returncode == 0, (reused_result.stdout + reused_result.stderr)[-3000:]
+    assert reused_output.read_text(encoding="utf-8") == ghidra_output.read_text(encoding="utf-8")
     gp_result = subprocess.run(
         ["gp", "-q", "-f"], input="factor(91)\n", capture_output=True,
         text=True, timeout=15, cwd=tool_tmp, env=tool_env,
