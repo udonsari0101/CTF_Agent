@@ -6,7 +6,9 @@ import asyncio
 import json
 import sys
 import tempfile
+import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,15 +17,70 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from ctf_agent.solver import normalize_provider_failure  # noqa: E402
+from ctf_agent.solver_exchange import EXCHANGE_PROTOCOL, ExchangeError, _validate_event  # noqa: E402
 from ctf_agent.solver_worker import (  # noqa: E402
     AppServerFailure,
     CodexAppServer,
     PlatformAttestation,
     SolverWorker,
+    failure_with_rate_limit,
+    safe_provider_failure_diagnostic,
 )
 
 
 class SolverFailureDiagnosticTests(unittest.TestCase):
+    def test_nonretryable_unknown_provider_error_stays_nonretryable(self) -> None:
+        payload = failure_with_rate_limit(
+            {"code": "provider_error", "retryable": False, "message": "secret"},
+            None,
+        )
+        self.assertEqual(payload, {"code": "provider_error", "retryable": False})
+        error = normalize_provider_failure(payload, stage="solve")
+        self.assertFalse(error.retryable)
+        self.assertNotIn("secret", json.dumps(error.public()))
+
+    def test_provider_diagnostic_keeps_only_fixed_non_secret_fields(self) -> None:
+        payload = {
+            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 503}},
+            "message": "secret-provider-text",
+        }
+        driver = SimpleNamespace(
+            provider_failure_phase="turn_stream",
+            provider_retry_events=2,
+            same_session_retry_attempted=True,
+            process=SimpleNamespace(returncode=1),
+        )
+        diagnostic = safe_provider_failure_diagnostic(payload, driver)
+        error = replace(
+            normalize_provider_failure(payload, stage="solve"),
+            diagnostic=diagnostic,
+        ).public()
+        self.assertEqual(error["diagnostic"], {
+            "phase": "turn_stream",
+            "kind": "httpConnectionFailed",
+            "http_status": 503,
+            "retry_events": 2,
+            "same_session_retry": True,
+            "cli_exit_code": 1,
+        })
+        self.assertNotIn("secret-provider-text", json.dumps(error))
+        event = {
+            "protocol": EXCHANGE_PROTOCOL,
+            "job_id": "a" * 32,
+            "sequence": 1,
+            "kind": "error",
+            "created_at": time.time(),
+            "error": error,
+            "terminal": False,
+        }
+        self.assertEqual(_validate_event(event, "a" * 32, 1), event)
+        event["error"]["diagnostic"]["message"] = "secret-provider-text"
+        with self.assertRaises(ExchangeError):
+            _validate_event(event, "a" * 32, 1)
+        event["error"]["diagnostic"] = {"kind": []}
+        with self.assertRaises(ExchangeError):
+            _validate_event(event, "a" * 32, 1)
+
     def test_unanswered_request_records_reader_end(self) -> None:
         async def scenario() -> dict:
             driver = CodexAppServer(Path("/tmp/codex-home"), Path("/tmp/challenge"))

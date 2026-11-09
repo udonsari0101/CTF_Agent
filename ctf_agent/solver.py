@@ -29,6 +29,15 @@ from .writeup_publication import contains_internal_operation, public_solution_no
 _OPAQUE_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SAFE_SETTING = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}\Z")
 _SAFE_PROVIDER_CODE = re.compile(r"(?:TAC|CVP)(?:[-_][A-Z0-9]{1,12})?\Z", re.IGNORECASE)
+_PROVIDER_DIAGNOSTIC_PHASES = frozenset({"startup", "thread_start", "thread_resume", "turn_start", "turn_stream"})
+_PROVIDER_DIAGNOSTIC_KINDS = frozenset({
+    "contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded",
+    "rateLimitExceeded", "serverOverloaded", "cyberPolicy",
+    "misalignmentPolicyViolation", "internalServerError", "unauthorized",
+    "badRequest", "threadRollbackFailed", "sandboxError", "other",
+    "httpConnectionFailed", "responseStreamConnectionFailed",
+    "responseStreamDisconnected", "responseTooManyFailedAttempts",
+})
 _PROVIDER_CODE_IN_TEXT = re.compile(
     r"(?<![A-Za-z0-9])((?:TAC|CVP)(?:[-_][A-Za-z0-9]{1,12})?)(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -567,6 +576,29 @@ class RefusingAdapter:
         return None
 
 
+def normalize_provider_diagnostic(value: object) -> dict[str, Any] | None:
+    """Keep only fixed, non-secret provider failure discriminators."""
+
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, Any] = {}
+    phase = value.get("phase")
+    kind = value.get("kind")
+    if isinstance(phase, str) and phase in _PROVIDER_DIAGNOSTIC_PHASES:
+        result["phase"] = phase
+    if isinstance(kind, str) and kind in _PROVIDER_DIAGNOSTIC_KINDS:
+        result["kind"] = kind
+    if type(value.get("http_status")) is int and 100 <= value["http_status"] <= 599:
+        result["http_status"] = value["http_status"]
+    if type(value.get("retry_events")) is int and 0 <= value["retry_events"] <= 32:
+        result["retry_events"] = value["retry_events"]
+    if type(value.get("same_session_retry")) is bool:
+        result["same_session_retry"] = value["same_session_retry"]
+    if type(value.get("cli_exit_code")) is int and -255 <= value["cli_exit_code"] <= 255:
+        result["cli_exit_code"] = value["cli_exit_code"]
+    return result or None
+
+
 @dataclass(frozen=True, slots=True)
 class SolverError:
     code: str
@@ -577,6 +609,7 @@ class SolverError:
     provider_code: str | None = None
     requirements: tuple[str, ...] = ()
     quota: Mapping[str, Any] | None = field(default=None, repr=False)
+    diagnostic: Mapping[str, Any] | None = field(default=None, repr=False)
 
     def public(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -593,6 +626,9 @@ class SolverError:
         quota = normalize_rate_limit_context(self.quota)
         if quota:
             result["quota"] = quota
+        diagnostic = normalize_provider_diagnostic(self.diagnostic)
+        if diagnostic:
+            result["diagnostic"] = diagnostic
         return result
 
 
@@ -1467,5 +1503,6 @@ __all__ = [
     "SolverLookupError",
     "normalize_rate_limit_context",
     "normalize_provider_failure",
+    "normalize_provider_diagnostic",
     "normalize_provider_soft_refusal",
 ]

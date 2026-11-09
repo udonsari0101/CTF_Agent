@@ -35,7 +35,7 @@ from typing import Any, Callable, Iterator, Mapping
 
 from .remote_relay import RemoteAccessError, parse_connection_info
 from .solver_continuation import ContinuationInvalid, stage_workspace_only
-from .solver import ModelConfiguration, SelectedAccount, normalize_rate_limit_context
+from .solver import ModelConfiguration, SelectedAccount, normalize_provider_diagnostic, normalize_rate_limit_context
 from .solver_worker import (
     EXCHANGE_PROTOCOL,
     WORKER_ATTACHMENT_ACTIVITY_SOURCE,
@@ -6862,7 +6862,7 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
     if value.get("error") is not None:
         error = value["error"]
         required = {"code", "message", "stage", "category", "retryable"}
-        if not isinstance(error, dict) or not required.issubset(error) or set(error) - (required | {"provider_code", "requirements", "quota"}):
+        if not isinstance(error, dict) or not required.issubset(error) or set(error) - (required | {"provider_code", "requirements", "quota", "diagnostic"}):
             raise ExchangeError("invalid_worker_error", "worker 오류 결과를 확인할 수 없습니다.", category="safety")
         for key in ("code", "message", "stage", "category"):
             if not isinstance(error.get(key), str) or not error[key] or len(error[key]) > 1000 or _CONTROL.search(error[key]):
@@ -6871,6 +6871,8 @@ def _validate_event(value: dict[str, Any], job_id: str, sequence: int) -> dict[s
             raise ExchangeError("invalid_worker_error", "worker 공급자 코드를 확인할 수 없습니다.", category="safety")
         if error.get("quota") is not None and normalize_rate_limit_context(error["quota"]) != error["quota"]:
             raise ExchangeError("invalid_worker_error", "worker 사용량 정보를 확인할 수 없습니다.", category="safety")
+        if error.get("diagnostic") is not None and normalize_provider_diagnostic(error["diagnostic"]) != error["diagnostic"]:
+            raise ExchangeError("invalid_worker_error", "worker 공급자 진단 정보를 확인할 수 없습니다.", category="safety")
         if type(error.get("retryable")) is not bool:
             raise ExchangeError("invalid_worker_error", "worker 재시도 상태를 확인할 수 없습니다.", category="safety")
     if kind == "released" and (value.get("terminal") is not True or value.get("status") not in (_TERMINAL_STATUSES | {"flag_found"})):
