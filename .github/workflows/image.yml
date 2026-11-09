@@ -84,6 +84,8 @@ jobs:
           test "$revision" = "$BUILD_SHA"
           image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$app_tag")"
           test "$image_version" = "$release_version"
+          image_bytes="$(docker image inspect --format '{{.Size}}' "$app_tag")"
+          [[ "$image_bytes" =~ ^[1-9][0-9]*$ ]]
           # Keep stdin attached so Python executes the smoke script. Provide
           # the same writable home/scratch paths the solver has in Compose.
           docker run --rm -i --network none \
@@ -102,4 +104,4 @@ jobs:
             echo 'A newer main commit exists; keeping the current production tag.' >> "$GITHUB_STEP_SUMMARY"
           fi
           digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$app_tag")"
-          printf 'Published %s\nToolchain %s\n' "$digest" "$toolchain_ref" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Published %s\nToolchain %s\nUnpacked image bytes %s\n' "$digest" "$toolchain_ref" "$image_bytes" >> "$GITHUB_STEP_SUMMARY"
