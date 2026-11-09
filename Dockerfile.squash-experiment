@@ -1,0 +1,23 @@
+# Disposable experiment: flatten the immutable v0.4.70 full-tool image without dropping tools.
+ARG SOURCE_IMAGE=ghcr.io/udonsari0101/ctf-agent-public@sha256:fa9861cedfb26abe49671fd8504211103c06fc438bec76ab7c81cef70522b055
+FROM ${SOURCE_IMAGE} AS source
+FROM scratch
+COPY --from=source / /
+LABEL org.opencontainers.image.source="https://github.com/udonsari0101/CTF_Agent" \
+      org.opencontainers.image.revision="8908ea044ba01554e71e06e6181c3b82c38cfade" \
+      org.opencontainers.image.version="v0.4.70"
+ENV JAVA_HOME=/opt/jdk-21 GHIDRA=/opt/ghidra GHIDRA_INSTALL_DIR=/opt/ghidra \
+    GHIDRA_HEADLESS_MAXMEM=4G \
+    PATH=/opt/jdk-21/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CTF_IMAGE_CODEX_VERSION=0.166.0 CTF_IMAGE_CLAUDE_VERSION=2.1.311 \
+    PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    CTF_DATA_DIR=/data CTF_DB_DIR=/database/sqlite \
+    CTF_CONFIG_DIR=/data/config CTF_LOG_DIR=/database/logs \
+    CTF_RELEASE_SHA=8908ea044ba01554e71e06e6181c3b82c38cfade \
+    CTF_RELEASE_VERSION=v0.4.70 \
+    HOME=/data/config/home npm_config_cache=/data/runtime/npm-cache \
+    SHELL=/usr/local/libexec/ctf-command/bash TZ=Asia/Seoul
+WORKDIR /app
+USER 10001:10001
+EXPOSE 5050
+CMD ["python", "-m", "uvicorn", "ctf_agent.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "5050", "--workers", "1", "--no-proxy-headers"]

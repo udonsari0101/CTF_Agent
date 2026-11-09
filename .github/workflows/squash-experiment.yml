@@ -1,0 +1,38 @@
+name: Full-tool image squash experiment
+on:
+  pull_request:
+    paths:
+      - Dockerfile.squash-experiment
+      - .github/workflows/squash-experiment.yml
+permissions:
+  contents: read
+  packages: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Pull, flatten, and smoke-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          source='ghcr.io/udonsari0101/ctf-agent-public@sha256:fa9861cedfb26abe49671fd8504211103c06fc438bec76ab7c81cef70522b055'
+          df -B1 /
+          docker pull "$source"
+          old_bytes="$(docker image inspect --format '{{.Size}}' "$source")"
+          docker build --progress plain --file Dockerfile.squash-experiment --tag ctf-squash-experiment:local .
+          new_bytes="$(docker image inspect --format '{{.Size}}' ctf-squash-experiment:local)"
+          echo "Original virtual bytes: $old_bytes"
+          echo "Flattened virtual bytes: $new_bytes"
+          test "$new_bytes" -lt "$old_bytes"
+          docker run --rm -i --network none \
+            --tmpfs /data:uid=10001,gid=10001,mode=0700 \
+            --tmpfs /solver-scratch:uid=10001,gid=10001,mode=0700 \
+            --entrypoint python ctf-squash-experiment:local - < deploy/image-smoke.py
+          docker run --rm --network none --entrypoint /bin/sh ctf-squash-experiment:local -c \
+            'test "$(id -u)" = 10001 && ghidra_headless -version >/dev/null 2>&1 || test -x /opt/ghidra/support/analyzeHeadless'
+          printf 'Old virtual bytes %s\nFlattened virtual bytes %s\n' "$old_bytes" "$new_bytes" >> "$GITHUB_STEP_SUMMARY"
+          df -B1 /
