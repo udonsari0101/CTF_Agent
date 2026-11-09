@@ -40,6 +40,23 @@ class ProgressNudgeTests(unittest.TestCase):
     async def _progress(self, code: str, **_details: object) -> None:
         self.progress_codes.append(code)
 
+    def test_ultra_limits_concurrent_children_without_disabling_delegation(self) -> None:
+        self.driver.command_prefix = ["codex"]
+        self.driver.configuration = ModelConfiguration("codex", "gpt-6-sol", "ultra")
+        with (
+            patch.object(worker, "CODEX_ULTRA_MAX_SUBAGENTS", 2),
+            patch.object(self.driver, "_uses_local_permissions", return_value=False),
+        ):
+            arguments = self.driver.command_arguments()
+        self.assertIn("agents.max_concurrent_threads_per_session=2", arguments)
+        self.assertEqual(arguments[arguments.index("multi_agent") - 1], "--enable")
+
+        self.driver.configuration = ModelConfiguration("codex", "gpt-6-sol", "xhigh")
+        with patch.object(self.driver, "_uses_local_permissions", return_value=False):
+            arguments = self.driver.command_arguments()
+        self.assertNotIn("agents.max_concurrent_threads_per_session=2", arguments)
+        self.assertEqual(arguments[arguments.index("multi_agent") - 1], "--disable")
+
     def _run(self, turn, *, nudges: int = 1, extra: int = 2) -> tuple[dict[str, str] | None, str | None]:
         self.driver._turn = turn
         with (

@@ -60,6 +60,25 @@ Classify the check, then solve at the lowest tier that works:
 | Stateful transform / path explosion / opaque predicates | **angr** symbolic exec |
 | One self-contained opaque routine you'd rather run than read | **unicorn** emulate it as a black box |
 
+### When the target is an output trace rather than a success branch
+
+A supplied capture, transcript, checksum list, or target output is an oracle even
+when the binary never prints "correct." Run the binary on one known input and
+on inputs that differ in exactly one byte. Compare outputs to locate the first
+input-dependent observation and the smallest state slice that reaches it.
+Trace the **last writers of that slice backward** from the output; undo
+permutations, rotations, XOR, and modular additions where possible. Model only
+the remaining coupled operations with z3 or a local emulator. Validate each
+recovered relation against several fresh inputs, then verify the final candidate
+against the *entire* supplied output.
+
+Before lifting every handler of an obfuscated dispatcher or launching a large
+collision search, make one bounded experiment on this narrow output-to-input
+path. Record what it proved, its time cost, and the next falsifying test in
+`notes/NEXT.md`. Broad lifting is warranted when that experiment shows the
+small cone cannot recover enough information; don't repeat a costly branch
+across retries without a new observation.
+
 ## Dynamic ground truth (frequently hands you the flag)
 ```
 ltrace -s200 ./chal     # strcmp/memcmp/strncmp often expose the flag verbatim
