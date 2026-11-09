@@ -31,7 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
-from .ctfd import connection_info
+from .ctfd import connection_info, description_connection_info
 from .db import Settings, connect, initialize
 from .flag_formats import normalize_flag_format
 from .password_policy import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH
@@ -447,6 +447,24 @@ def normalize_remote_pair(mode: str | None, remote: str) -> tuple[str, str]:
     if selected != "endpoint" and normalized:
         raise HTTPException(422, "원격 대상 상태와 접속 정보가 일치하지 않습니다.")
     return selected, normalized
+
+
+def normalize_challenge_remote(
+    mode: str | None, remote: str, description: str, site_url: str = ""
+) -> tuple[str, str]:
+    """Promote one concrete endpoint in the brief when no field was supplied.
+
+    The persisted endpoint is authoritative for the solver. A user-entered
+    remote field always wins over description text, including during edits.
+    An explicit ``none`` selection cannot hide an unambiguous address already
+    present in the same challenge brief.
+    """
+
+    if not remote.strip():
+        inferred, _possible = description_connection_info(description, site_url)
+        if inferred:
+            return "endpoint", inferred
+    return normalize_remote_pair(mode, remote)
 
 
 def edit_token(row, fields: tuple[str, ...]) -> str:
@@ -1225,15 +1243,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/workspaces/{workspace_id}/challenges", status_code=201, dependencies=[Depends(require_auth)])
     def create_challenge(workspace_id: str, payload: ChallengeInput):
         challenge_id, timestamp = uuid.uuid4().hex, now()
-        remote_mode, remote = normalize_remote_pair(payload.remote_mode, payload.remote)
+        remote_mode, remote = normalize_challenge_remote(
+            payload.remote_mode, payload.remote, payload.description
+        )
+        remote_origin = "description" if remote and not payload.remote else "explicit"
         with database() as db:
             db.execute("BEGIN IMMEDIATE")
             workspace_row(db, workspace_id)
             app.state.storage_layout.reserve_challenge(
                 db, workspace_id, challenge_id, payload.name
             )
-            db.execute("""INSERT INTO challenges(id,workspace_id,name,category,description,remote,remote_mode,flag,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?)""", (challenge_id, workspace_id, payload.name, payload.category, payload.description, remote, remote_mode, payload.flag or None, timestamp, timestamp))
+            db.execute("""INSERT INTO challenges(id,workspace_id,name,category,description,remote,remote_mode,remote_origin,flag,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (challenge_id, workspace_id, payload.name, payload.category, payload.description, remote, remote_mode, remote_origin, payload.flag or None, timestamp, timestamp))
             db.execute("UPDATE workspaces SET updated_at=? WHERE id=?", (timestamp, workspace_id))
             if payload.flag:
                 db.execute("UPDATE challenges SET status='flag_found' WHERE id=?", (challenge_id,))
@@ -1260,7 +1281,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         clone_id, timestamp = uuid.uuid4().hex, now()
         reservation_key = f"challenge-clone:{clone_id}"
         current_owner = owner_id()
-        core_fields = ("name", "category", "description", "remote", "remote_mode")
+        core_fields = ("name", "category", "description", "remote", "remote_mode", "remote_origin")
         with database() as db:
             db.execute("BEGIN IMMEDIATE")
             source = challenge_row(db, workspace_id, challenge_id)
@@ -1352,8 +1373,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             connection.execute(
                 """INSERT INTO challenges(
                        id,workspace_id,name,category,description,remote,remote_mode,
-                       canonical_name,created_at,updated_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                       remote_origin,canonical_name,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     clone_id,
                     workspace_id,
@@ -1362,6 +1383,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     current_source["description"],
                     current_source["remote"],
                     current_source["remote_mode"],
+                    current_source["remote_origin"],
                     current_source["canonical_name"] or current_source["name"],
                     timestamp,
                     timestamp,
@@ -1682,12 +1704,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 reject_active_ctfd_refresh(db, workspace_id, challenge_id)
             values = {**dict(row), **changes}
             requested_mode = None if "remote" in changes and "remote_mode" not in changes else values["remote_mode"]
-            values["remote_mode"], values["remote"] = normalize_remote_pair(
-                requested_mode, values["remote"]
+            remote_origin = row["remote_origin"]
+            if "remote" in changes or "remote_mode" in changes:
+                remote_origin = "explicit"
+            if "description" in changes and "remote" not in changes and "remote_mode" not in changes:
+                old_inferred, _possible = description_connection_info(
+                    row["description"], row["ctfd_url"] or ""
+                )
+                if row["remote_origin"] == "description" or (
+                    row["remote_origin"] == "legacy"
+                    and row["ctfd_id"] is None
+                    and old_inferred and row["remote"] == old_inferred
+                ):
+                    # This stored endpoint came from the old brief. Re-evaluate
+                    # the new brief instead of retaining a stale address.
+                    values["remote"] = ""
+                    requested_mode = "unknown"
+            values["remote_mode"], values["remote"] = normalize_challenge_remote(
+                requested_mode, values["remote"], values["description"],
+                values["ctfd_url"] or "",
             )
+            if (
+                values["remote"] and not changes.get("remote")
+                and (not row["remote"] or row["remote_origin"] == "description")
+            ):
+                remote_origin = "description"
             flag_changed = bool(values["flag"] and values["flag"] != row["flag"])
-            db.execute("UPDATE challenges SET name=?,category=?,description=?,remote=?,remote_mode=?,flag=?,updated_at=? WHERE workspace_id=? AND id=?", (
-                values["name"], values["category"], values["description"], values["remote"], values["remote_mode"], values["flag"] or None, now(), workspace_id, challenge_id,
+            db.execute("UPDATE challenges SET name=?,category=?,description=?,remote=?,remote_mode=?,remote_origin=?,flag=?,updated_at=? WHERE workspace_id=? AND id=?", (
+                values["name"], values["category"], values["description"], values["remote"], values["remote_mode"], remote_origin, values["flag"] or None, now(), workspace_id, challenge_id,
             ))
             if flag_changed:
                 db.execute("UPDATE challenges SET status='flag_found',previous_status=NULL,completion_source=NULL WHERE id=?", (challenge_id,))

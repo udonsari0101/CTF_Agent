@@ -53,6 +53,7 @@ _RESERVED_TOP_LEVEL = {
     ".remote-request",
     "AGENTS.md",
     "CLAUDE.md",
+    "artifacts",
     "extracted",
     "notes",
     "solver.py",
@@ -285,7 +286,7 @@ def assemble_manual(
         [
             "- Brief: `../chal_desc.md` — read-only; read it first.",
             f"- Category playbooks: shared, read-only `../../skills/` — start with {playbooks} and open others only when triage warrants it.",
-            "- Working dir: keep notes in `notes/`, the reproducible exploit in `solver.py`, and scratch output in `tmp/`.",
+            "- Working dir: keep notes in `notes/`, the reproducible exploit in `solver.py`, and scratch output in `tmp/`. Put small derived files that a retry must reuse in `artifacts/`; large tool caches and generated blobs are not durable. Record a command or script that can rebuild any omitted dependency.",
             "- Tool runtime: for parsers that need a home, cache, or temporary files, create `tmp/{home,cache,temp}` and run them with `HOME=$PWD/tmp/home XDG_CACHE_HOME=$PWD/tmp/cache TMPDIR=$PWD/tmp/temp`; the provider credential home is intentionally inaccessible to commands.",
             "- Select tools from evidence: `apktool` for APK resources and bytecode, `r2`/angr for native binaries, `gdbserver`/pwntools for live pwn debugging, `testdisk`/`photorec` for disk images, `sqlmap` for an observed SQL injection path, and `nmap` for an in-scope network service. Check the category playbook before a large scan or extraction.",
             "- Installed specialist tools when the input warrants them: `ghidra_headless` for native decompilation, `jadx` for APK/DEX/Java source, `pwndbg` for native exploit debugging, `websocat` for interactive WebSockets, `gp` for number theory, `stegseek` for steghide-compatible files, and `multimon-ng` for recorded DTMF/POCSAG signals. Keep project/output files under `tmp/`; Ghidra starts with a 4G Java heap, adjustable via `GHIDRA_HEADLESS_MAXMEM` for a large target.",
@@ -362,6 +363,7 @@ def prepare_agent_workspace(
         text = _asset_text("scaffolds", name).replace("{{CHAL}}", challenge_name)
         (notes / name).write_text(text.rstrip("\n") + "\n", encoding="utf-8")
     (workdir / "tmp").mkdir(mode=0o700)
+    (workdir / "artifacts").mkdir(mode=0o700)
     staged_inputs = _copy_regular_tree(
         source,
         workdir,

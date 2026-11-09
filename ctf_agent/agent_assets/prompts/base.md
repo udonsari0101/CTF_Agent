@@ -58,6 +58,8 @@ Run this loop, **branching selectively** — take the steps the challenge needs,
 
 ## 4. Persist Your Work (write, don't read-first)
 
+Keep small derived tables, traces, and models needed by `solver.py` in `artifacts/` so a retry can reuse them. A bounded retry also preserves small `tmp/` files, but large caches are omitted. Make the solver regenerate any omitted dependency from the supplied inputs and record that command in `notes/NEXT.md`; never leave only a script that depends on missing files.
+
 `notes/` is your **output** so the operator can follow and steer, and your restart point after an interruption. **Write** these at the **end of each cycle** — you do NOT read them at the start of a fresh solve (they're empty; reading them just wastes time). Read them only to resume.
 
 **Language: write the three `notes/` files in Korean (한국어)** — the operator reads Korean. Everything else stays in English: `solver.py` code, code comments, commands, filenames.

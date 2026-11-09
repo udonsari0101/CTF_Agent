@@ -106,12 +106,20 @@ class ProgressNudgeTests(unittest.TestCase):
             request_path = self.challenge / ".remote-request"
             watcher = asyncio.create_task(worker._watch_remote_request(
                 request_path, requested, cancelled, result, reviewed,
+                lambda: worker._offline_remote_review_has_new_evidence(self.driver, self.challenge),
             ))
             try:
                 record_request("First unverified request", self.challenge)
                 await asyncio.sleep(0.06)
                 self.assertFalse(requested.is_set())
                 request_path.unlink()
+                self.driver.remote_request_review_tool_count = 1
+                self.driver.remote_request_review_notes = "previous note"
+                self.driver._solve_tool_count = 3
+                (self.challenge / "notes" / "NEXT.md").write_text(
+                    "Verified local probe: checker reads a network-only key after the supplied files are exhausted.",
+                    encoding="utf-8",
+                )
                 reviewed.set()
                 record_request("Verified missing endpoint", self.challenge)
                 await asyncio.wait_for(requested.wait(), 1)
@@ -124,6 +132,38 @@ class ProgressNudgeTests(unittest.TestCase):
             asyncio.run(scenario()),
             (True, True, "Verified missing endpoint"),
         )
+
+    def test_repeated_missing_device_request_without_new_test_keeps_solving(self) -> None:
+        self.driver.remote_request_reviewed = asyncio.Event()
+        prompts: list[str] = []
+
+        async def turn(_manifest, prompt, _schema, _cancelled, _progress):
+            prompts.append(prompt)
+            if len(prompts) <= 2:
+                record_request("The local VM lacks /dev/example.", self.challenge)
+                return {}
+            self.assertFalse((self.challenge / ".remote-request").exists())
+            return {"flag": "CTF{offline_verified}"}
+
+        result, error = self._run(turn, nudges=0)
+        self.assertIsNone(error)
+        self.assertEqual(result["flag"], "CTF{offline_verified}")
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("no new local test", prompts[2])
+
+    def test_offline_remote_confirmation_requires_new_probe_and_notes(self) -> None:
+        self.driver._solve_tool_count = 1
+        self.driver.remote_request_review_tool_count = 1
+        (self.challenge / "notes" / "NEXT.md").write_text("old finding", encoding="utf-8")
+        self.driver.remote_request_review_notes = worker._solver_notes(self.challenge)
+        self.assertFalse(worker._offline_remote_review_has_new_evidence(self.driver, self.challenge))
+        self.driver._solve_tool_count = 3
+        self.assertFalse(worker._offline_remote_review_has_new_evidence(self.driver, self.challenge))
+        (self.challenge / "notes" / "NEXT.md").write_text(
+            "The supplied verifier calls a documented network-only oracle; local parser test returned no key.",
+            encoding="utf-8",
+        )
+        self.assertTrue(worker._offline_remote_review_has_new_evidence(self.driver, self.challenge))
 
     def test_offline_remote_confirmation_reaches_terminal_handoff(self) -> None:
         async def scenario() -> tuple[int, str]:

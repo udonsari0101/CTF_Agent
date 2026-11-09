@@ -24,6 +24,9 @@ from .request_remote import REQUEST_NAME
 SNAPSHOT_LIMIT = 512 * 1024 * 1024
 SNAPSHOT_FREE_RESERVE = 1024 * 1024 * 1024
 SNAPSHOT_FILE_LIMIT = 20_000
+RETAINED_TMP_FILE_LIMIT = 128
+RETAINED_TMP_BYTES_LIMIT = 32 * 1024 * 1024
+RETAINED_TMP_SINGLE_FILE_LIMIT = 8 * 1024 * 1024
 BASELINE_FILE_LIMIT = 50_000
 BASELINE_PATH_BYTES_LIMIT = 8 * 1024 * 1024
 WORKDIR_REL = "competition/challenge/codex-workdir"
@@ -115,12 +118,19 @@ def read_input(active: Path, provider: str) -> ContinuationInput | None:
     )
 
 
-def _private_path(relative: PurePosixPath) -> bool:
+def _private_path(relative: PurePosixPath, *, workdir: bool = False) -> bool:
+    parts = relative.parts
+    if workdir and parts and parts[0] == "workdir":
+        parts = parts[1:]
+    # Keep small derived files made in the challenge's own tmp/ tree across
+    # retries. Never carry provider caches or temporary credential homes.
+    if workdir and parts and parts[0] == "tmp":
+        parts = parts[1:]
     return any(
         part.casefold() in _PRIVATE_NAMES
         or part.casefold().startswith(".env.")
-        or part.casefold() in _SKIP_DIRS
-        for part in relative.parts
+        or part.casefold() in (_SKIP_DIRS | {"home", "temp"})
+        for part in parts
     )
 
 
@@ -177,6 +187,8 @@ def workspace_baseline(workdir: Path) -> dict[str, tuple[int, int, int, int]] | 
 def _source_files(root: Path, provider: str, baseline: dict[str, tuple[int, int, int, int]]):
     sources = [(root / WORKDIR_REL, "workdir"), *_provider_paths(root, provider)]
     for source, prefix in sources:
+        retained_tmp_files = 0
+        retained_tmp_bytes = 0
         if not source.exists() or source.is_symlink():
             continue
         if source.is_file():
@@ -193,12 +205,13 @@ def _source_files(root: Path, provider: str, baseline: dict[str, tuple[int, int,
             relative_dir = current_path.relative_to(source)
             dirs[:] = [
                 name for name in dirs
-                if not _private_path(PurePosixPath(*relative_dir.parts, name))
+                if not _private_path(PurePosixPath(*relative_dir.parts, name), workdir=prefix == "workdir")
                 and not (current_path / name).is_symlink()
             ]
-            for name in files:
+            dirs.sort()
+            for name in sorted(files):
                 relative = PurePosixPath(*relative_dir.parts, name)
-                if _private_path(relative):
+                if _private_path(relative, workdir=prefix == "workdir"):
                     continue
                 if prefix == "workdir":
                     if _ephemeral_workdir_signal(relative):
@@ -215,6 +228,15 @@ def _source_files(root: Path, provider: str, baseline: dict[str, tuple[int, int,
                 path = current_path / name
                 info = path.lstat()
                 if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    if prefix == "workdir" and relative.parts[0] == "tmp":
+                        if (
+                            info.st_size > RETAINED_TMP_SINGLE_FILE_LIMIT
+                            or retained_tmp_files >= RETAINED_TMP_FILE_LIMIT
+                            or retained_tmp_bytes + info.st_size > RETAINED_TMP_BYTES_LIMIT
+                        ):
+                            continue
+                        retained_tmp_files += 1
+                        retained_tmp_bytes += info.st_size
                     if info.st_size > SNAPSHOT_LIMIT:
                         raise ContinuationInvalid("continuation file exceeds size limit")
                     yield path, PurePosixPath(prefix, *relative.parts)
@@ -321,7 +343,7 @@ def _archive_target(job_root: Path, name: str, mode: str, provider: str) -> Path
     pure = PurePosixPath(name)
     if pure.is_absolute() or not pure.parts or any(part in {".", "..", ""} for part in pure.parts):
         raise ContinuationInvalid("unsafe continuation path")
-    if _private_path(pure):
+    if _private_path(pure, workdir=pure.parts[0] == "workdir"):
         raise ContinuationInvalid("private continuation path")
     if pure.parts[0] == "workdir" and len(pure.parts) >= 2:
         if _ephemeral_workdir_signal(PurePosixPath(*pure.parts[1:])):
