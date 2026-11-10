@@ -87,16 +87,6 @@ function quotaWindowLabel(label) {
   return match ? `${match[1]}${match[2]} ${windowUnits[match[3]]}${match[2] === '1' ? '' : 's'}` : translated;
 }
 
-const VERSION_FORMAT = /^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$/;
-const runtimeStatusLabels = {installing:'설치 중', verifying:'검증 중', completed:'업데이트 완료', failed:'업데이트 실패', interrupted:'업데이트 중단'};
-const runtimeBusy = info => ['installing', 'verifying'].includes(info?.operation?.status);
-const runtimeSources = [
-  {key:'codex', name:'Codex', title:'Codex 업데이트', adminOnly:'Codex 업데이트는 관리자만 실행할 수 있습니다.',
-    placeholder:'버전 (예: 0.164.0)', versionLabel:'설치할 Codex 버전', latestMissing:'최신 Codex 버전을 확인하지 못했습니다.'},
-  {key:'claude', name:'Claude Code', title:'Claude Code 업데이트', adminOnly:'Claude Code 업데이트는 관리자만 실행할 수 있습니다.',
-    placeholder:'버전 (예: 2.1.310)', versionLabel:'설치할 Claude Code 버전', latestMissing:'최신 Claude Code 버전을 확인하지 못했습니다.'},
-];
-
 const proIdentity = identity => [identity?.planType,identity?.subscriptionType]
   .some(value => String(value || '').toLowerCase().split(/[^a-z0-9]+/).includes('pro'));
 
@@ -143,9 +133,6 @@ export function quotaDisplayState(account) {
 }
 
 export async function renderAccounts(container, api, options = {}) {
-  // Set by the #admin 'Update agent CLI' link: land on the update controls.
-  const revealRuntime = globalThis.ctfAccountsTarget === 'runtime';
-  delete globalThis.ctfAccountsTarget;
   container.replaceChildren();
   const shell = el('section', undefined, 'account-management');
   container.append(shell);
@@ -176,7 +163,6 @@ export async function renderAccounts(container, api, options = {}) {
       policy && i18n.t('보안 작업 정책 제한입니다. 다른 모델을 선택하거나 계정 권한을 확인하세요.')].filter(Boolean).join(' · ');
   };
   const accounts = el('div', undefined, 'account-list');
-  const runtime = el('section', undefined, 'card account-runtime');
   const form = el('form', undefined, 'card account-create');
   const provider = el('select');
   provider.setAttribute('aria-label', '계정 제공자');
@@ -195,15 +181,11 @@ export async function renderAccounts(container, api, options = {}) {
   form.append(provider, authKind, label, submit);
   if (returnActions) pageHead.append(returnActions);
   shell.append(pageHead);
-  shell.append(form, usageStatus.node, feedback.node, accounts, runtime);
+  shell.append(form, usageStatus.node, feedback.node, accounts);
   heading.focus?.();
   let stopped = false;
   let loadGeneration = 0;
-  let runtimeLoadGeneration = 0;
-  let runtimePollFailures = 0;
-  let runtimeTimer = null;
   let buttonCount = 0;
-  const runtimeStates = new Map(runtimeSources.map(source => [source.key, {info:null, error:'', notice:createNotice()}]));
   const loginGeneration = new WeakMap();
   const modelTargets = new Map();
   const formTargets = new Map();
@@ -688,113 +670,15 @@ export async function renderAccounts(container, api, options = {}) {
     usageStatus.set(failed ? localized(`${failed}개 계정의 사용량을 새로고침하지 못했습니다.`, `Could not refresh usage for ${failed} account(s).`) : '', failed > 0);
   }
 
-  function runtimeControls(source, state, disabled) {
-    const path = `/api/providers/${source.key}`;
-    const version = el('input');
-    version.placeholder = source.placeholder;
-    version.dataset.focusKey = `runtime:${source.key}:version`;
-    version.setAttribute('aria-label', source.versionLabel);
-    const runtimeButton = (name, text, task) => button(text, task, state.notice, `runtime:${source.key}:${name}`);
-    const fillLatest = async () => {
-      const data = await api(`${path}/catalog`);
-      if (!data.latest) throw new Error(source.latestMissing);
-      version.value = data.latest;
-      return data.latest;
-    };
-    const install = async value => {
-      const operation = await api(`${path}/update`, {method: 'POST', body: {version: value}});
-      // The install is running now, so polling must start even if the next status read fails.
-      state.info = {...state.info, operation};
-      await loadRuntime();
-    };
-    const controls = el('div', undefined, 'runtime-controls');
-    controls.append(version, runtimeButton('check', '최신 버전 조회', fillLatest),
-      runtimeButton('update', '최신 버전으로 업데이트', async () => install(await fillLatest())),
-      runtimeButton('install', '버전 설치', async () => {
-        const value = version.value.trim();
-        if (!VERSION_FORMAT.test(value)) throw new Error(i18n.t('버전은 0.164.0 같은 정확한 숫자 버전이어야 합니다.'));
-        await install(value);
-      }));
-    if (state.info.selected) controls.append(runtimeButton('rollback', '이전 버전으로 복원', async () => {
-      await api(`${path}/rollback`, {method: 'POST'}); await loadRuntime();
-    }));
-    if (disabled) for (const control of controls.children) control.disabled = true;
-    return controls;
-  }
-
-  function runtimeSection(source, polling) {
-    const state = runtimeStates.get(source.key);
-    const {info} = state;
-    const operation = info?.operation || {};
-    const section = el('section', undefined, 'runtime-provider');
-    section.append(el('h3', source.title), el('p', `${i18n.t('현재 버전')}: ${info?.version || i18n.t(info ? '설치 확인 불가' : '확인 불가')}`));
-    if (info) {
-      const label = !operation.status || operation.status === 'idle' ? localized('대기', 'Idle') : i18n.t(runtimeStatusLabels[operation.status] || operation.status);
-      const busy = runtimeBusy(info);
-      const status = el('p', `${i18n.t('상태')}: ${label}${operation.version ? ` · ${operation.version}` : ''}`,
-        busy ? 'runtime-progress' : ['failed', 'interrupted'].includes(operation.status) ? 'runtime-status error-text' : 'runtime-status');
-      status.setAttribute('role', 'status');
-      status.setAttribute('aria-live', 'polite');
-      section.append(status);
-      if (busy) {
-        const progress = el('progress');
-        progress.setAttribute('aria-label', `${source.name} ${label}`);
-        section.append(progress);
-      }
-      if (operation.message) section.append(el('p', operation.message, 'error-text'));
-    }
-    if (state.error && polling) section.append(el('p', '상태 확인에 실패해 다시 시도합니다.', 'error-text'));
-    else if (state.error) section.append(el('p', `${i18n.t('상태를 확인하지 못했습니다.')} ${state.error}`, 'error-text'),
-      button('다시 조회', loadRuntime, state.notice, `runtime:${source.key}:retry`));
-    if (info && !info.can_manage) section.append(el('p', source.adminOnly));
-    else if (info && !info.update_supported) section.append(el('p', '이 환경에서는 웹 업데이트를 지원하지 않습니다.'));
-    else if (info) section.append(runtimeControls(source, state, polling));
-    section.append(state.notice.node);
-    return section;
-  }
-
-  async function loadRuntime() {
-    const generation = ++runtimeLoadGeneration;
-    window.clearTimeout(runtimeTimer);
-    const results = await Promise.allSettled(runtimeSources.map(source => api(`/api/providers/${source.key}/runtime`)));
-    if (!active() || generation !== runtimeLoadGeneration) return;
-    runtimeSources.forEach((source, index) => {
-      const state = runtimeStates.get(source.key);
-      const {status, value, reason} = results[index];
-      if (status === 'fulfilled') { state.info = value; state.error = ''; }
-      else state.error = errorText(reason);
-    });
-    // A failed read says nothing about the install, so keep following the last known state.
-    const polling = [...runtimeStates.values()].some(state => runtimeBusy(state.info));
-    runtimePollFailures = results.some(item => item.status === 'rejected') ? runtimePollFailures + 1 : 0;
-    const focusKey = document.activeElement?.dataset?.focusKey;
-    const versions = [...runtime.querySelectorAll('input[data-focus-key]')].map(input => [input.dataset.focusKey, input.value]);
-    runtime.replaceChildren(...runtimeSources.map(source => runtimeSection(source, polling)));
-    for (const [key, value] of versions) {
-      const input = runtime.querySelector(`input[data-focus-key="${CSS.escape(key)}"]`);
-      if (input) input.value = value;
-    }
-    restoreFocus(focusKey);
-    if (polling) runtimeTimer = window.setTimeout(() => { if (active()) loadRuntime(); }, Math.min(3000 * 2 ** runtimePollFailures, 30000));
-  }
-
   const onLanguageChanged = () => {
     if (!active()) return;
     quietly(load, feedback);
-    loadRuntime();
   };
   document.addEventListener('ctf-language-changed', onLanguageChanged);
   const data = await quietly(load, feedback);
-  await loadRuntime();
-  if (revealRuntime && active()) {
-    runtime.tabIndex = -1;
-    runtime.focus({preventScroll:true});
-    runtime.scrollIntoView({block:'start'});
-  }
   await refreshUsageOnEnter(data);
   return () => {
     stopped = true;
-    window.clearTimeout(runtimeTimer);
     document.removeEventListener('ctf-language-changed', onLanguageChanged);
   };
 }

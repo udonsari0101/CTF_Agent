@@ -259,7 +259,7 @@ jobs:
         run: node .github/scripts/check_local_browser_bootstrap.js
       - name: Check UI follow-up regressions
         run: node .github/scripts/check_ui_followup_regressions.js
-      - name: Check admin runtime version lookup
+      - name: Check administrator CLI update controls
         run: python .github/scripts/check_admin_versions.py
       - name: Check admin diagnostic log export
         run: python .github/scripts/check_admin_log_export.py

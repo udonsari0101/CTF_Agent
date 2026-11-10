@@ -5005,7 +5005,7 @@ async function renderAdmin(ticket = rendering) {
 }
 
 function adminMarkup({capacity,users}) {
-  const panels = `<section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section class="settings-card"><h2>${tr("Service logs")}</h2><p class="form-hint">${tr("Download rotated service logs and recent solver job states for debugging.")}</p><button data-action="open-admin-log-export">${tr("Download logs")}</button></section><div class="divider"></div><section id="admin-cli-version-panel" class="settings-card" data-morph-keep></section><div class="divider"></div><section id="release-update-panel" class="settings-card" data-morph-keep></section>`;
+  const panels = `<section class="settings-card"><h2>미완료 업로드 정리</h2><p class="form-hint">7일 이상 진행하지 않은 미완료 임시 파일만 정리합니다. 완료된 첨부파일은 유지됩니다.</p><button data-action="cleanup-uploads">만료된 업로드 정리</button></section><div class="divider"></div><section class="settings-card"><h2>${tr("Service logs")}</h2><p class="form-hint">${tr("Download rotated service logs and recent solver job states for debugging.")}</p><button data-action="open-admin-log-export">${tr("Download logs")}</button></section><div class="divider"></div><section id="admin-cli-version-panel" class="settings-card account-runtime" data-morph-keep></section><div class="divider"></div><section id="release-update-panel" class="settings-card" data-morph-keep></section>`;
   if (!users) return `<div class="page-head"><div><div class="eyebrow">ADMIN SETTINGS</div><h1>관리자 설정</h1></div></div>
       ${solverCapacityAdminMarkup(capacity)}<div class="divider"></div>
       ${panels}`;

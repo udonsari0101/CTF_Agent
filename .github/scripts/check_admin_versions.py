@@ -1,119 +1,96 @@
-"""Browser regression for read-only, nonblocking admin CLI version lookup."""
-
-from __future__ import annotations
-
+"""Browser regression for administrator-only provider CLI updates."""
 import shutil
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / "ctf_agent/web/admin_versions.js").read_text(encoding="utf-8")
 APP = (ROOT / "ctf_agent/web/app.js").read_text(encoding="utf-8")
+ACCOUNTS = (ROOT / "ctf_agent/web/accounts.js").read_text(encoding="utf-8")
 
 
-def browser_path() -> str | None:
-    for name in ("google-chrome", "chromium", "chromium-browser", "chrome", "msedge"):
-        found = shutil.which(name)
-        if found:
-            return found
-    for candidate in (
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ):
-        if candidate.exists():
-            return str(candidate)
-    return None
-
-
-def main() -> int:
-    assert "import {renderAdminCliVersions} from './admin_versions.js'" in APP
-    assert APP.count('renderAdminCliVersions(document.querySelector(\'#admin-cli-version-panel\')') == 2
-    browser = browser_path()
+def main():
+    assert APP.count("renderAdminCliVersions(document.querySelector('#admin-cli-version-panel')") == 2
+    assert 'class="settings-card account-runtime"' in APP
+    assert "runtimeControls(" not in ACCOUNTS
+    browser = next((shutil.which(n) for n in ("chrome", "msedge", "chromium", "google-chrome")
+                    if shutil.which(n)), None)
+    if not browser:
+        for candidate in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                          r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"):
+            if Path(candidate).exists():
+                browser = candidate
+                break
     if not browser:
         print("SKIP: Chrome/Chromium is not installed")
         return 0
     implementation = SOURCE.replace("export function renderAdminCliVersions", "function renderAdminCliVersions")
-    fixture = """<!doctype html><html><body><main id="root"><section id="versions"></section></main>
-<pre id="result">PENDING</pre><script>
-""" + implementation + """
-const root=document.querySelector('#root');
-const nativeAdd=document.addEventListener.bind(document), nativeRemove=document.removeEventListener.bind(document);
-const languageListeners=new Set();
-document.addEventListener=(type,listener,...options)=>{
- if(type==='ctf-language-changed') languageListeners.add(listener);
- return nativeAdd(type,listener,...options);
+    fixture = """<!doctype html><meta charset="utf-8"><body><section id="versions"></section>
+<pre id="result">PENDING</pre><script>""" + implementation + """
+const root=document.querySelector('#versions'),tick=()=>new Promise(r=>setTimeout(r,0));
+let calls=[],version='0.164.0',operation={status:'idle'},holdCatalog=false;
+const api=(url,options={})=>{
+  calls.push({url,options});
+  if(holdCatalog&&url.endsWith('/catalog')) return new Promise(()=>{});
+  if(url.endsWith('/catalog')) return Promise.resolve({latest:url.includes('/codex/')?'0.166.0':'2.1.310'});
+  if(url.endsWith('/update')) {
+    if(url.includes('/codex/')) {version=options.body.version;operation={status:'completed',version};}
+    return Promise.resolve(operation);
+  }
+  return Promise.resolve({version:url.includes('/codex/')?version:'2.1.300',
+    operation:url.includes('/codex/')?operation:{status:'idle'},
+    can_manage:true,update_supported:true,selected:url.includes('/codex/')});
 };
-document.removeEventListener=(type,listener,...options)=>{
- if(type==='ctf-language-changed') languageListeners.delete(listener);
- return nativeRemove(type,listener,...options);
-};
-const tick=()=>new Promise(resolve=>setTimeout(resolve,0));
-let calls=[],offline=false,hold=false,resolvers=[],codexCurrent='0.164.0';
-const catalogs=()=>calls.filter(url=>url.endsWith('/catalog')).length;
-const api=url=>{
- calls.push(url);
- if(hold && url.endsWith('/catalog')) return new Promise(resolve=>resolvers.push([url,resolve]));
- if(offline && url.endsWith('/catalog')) return Promise.reject(new Error('offline'));
- return Promise.resolve(url.endsWith('/catalog')?{latest:url.includes('/codex/')?'0.166.0':'2.1.310'}:
-  {version:url.includes('/codex/')?codexCurrent:'2.1.300'});
-};
+const settle=async()=>{for(let i=0;i<8;i++) await tick()};
 (async()=>{
- const first=document.querySelector('#versions');
- renderAdminCliVersions(first,api,{scope:'admin-a'});
- const nonblocking=first.textContent.includes('조회 중')&&first.querySelector('button').disabled;
- await tick();await tick();
- const firstResult=first.textContent.includes('현재 0.164.0 · 최신 0.166.0')
-  &&first.textContent.includes('현재 2.1.300 · 최신 2.1.310')&&calls.length===4;
- // Re-entry keeps the registry result but reads the local runtime again,
- // so an install is visible without waiting for the registry TTL.
- codexCurrent='0.166.0';
- const second=document.createElement('section');root.replaceChildren(second);
- renderAdminCliVersions(second,api,{scope:'admin-a'});
- await tick();await tick();
- const cached=second.textContent.includes('현재 0.166.0 · 최신 0.166.0')&&catalogs()===2&&calls.length===6;
- offline=true;second.querySelector('button').click();await tick();await tick();
- const offlineResult=catalogs()===4&&second.textContent.includes('최신 0.166.0')
-  &&second.textContent.includes('조회 실패 · 이전 결과 표시')&&!second.querySelector('button').disabled;
- const third=document.createElement('section');root.replaceChildren(third);
- renderAdminCliVersions(third,api,{scope:'admin-a'});
- await tick();await tick();
- const backoff=catalogs()===4&&third.textContent.includes('이전 결과 표시');
- offline=false;hold=true;
- const fourth=document.createElement('section');root.replaceChildren(fourth);
- renderAdminCliVersions(fourth,api,{scope:'admin-b',locale:'en'});
- await tick();
- const beforeReentry=catalogs()===6&&fourth.textContent.includes('Checking');
- const fifth=document.createElement('section');root.replaceChildren(fifth);
- renderAdminCliVersions(fifth,api,{scope:'admin-b',locale:'en'});
- await tick();
- const deduplicated=catalogs()===6;
- for(const [url,resolve] of resolvers) resolve({latest:url.includes('/codex/')?'0.166.0':'2.1.310'});
- await tick();await tick();
- const result=nonblocking&&firstResult&&cached&&offlineResult&&backoff&&beforeReentry&&deduplicated
-  &&languageListeners.size===1
-  &&fifth.textContent.includes('Latest 0.166.0')&&!calls.some(url=>url.endsWith('/update'));
- document.querySelector('#result').textContent=result?'PASS':'FAIL '+JSON.stringify({nonblocking,firstResult,cached,offlineResult,backoff,beforeReentry,deduplicated,calls,text:fifth.textContent});
-})().catch(error=>{document.querySelector('#result').textContent='ERROR '+error.stack});
-</script></body></html>"""
-    with tempfile.TemporaryDirectory(prefix="ctf-admin-cli-versions-") as temp:
+  renderAdminCliVersions(root,api,{scope:'admin-a'});await settle();
+  const rows=[...root.querySelectorAll('.runtime-provider')],codex=rows[0];
+  const button=(row,name)=>[...row.querySelectorAll('button')].find(b=>b.textContent===name);
+  const initial=rows.length===2&&root.textContent.includes('현재 0.164.0 · 최신 0.166.0')
+    &&root.textContent.includes('현재 2.1.300 · 최신 2.1.310')
+    &&button(codex,'최신 버전으로 업데이트')&&button(rows[1],'버전 설치')
+    &&button(codex,'이전 버전으로 복원');
+  codex.querySelector('input').value='bad';button(codex,'버전 설치').click();await settle();
+  const invalid=!calls.some(c=>c.url.endsWith('/update'))&&codex.textContent.includes('정확한 숫자 버전');
+  button(codex,'최신 버전으로 업데이트').click();await settle();
+  const updates=calls.filter(c=>c.url.endsWith('/update'));
+  const installed=updates.length===1&&updates[0].options.body.version==='0.166.0'
+    &&codex.textContent.includes('현재 0.166.0')&&codex.textContent.includes('업데이트 완료');
+  const next=document.createElement('section');root.replaceWith(next);
+  renderAdminCliVersions(next,api,{scope:'admin-a'});await settle();
+  const reentry=next.textContent.includes('현재 0.166.0');
+  holdCatalog=true;
+  const third=document.createElement('section');next.replaceWith(third);
+  renderAdminCliVersions(third,api,{scope:'admin-b'});await settle();
+  const direct=third.querySelector('.runtime-provider');
+  const manual=button(direct,'버전 설치');
+  const independent=!manual.disabled;
+  direct.querySelector('input').value='0.165.0';manual.click();await settle();
+  const installWithoutCatalog=independent&&calls.filter(c=>c.url.endsWith('/update')).length===2
+    &&version==='0.165.0';
+  document.querySelector('#result').textContent=initial&&invalid&&installed&&reentry&&installWithoutCatalog?'PASS':
+    'FAIL '+JSON.stringify({initial:!!initial,invalid,installed,reentry,installWithoutCatalog,calls,text:third.textContent});
+})().catch(e=>document.querySelector('#result').textContent='ERROR '+e.stack);
+</script></body>"""
+    with tempfile.TemporaryDirectory(prefix="ctf-admin-cli-updates-") as temp:
         root = Path(temp)
         page = root / "index.html"
         page.write_text(fixture, encoding="utf-8")
-        cmd = [browser, "--headless=new", "--disable-gpu", "--no-first-run",
-               "--disable-extensions", f"--user-data-dir={root / 'profile'}",
-               "--virtual-time-budget=2000", "--dump-dom", page.as_uri()]
+        cmd = [browser, "--headless=new", "--disable-gpu", "--no-first-run", "--disable-extensions",
+               f"--user-data-dir={root / 'profile'}", "--virtual-time-budget=2500", "--dump-dom", page.as_uri()]
         if sys.platform != "win32":
             cmd.append("--no-sandbox")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
                                 encoding="utf-8", errors="replace")
         if result.returncode != 0 or '<pre id="result">PASS</pre>' not in result.stdout:
-            print(result.stdout[-3500:])
+            state = re.search(r'<pre id="result">([^<]*)</pre>', result.stdout)
+            print(state.group(1) if state else "Browser result not rendered")
             print(result.stderr[-1000:])
             return 1
-    print("PASS: admin CLI versions load without blocking; cache, retry and in-flight dedup preserve read-only state")
+    print("PASS: admin CLI install controls, validation, update status, and re-entry")
     return 0
 
 

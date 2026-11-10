@@ -69,6 +69,7 @@
 .account-runtime .runtime-progress { display: flex; align-items: center; gap: .55rem; color: var(--accent); }
 .account-runtime .runtime-progress::before { content: ''; width: .8rem; height: .8rem; flex: 0 0 auto; border: 2px solid var(--accent); border-top-color: transparent; border-radius: 50%; animation: runtime-spin .8s linear infinite; }
 .account-runtime progress { display: block; width: min(100%, 350px); height: 5px; margin: .35rem 0 1rem; accent-color: var(--accent); }
+.account-runtime progress[hidden] { display: none; }
 @keyframes runtime-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .account-runtime .runtime-progress::before { animation: none; } }
 @media (max-width: 620px) { .account-create > * { width: 100%; } .account-management .card { padding: 1rem; } .account-list .model-fields { grid-template-columns: 1fr; } .account-list .actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); } }
