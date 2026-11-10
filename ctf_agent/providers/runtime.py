@@ -26,6 +26,7 @@ class CodexRuntime:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.storage_budget = storage_budget
         self._cleanup_interrupted()
+        self._cleanup_installed_disposables()
         if self.storage_budget is not None:
             # No install subprocess survives application startup. Remove a
             # crash-left reservation only after its exact stage was removed.
@@ -50,6 +51,22 @@ class CodexRuntime:
         for path in tuple(self.root.iterdir()):
             if STAGE.fullmatch(path.name) or path.name == "installer":
                 self._remove_child(path)
+
+    def _cleanup_installed_disposables(self):
+        """Reclaim npm artifacts left by older, otherwise valid installs."""
+        for package in self.root.iterdir():
+            if (not package.is_dir() or package.is_symlink()
+                    or not VERSION.fullmatch(package.name.removeprefix("codex-"))
+                    or not package.name.startswith("codex-")):
+                continue
+            for name in (".npm-cache", "installer-home"):
+                disposable = package / name
+                if disposable.is_dir() and not disposable.is_symlink():
+                    try:
+                        shutil.rmtree(disposable)
+                    except OSError:
+                        # Cache cleanup must not prevent the app from starting.
+                        pass
 
     @staticmethod
     def _tree_size(root: Path) -> int:
@@ -220,6 +237,12 @@ class CodexRuntime:
                         raise ProviderError("공식 Codex 패키지 설치에 실패했습니다.")
                     if self._tree_size(stage) > RUNTIME_INSTALL_RESERVATION:
                         raise ProviderError("The Codex runtime package exceeded the safe installation size.")
+                    # npm's download cache and isolated home are only needed
+                    # while installing. Publishing them would duplicate the
+                    # cache in every solver slot's immutable runtime snapshot.
+                    for disposable in (stage / ".npm-cache", stage / "installer-home"):
+                        if disposable.is_dir() and not disposable.is_symlink():
+                            shutil.rmtree(disposable)
                     if destination.exists():
                         raise ProviderError("기존 버전 디렉터리를 확인해야 합니다.")
                     stage.rename(destination)

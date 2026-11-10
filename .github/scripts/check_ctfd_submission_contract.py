@@ -42,7 +42,7 @@ def fake_resolver(host: str, port: int, *, type: int):
 
 class FakeTransport:
     def __init__(self, mode: str):
-        if mode not in {"token", "html", "html_late", "json", "json_redirect", "json_unsupported", "sso"}:
+        if mode not in {"token", "token_closed", "html", "html_late", "json", "json_redirect", "json_unsupported", "sso"}:
             raise ValueError(mode)
         self.mode = mode
         self.requests: list[dict] = []
@@ -63,7 +63,7 @@ class FakeTransport:
 
         # The transport also verifies what a real site would need in order to
         # accept a request; an in-memory success response alone proves little.
-        if self.mode == "token":
+        if self.mode in {"token", "token_closed"}:
             assert headers.get("Authorization") == "Token offline-token"
             assert "Cookie" not in headers
         else:
@@ -141,6 +141,9 @@ class FakeTransport:
             return self._json({"id": 7, "name": "offline-user"})
 
         if method == "GET" and path == "/api/v1/challenges":
+            if self.mode == "token_closed":
+                return Response(403, {"content-type": "application/json"},
+                                b'{"success":false,"code":"competition_closed"}')
             # A JSON-session site can permit imports even when its login page
             # does not expose the CSRF nonce needed for CTFd's attempt API.
             return self._json([])
@@ -163,6 +166,7 @@ class FakeTransport:
 def client_for(mode: str) -> tuple[CTFdClient, FakeTransport]:
     transport = FakeTransport(mode)
     auth = {"token": {"auth_type": "token", "token": "offline-token"},
+            "token_closed": {"auth_type": "token", "token": "offline-token"},
             "html": {"auth_type": "password", "username": "offline-user",
                      "password": "offline-password"},
             "html_late": {"auth_type": "password", "username": "offline-user",
@@ -189,8 +193,15 @@ class CTFdClientContract(unittest.TestCase):
         paths = [r["path"] for r in transport.requests]
         self.assertNotIn("/login", paths)
         self.assertIn("/api/v1/users/me", paths)
-        self.assertIn("/api/v1/challenges", paths)
+        self.assertNotIn("/api/v1/challenges", paths)
         self.assertEqual(paths.count("/api/v1/challenges/attempt"), 1)
+
+    def test_token_can_be_prepared_before_challenge_list_opens(self):
+        client, transport = client_for("token_closed")
+        ready, reason = client.submission_readiness()
+        self.assertEqual((ready, reason), (True, ""))
+        self.assertEqual([request["path"] for request in transport.requests],
+                         ["/api/v1/users/me"])
 
     def test_html_password_uses_rotated_session_nonce_and_cookie(self):
         client, transport = client_for("html")
@@ -203,7 +214,7 @@ class CTFdClientContract(unittest.TestCase):
         self.assertEqual(paths.count("/login"), 2)
         self.assertIn("/challenges", paths)
         self.assertIn("/api/v1/users/me", paths)
-        self.assertIn("/api/v1/challenges", paths)
+        self.assertNotIn("/api/v1/challenges", paths)
         self.assertEqual(paths.count("/api/v1/challenges/attempt"), 1)
 
     def test_json_password_is_import_only_without_session_nonce(self):
@@ -373,7 +384,10 @@ class ConnectionReadinessContract(unittest.TestCase):
             transports: list[FakeTransport] = []
 
             def factory(**kwargs):
-                mode = "token" if kwargs["auth_type"] == "token" else kwargs["url"].split("//", 1)[1].split(".", 1)[0]
+                mode = ("token_closed" if kwargs["auth_type"] == "token" and
+                        "closed.example.test" in kwargs["url"] else
+                        "token" if kwargs["auth_type"] == "token" else
+                        kwargs["url"].split("//", 1)[1].split(".", 1)[0])
                 transport = FakeTransport(mode)
                 transports.append(transport)
                 return CTFdClient(
@@ -431,6 +445,52 @@ class ConnectionReadinessContract(unittest.TestCase):
                         [request["path"] for request in transport.requests],
                         "Connection readiness must never submit a flag",
                     )
+
+    def test_old_precontest_token_connection_can_recheck_without_resaving(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            root = Path(temp)
+            settings = Settings(root / "data", root / "db", root / "config", root / "logs",
+                                storage_min_free_bytes=0, auth_mode="nologin")
+            app = create_app(settings)
+            transports = []
+
+            def factory(**kwargs):
+                transport = FakeTransport("token_closed")
+                transports.append(transport)
+                return CTFdClient(
+                    **kwargs, resolver=lambda _host, port, *, type: [
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+                    ], transport=transport,
+                )
+
+            app.state.ctfd_client_factory = factory
+            with TestClient(app) as browser:
+                csrf = browser.get("/api/auth/state").json()["csrf_token"]
+                browser.headers.update({"x-csrf-token": csrf})
+                workspace = browser.post("/api/workspaces", json={"name": "precontest"})
+                self.assertEqual(workspace.status_code, 201, workspace.text)
+                base = f'/api/workspaces/{workspace.json()["id"]}/ctfd'
+                saved = browser.put(base + "/connection", json={
+                    "url": "https://closed.example.test", "auth_type": "token", "token": "offline-token",
+                })
+                self.assertEqual(saved.status_code, 200, saved.text)
+                self.assertTrue(saved.json()["submit_ready"])
+                # A previous release persisted this state when the contest's
+                # list API returned competition_closed.
+                with app.state.ctfd_submit.db() as db:
+                    db.execute("UPDATE ctfd_submit_connections SET submit_ready=0,"
+                               "submit_check_reason='challenge_access_unavailable' WHERE workspace_id=?",
+                               (workspace.json()["id"],))
+                checked = browser.post(base + "/connection/recheck")
+                self.assertEqual(checked.status_code, 200, checked.text)
+                self.assertTrue(checked.json()["submit_ready"])
+                self.assertEqual(checked.json()["submit_check_reason"], "")
+                enabled = browser.put(base + "/settings", json={"auto_submit": True})
+                self.assertEqual(enabled.status_code, 200, enabled.text)
+                self.assertTrue(enabled.json()["auto_submit"])
+                for transport in transports:
+                    paths = [request["path"] for request in transport.requests]
+                    self.assertEqual(paths, ["/api/v1/users/me"])
 
 
 if __name__ == "__main__":

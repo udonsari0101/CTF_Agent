@@ -23,26 +23,15 @@ FLAG = "test{offline_dedup_only}"
 
 
 class SubmissionReadinessTests(unittest.TestCase):
-    def test_transient_challenge_listing_failure_is_not_auth_failure(self):
+    def test_token_readiness_does_not_depend_on_challenge_listing(self):
         client = CTFdClient(SITE, auth_type="token", token="offline-token")
-        with patch.object(client, "validate"), patch.object(client, "_json") as listing:
-            for message in (
-                "The remote request failed or timed out.",
-                "The remote server returned HTTP 503.",
-                "The remote server returned HTTP 520.",
-                "The CTFd site rate limited this request.",
-            ):
-                with self.subTest(message=message):
-                    listing.side_effect = CTFdError(message)
-                    with self.assertRaises(CTFdError):
-                        client.submission_readiness()
-
-            listing.side_effect = CTFdError(
-                "CTFd denied access. Check the selected authentication method."
-            )
-            self.assertEqual(
-                client.submission_readiness(), (False, "challenge_access_unavailable")
-            )
+        with patch.object(client, "validate") as validate, patch.object(client, "_json") as listing:
+            self.assertEqual(client.submission_readiness(), (True, ""))
+            validate.assert_called_once_with()
+            listing.assert_not_called()
+        with patch.object(client, "validate", side_effect=CTFdError("The remote request timed out.")):
+            with self.assertRaises(CTFdError):
+                client.submission_readiness()
 
     def test_transient_password_csrf_page_failure_is_not_auth_failure(self):
         client = CTFdClient(

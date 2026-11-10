@@ -2826,6 +2826,15 @@ class SolverExchangeCoordinator:
         if source_root is None:
             if version != (REQUIRED_CODEX_VERSION if provider == "codex" else REQUIRED_CLAUDE_VERSION):
                 raise ExchangeError("runtime_not_published", "선택한 Codex runtime 원본을 찾을 수 없습니다.", category="model")
+            runtime_root = self.exchange / "runtime"
+            destination = runtime_root / f"{provider}-{version}"
+            # Old releases may have published a full copy of the same CLI
+            # already present in the image. Only reclaim that derived tree
+            # after all queued/running jobs have finished using its digest.
+            with self._lock():
+                if destination.exists() and not self.has_open_jobs():
+                    _make_tree_owner_writable(destination, runtime_root)
+                    _safe_remove_tree(destination, runtime_root)
             return {"version": version, "sha256": None, "source": "image"}
         source = Path(source_root)
         if source.name != f"{provider}-{version}" or source.is_symlink() or not source.is_dir():

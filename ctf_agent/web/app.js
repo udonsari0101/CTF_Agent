@@ -5209,7 +5209,7 @@ function ctfdConnectionState(state) {
       ${state.connected ? `<p class="ctfd-connection-meta"><strong data-i18n-ignore>${esc(state.url)}</strong><small>${state.auth_type === 'password' ? '아이디·비밀번호' : 'API 토큰'}</small></p>` : '<p class="form-hint">CTFd 연결을 저장하세요.</p>'}
       <div class="ctfd-submit-toggle-row"><label class="ctfd-submit-toggle"><input id="ctfd-auto-submit-toggle" type="checkbox" data-saved="${Boolean(state.auto_submit)}" aria-describedby="ctfd-auto-submit-help" ${state.auto_submit ? 'checked' : ''} ${state.submit_ready ? '' : 'disabled'}><span>Flag 자동 제출</span></label></div>
       <p id="ctfd-auto-submit-help" class="notice ctfd-submit-help ${state.auto_submit ? '' : 'muted'}">${state.connected && !state.submit_ready ? esc(reason) : '기본 OFF · CTFd 오답 패널티가 적용될 수 있습니다.'}</p>
-      ${state.connected ? '<div class="ctfd-submit-actions"><button type="button" class="small danger ghost" data-action="disconnect-ctfd-submit">연결 해제</button></div>' : ''}`;
+      ${state.connected ? `<div class="ctfd-submit-actions">${state.submit_ready ? '' : '<button type="button" class="small ghost" data-action="recheck-ctfd-submit">제출 연결 다시 확인</button>'}<button type="button" class="small danger ghost" data-action="disconnect-ctfd-submit">연결 해제</button></div>` : ''}`;
 }
 
 function ctfdSubmitScope() {
@@ -5255,6 +5255,14 @@ async function refreshCTFdSubmit() {
       api(`/api/workspaces/${scope.workspaceId}/ctfd/submissions`),
     ]);
     scope.state = state; scope.history = history;
+  });
+}
+
+async function recheckCTFdSubmit() {
+  await ctfdSubmitAction(async scope => {
+    scope.state = await api(`/api/workspaces/${scope.workspaceId}/ctfd/connection/recheck`,{method:'POST'});
+    scope.focusSelector = scope.state.submit_ready ? '#ctfd-auto-submit-toggle' : '[data-action="recheck-ctfd-submit"]';
+    if (scope.state.submit_ready && ctfdSubmitCurrent(scope)) toast('CTFd 제출 연결을 확인했습니다. 자동 제출을 켤 수 있습니다.');
   });
 }
 
@@ -5322,6 +5330,7 @@ async function ctfdSubmitSettings() {
     <div id="ctfd-submission-history" class="submission-history" role="region" tabindex="0" aria-label="최근 자동 제출 기록">${ctfdSubmissionRows(history)}</div></div>`,
     '<button type="button" data-action="close-modal">닫기</button>');
   modal.dataset.kind = 'ctfd-submit'; modal.dataset.workspaceId = workspaceId;
+  if (state.connected && !state.submit_ready && state.auth_type === 'token') run(() => recheckCTFdSubmit());
 }
 
 function showImportPreview(result, credentials) {
@@ -5887,6 +5896,7 @@ document.addEventListener('click', event => {
     'ctfd-refresh-auth': () => ctfdRefreshAuthForm(),
     'ctfd-submit-settings': () => ctfdSubmitSettings(),
     'refresh-ctfd-submit': () => refreshCTFdSubmit(),
+    'recheck-ctfd-submit': () => recheckCTFdSubmit(),
     'disconnect-ctfd-submit': () => disconnectCTFdSubmit(),
     'cancel-ctfd': async () => { await api(`/api/workspaces/${currentWorkspace.id}/ctfd/jobs/${button.dataset.id}/cancel`,{method:'POST'}); await pollCTFdJobs(currentWorkspace?.id); },
     'retry-ctfd': () => retryCTFdJob(button),

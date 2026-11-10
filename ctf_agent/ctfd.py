@@ -740,7 +740,7 @@ class CTFdClient:
             raise CTFdError("The site returned an unsupported CTFd account response.")
 
     def submission_readiness(self) -> tuple[bool, str]:
-        """Check read access and submission credentials without posting a flag.
+        """Check account credentials and password-session CSRF without posting.
 
         A successful import does not prove that a password session has the
         post-login CSRF nonce required by the CTFd attempt API. This check is
@@ -748,14 +748,12 @@ class CTFdClient:
         """
 
         self.validate()
-        try:
-            listing = self._json(self.url + "/api/v1/challenges")
-        except CTFdError as exc:
-            if transient_ctfd_failure(exc):
-                raise
-            return False, "challenge_access_unavailable"
-        if not isinstance(listing, list):
-            return False, "challenge_access_unavailable"
+        # A contest can hide the challenge list before opening (or after
+        # closing) while still accepting an authenticated account/token. The
+        # list's visibility is not a credential or submission capability test.
+        # Each actual submission still checks its challenge before posting.
+        if self.auth_type == "token":
+            return True, ""
         if self.auth_type == "password" and not self.csrf_nonce:
             # CTFd often renders its rotated session nonce on the challenge
             # page rather than in the redirected login response. Never reuse

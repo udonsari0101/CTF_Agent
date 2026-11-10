@@ -243,6 +243,8 @@
     "CTFd 연결을 저장했습니다. 자동 제출은 직접 켜야 합니다.": "CTFd connection saved. Enable auto-submit separately.",
     "연결 바꾸기": "Change connection",
     "연결 해제": "Disconnect",
+    "제출 연결 다시 확인": "Recheck submission connection",
+    "CTFd 제출 연결을 확인했습니다. 자동 제출을 켤 수 있습니다.": "CTFd submission connection verified. You can now enable auto-submit.",
     "제출 계정 연결": "Connect submission account",
     "자동 제출": "Automatic submission",
     "최근 자동 제출": "Recent automatic submissions",

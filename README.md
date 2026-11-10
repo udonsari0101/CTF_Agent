@@ -2,6 +2,8 @@
 
 <h1 align="center">CTF Agent</h1>
 
+<p align="center">Built for Jeopardy-style CTF challenges: analyze, find flags, and document solutions. Continuous-score King of the Hill arenas are outside the automated solve and submission workflow.</p>
+
 <p align="center">A workspace for CTF challenges, solver sessions, files, flags, and write-ups.</p>
 
 <p align="center"><a href="https://github.com/udonsari0101/CTF_Agent/releases/latest">Download</a> · <a href="docs/guides/docker-desktop.md">Windows installation</a> · <a href="docs/README.md">Documentation</a> · <a href="README.ko.md">한국어</a></p>

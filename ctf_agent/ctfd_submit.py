@@ -651,6 +651,50 @@ class CTFdSubmitService:
             "updated_at": row["updated_at"],
         }
 
+    def recheck_connection(self, workspace_id: str, user: dict) -> dict:
+        """Revalidate saved credentials without replacing them or posting a flag."""
+        self.app.state.require_workspace_owner(workspace_id, user)
+        try:
+            with self.validation_slot(user["id"], workspace_id) as cancellation:
+                with self.workspace_slot(workspace_id):
+                    with self.db() as db:
+                        row = db.execute(
+                            "SELECT url,credentials_ciphertext,generation,auto_submit "
+                            "FROM ctfd_submit_connections WHERE workspace_id=? AND owner_user_id=?",
+                            (workspace_id, user["id"]),
+                        ).fetchone()
+                    if not row:
+                        raise HTTPException(404, "The saved CTFd connection is no longer available.")
+                    if row["auto_submit"]:
+                        return self.connection_state(workspace_id, user)
+                    credentials = self.vault.decrypt(
+                        row["credentials_ciphertext"],
+                        scope=self._scope(user["id"], workspace_id),
+                    )
+                    client = self._factory(credentials, row["url"])
+                    try:
+                        if hasattr(client, "cancel_event"):
+                            client.cancel_event = cancellation
+                        if cancellation.is_set():
+                            raise CTFdError("The workspace or user is no longer available.")
+                        ready, reason = client.submission_readiness()
+                    finally:
+                        client.clear_credentials()
+                    with self.db() as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        updated = db.execute(
+                            "UPDATE ctfd_submit_connections SET submit_ready=?,submit_check_reason=?,updated_at=? "
+                            "WHERE workspace_id=? AND owner_user_id=? AND generation=? AND auto_submit=0",
+                            (int(ready), reason, _stamp(), workspace_id, user["id"], row["generation"]),
+                        )
+                        if not updated.rowcount:
+                            raise HTTPException(409, "The CTFd connection changed. Refresh and try again.")
+                    return self.connection_state(workspace_id, user)
+        except CTFdError as exc:
+            raise HTTPException(400, self._connection_error(exc)) from None
+        except CredentialVaultError:
+            raise HTTPException(503, "Saved CTFd credentials are unavailable. Reconnect the account.") from None
+
     def client_for_import(self, workspace_id: str, user: dict):
         """Build a short-lived importer from the owner's saved connection.
 
@@ -1583,6 +1627,10 @@ def register_ctfd_submit(app, require_auth, settings):
     @app.delete("/api/workspaces/{workspace_id}/ctfd/connection", dependencies=[Depends(require_auth)])
     def delete_connection(workspace_id: str, request: Request):
         return service.delete_connection(workspace_id, request.state.user)
+
+    @app.post("/api/workspaces/{workspace_id}/ctfd/connection/recheck", dependencies=[Depends(require_auth)])
+    def recheck_connection(workspace_id: str, request: Request):
+        return service.recheck_connection(workspace_id, request.state.user)
 
     @app.get("/api/workspaces/{workspace_id}/ctfd/settings", dependencies=[Depends(require_auth)])
     def get_settings(workspace_id: str, request: Request):

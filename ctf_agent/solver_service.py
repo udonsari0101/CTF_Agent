@@ -588,10 +588,13 @@ class SolverService:
         return telegram(*telegram_args) is not False
 
     def _runtime_source(self, version: str, selected: str | None) -> Path | None:
+        # An explicitly selected CLI can become the version bundled by a
+        # later image update. The image already has the same official version,
+        # so copying the installed package into each solver slot wastes space.
+        if version == REQUIRED_CODEX_VERSION:
+            return None
         if selected == version:
             return self.accounts.runtime.root / f"codex-{version}"
-        if selected is None and version == REQUIRED_CODEX_VERSION:
-            return None
         raise ExchangeError(
             "runtime_unavailable",
             "선택한 Codex runtime을 solver에서 확인할 수 없습니다.",
@@ -618,10 +621,10 @@ class SolverService:
         if not state.get("available") or not isinstance(version, str):
             raise ExchangeError("runtime_unavailable", "Claude Code 실행 파일을 확인하지 못했습니다.",
                                 category="model", retryable=True)
-        if selected:
-            source = self.accounts.claude_runtime.root / f"claude-{version}"
-        elif version == REQUIRED_CLAUDE_VERSION:
+        if version == REQUIRED_CLAUDE_VERSION:
             source = None
+        elif selected:
+            source = self.accounts.claude_runtime.root / f"claude-{version}"
         else:
             raise ExchangeError("runtime_unavailable", "Claude Code 실행 버전이 일치하지 않습니다.",
                                 category="model", retryable=True)
@@ -641,7 +644,7 @@ class SolverService:
 
             async def switched():
                 await after_switch()
-                source = runtime.root / f"codex-{version}"
+                source = self._runtime_source(version, version)
                 await asyncio.to_thread(self.coordinator.publish_runtime, version, source)
                 self.runtime_ready, self.runtime_error = True, None
 

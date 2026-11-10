@@ -2,6 +2,8 @@
 
 <h1 align="center">CTF Agent</h1>
 
+<p align="center">Jeopardy 형식 CTF 문제의 분석, Flag 탐색, 풀이 기록에 특화되어 있습니다. 지속적으로 점수를 겨루는 King of the Hill 경기의 자동 풀이·제출은 지원 범위에 포함되지 않습니다.</p>
+
 <p align="center">CTF 문제, 풀이 세션, 파일, Flag, write-up을 작업공간별로 관리합니다.</p>
 
 <p align="center"><a href="https://github.com/udonsari0101/CTF_Agent/releases/latest">다운로드</a> · <a href="docs/guides/docker-desktop.md">Windows 설치 안내</a> · <a href="docs/README.md">문서 목록</a> · <a href="README.md">English</a></p>
