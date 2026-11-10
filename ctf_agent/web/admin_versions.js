@@ -94,8 +94,8 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
       const row = rows.get(source.key);
       const operation = current.runtime?.operation || {};
       const installing = ['installing','verifying'].includes(operation.status);
-      const busy = Boolean(current.pending || catalog.pending || row.actionBusy || installing);
-      anyBusy ||= busy;
+      const busy = Boolean(current.pending || row.actionBusy || installing);
+      anyBusy ||= busy || Boolean(catalog.pending);
       row.versions.textContent = label(
         `현재 ${current.value || '확인 불가'} · 최신 ${catalog.value || '조회 불가'}`,
         `Current ${current.value || 'Unavailable'} · Latest ${catalog.value || 'Unavailable'}`);
@@ -109,7 +109,7 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
         ? `${label('확인 실패','Lookup failed')}: ${failures.join(' / ')}`
         : operationLabel
           ? `${operationLabel}${operation.version ? ` · ${operation.version}` : ''}${operation.message ? ` · ${operation.message}` : ''}`
-        : busy ? label('조회 중…','Checking…')
+        : busy || catalog.pending ? label('조회 중…','Checking…')
         : current.runtime?.update_supported === false ? label('이 환경에서는 웹 업데이트를 지원하지 않습니다.','Web updates are unavailable in this environment.')
         : current.checkedAt || catalog.checkedAt ? label('조회 완료','Checked') : label('대기','Waiting');
       row.status.classList.toggle('error-text',Boolean(failures.length || ['failed','interrupted'].includes(operation.status)));
@@ -122,7 +122,8 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
       row.rollback.textContent = label('이전 버전으로 복원','Restore previous version');
       row.rollback.hidden = !current.runtime?.selected;
       const canManage = current.runtime?.can_manage === true && current.runtime?.update_supported !== false;
-      for (const button of [row.check,row.latest,row.install,row.rollback]) button.disabled = busy || !canManage;
+      for (const button of [row.check,row.latest]) button.disabled = busy || Boolean(catalog.pending) || !canManage;
+      for (const button of [row.install,row.rollback]) button.disabled = busy || !canManage;
       row.version.disabled = installing || row.actionBusy || !canManage;
       row.version.placeholder = label(`버전 (예: ${source.example})`,`Version (e.g. ${source.example})`);
       row.version.setAttribute('aria-label',label(`${source.name} 설치 버전`,`${source.name} version to install`));
@@ -146,9 +147,11 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
   }
 
   function load(force=false) {
-    const requests = SOURCES.flatMap(source => [fetchVersion(api,source.key,'current',true),fetchVersion(api,source.key,'latest',force)]);
+    const currentRequests = SOURCES.map(source => fetchVersion(api,source.key,'current',true));
+    const catalogRequests = SOURCES.map(source => fetchVersion(api,source.key,'latest',force));
     paint();
-    Promise.all(requests).then(() => { paint(); schedulePoll(); });
+    for (const request of [...currentRequests,...catalogRequests]) request.then(paint);
+    Promise.all(currentRequests).then(schedulePoll);
   }
 
   async function action(source,task) {

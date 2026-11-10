@@ -1,5 +1,6 @@
 """Browser regression for administrator-only provider CLI updates."""
 import shutil
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,9 +31,10 @@ def main():
     fixture = """<!doctype html><meta charset="utf-8"><body><section id="versions"></section>
 <pre id="result">PENDING</pre><script>""" + implementation + """
 const root=document.querySelector('#versions'),tick=()=>new Promise(r=>setTimeout(r,0));
-let calls=[],version='0.164.0',operation={status:'idle'};
+let calls=[],version='0.164.0',operation={status:'idle'},holdCatalog=false;
 const api=(url,options={})=>{
   calls.push({url,options});
+  if(holdCatalog&&url.endsWith('/catalog')) return new Promise(()=>{});
   if(url.endsWith('/catalog')) return Promise.resolve({latest:url.includes('/codex/')?'0.166.0':'2.1.310'});
   if(url.endsWith('/update')) {
     if(url.includes('/codex/')) {version=options.body.version;operation={status:'completed',version};}
@@ -60,8 +62,17 @@ const settle=async()=>{for(let i=0;i<8;i++) await tick()};
   const next=document.createElement('section');root.replaceWith(next);
   renderAdminCliVersions(next,api,{scope:'admin-a'});await settle();
   const reentry=next.textContent.includes('현재 0.166.0');
-  document.querySelector('#result').textContent=initial&&invalid&&installed&&reentry?'PASS':
-    'FAIL '+JSON.stringify({initial:!!initial,invalid,installed,reentry,calls,text:next.textContent});
+  holdCatalog=true;
+  const third=document.createElement('section');next.replaceWith(third);
+  renderAdminCliVersions(third,api,{scope:'admin-b'});await settle();
+  const direct=third.querySelector('.runtime-provider');
+  const manual=button(direct,'버전 설치');
+  const independent=!manual.disabled;
+  direct.querySelector('input').value='0.165.0';manual.click();await settle();
+  const installWithoutCatalog=independent&&calls.filter(c=>c.url.endsWith('/update')).length===2
+    &&version==='0.165.0';
+  document.querySelector('#result').textContent=initial&&invalid&&installed&&reentry&&installWithoutCatalog?'PASS':
+    'FAIL '+JSON.stringify({initial:!!initial,invalid,installed,reentry,installWithoutCatalog,calls,text:third.textContent});
 })().catch(e=>document.querySelector('#result').textContent='ERROR '+e.stack);
 </script></body>"""
     with tempfile.TemporaryDirectory(prefix="ctf-admin-cli-updates-") as temp:
@@ -75,7 +86,8 @@ const settle=async()=>{for(let i=0;i<8;i++) await tick()};
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
                                 encoding="utf-8", errors="replace")
         if result.returncode != 0 or '<pre id="result">PASS</pre>' not in result.stdout:
-            print(result.stdout[-3500:])
+            state = re.search(r'<pre id="result">([^<]*)</pre>', result.stdout)
+            print(state.group(1) if state else "Browser result not rendered")
             print(result.stderr[-1000:])
             return 1
     print("PASS: admin CLI install controls, validation, update status, and re-entry")
