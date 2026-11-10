@@ -79,12 +79,7 @@ try {
   check(aged.stale && !aged.blocked && !aged.exhausted, 'aged limit is historical');
   check(!quotaDisplayState(items[4]).exhausted, 'unknown usage is not exhausted');
   await renderAccounts(document.querySelector('#root'), api);
-  const updates = document.querySelectorAll('.runtime-provider');
-  check(updates.length === 2, 'both provider CLI update sections visible');
-  for (const section of updates) {
-    check([...section.querySelectorAll('button')].some(item => item.textContent === '최신 버전으로 업데이트'),
-      'direct CLI update control visible');
-  }
+  check(!document.querySelector('.runtime-provider'), 'CLI updates are in administrator settings only');
   const card = id => document.querySelector(`.account-list [data-account-id="${id}"]`);
   const codex = card('codex-zero-week');
   check(codex.classList.contains('quota-exhausted') && !codex.classList.contains('quota-limited'),
