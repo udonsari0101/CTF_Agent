@@ -37,6 +37,20 @@
 | 개인 설정 | 관리자 설정 |
 | ![개인 설정](docs/images/ko/settings.png) | ![사용자 관리](docs/images/ko/admin.png) |
 
+## 시스템 요구 사항
+
+Windows 릴리스는 WSL 2와 Docker Desktop의 Linux 컨테이너 엔진을 사용합니다. 지원되는 64비트 Windows, 하드웨어 가상화와 SLAT가 활성화된 CPU, Docker Desktop과 통합된 WSL 배포판이 필요합니다. Docker의 [최신 Windows 요구 사항](https://docs.docker.com/desktop/setup/install/windows-install/)은 RAM 8GB 이상과 WSL 2.1.5 이상을 명시하지만, 이는 **Docker 실행 조건이지 CTF Agent를 여유 있게 쓰기 위한 사양은 아닙니다**.
+
+| 사용 규모 | RAM | CPU | CTF Agent 설치 전 SSD 여유 공간* |
+| --- | --- | --- | --- |
+| 솔버 1개와 작은 문제 파일 | 16GB | 논리 CPU 4개 | 30GiB |
+| 여유 있는 사용, 솔버 약 2~3개 동시 실행 | 32GB | 논리 CPU 8개 | 50GiB |
+| 솔버 4개 이상, 대형 디스크 이미지나 호스트의 별도 VM 작업 | 64GB 이상 | 논리 CPU 12개 이상 | 100GiB 이상 + 문제 파일 공간 |
+
+\* WSL과 Docker Desktop이 이미 설치된 PC의 **용량 계획 기준이며 보장되는 처리 한도는 아닙니다**. 둘을 새로 설치한다면 공간이 더 필요합니다. 릴리스 설치기는 새 이미지 다운로드·압축 해제에 18GiB, 앱 준비에 1GiB를 잡고 5GiB를 남기도록 검사합니다. 별도 DB VHDX를 쓰면 1GiB의 증가분을 추가합니다. 같은 Windows 드라이브에 두면 예상 사용량을 합산하고, 다른 드라이브는 따로 검사합니다. 큰 첨부파일은 원본 다운로드, 압축 해제본, 솔버 임시 파일이 동시에 공간을 차지할 수 있습니다. 자세한 기준은 [설치기의 디스크 검사](docs/guides/docker-desktop.md#release-installer)를 참고하세요.
+
+로컬 솔버 수는 **WSL 안에서 실제로 사용 가능한 메모리**와 CPU 한도를 기준으로 자동 계산합니다. 서비스용 2GiB를 제외하고 솔버 하나당 메모리 6GiB와 논리 CPU 2개를 잡습니다. 따라서 PC에 장착된 RAM만으로 표의 동시 실행 수가 보장되지는 않으며, 다른 프로그램·WSL 제한·문제 유형에 따라 달라집니다. 관리자 설정에서 최대 솔버 수를 제한할 수 있습니다. 파일 I/O를 위해 문제 데이터는 WSL의 Linux 파일시스템에 두는 것을 권장하며, Windows 파일 탐색기에서는 `\\wsl.localhost`로 접근할 수 있습니다([Docker의 WSL 안내](https://docs.docker.com/desktop/features/wsl/)).
+
 ## Windows에 설치
 
 1. 최신 릴리즈의 `CTF_Agent-*-local-windows.zip` 파일을 내려받아 로컬 폴더에 압축을 풉니다.
@@ -45,7 +59,7 @@
 
 기존 WSL 배포판에서 자체 Docker Engine을 실행 중이면 `-Interactive`로 새 Ubuntu를 선택하거나 `-Distribution`으로 별도 배포판을 지정하세요. Linux 사용자 이름과 비밀번호를 설정한 뒤 Linux 창에서 `exit`를 입력하면 설치기가 계속 진행됩니다.
 
-**관리자 설정 → 서비스 업데이트**에서 공개 릴리스와 변경 내역을 확인하고 업데이트할 수 있습니다. 기존 설치에도 `Install.cmd`를 다시 실행해 업데이트할 수 있습니다. 두 방법 모두 선택한 데이터 폴더를 유지합니다. 설치기는 서버와 동일한 커밋 고정 공개 GHCR 이미지를 내려받고 Windows 풀이 정책을 위한 작은 로컬 런타임 레이어를 빌드합니다. CTF 도구 모음은 다시 빌드하지 않습니다. 설치와 Start는 `/readyz`에서 solver 준비가 확인된 뒤 성공을 표시합니다. 자세한 요구 사항과 문제 해결 방법은 [설치 안내](docs/guides/docker-desktop.md)를 참고하세요.
+**관리자 설정 → 서비스 업데이트**에서 공개 릴리스와 변경 내역을 확인하고 업데이트할 수 있습니다. 기존 설치에도 `Install.cmd`를 다시 실행해 업데이트할 수 있습니다. 두 방법 모두 선택한 데이터 폴더를 유지합니다. 설치기는 서버와 동일한 커밋 고정 공개 GHCR 이미지를 내려받아 그대로 사용하며 CTF 도구 모음이나 별도의 로컬 런타임 레이어를 다시 빌드하지 않습니다. 설치와 Start는 `/readyz`에서 solver 준비가 확인된 뒤 성공을 표시합니다. 자세한 요구 사항과 문제 해결 방법은 [설치 안내](docs/guides/docker-desktop.md)를 참고하세요.
 
 웹에서 업데이트한 뒤 Windows 실행 파일이 변경된 릴리스라면 새 ZIP의 `Install.cmd`를 한 번 실행해 Windows 사용자 폴더의 Start.cmd와 Uninstall.cmd도 갱신하세요. 웹 업데이트는 WSL 서비스를 갱신하지만, WSL interop을 사용할 수 없는 환경에서 Windows 실행 파일까지 교체하지는 못합니다. DB를 Windows 드라이브의 별도 VHDX에 저장한 기존 설치는 새 릴리스의 `Install.cmd`를 한 번 실행해 검증된 Docker DB 경로로 이전한 뒤 웹 업데이트를 사용하세요.
 

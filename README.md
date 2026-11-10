@@ -46,6 +46,20 @@ Cloudflare Access protected destinations.
 | Personal settings | Administration |
 | ![Personal settings](docs/images/en/settings.png) | ![User administration](docs/images/en/admin.png) |
 
+## System requirements
+
+The Windows release uses WSL 2 and Docker Desktop's Linux-container backend. Use a supported 64-bit Windows version, a CPU with hardware virtualization and SLAT enabled, and a WSL distribution integrated with Docker Desktop. Docker's [current Windows requirements](https://docs.docker.com/desktop/setup/install/windows-install/) specify at least 8 GB of RAM and WSL 2.1.5 or later; that is a **Docker prerequisite, not a comfortable CTF Agent target**.
+
+| Usage target | RAM | CPU | Free SSD space before CTF Agent installation* |
+| --- | --- | --- | --- |
+| One solver, modest challenge files | 16 GB | 4 logical CPUs | 30 GiB |
+| Comfortable use, roughly 2–3 simultaneous solvers | 32 GB | 8 logical CPUs | 50 GiB |
+| Four or more solvers, large disk images, or separate host-side VM work | 64 GB or more | 12+ logical CPUs | 100 GiB or more, plus space for the challenge files |
+
+\* Planning estimates for an existing WSL/Docker Desktop installation, **not guaranteed capacity limits**. A fresh WSL/Docker installation needs additional room. The release installer reserves 18 GiB for a cold image pull, 1 GiB for application staging, and 5 GiB that must remain free; a separate database VHDX adds a 1 GiB growth estimate. If these use the same Windows drive, their estimates are added; different drives are checked independently. Large attachments may need space for the download, extracted files, and solver scratch at the same time. See the [disk-space checks](docs/guides/docker-desktop.md#release-installer).
+
+The local solver pool sizes itself from **available memory inside WSL** and effective CPU limits, budgeting 6 GiB and two logical CPUs per solver after a 2 GiB service reserve. Installed RAM alone therefore does not guarantee the solver counts in the table; other apps, WSL limits, and challenge workloads matter. The administrator can cap the pool. Keep challenge data on the WSL Linux filesystem for better file I/O; Windows Explorer can still reach it through `\\wsl.localhost` ([Docker's WSL guidance](https://docs.docker.com/desktop/features/wsl/)).
+
 ## Install on Windows
 
 1. Download the latest `CTF_Agent-*-local-windows.zip` release and extract it to a local folder.
