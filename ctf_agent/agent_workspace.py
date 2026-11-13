@@ -64,21 +64,18 @@ _RESERVED_TOP_LEVEL = {
 # Adapted from the original driver. The web worker uses the same solve loop;
 # flag provenance follows the challenge evidence and configured remote mode.
 INITIAL_GOAL = (
-    "You are competing to solve this CTF challenge; your job is to build a working "
-    "exploit and capture the flag. Read your operating manual (CLAUDE.md or "
-    "AGENTS.md here) and the read-only brief ../chal_desc.md, then work fully "
-    "autonomously through the solve loop: recon -> open a relevant "
-    "../../skills/<cat>.md only when a tactic or tool is needed -> analyze "
-    "(decompose hard targets file/function-by-"
-    "function) -> identify the vuln -> verify it's real and reaches the flag -> "
-    "build solver.py -> on failure, branch (more skills only if relevant, check "
-    "patch/CVE for 0/1-day, side-channels, re-chain the primitives you already have). "
-    "Write notes/{ANALYSIS,VULN,NEXT}.md at each cycle end (don't read them at the "
-    "start), keep scratch in tmp/. Verify the genuine flag from the brief, "
-    "supplied artifacts, and observed target behavior; a local value may be "
-    "genuine or a placeholder. Solve any PoW if required. Submit with "
-    "submit-flag \"<flag>\". Don't stop until it's "
-    "accepted; don't grind — when stuck, vary the tactic."
+    "Solve this CTF challenge. Read AGENTS.md or CLAUDE.md and the read-only "
+    "brief ../chal_desc.md. Start with the cheapest decisive test and follow "
+    "the evidence, even if the category label is missing or misleading. Open a "
+    "relevant ../../skills/<cat>.md only when a tactic or tool is needed. "
+    "If exploitation is required, verify the primitive and write a replayable "
+    "solver.py; if a direct artifact or command yields the genuine flag, record "
+    "its extraction without making an unnecessary script. On failure, test a "
+    "different hypothesis rather than repeating an unchanged experiment. "
+    "Write notes/{ANALYSIS,VULN,NEXT}.md at each cycle end, and keep scratch "
+    "in tmp/. Verify the genuine flag from the brief, supplied artifacts, and "
+    "observed target behavior; a local value may be genuine or a placeholder. "
+    "Solve any PoW if required. Submit with submit-flag \"<flag>\"."
 )
 
 NUDGE = (

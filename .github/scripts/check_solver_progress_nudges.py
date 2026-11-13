@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 from ctf_agent import solver_worker as worker  # noqa: E402
 from ctf_agent.solver import ModelConfiguration  # noqa: E402
 from ctf_agent.request_remote import record_request  # noqa: E402
+from ctf_agent.solve_repeat import SolveRepeatObserver  # noqa: E402
 
 
 class ProgressNudgeTests(unittest.TestCase):
@@ -40,6 +41,27 @@ class ProgressNudgeTests(unittest.TestCase):
 
     async def _progress(self, code: str, **_details: object) -> None:
         self.progress_codes.append(code)
+
+    def test_repeated_shell_result_only_changes_the_next_nudge(self) -> None:
+        self.driver._solve_repeat_observer = SolveRepeatObserver()
+        prompts: list[str] = []
+
+        async def turn(_manifest, prompt, _schema, _cancelled, _progress):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                for index in range(3):
+                    activity_id = f"command-{index}"
+                    self.driver._solve_repeat_observer.started(activity_id, "cat missing")
+                    self.driver._solve_repeat_observer.completed(activity_id, "not found", 1)
+                return {}
+            return {"flag": "CTF{verified}"}
+
+        result, error = self._run(turn)
+        self.assertIsNone(error)
+        self.assertEqual(result["flag"], "CTF{verified}")
+        self.assertNotIn("three times", prompts[0])
+        self.assertIn("three times", prompts[1])
+        self.assertFalse(self.driver._solve_repeat_observer.take_hint())
 
     def test_ultra_limits_concurrent_children_without_disabling_delegation(self) -> None:
         self.driver.command_prefix = ["codex"]

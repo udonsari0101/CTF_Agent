@@ -34,6 +34,7 @@ from ctf_agent.solver_worker import (  # noqa: E402
     _provider_activity_id,
     _watch_live_attachments,
 )
+from ctf_agent.solve_repeat import SolveRepeatObserver  # noqa: E402
 
 JOB_ID = "a" * 32
 OWNER_ID = "owner-1"
@@ -79,6 +80,55 @@ def create_job_db(db_path):
 
 
 class ActivityProvenanceTests(unittest.TestCase):
+    def test_repeated_root_shell_result_is_a_private_next_turn_hint(self):
+        driver = make_driver(activity_count=MAX_LIVE_ACTIVITY_EVENTS)
+        driver._solve_repeat_observer = SolveRepeatObserver()
+        driver.agent_nodes["child"] = {}
+
+        async def run():
+            for index in range(3):
+                key = f"child-{index}"
+                await driver._report_activity(
+                    "started", "shell", "Started", command="ls", agent_id="child",
+                    activity_id=key,
+                )
+                await driver._report_activity(
+                    "completed", "shell", "Done", output="same", agent_id="child",
+                    activity_id=key,
+                )
+            for index in range(3):
+                key = f"root-{index}"
+                await driver._report_activity(
+                    "started", "shell", "Started", command="ls", activity_id=key,
+                )
+                await driver._report_activity(
+                    "completed", "shell", "Done", output="same", activity_id=key,
+                )
+
+        asyncio.run(run())
+        self.assertTrue(driver._solve_repeat_observer.take_hint())
+        self.assertFalse(driver._solve_repeat_observer.take_hint())
+
+    def test_changed_shell_results_and_unpaired_completions_do_not_hint(self):
+        observer = SolveRepeatObserver()
+        for index in range(4):
+            key = str(index)
+            observer.started(key, "curl https://example.test/status")
+            observer.completed(key, f"state={index}", 0)
+        observer.completed("orphan", "state=0", 0)
+        self.assertFalse(observer.take_hint())
+
+    def test_repeated_result_only_compares_matching_command_and_output(self):
+        observer = SolveRepeatObserver()
+        for index, command in enumerate(("ls a", "ls b", "ls a")):
+            key = str(index)
+            observer.started(key, command)
+            observer.completed(key, "same", 0)
+        self.assertFalse(observer.take_hint())
+        observer.started("last", "ls a")
+        observer.completed("last", "same", 0)
+        self.assertTrue(observer.take_hint())
+
     def test_legacy_live_attachment_events_are_narrowly_recovered(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
             active = Path(temp)

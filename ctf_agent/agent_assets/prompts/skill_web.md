@@ -3,9 +3,9 @@
 Fingerprint the framework, learn its **safe default idiom** (auth decorator, ORM parametrization, autoescape, signed session), then find the ONE handler that opts out. The bug is the outlier against its neighbors — diff, don't CVE-grep. Everything below is web-specific tactics + the tools to run them; base.md owns the solve loop, submission/POISON, belief≠proof, local→remote/PoW, and the `notes/` model.
 
 ## Source-first when source ships
-Read top-down before touching the network — beats blind fuzzing here.
+Map the supplied source quickly. If a target endpoint is supplied, check one normal response against it before expanding the analysis. When there is no endpoint, use a runnable local copy or the supplied code as the observation. Reading every file before the first observation or fuzzing blindly wastes time.
 1. **Stack** from manifests: `requirements.txt`/`Pipfile`, `package.json`, `composer.json`, `Gemfile`, `go.mod`, framework imports, pinned versions (record in `notes/ANALYSIS.md` — version decides which gadget/escape works).
-2. **Routes → handlers**, then read each handler for its sink.
+2. **Routes → relevant handlers**; identify the one path that controls the likely Flag route, then follow its sink. Expand to other handlers only when the first observation calls for it.
 3. **Establish the norm**: how do the *other* handlers auth/query/render/deserialize? The vuln handler differs by one line.
 4. Trace user input → sink (dataflow), not names.
 

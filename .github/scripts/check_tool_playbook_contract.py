@@ -83,6 +83,10 @@ class ToolPlaybookContract(unittest.TestCase):
         self.assertIn("Verify the genuine flag", INITIAL_GOAL)
         self.assertIn("a local value may be genuine or a placeholder", INITIAL_GOAL)
         self.assertIn("only when a tactic or tool is needed", INITIAL_GOAL)
+        self.assertIn("if a direct artifact or command yields the genuine flag", INITIAL_GOAL)
+        self.assertIn("without making an unnecessary script", INITIAL_GOAL)
+        self.assertIn("without manufacturing a script", asset("base.md"))
+        self.assertIn("If a target endpoint is supplied, check one normal response", asset("skill_web.md"))
         self.assertIn('submit-flag "<flag>"', INITIAL_GOAL)
         self.assertNotIn("The REAL flag is on the remote", INITIAL_GOAL)
         for mode, remote, expected in (

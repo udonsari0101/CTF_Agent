@@ -68,6 +68,7 @@ from .solver_retry import (
     solver_artifact_from_bytes,
 )
 from .request_remote import MAX_REQUEST_BYTES
+from .solve_repeat import SolveRepeatObserver
 from .writeup_publication import (
     contains_internal_operation,
     public_solution_notes,
@@ -3056,6 +3057,7 @@ class CodexAppServer:
         self._discovery_command_execution_seen = False
         self._solve_tool_count = 0
         self._first_solve_tool_at: float | None = None
+        self._solve_repeat_observer = SolveRepeatObserver()
         self.guidance_mailbox: GuidanceMailbox | None = None
         self.activity_reporter: Callable[..., Awaitable[None]] | None = None
         self.evidence_reporter: Callable[..., Awaitable[None]] | None = None
@@ -3100,6 +3102,13 @@ class CodexAppServer:
             not isinstance(activity_agent_id, str) or activity_agent_id not in self.agent_nodes
         ):
             activity_agent_id = None
+        if activity_agent_id == "root" and tool == "shell":
+            repeat_observer = getattr(self, "_solve_repeat_observer", None)
+            if repeat_observer is not None:
+                if phase == "started":
+                    repeat_observer.started(activity_id, command)
+                elif phase == "completed":
+                    repeat_observer.completed(activity_id, output, exit_code)
         # This phase measures the first observable root tool result, not merely
         # a provider's completed marker. A silent command still has its exit
         # code; web/file completion markers without output do not qualify.
@@ -5009,6 +5018,16 @@ is a fresh isolated job; do not repeat completed work.
             prompt = (recovery_prompt or (
                 phase_first_prompt if current_attempt == 0 else NUDGE
             )) + result_bridge
+            repeat_observer = getattr(self, "_solve_repeat_observer", None)
+            if current_attempt > 0 and repeat_observer is not None and repeat_observer.take_hint():
+                prompt += (
+                    "\n\nThe worker observed a root shell command return exactly the same "
+                    "result at least three times in the last six completed shell calls. "
+                    "If you are intentionally waiting for a changing state, use a bounded "
+                    "wait and check the expected change. Otherwise record the unchanged "
+                    "observation and run one different, falsifiable test. Do not infer "
+                    "remote unavailability or a missing input from repetition alone."
+                )
             recovery_prompt = ""
             try:
                 result = await self._turn(
@@ -5575,6 +5594,7 @@ class ClaudePrintDriver(CodexAppServer):
         self._discovery_command_execution_seen = False
         self._solve_tool_count = 0
         self._first_solve_tool_at: float | None = None
+        self._solve_repeat_observer = SolveRepeatObserver()
         self.guidance_mailbox: GuidanceMailbox | None = None
         self.activity_reporter: Callable[..., Awaitable[None]] | None = None
         self.evidence_reporter: Callable[..., Awaitable[None]] | None = None

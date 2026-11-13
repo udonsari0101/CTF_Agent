@@ -41,7 +41,7 @@ Run this loop, **branching selectively** — take the steps the challenge needs,
 
 **⑤ Verify it's REAL and reaches the flag.** Before building the full exploit, confirm three things by *running*: the tainted input actually **reaches** the bug; you can **trigger** it (satisfy every guard); and the primitive **chains to the flag** (shell/read/leak → flag). If any fails, it's not the bug — go back to ③.
 
-**⑥ Build the solver** — a program (`solver.py`, pwntools/struct/requests) that constructs the payload exactly and is replayable. Parameterize `HOST`/`PORT` when the challenge has a remote service. Develop locally where useful, then verify on the actual challenge target or artifact.
+**⑥ Reproduce the solve** — when a script is needed, make `solver.py` construct the payload exactly and replay it. Parameterize `HOST`/`PORT` when the challenge has a remote service. If a supplied artifact or one direct command already yields the genuine Flag, record the exact extraction and verification in notes and submit it without manufacturing a script. Develop locally where useful, then verify on the actual challenge target or artifact.
 
 **⑦ When it fails or stalls, branch — don't grind:**
 - **Open additional skills** *only if genuinely relevant and not already read* — never re-read a skill or open an unrelated one.
