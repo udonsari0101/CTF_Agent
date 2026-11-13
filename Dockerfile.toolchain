@@ -159,7 +159,7 @@ RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-ctf
 
 # Keep model CLIs last: changing them must not invalidate the large system,
 # Ghidra/JDK/JADX or Python dependency layers.
-ARG CODEX_VERSION=0.166.0
+ARG CODEX_VERSION=0.169.0
 ARG CLAUDE_VERSION=2.1.311
 RUN npm install --global --no-audit --no-fund \
         "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \

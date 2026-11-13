@@ -83,7 +83,7 @@ except ImportError:  # pragma: no cover - Windows development host
 
 EXCHANGE_PROTOCOL = 1
 WORKER_ATTACHMENT_ACTIVITY_SOURCE = "worker_attachment"
-REQUIRED_CODEX_VERSION = os.environ.get("CTF_IMAGE_CODEX_VERSION", "0.166.0")
+REQUIRED_CODEX_VERSION = os.environ.get("CTF_IMAGE_CODEX_VERSION", "0.169.0")
 if not re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", REQUIRED_CODEX_VERSION):
     raise RuntimeError("CTF_IMAGE_CODEX_VERSION must be an exact semantic version")
 REQUIRED_CLAUDE_VERSION = os.environ.get("CTF_IMAGE_CLAUDE_VERSION", "2.1.311")
