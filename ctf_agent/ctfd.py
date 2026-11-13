@@ -110,6 +110,11 @@ _DESCRIPTION_HOST_PORT = re.compile(
     re.I,
 )
 _NON_SERVICE_PATH = re.compile(r"\.(?:zip|7z|tar|gz|pdf|md|txt|png|jpe?g|gif|svg)(?:$|[?#])", re.I)
+_REFERENCE_URL_CONTEXT = re.compile(
+    r"(?i)(?:\b(?:tool|utility|website)\s+(?:like|such as)|"
+    r"\b(?:docs|documentation|tutorial|write[- ]?up|guide|reference)\s*(?:at|on|:)?|"
+    r"\[(?:[^]]*\b)?(?:tool|utility|docs|documentation|tutorial|guide|reference)\])\s*\(?\s*$"
+)
 _EXPLICITLY_OFFLINE = re.compile(
     r"(?i)(?:\b(?:no|without)\s+(?:remote|network|server|service)\b|"
     r"\b(?:offline|local[- ]only)\b|원격\s*(?:대상|서버|접속)?\s*(?:은|가|이)?\s*"
@@ -139,6 +144,11 @@ def description_connection_info(description: str, site_url: str = "") -> tuple[s
             candidates.add(f"nc {host} {port}")
             possible = True
     for match in _DESCRIPTION_URL.finditer(source):
+        # A URL cited as an analysis aid is not a challenge endpoint. Limit
+        # this check to the text immediately before the URL so an earlier
+        # reference does not suppress a later service address.
+        if _REFERENCE_URL_CONTEXT.search(source[max(0, match.start() - 120):match.start()]):
+            continue
         url = match.group().rstrip(".,;:!?)]}")
         parsed = urlsplit(url)
         host = (parsed.hostname or "").lower()
