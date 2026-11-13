@@ -83,6 +83,11 @@ def run() -> None:
                 description="Choose http://one.example.org/ or http://two.example.org/",
             )
             assert (ambiguous["remote_mode"], ambiguous["remote"]) == ("none", "")
+            reference = create(
+                "analysis reference", remote_mode="none",
+                description="Maybe try a tool like https://dogbolt.org/ to inspect the binary.",
+            )
+            assert (reference["remote_mode"], reference["remote"]) == ("none", "")
             print("PASS: manual body endpoint create/edit persistence and override")
 
 
