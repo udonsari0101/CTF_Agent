@@ -79,6 +79,26 @@ const settle=async()=>{for(let i=0;i<8;i++) await tick()};
         root = Path(temp)
         page = root / "index.html"
         page.write_text(fixture, encoding="utf-8")
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            sync_playwright = None
+        if sync_playwright is not None:
+            with sync_playwright() as playwright:
+                args = ["--no-sandbox"] if sys.platform != "win32" else []
+                with playwright.chromium.launch(headless=True, executable_path=browser, args=args) as chrome:
+                    browser_page = chrome.new_page()
+                    browser_page.goto(page.as_uri(), wait_until="domcontentloaded", timeout=15000)
+                    browser_page.wait_for_function(
+                        "document.querySelector('#result').textContent !== 'PENDING'",
+                        timeout=15000,
+                    )
+                    outcome = browser_page.locator("#result").inner_text()
+            if outcome != "PASS":
+                print(outcome)
+                return 1
+            print("PASS: admin CLI install controls, validation, update status, and re-entry")
+            return 0
         cmd = [browser, "--headless=new", "--disable-gpu", "--no-first-run", "--disable-extensions",
                f"--user-data-dir={root / 'profile'}", "--virtual-time-budget=2500", "--dump-dom", page.as_uri()]
         if sys.platform != "win32":
