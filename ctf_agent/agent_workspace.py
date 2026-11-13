@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import stat
 from dataclasses import dataclass
 from importlib.resources import files
@@ -200,8 +199,23 @@ def _copy_regular_tree(
                 target.symlink_to(visible)
                 staged_inputs.append(ArchiveInput(relative / filename, visible))
             else:
-                with item.open("rb") as input_stream, target.open("xb") as output_stream:
-                    shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
+                copied_bytes = 0
+                try:
+                    with item.open("rb") as input_stream, target.open("xb") as output_stream:
+                        while chunk := input_stream.read(1024 * 1024):
+                            written = output_stream.write(chunk)
+                            if written != len(chunk):
+                                raise OSError("challenge input copy wrote fewer bytes than read")
+                            copied_bytes += written
+                    if (
+                        copied_bytes != details.st_size
+                        or item.lstat().st_size != details.st_size
+                        or target.stat().st_size != details.st_size
+                    ):
+                        raise ValueError("challenge source changed or was truncated during workspace preparation")
+                except (OSError, ValueError):
+                    target.unlink(missing_ok=True)
+                    raise
                 target.chmod(0o600)
                 staged_inputs.append(ArchiveInput(relative / filename, target))
     return tuple(staged_inputs)
