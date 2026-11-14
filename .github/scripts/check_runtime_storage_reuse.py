@@ -19,6 +19,31 @@ from ctf_agent.solver_worker import REQUIRED_CODEX_VERSION  # noqa: E402
 
 
 class RuntimeStorageReuseTests(unittest.TestCase):
+    def test_old_installs_are_removed_without_losing_rollback(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            root = Path(temp)
+            runtime = CodexRuntime(root)
+            runtime.save({"selected": None, "previous": "0.165.0"})
+            for version in ("0.153.4", "0.164.0", "0.165.0"):
+                package = root / f"codex-{version}"
+                package.mkdir()
+                (package / "cli").write_bytes(b"installed CLI")
+            unrelated = root / "codex-invalid"
+            unrelated.mkdir()
+            CodexRuntime(root)
+            self.assertFalse((root / "codex-0.153.4").exists())
+            self.assertFalse((root / "codex-0.164.0").exists())
+            self.assertTrue((root / "codex-0.165.0" / "cli").exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_unknown_runtime_state_does_not_remove_installs(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            root = Path(temp)
+            package = root / "codex-0.165.0"
+            package.mkdir()
+            CodexRuntime(root)
+            self.assertTrue(package.exists())
+
     def test_old_installer_cache_is_removed_without_touching_package(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
             root = Path(temp)

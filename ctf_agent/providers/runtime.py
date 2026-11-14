@@ -32,6 +32,7 @@ class CodexRuntime:
             # crash-left reservation only after its exact stage was removed.
             self.storage_budget.reconcile_kind("runtime", {})
         self.state_file = self.root / "codex-runtime.json"
+        self.prune_unused_installs()
         self.task = None
         self.operation = {"status": "idle"}
         self.lock = asyncio.Lock()
@@ -67,6 +68,33 @@ class CodexRuntime:
                     except OSError:
                         # Cache cleanup must not prevent the app from starting.
                         pass
+
+    def prune_unused_installs(self):
+        """Keep only the selected CLI and its one-step rollback installation."""
+        state = self.state()
+        selected, previous = state.get("selected"), state.get("previous")
+        if ("selected" not in state
+                or any(value is not None and (not isinstance(value, str)
+                       or not VERSION.fullmatch(value)) for value in (selected, previous))):
+            return
+        retained = {value for value in (selected, previous) if value}
+        try:
+            paths = tuple(self.root.iterdir())
+        except OSError:
+            return
+        for path in paths:
+            if (not path.name.startswith("codex-") or path.is_symlink()
+                    or not path.is_dir()):
+                continue
+            version = path.name.removeprefix("codex-")
+            if not VERSION.fullmatch(version) or version in retained:
+                continue
+            try:
+                self._remove_child(path)
+            except (OSError, RuntimeError):
+                # A stale install can be retried at the next startup.
+                continue
+        self.status_cache = None
 
     @staticmethod
     def _tree_size(root: Path) -> int:
@@ -256,6 +284,7 @@ class CodexRuntime:
                 self.save({"selected": version, "previous": previous, "updated_at": time.time()})
                 switched = True
                 await after_switch()
+                await asyncio.to_thread(self.prune_unused_installs)
                 self.operation = {"status": "completed", "version": version, "finished_at": time.time()}
             except asyncio.CancelledError:
                 if process and process.returncode is None:
@@ -364,6 +393,7 @@ class CodexRuntime:
                 except BaseException:
                     self.save(previous)
                     raise
+                await asyncio.to_thread(self.prune_unused_installs)
                 return await self.status()
         finally:
             self.rolling_back = False
@@ -396,6 +426,7 @@ class CodexRuntime:
         except BaseException:
             self.save(current)
             raise
+        await asyncio.to_thread(self.prune_unused_installs)
         return await self.status()
 
     async def close(self):
