@@ -122,6 +122,11 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     playwright_node = Path("/usr/local/lib/python3.12/site-packages/playwright/driver/node")
     node_link = Path("/usr/local/bin/node")
     assert node_link.is_symlink() and node_link.samefile(playwright_node)
+    npm_prefix = subprocess.run(
+        ["npm", "prefix", "--global"], capture_output=True, text=True, timeout=15,
+    )
+    assert npm_prefix.returncode == 0 and npm_prefix.stdout.strip() == "/usr/local"
+    assert not Path("/opt/jdk-21/lib/src.zip").exists()
     from playwright.sync_api import sync_playwright
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
