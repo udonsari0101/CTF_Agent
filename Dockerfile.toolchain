@@ -135,7 +135,7 @@ RUN curl --fail --silent --show-error --location --retry 3 \
     && mv /opt/ghidra_${GHIDRA_VERSION}_PUBLIC /opt/ghidra \
     && chmod 0555 /opt/ghidra/support/analyzeHeadless \
     && ln -s /opt/ghidra/support/analyzeHeadless /usr/local/bin/ghidra_headless \
-    && rm -rf /opt/ghidra/docs /opt/jdk-21/jmods \
+    && rm -rf /opt/ghidra/docs /opt/jdk-21/jmods /opt/jdk-21/lib/src.zip \
     && curl --fail --silent --show-error --location --retry 3 \
         --output /tmp/jadx.zip \
         "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
@@ -160,6 +160,10 @@ RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-ctf
     && test -x /usr/local/lib/python3.12/site-packages/playwright/driver/node \
     && ln -s /usr/local/lib/python3.12/site-packages/playwright/driver/node /usr/local/bin/node \
     && node --version
+
+# Node resolves its real path inside Playwright. Pin npm's global destination
+# so CLI updates never write into the Python package tree.
+ENV NPM_CONFIG_PREFIX=/usr/local
 
 # Keep model CLIs last: changing them must not invalidate the large system,
 # Ghidra/JDK/JADX or Python dependency layers.
