@@ -76,11 +76,13 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
     const latest = document.createElement('button');
     const install = document.createElement('button');
     const rollback = document.createElement('button');
-    for (const button of [check,latest,install,rollback]) button.type = 'button';
+    const bundled = document.createElement('button');
+    for (const button of [check,latest,install,rollback,bundled]) button.type = 'button';
     controls.append(version,check,latest,install,rollback);
+    if (source.key === 'codex') controls.append(bundled);
     row.append(name,versions,status,progress,controls);
     container.append(row);
-    rows.set(source.key,{versions,status,progress,version,check,latest,install,rollback,actionBusy:false,actionError:''});
+    rows.set(source.key,{versions,status,progress,version,check,latest,install,rollback,bundled,actionBusy:false,actionError:''});
   }
 
   function paint() {
@@ -121,6 +123,11 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
       row.install.textContent = label('버전 설치','Install version');
       row.rollback.textContent = label('이전 버전으로 복원','Restore previous version');
       row.rollback.hidden = !current.runtime?.selected;
+      if (source.key === 'codex') {
+        row.bundled.textContent = label('이미지에 포함된 Codex 사용','Use bundled Codex');
+        row.bundled.hidden = !current.runtime?.selected;
+        row.bundled.disabled = busy || current.runtime?.can_manage !== true;
+      }
       const canManage = current.runtime?.can_manage === true && current.runtime?.update_supported !== false;
       for (const button of [row.check,row.latest]) button.disabled = busy || Boolean(catalog.pending) || !canManage;
       for (const button of [row.install,row.rollback]) button.disabled = busy || !canManage;
@@ -197,6 +204,9 @@ export function renderAdminCliVersions(container,api,{scope='',locale='ko'}={}) 
     }));
     row.rollback.addEventListener('click',() => action(source,async () => {
       await api(`/api/providers/${source.key}/rollback`,{method:'POST'});
+    }));
+    if (source.key === 'codex') row.bundled.addEventListener('click',() => action(source,async () => {
+      await api('/api/providers/codex/use-bundled',{method:'POST'});
     }));
   }
   refresh.addEventListener('click',() => load(true));

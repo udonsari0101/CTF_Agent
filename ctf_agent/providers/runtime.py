@@ -330,6 +330,44 @@ class CodexRuntime:
         finally:
             await probe.close()
 
+    async def select_bundled(self, version: str, after_switch):
+        """Select the already verified image CLI without downloading a copy."""
+        if self.busy:
+            raise ProviderError("A runtime update is already in progress.", "busy")
+        binary = shutil.which("codex")
+        if not binary or os.name == "nt" or not VERSION.fullmatch(version):
+            raise ProviderError("The bundled Codex CLI is unavailable.", "unavailable")
+        self.rolling_back = True
+        try:
+            async with self.lock:
+                process = None
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        binary, "--version", stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                        env=isolated_environment(self.root / "probe"), cwd=self.root,
+                    )
+                    output, _ = await asyncio.wait_for(process.communicate(), 10)
+                    match = re.search(rb"\b[0-9]+\.[0-9]+\.[0-9]+\b", output[:2048])
+                    if process.returncode != 0 or not match or match.group().decode() != version:
+                        raise ProviderError("The bundled Codex CLI version does not match the image.", "version_mismatch")
+                finally:
+                    await stop_process(process)
+                await self.verify([binary])
+                previous = self.state()
+                if previous.get("selected") is None:
+                    return await self.status()
+                self.save({"selected": None, "previous": previous.get("selected"),
+                           "updated_at": time.time()})
+                try:
+                    await after_switch()
+                except BaseException:
+                    self.save(previous)
+                    raise
+                return await self.status()
+        finally:
+            self.rolling_back = False
+
     async def rollback(self, after_switch):
         if self.busy:
             raise ProviderError("업데이트가 진행 중입니다.", "busy")

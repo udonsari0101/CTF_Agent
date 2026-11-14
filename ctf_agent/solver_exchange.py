@@ -2815,6 +2815,24 @@ class SolverExchangeCoordinator:
             "scratch_limit_bytes": None,
         }
 
+    def _prune_old_published_runtimes(self, runtime_root: Path, provider: str,
+                                      keep: str | None) -> None:
+        """Discard reproducible CLI copies only while the entire queue is idle."""
+        if self.has_open_jobs() or not runtime_root.is_dir() or runtime_root.is_symlink():
+            return
+        for candidate in runtime_root.iterdir():
+            if (candidate.name == keep or not candidate.name.startswith(provider + "-")
+                    or not _VERSION.fullmatch(candidate.name[len(provider) + 1:])
+                    or candidate.is_symlink() or not candidate.is_dir()):
+                continue
+            try:
+                _make_tree_owner_writable(candidate, runtime_root)
+                _safe_remove_tree(candidate, runtime_root)
+            except (OSError, ExchangeError):
+                # A damaged historical copy is inert. Keep the selected CLI
+                # available and retry cleanup after the operator repairs it.
+                continue
+
     def publish_runtime(self, version: str, source_root: Path | None = None,
                         provider: str = "codex") -> dict[str, Any]:
         """Publish one verified CLI tree as an immutable job snapshot."""
@@ -2835,6 +2853,7 @@ class SolverExchangeCoordinator:
                 if destination.exists() and not self.has_open_jobs():
                     _make_tree_owner_writable(destination, runtime_root)
                     _safe_remove_tree(destination, runtime_root)
+                self._prune_old_published_runtimes(runtime_root, provider, None)
             return {"version": version, "sha256": None, "source": "image"}
         source = Path(source_root)
         if source.name != f"{provider}-{version}" or source.is_symlink() or not source.is_dir():
@@ -2860,6 +2879,7 @@ class SolverExchangeCoordinator:
                 digest = runtime_tree_digest(destination)
                 if published[1] != total or digest != source_digest:
                     raise ExchangeError("runtime_integrity_failed", "게시된 Codex runtime이 원본과 일치하지 않습니다.", category="safety")
+                self._prune_old_published_runtimes(runtime_root, provider, destination.name)
                 return {"version": version, "sha256": digest, "source": "exchange"}
             if self.has_open_jobs():
                 raise ExchangeError(
@@ -2911,6 +2931,7 @@ class SolverExchangeCoordinator:
                 os.replace(staging, destination)
                 _fsync(runtime_root)
                 self.storage_budget.release(reservation)
+                self._prune_old_published_runtimes(runtime_root, provider, destination.name)
                 return {"version": version, "sha256": digest, "source": "exchange"}
             except BaseException:
                 try:

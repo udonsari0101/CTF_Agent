@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import sys
+import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -44,17 +46,51 @@ class RuntimeStorageReuseTests(unittest.TestCase):
             destination = service.coordinator.primary.exchange / "runtime" / f"codex-{REQUIRED_CODEX_VERSION}"
             destination.mkdir(parents=True)
             (destination / "old-package").write_bytes(b"derived copy")
+            stale = destination.parent / "codex-0.165.0"
+            stale.mkdir()
+            (stale / "old-package").write_bytes(b"stale derived copy")
+            claude = destination.parent / "claude-2.1.310"
+            claude.mkdir()
+            (claude / "package").write_bytes(b"other provider")
             result = service.coordinator.publish_runtime(REQUIRED_CODEX_VERSION, None)
             self.assertEqual(result, {"version": REQUIRED_CODEX_VERSION,
                                       "sha256": None, "source": "image"})
             self.assertFalse(destination.exists())
+            self.assertFalse(stale.exists())
+            self.assertTrue(claude.exists())
 
             destination.mkdir()
             (destination / "active-package").write_bytes(b"needed by a job")
+            stale.mkdir()
             with patch.object(service.coordinator.primary, "has_open_jobs", return_value=True):
                 result = service.coordinator.publish_runtime(REQUIRED_CODEX_VERSION, None)
             self.assertEqual(result["source"], "image")
             self.assertTrue((destination / "active-package").exists())
+            self.assertTrue(stale.exists())
+
+    @unittest.skipIf(os.name == "nt", "bundled executable check runs in the Linux image")
+    def test_select_bundled_keeps_rollback_and_restores_failed_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executable = root / "codex"
+            executable.write_text(f"#!/bin/sh\necho codex-cli {REQUIRED_CODEX_VERSION}\n")
+            executable.chmod(0o755)
+            runtime = CodexRuntime(root / "runtime")
+            old = {"selected": "0.165.0", "previous": "0.164.0"}
+            runtime.save(old)
+            with (patch("ctf_agent.providers.runtime.shutil.which", return_value=str(executable)),
+                  patch.object(runtime, "verify", new=AsyncMock())):
+                switched = AsyncMock()
+                result = asyncio.run(runtime.select_bundled(REQUIRED_CODEX_VERSION, switched))
+                self.assertIsNone(result["selected"])
+                self.assertEqual(runtime.state()["previous"], "0.165.0")
+                switched.assert_awaited_once()
+
+                runtime.save(old)
+                failed = AsyncMock(side_effect=RuntimeError("publish failed"))
+                with self.assertRaisesRegex(RuntimeError, "publish failed"):
+                    asyncio.run(runtime.select_bundled(REQUIRED_CODEX_VERSION, failed))
+                self.assertEqual(runtime.state(), old)
 
 
 if __name__ == "__main__":
