@@ -24,6 +24,7 @@ from .providers.runtime import CodexRuntime
 from .providers.auth_file import install_auth_file, private_file, validate_auth_file, MAX_AUTH_BYTES
 from .process_lock import account_lifecycle_lock
 from .storage_budget import get_storage_budget
+from .solver_worker import REQUIRED_CODEX_VERSION
 
 
 class AccountCreate(BaseModel):
@@ -1286,6 +1287,12 @@ def register_accounts(app, require_auth, settings):
                 return await manager.runtime.rollback(manager.reset_codex)
             except OSError:
                 raise ProviderError("버전 복원에 실패하여 기존 선택을 유지합니다.") from None
+
+    @router.post("/providers/codex/use-bundled")
+    async def runtime_use_bundled(_admin=Depends(require_admin)):
+        async with manager.lifecycle_lock:
+            manager.no_login_in_progress()
+            return await manager.runtime.select_bundled(REQUIRED_CODEX_VERSION, manager.reset_codex)
 
     app.include_router(router)
     app.router.add_event_handler("shutdown", manager.close)

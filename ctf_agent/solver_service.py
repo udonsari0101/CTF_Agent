@@ -634,6 +634,7 @@ class SolverService:
         runtime = self.accounts.runtime
         original_update = runtime.update
         original_rollback = runtime.rollback
+        original_select_bundled = runtime.select_bundled
 
         async def update(version: str, after_switch):
             if self.coordinator.has_open_jobs():
@@ -672,6 +673,19 @@ class SolverService:
 
         runtime.update = update
         runtime.rollback = rollback
+
+        async def select_bundled(version: str, after_switch):
+            if self.coordinator.has_open_jobs():
+                raise ProviderError("Finish queued and running jobs before changing Codex CLI.", "busy")
+
+            async def switched():
+                await after_switch()
+                await asyncio.to_thread(self.coordinator.publish_runtime, version, None)
+                self.runtime_ready, self.runtime_error = True, None
+
+            return await original_select_bundled(version, switched)
+
+        runtime.select_bundled = select_bundled
 
         claude_runtime = self.accounts.claude_runtime
         original_claude_update = claude_runtime.update
