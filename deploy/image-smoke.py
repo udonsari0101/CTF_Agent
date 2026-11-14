@@ -116,6 +116,26 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
             assert REQUIRED_CLAUDE_VERSION in result.stdout
         print(result.stdout.strip())
 
+    # The Playwright package supplies the one Node runtime shared by npm and
+    # both provider launchers. Exercise a real browser with networking off so
+    # the image-size optimization cannot silently break web challenges.
+    playwright_node = Path("/usr/local/lib/python3.12/site-packages/playwright/driver/node")
+    node_link = Path("/usr/local/bin/node")
+    assert node_link.is_symlink() and node_link.samefile(playwright_node)
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            executable_path="/usr/bin/chromium", headless=True,
+            args=["--no-sandbox"],
+        )
+        try:
+            page = browser.new_page()
+            page.goto("data:text/html,<title>offline-browser-smoke</title>")
+            assert page.title() == "offline-browser-smoke"
+        finally:
+            browser.close()
+    print("Shared Node runtime and offline Playwright browser verified")
+
     codex_native = native_codex_binary(Path("/usr/local/lib/node_modules/@openai/codex"))
     assert codex_native is not None
     assert codex_native.is_file() and not codex_native.is_symlink()

@@ -3548,7 +3548,7 @@ class CodexAppServer:
             self._full_canary_verified = False
             self._full_canary_context = None
         elif profile == "ready_toolchain_isolation_only":
-            if not external or not isinstance(self._ready_toolchain_checks, dict) or (
+            if not (external or self._uses_local_permissions()) or not isinstance(self._ready_toolchain_checks, dict) or (
                 self._ready_toolchain_checks.get("toolchain_browser_functional") is not True
                 or type(self._ready_toolchain_checks.get("toolchain_trace_functional")) is not bool
             ):
@@ -7305,9 +7305,12 @@ class SolverWorker:
         cached = self._ready_codex_toolchain
         if not (
             os.environ.get("CTF_SOLVER_REUSE_READY_TOOLCHAIN_CANARY", "false") == "true"
-            and os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
             and self.driver_factory is None
             and type(driver) is CodexAppServer
+            and (
+                os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
+                or driver._uses_local_permissions()
+            )
             and self.attestation is not None and self.attestation.ready
             and self.runtime_ready and self.sandbox_attested and clean_before_job
             and not self.restart_required
@@ -7318,10 +7321,17 @@ class SolverWorker:
             return None
         pid, instance_id, command, arguments, attested_version, browser_ok, trace_ok = cached
         try:
-            same_policy = driver._sandbox_parameters(
+            policy = driver._sandbox_parameters(
                 "command/exec", driver.challenge, network_access=True,
-            ).get("sandboxPolicy") == {"type": "externalSandbox", "networkAccess": "enabled"}
-            same_arguments = arguments == tuple(driver.command_arguments())
+            )
+            same_policy = (
+                policy.get("sandboxPolicy") == {"type": "externalSandbox", "networkAccess": "enabled"}
+                if os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
+                else policy.get("permissionProfile") == "ctf-local"
+            )
+            same_arguments = self._same_toolchain_canary_arguments(
+                arguments, tuple(driver.command_arguments()),
+            )
         except Exception:
             return None
         if (
@@ -7339,6 +7349,61 @@ class SolverWorker:
             "toolchain_browser_functional": browser_ok,
             "toolchain_trace_functional": trace_ok,
         }
+
+    @staticmethod
+    def _same_toolchain_canary_arguments(
+        ready: tuple[str, ...], job: tuple[str, ...],
+    ) -> bool:
+        """Ignore only routing flags that cannot change the checked toolchain.
+
+        Readiness used the same immutable CLI executable and image. The job
+        still runs its own filesystem and command-policy isolation canary.
+        Reject every unknown argument change, including future sandbox flags.
+        """
+
+        if ready == job:
+            return True
+
+        def invariant(arguments: tuple[str, ...]) -> tuple[str, ...] | None:
+            output: list[str] = []
+            agent_setting = None
+            agent_toggle = None
+            thread_limit = fast_tier = fast_mode = False
+            index = 0
+            while index < len(arguments):
+                pair = arguments[index:index + 2]
+                if pair == ("-c", "agents.enabled=false") or pair == ("-c", "agents.enabled=true"):
+                    if agent_setting is not None:
+                        return None
+                    agent_setting = pair[1] == "agents.enabled=true"
+                elif pair == ("--disable", "multi_agent") or pair == ("--enable", "multi_agent"):
+                    if agent_toggle is not None:
+                        return None
+                    agent_toggle = pair[0] == "--enable"
+                elif pair == ("-c", f"agents.max_concurrent_threads_per_session={CODEX_ULTRA_MAX_SUBAGENTS}"):
+                    if thread_limit:
+                        return None
+                    thread_limit = True
+                elif pair == ("-c", 'service_tier="fast"'):
+                    if fast_tier:
+                        return None
+                    fast_tier = True
+                elif pair == ("-c", "features.fast_mode=true"):
+                    if fast_mode:
+                        return None
+                    fast_mode = True
+                else:
+                    output.append(arguments[index])
+                    index += 1
+                    continue
+                index += 2
+            if (agent_setting is None or agent_setting != agent_toggle
+                    or thread_limit != agent_setting or fast_tier != fast_mode):
+                return None
+            return tuple(output)
+
+        ready_fixed = invariant(ready)
+        return ready_fixed is not None and ready_fixed == invariant(job)
 
     def _publish_worker(self, *, reason: str | None = None) -> None:
         base = self.attestation.public() if self.attestation else PlatformAttestation(False, {}, reason).public()
@@ -7499,7 +7564,10 @@ class SolverWorker:
                         if (
                             type(driver) is CodexAppServer
                             and driver._full_canary_verified
-                            and os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
+                            and (
+                                os.environ.get("CTF_SOLVER_EXTERNAL_SANDBOX") == "true"
+                                or driver._uses_local_permissions()
+                            )
                             and self.provider_runtime_checks["toolchain_browser_functional"]
                         ):
                             ready_codex_toolchain = (
