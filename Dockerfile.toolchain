@@ -30,7 +30,6 @@ ARG APKTOOL_VERSION=2.12.1
 ARG APKTOOL_SHA256=66cf4524a4a45a7f56567d08b2c9b6ec237bcdd78cee69fd4a59c8a0243aeafa
 LABEL org.opencontainers.image.source="https://github.com/udonsari0101/CTF_Agent"
 
-COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 # Pwndbg's packaged Python includes optional ziglang. Its official lite
 # installation omits this compiler; GCC remains available for CTF builds.
@@ -154,8 +153,13 @@ COPY --chown=0:0 --chmod=0444 deploy/DecompileAll.java deploy/DecompileFn.java /
 
 WORKDIR /app
 COPY requirements.txt requirements-ctf.txt ./
+# Playwright already bundles a tested Node runtime. Reuse it for npm and the
+# provider CLIs instead of copying a second 120 MB Node binary.
 RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-ctf.txt \
-    && find /usr/local/lib/python3.12/site-packages -type d -name __pycache__ -prune -exec rm -rf {} +
+    && find /usr/local/lib/python3.12/site-packages -type d -name __pycache__ -prune -exec rm -rf {} + \
+    && test -x /usr/local/lib/python3.12/site-packages/playwright/driver/node \
+    && ln -s /usr/local/lib/python3.12/site-packages/playwright/driver/node /usr/local/bin/node \
+    && node --version
 
 # Keep model CLIs last: changing them must not invalidate the large system,
 # Ghidra/JDK/JADX or Python dependency layers.

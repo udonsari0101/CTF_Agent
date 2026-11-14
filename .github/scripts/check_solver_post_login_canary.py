@@ -27,6 +27,7 @@ from ctf_agent.solver_worker import (  # noqa: E402
     _post_login_canary_profile,
     _record_startup_timing,
 )
+from ctf_agent.solver import ModelConfiguration  # noqa: E402
 
 
 BASE_BOUNDARIES = {
@@ -277,9 +278,29 @@ class PostLoginCanaryTests(unittest.TestCase):
                 self.assertFalse(self.driver._full_canary_verified)
 
         self.driver._ready_toolchain_checks = cached
-        with self.assertRaises(WorkerRefusal) as raised:
-            self.run_canary(external=False, profile="ready_toolchain_isolation_only")
+        with patch.dict(os.environ, {"CTF_SOLVER_LOCAL_DESKTOP": "false"}):
+            with self.assertRaises(WorkerRefusal) as raised:
+                self.run_canary(external=False, profile="ready_toolchain_isolation_only")
         self.assertEqual(raised.exception.error.requirements, ("ready_toolchain_attestation",))
+
+    def test_local_ready_profile_rechecks_job_isolation(self) -> None:
+        cached = {
+            "toolchain_browser_functional": True,
+            "toolchain_trace_functional": False,
+        }
+        with patch.dict(os.environ, {"CTF_SOLVER_LOCAL_DESKTOP": "true"}):
+            self.driver._ready_toolchain_checks = cached
+            self.checks = self.full_checks(external=False)
+            for name in FUNCTIONAL | {"toolchain_trace_functional"}:
+                self.checks.pop(name)
+            self.run_canary(external=False, profile="ready_toolchain_isolation_only")
+            self.assertEqual(self.driver.sandbox_checks, cached)
+            self.driver._ready_toolchain_checks = cached
+            self.driver._full_canary_verified = False
+            self.checks["exchange_inventory_safe"] = False
+            with self.assertRaises(WorkerRefusal) as raised:
+                self.run_canary(external=False, profile="ready_toolchain_isolation_only")
+            self.assertEqual(raised.exception.error.requirements, ("exchange_inventory_safe",))
 
     def test_ready_toolchain_reuse_guard_requires_opt_in_and_same_pinned_worker(self) -> None:
         worker = SolverWorker(exchange=self.exchange)
@@ -332,6 +353,78 @@ class PostLoginCanaryTests(unittest.TestCase):
                 worker.runtime_ready = True
                 worker.restart_required = True
                 self.assertIsNone(candidate())
+
+    def test_ready_toolchain_reuse_accepts_only_known_routing_flags(self) -> None:
+        worker = SolverWorker(exchange=self.exchange)
+        worker.attestation = PlatformAttestation(True, {}, None)
+        worker.runtime_ready = worker.sandbox_attested = worker.clean = True
+        worker.provider_runtime_checks["codex_runtime_attested"] = True
+        ready = CodexAppServer(
+            self.scratch / "ready-home", self.scratch,
+            command_prefix=["/image/codex"],
+        )
+        worker._ready_codex_toolchain = (
+            os.getpid(), worker.instance_id, tuple(ready.command_prefix),
+            tuple(ready.command_arguments()), REQUIRED_CODEX_VERSION, True, False,
+        )
+        with patch.dict(os.environ, {
+            "CTF_SOLVER_EXTERNAL_SANDBOX": "true",
+            "CTF_SOLVER_REUSE_READY_TOOLCHAIN_CANARY": "true",
+        }):
+            for effort, tier in (("xhigh", None), ("ultra", None),
+                                 ("xhigh", "fast"), ("ultra", "fast")):
+                with self.subTest(effort=effort, tier=tier):
+                    driver = CodexAppServer(
+                        self.scratch / "job-home", self.scratch,
+                        ModelConfiguration("codex", "gpt-6-sol", effort, tier),
+                        command_prefix=["/image/codex"],
+                    )
+                    self.assertEqual(worker._ready_toolchain_reuse_candidate(
+                        driver, REQUIRED_CODEX_VERSION, None, clean_before_job=True,
+                    ), {
+                        "toolchain_browser_functional": True,
+                        "toolchain_trace_functional": False,
+                    })
+                    original = driver.command_arguments
+                    driver.command_arguments = lambda: original() + [
+                        "-c", "sandbox_mode=unsafe",
+                    ]
+                    self.assertIsNone(worker._ready_toolchain_reuse_candidate(
+                        driver, REQUIRED_CODEX_VERSION, None, clean_before_job=True,
+                    ))
+
+    def test_local_ready_candidate_requires_the_same_named_policy(self) -> None:
+        worker = SolverWorker(exchange=self.exchange)
+        worker.attestation = PlatformAttestation(True, {}, None)
+        worker.runtime_ready = worker.sandbox_attested = worker.clean = True
+        worker.provider_runtime_checks["codex_runtime_attested"] = True
+        with patch.dict(os.environ, {
+            "CTF_SOLVER_EXTERNAL_SANDBOX": "false",
+            "CTF_SOLVER_LOCAL_DESKTOP": "true",
+            "CTF_SOLVER_REUSE_READY_TOOLCHAIN_CANARY": "true",
+        }):
+            ready = CodexAppServer(
+                self.scratch / "ready-home", self.scratch,
+                command_prefix=["/image/codex"],
+            )
+            driver = CodexAppServer(
+                self.scratch / "job-home", self.scratch,
+                ModelConfiguration("codex", "gpt-6-sol", "ultra", "fast"),
+                command_prefix=["/image/codex"],
+            )
+            worker._ready_codex_toolchain = (
+                os.getpid(), worker.instance_id, tuple(ready.command_prefix),
+                tuple(ready.command_arguments()), REQUIRED_CODEX_VERSION, True, False,
+            )
+            self.assertIsNotNone(worker._ready_toolchain_reuse_candidate(
+                driver, REQUIRED_CODEX_VERSION, None, clean_before_job=True,
+            ))
+            driver._sandbox_parameters = lambda *_args, **_kwargs: {
+                "permissionProfile": "broader-profile",
+            }
+            self.assertIsNone(worker._ready_toolchain_reuse_candidate(
+                driver, REQUIRED_CODEX_VERSION, None, clean_before_job=True,
+            ))
 
     def test_process_active_uses_ready_profile_after_marking_job_unclean(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
