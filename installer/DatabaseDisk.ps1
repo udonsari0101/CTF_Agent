@@ -119,14 +119,25 @@ function Invoke-DatabaseDiskAction([string]$action, [string]$vhd, [string]$owner
 function Invoke-DatabaseRootTool([string]$distro, [string]$tool, [string[]]$arguments = @()) {
     # WSL --exec resolves a bare program before the root user's usual shell
     # PATH is applied. Explicit env also covers tools in /usr/sbin and /sbin.
+    # WSL writes a path-translation warning to stderr when PowerShell was
+    # launched from a UNC directory. That warning must not be mistaken for
+    # blkid's UUID (or make an otherwise valid database look corrupt).
     $previousPreference = $ErrorActionPreference
+    $localWorkingDirectory = $false
     try {
+        if ((Get-Location).ProviderPath.StartsWith('\\')) {
+            Push-Location -LiteralPath $env:LOCALAPPDATA
+            $localWorkingDirectory = $true
+        }
         $ErrorActionPreference = 'Continue'
         $output = @(& wsl.exe --distribution $distro --user root --exec /usr/bin/env `
             'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' `
             $tool @arguments 2>&1 | ForEach-Object { $_.ToString() })
         $exitCode = $LASTEXITCODE
-    } finally { $ErrorActionPreference = $previousPreference }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        if ($localWorkingDirectory) { Pop-Location }
+    }
     return [pscustomobject]@{ExitCode=$exitCode;Output=$output}
 }
 

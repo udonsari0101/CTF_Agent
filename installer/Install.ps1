@@ -16,6 +16,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if ($env:CTF_AGENT_LAUNCH_MARKER) { [IO.File]::WriteAllText($env:CTF_AGENT_LAUNCH_MARKER, '') }
+# Keep WSL calls independent of the directory from which Install.cmd opened.
+if ((Get-Location).ProviderPath.StartsWith('\\')) {
+    Set-Location -LiteralPath $env:LOCALAPPDATA
+}
 $installer = Join-Path $PSScriptRoot 'installer\install.sh'
 $stateFile = Join-Path $env:LOCALAPPDATA 'CTF Agent\install.json'
 $minimumFreeBytes = 5GB
