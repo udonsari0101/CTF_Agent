@@ -1,6 +1,11 @@
 $ErrorActionPreference = 'Stop'
 # Start.cmd retries when PowerShell exits without reaching this line.
 if ($env:CTF_AGENT_START_MARKER) { [IO.File]::WriteAllText($env:CTF_AGENT_START_MARKER, '') }
+# WSL cannot translate a UNC current directory and can pollute command output
+# with a warning. All release paths below are resolved from $PSScriptRoot.
+if ((Get-Location).ProviderPath.StartsWith('\\')) {
+    Set-Location -LiteralPath $env:LOCALAPPDATA
+}
 $dockerDesktopHelper = Join-Path $PSScriptRoot 'DockerDesktop.ps1'
 if (-not (Test-Path -LiteralPath $dockerDesktopHelper -PathType Leaf)) { throw 'DockerDesktop.ps1 is missing. Reinstall the patched release.' }
 . $dockerDesktopHelper

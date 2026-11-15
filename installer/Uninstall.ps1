@@ -1,5 +1,9 @@
 $ErrorActionPreference = 'Stop'
 if ($env:CTF_AGENT_LAUNCH_MARKER) { [IO.File]::WriteAllText($env:CTF_AGENT_LAUNCH_MARKER, '') }
+# WSL emits a path-translation warning for UNC working directories.
+if ((Get-Location).ProviderPath.StartsWith('\\')) {
+    Set-Location -LiteralPath $env:LOCALAPPDATA
+}
 $dockerDesktopHelper = Join-Path $PSScriptRoot 'DockerDesktop.ps1'
 if (-not (Test-Path -LiteralPath $dockerDesktopHelper -PathType Leaf)) { throw 'DockerDesktop.ps1 is missing. Reinstall the patched release.' }
 . $dockerDesktopHelper
