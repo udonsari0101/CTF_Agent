@@ -59,14 +59,14 @@ jobs:
 
           retry_once() {
             if "$@"; then return 0; fi
-            echo 'Build failed; retrying once after 20 seconds.' >&2
+            echo 'Image operation failed; retrying once after 20 seconds.' >&2
             sleep 20
             "$@"
           }
 
           if ! docker manifest inspect "$toolchain_tag" >/dev/null 2>&1; then
             retry_once docker build --file Dockerfile.toolchain --tag "$toolchain_tag" .
-            docker push "$toolchain_tag"
+            retry_once docker push "$toolchain_tag"
           fi
           docker pull "$toolchain_tag" >/dev/null
           toolchain_ref="$(docker image inspect --format '{{index .RepoDigests 0}}' "$toolchain_tag")"
@@ -93,13 +93,13 @@ jobs:
             --tmpfs /solver-scratch:uid=10001,gid=10001,mode=0700 \
             --entrypoint python "$app_tag" - < deploy/image-smoke.py
           if ! docker manifest inspect "$app_tag" >/dev/null 2>&1; then
-            docker push "$app_tag"
+            retry_once docker push "$app_tag"
           fi
           current_main="$(git ls-remote origin refs/heads/main | cut -f1)"
           [[ "$current_main" =~ ^[0-9a-f]{40}$ ]]
           if [ "$BUILD_SHA" = "$current_main" ]; then
             docker tag "$app_tag" "$app:production"
-            docker push "$app:production"
+            retry_once docker push "$app:production"
           else
             echo 'A newer main commit exists; keeping the current production tag.' >> "$GITHUB_STEP_SUMMARY"
           fi
