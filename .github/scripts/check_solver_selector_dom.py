@@ -55,6 +55,8 @@ def main() -> int:
 let solverOptionsState='ready',solverProvider='codex',solverAccountId='a1';
 let solverModel='m2',solverReasoning='low',solverServiceTier=null,solverUltracode=false;
 let solverRetryRequiresSelection=false;
+let solverPresetNeedsAccount=false,solverPresetAccountConfirmed=false;
+let solverSubagentsEnabled=false,solverSubagentsTouched=false;
 let solverUltraEscalationMode='ask',solverAccounts=[{id:'a1'}],solverModels=[{model:'m2'}];
 let currentSolverJob=null,currentSolverEvents=[],nextConfig='';
 function solverSelectedAccount(){return solverAccounts.find(x=>x.id===solverAccountId)}

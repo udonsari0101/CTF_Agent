@@ -38,6 +38,9 @@ class SolveInput(BaseModel):
     reasoning_effort: str | None = Field(default=None, min_length=1, max_length=40)
     service_tier: Literal["fast"] | None = None
     ultracode: bool = False
+    # Omission keeps the pre-existing Codex behavior: Ultra enables
+    # delegation and the lower reasoning levels do not.
+    subagents_enabled: bool | None = None
     ultra_escalation_mode: Literal["ask", "auto", "off"] = "ask"
     writeup_locale: Literal["ko", "en"] = "ko"
 
@@ -832,6 +835,7 @@ class SolverService:
             model=source["model"],
             reasoning_effort="ultra",
             service_tier=source["service_tier"],
+            subagents_enabled=bool(source["subagents_enabled"]),
             ultra_escalation_mode="off",
             writeup_locale=source["writeup_locale"],
         )
@@ -852,6 +856,7 @@ class SolverService:
                 codex_runtime_sha256=runtime["sha256"],
                 configuration_override=configuration,
                 expected_account_id=account_id,
+                subagents_enabled=payload.subagents_enabled,
                 ultra_escalation_mode="off",
                 ultra_source_job_id=job_id,
                 writeup_locale=source["writeup_locale"],
@@ -910,6 +915,44 @@ def register_solver(app, require_auth, require_admin, settings, database):
     app.state.solver_jobs = service.coordinator
     router = APIRouter(prefix="/api", dependencies=[Depends(require_auth)])
 
+    def apply_challenge_preset(
+        payload: SolveInput, owner_id: str, workspace_id: str, challenge_id: str,
+    ) -> SolveInput:
+        """Use a cloned challenge's Codex preset for sparse direct starts too."""
+        if payload.provider != "codex" or any(
+            getattr(payload, field) is not None
+            for field in ("model", "reasoning_effort")
+        ) or "service_tier" in payload.model_fields_set:
+            return payload
+        with database() as db:
+            row = db.execute(
+                """SELECT p.account_id,p.provider,p.model,p.reasoning_effort,
+                          p.service_tier,p.subagents_enabled,p.ultra_escalation_mode
+                   FROM challenge_solver_presets p
+                   JOIN challenges c ON c.id=p.challenge_id AND c.workspace_id=p.workspace_id
+                   JOIN workspaces w ON w.id=c.workspace_id
+                   WHERE p.challenge_id=? AND p.workspace_id=?
+                     AND c.deleted_at IS NULL AND w.owner_user_id=?""",
+                (challenge_id, workspace_id, owner_id),
+            ).fetchone()
+        if row is None or row["provider"] != "codex":
+            return payload
+        if row["account_id"] is None and payload.account_id is None:
+            raise ExchangeError(
+                "account_required",
+                "이 문제의 저장된 실행 설정에는 연결된 계정이 없습니다. 계정을 선택해 주세요.",
+                category="auth",
+            )
+        values = payload.model_dump()
+        for name in (
+            "account_id", "model", "reasoning_effort", "service_tier",
+            "subagents_enabled", "ultra_escalation_mode",
+        ):
+            if name not in payload.model_fields_set:
+                value = row[name]
+                values[name] = bool(value) if name == "subagents_enabled" else value
+        return SolveInput.model_validate(values)
+
     def sync_solver_input(owner_id: str, workspace_id: str, challenge_id: str) -> None:
         with database() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -935,6 +978,9 @@ def register_solver(app, require_auth, require_admin, settings, database):
                 sync_solver_input, user["id"], workspace_id, challenge_id
             )
             payload = payload or SolveInput()
+            payload = await asyncio.to_thread(
+                apply_challenge_preset, payload, user["id"], workspace_id, challenge_id,
+            )
             provider = payload.provider
             async with service.accounts.lifecycle_lock:
                 if service.accounts.runtime.busy or service.accounts.claude_runtime.busy:
@@ -951,6 +997,12 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         category="model",
                     )
                 ultra_mode = payload.ultra_escalation_mode if ultra_available else "off"
+                if payload.subagents_enabled is True and provider != "codex":
+                    raise ExchangeError(
+                        "invalid_subagents_setting",
+                        "Subagents can only be enabled for Codex jobs.",
+                        category="model",
+                    )
                 if provider == "codex":
                     if service.accounts.runtime.busy:
                         raise ExchangeError("runtime_busy", "Codex 업데이트가 끝난 뒤 시작해 주세요.", retryable=True)
@@ -967,6 +1019,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         expected_account_id=expected_account_id,
                         max_reasoning_available=max_reasoning_available,
                         ultra_escalation_mode=ultra_mode,
+                        subagents_enabled=payload.subagents_enabled,
                         writeup_locale=payload.writeup_locale,
                     )
                     service.runtime_ready, service.runtime_error = True, None

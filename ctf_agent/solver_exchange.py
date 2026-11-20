@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     auth_kind TEXT NOT NULL DEFAULT 'oauth' CHECK(auth_kind IN ('oauth','api_key')),
     model TEXT NOT NULL,
     reasoning_effort TEXT NOT NULL,
+    subagents_enabled INTEGER NOT NULL DEFAULT 0 CHECK(subagents_enabled IN (0,1)),
     ultra_escalation_mode TEXT NOT NULL DEFAULT 'off' CHECK(ultra_escalation_mode IN ('off','ask','auto')),
     ultra_source_job_id TEXT,
     ultra_auto_attempted INTEGER NOT NULL DEFAULT 0 CHECK(ultra_auto_attempted IN (0,1)),
@@ -981,6 +982,11 @@ class SolverExchangeCoordinator:
                 "UPDATE solver_jobs SET reasoning_effort='xhigh',ultracode=1 "
                 "WHERE provider='claude' AND reasoning_effort='ultracode'"
             )
+            if "subagents_enabled" not in columns:
+                db.execute("ALTER TABLE solver_jobs ADD COLUMN subagents_enabled INTEGER NOT NULL DEFAULT 0 CHECK(subagents_enabled IN (0,1))")
+                # Preserve the behavior of jobs created before this preference
+                # existed, including jobs still queued during an upgrade.
+                db.execute("UPDATE solver_jobs SET subagents_enabled=1 WHERE provider='codex' AND reasoning_effort='ultra' AND job_mode='solve'")
             guidance_columns = {row[1] for row in db.execute("PRAGMA table_info(solver_job_guidance)")}
             if "requested_delivery" not in guidance_columns:
                 db.execute(
@@ -1164,6 +1170,7 @@ class SolverExchangeCoordinator:
         configuration_override: ModelConfiguration | None = None,
         expected_account_id: str | None = None,
         max_reasoning_available: bool = False,
+        subagents_enabled: bool | None = None,
         ultra_escalation_mode: str = "off",
         ultra_source_job_id: str | None = None,
         job_mode: str = "solve",
@@ -1189,6 +1196,10 @@ class SolverExchangeCoordinator:
             )
         if provider not in {"codex", "claude"}:
             raise ExchangeError("invalid_provider", "공급자 선택을 확인할 수 없습니다.", category="model")
+        if subagents_enabled is not None and type(subagents_enabled) is not bool:
+            raise ExchangeError("invalid_subagents_setting", "하위 에이전트 설정을 확인할 수 없습니다.", category="model")
+        if subagents_enabled is True and (provider != "codex" or job_mode != "solve"):
+            raise ExchangeError("invalid_subagents_setting", "Codex 풀이에서만 하위 에이전트를 활성화할 수 있습니다.", category="model")
         if ultra_escalation_mode not in {"off", "ask", "auto"} or (
             ultra_escalation_mode != "off" and (job_mode != "solve" or provider != "codex")
         ):
@@ -1472,6 +1483,12 @@ class SolverExchangeCoordinator:
                     except ValueError as exc:
                         raise ExchangeError("model_configuration_required", "모델과 추론 수준을 먼저 선택해 주세요.", category="model") from exc
                 configuration = configuration_override or selected.configuration
+                effective_subagents_enabled = bool(
+                    job_mode == "solve" and provider == "codex" and (
+                        configuration.reasoning_effort == "ultra"
+                        if subagents_enabled is None else subagents_enabled
+                    )
+                )
                 if ultra_escalation_mode != "off" and configuration.reasoning_effort not in {"high", "xhigh"}:
                     raise ExchangeError("invalid_ultra_escalation", "High 또는 xhigh 실행에서만 Ultra 자동 전환을 요청할 수 있습니다.", category="model")
                 snapshot = _optional_json(account["snapshot"])
@@ -1688,6 +1705,7 @@ class SolverExchangeCoordinator:
                                 and source["reasoning_effort"] == configuration.reasoning_effort
                                 and source["service_tier"] == configuration.service_tier
                                 and bool(source["ultracode"]) == bool(configuration.ultracode)
+                                and bool(source["subagents_enabled"]) == effective_subagents_enabled
                                 and runtime_match
                             )
                             continuation_mode = "session" if saved_exact and exact_configuration and saved["session_id"] else "workspace"
@@ -1725,12 +1743,12 @@ class SolverExchangeCoordinator:
                 db.execute(
                     """INSERT INTO solver_jobs
                        (id,job_mode,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,auth_kind,model,
-                        reasoning_effort,ultra_escalation_mode,ultra_source_job_id,ultracode,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
+                         reasoning_effort,subagents_enabled,ultra_escalation_mode,ultra_source_job_id,ultracode,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
                          retry_checkpoint_json,continuation_mode,continuation_source_job_id,writeup_instruction,writeup_locale,source_writeup_sha256,source_solver_job_id,
                         challenge_input_sha256,challenge_base_sha256,challenge_description,remote_mode,status,previous_challenge_status,flag,private_notes,
                         solver_artifact_json,flag_hooked,created_at,updated_at)
                        VALUES(:id,:job_mode,:owner_user_id,:workspace_id,:challenge_id,:account_id,
-                               :account_label,:provider,:auth_kind,:model,:reasoning_effort,:ultra_escalation_mode,:ultra_source_job_id,:ultracode,:max_reasoning_available,:service_tier,:codex_version,
+                                :account_label,:provider,:auth_kind,:model,:reasoning_effort,:subagents_enabled,:ultra_escalation_mode,:ultra_source_job_id,:ultracode,:max_reasoning_available,:service_tier,:codex_version,
                                :codex_runtime_sha256,:claude_version,:claude_runtime_sha256,:retry_checkpoint_json,:continuation_mode,:continuation_source_job_id,
                               :writeup_instruction,:writeup_locale,:source_writeup_sha256,:source_solver_job_id,
                               :challenge_input_sha256,:challenge_base_sha256,:challenge_description,:remote_mode,'queued',:previous_challenge_status,:flag,
@@ -1747,6 +1765,7 @@ class SolverExchangeCoordinator:
                         "auth_kind": auth_kind,
                         "model": configuration.model,
                         "reasoning_effort": configuration.reasoning_effort,
+                        "subagents_enabled": int(effective_subagents_enabled),
                         "ultra_escalation_mode": ultra_escalation_mode,
                         "ultra_source_job_id": ultra_source_job_id,
                         "ultracode": int(configuration.ultracode),
@@ -1958,7 +1977,7 @@ class SolverExchangeCoordinator:
             )
         with self._connect() as db:
             row = db.execute(
-                "SELECT account_id,model,service_tier,workspace_id,challenge_id,writeup_locale FROM solver_jobs WHERE id=? AND owner_user_id=?",
+                "SELECT account_id,model,service_tier,workspace_id,challenge_id,writeup_locale,subagents_enabled FROM solver_jobs WHERE id=? AND owner_user_id=?",
                 (job_id, owner_user_id),
             ).fetchone()
         if not row:
@@ -4000,6 +4019,7 @@ class SolverExchangeCoordinator:
                     "remote": "" if is_refinement else (record.get("remote") or ""),
                     "remote_mode": "none" if is_refinement else (record.get("remote_mode") or "unknown"),
                     **configuration.public(),
+                    "subagents_enabled": bool(job["subagents_enabled"]),
                     "max_reasoning_available": bool(job["max_reasoning_available"]),
                     "codex_version": job["codex_version"],
                     "codex_runtime_sha256": job["codex_runtime_sha256"],
@@ -6526,9 +6546,11 @@ def _public_job(
             "provider": row["provider"],
             "model": row["model"],
             "reasoning_effort": row["reasoning_effort"],
+            "subagents_enabled": bool(row["subagents_enabled"]),
             "service_tier": row["service_tier"],
             **({"ultracode": True} if row["ultracode"] else {}),
         },
+        "subagents_enabled": bool(row["subagents_enabled"]),
         "max_reasoning_available": bool(row["max_reasoning_available"]),
         "ultra_escalation": {
             "mode": row["ultra_escalation_mode"],

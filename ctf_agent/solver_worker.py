@@ -124,6 +124,21 @@ MAX_PROGRESS_NUDGES = _nonnegative_int_setting("CTF_SOLVER_PROGRESS_NUDGES", 2)
 CODEX_ULTRA_MAX_SUBAGENTS = _nonnegative_int_setting("CTF_CODEX_ULTRA_MAX_SUBAGENTS", 2)
 if not 1 <= CODEX_ULTRA_MAX_SUBAGENTS <= 16:
     raise RuntimeError("CTF_CODEX_ULTRA_MAX_SUBAGENTS must be between 1 and 16")
+
+
+def _codex_subagents_enabled(
+    configuration: ModelConfiguration | None,
+    requested: bool | None,
+    *,
+    job_mode: str = "solve",
+) -> bool:
+    """Resolve the persisted job choice, retaining legacy Ultra defaults."""
+    return bool(
+        job_mode == "solve"
+        and configuration is not None
+        and configuration.provider == "codex"
+        and (configuration.reasoning_effort == "ultra" if requested is None else requested)
+    )
 MAX_SOFT_MESSAGE_BYTES = 64 * 1024
 FLAG_WATCH_INTERVAL_SECONDS = 0.025
 CODEX_LAUNCHER = Path("/usr/local/libexec/ctf-agent-codex-launcher")
@@ -670,6 +685,9 @@ class JobManifest:
     created_at: float
     deadline_unix: float | None
     ultra_escalation_mode: str = "off"
+    # None is reserved for pre-upgrade manifests and direct test fixtures.
+    # Those retain the former Ultra-only default.
+    subagents_enabled: bool | None = None
     writeup_locale: str = "ko"
     related_context: str = field(default="", repr=False)
     network_enabled: bool = False
@@ -703,6 +721,7 @@ class JobManifest:
             "provider",
             "model",
             "reasoning_effort",
+            "subagents_enabled",
             "ultracode",
             "max_reasoning_available",
             "service_tier",
@@ -851,6 +870,14 @@ class JobManifest:
             raise WorkerRefusal("invalid_manifest", "자동 추론 승격 설정을 확인할 수 없습니다.")
         if configuration.provider not in {"codex", "claude"}:
             raise WorkerRefusal("provider_not_supported", "지원하지 않는 공급자입니다.")
+        subagents_enabled = payload.get(
+            "subagents_enabled",
+            configuration.provider == "codex" and configuration.reasoning_effort == "ultra" and job_mode == "solve",
+        )
+        if type(subagents_enabled) is not bool or (
+            subagents_enabled and (configuration.provider != "codex" or job_mode != "solve")
+        ):
+            raise WorkerRefusal("invalid_manifest", "Codex 하위 에이전트 설정을 확인할 수 없습니다.")
         auth_kind = payload.get("auth_kind", "oauth")
         if auth_kind not in {"oauth", "api_key"}:
             raise WorkerRefusal("invalid_manifest", "계정 인증 방식이 올바르지 않습니다.", category="auth")
@@ -995,6 +1022,7 @@ class JobManifest:
             created_at=float(created_at),
             deadline_unix=float(deadline) if deadline is not None else None,
             ultra_escalation_mode=ultra_mode,
+            subagents_enabled=subagents_enabled,
             network_enabled=network_enabled,
             network_policy=network_policy,
             retry_checkpoint=retry_checkpoint,
@@ -3015,6 +3043,7 @@ class CodexAppServer:
         self.codex_home = codex_home
         self.challenge = challenge
         self.configuration = configuration
+        self.subagents_enabled: bool | None = None
         chosen = executable or shutil.which("codex") or ""
         self.command_prefix = list(command_prefix) if command_prefix is not None else ([chosen] if chosen else [])
         self.executable = self.command_prefix[0] if self.command_prefix else ""
@@ -3246,10 +3275,7 @@ class CodexAppServer:
         }
 
     def command_arguments(self) -> list[str]:
-        multi_agent = bool(
-            self.configuration
-            and self.configuration.reasoning_effort == "ultra"
-        )
+        multi_agent = _codex_subagents_enabled(self.configuration, getattr(self, "subagents_enabled", None))
         command = [
             *self.command_prefix,
             "-c", 'cli_auth_credentials_store="file"',
@@ -4162,6 +4188,10 @@ print(json.dumps(result,separators=(",",":")))
         # environment, while the container and AppArmor remain authoritative.
         provider_model = self._provider_model(manifest.configuration.model)
         is_refinement = getattr(manifest, "job_mode", "solve") == "writeup_refine"
+        multi_agent = _codex_subagents_enabled(
+            manifest.configuration, getattr(manifest, "subagents_enabled", None),
+            job_mode=getattr(manifest, "job_mode", "solve"),
+        )
         params: dict[str, Any] = {
             "cwd": str(self.challenge),
             "runtimeWorkspaceRoots": [str(self.challenge)],
@@ -4175,9 +4205,9 @@ print(json.dumps(result,separators=(",",":")))
             "config": {
                 "web_search": "disabled" if is_refinement else "live",
                 "tools": {"web_search": not is_refinement},
-                "features": {"multi_agent": manifest.configuration.reasoning_effort == "ultra" and not is_refinement},
+                "features": {"multi_agent": multi_agent},
                 "agents": {
-                    "enabled": manifest.configuration.reasoning_effort == "ultra" and not is_refinement,
+                    "enabled": multi_agent,
                     "max_concurrent_threads_per_session": CODEX_ULTRA_MAX_SUBAGENTS,
                 },
             },
@@ -4300,9 +4330,13 @@ print(json.dumps(result,separators=(",",":")))
         self, item: Mapping[str, Any], source_thread_id: str, manifest: JobManifest
     ) -> None:
         item_type = item.get("type")
+        if item_type in {"collabAgentToolCall", "subAgentActivity"}:
+            if not _codex_subagents_enabled(
+                manifest.configuration, getattr(manifest, "subagents_enabled", None),
+                job_mode=getattr(manifest, "job_mode", "solve"),
+            ):
+                raise WorkerRefusal("unexpected_multi_agent_tool", "Codex subagents are disabled for this job.")
         if item_type == "collabAgentToolCall":
-            if manifest.configuration.reasoning_effort != "ultra" or getattr(manifest, "job_mode", "solve") != "solve":
-                raise WorkerRefusal("unexpected_multi_agent_tool", "Subagents require Codex ultra reasoning.")
             sender = item.get("senderThreadId") or source_thread_id
             parent_id = "root" if sender == self.thread_id else self.thread_agents.get(sender)
             if parent_id is None:
@@ -4903,10 +4937,13 @@ the worker owns the fixed deadline and cancellation. The read-only brief records
 the configured remote state; follow the evidence-based missing-input rule above
 if it is contradicted. Do not write the final write-up in this turn.
 """
-        if getattr(configuration, "reasoning_effort", None) == "ultra":
+        if _codex_subagents_enabled(
+            configuration, getattr(manifest, "subagents_enabled", None),
+            job_mode=getattr(manifest, "job_mode", "solve"),
+        ):
             result_bridge += """
 
-Ultra is enabled. Delegate independent analysis or verification to Codex
+Codex subagents are enabled. Delegate independent analysis or verification to Codex
 subagents only when that can reduce wall-clock time. First identify the
 smallest observable path to a verified flag; do not split a still-unknown
 single chain across agents. Give each child a distinct question, an expected
@@ -7991,6 +8028,8 @@ class SolverWorker:
                 manifest.claude_runtime_sha256 if manifest.configuration.provider == "claude" else manifest.codex_runtime_sha256,
                 auth_kind=manifest.auth_kind,
             )
+            if isinstance(driver, CodexAppServer):
+                driver.subagents_enabled = manifest.subagents_enabled
             if isinstance(driver, (CodexAppServer, ClaudePrintDriver)):
                 driver.continuation_event = lambda code: writer.emit("progress", code=code)
                 if isinstance(driver, CodexAppServer):

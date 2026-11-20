@@ -51,6 +51,10 @@ const A='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', B='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 let solverProvider='codex', solverAccounts=[], solverAccountId='', solverModels=[], solverModel='';
 let solverReasoning='', solverServiceTier=null, solverUltracode=false, solverOptionsState='idle', solverOptionsError='';
 let solverUltraEscalationMode='ask', solverRetryIssues=[], solverRetryRequiresSelection=false;
+let solverPresetNeedsAccount=false, solverPresetAccountConfirmed=false;
+let solverSubagentsEnabled=false, solverSubagentsTouched=false;
+let solverProviderChoiceTouched=false;
+let currentChallenge=null;
 let solverConfigurationJobId='', solverOptionsGeneration=0, currentSolverJob=null;
 const tr=value=>value;
 const i18n={t:tr,format:(template,values={})=>Object.entries(values).reduce(

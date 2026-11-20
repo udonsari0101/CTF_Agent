@@ -145,6 +145,23 @@ CREATE TABLE IF NOT EXISTS challenge_clone_members (
 );
 CREATE INDEX IF NOT EXISTS idx_challenge_clone_family
     ON challenge_clone_members(workspace_id,family_id,challenge_id);
+-- A clone can carry a preferred Codex configuration without starting a job.
+-- Normal challenges have no row and continue to use the selected account.
+CREATE TABLE IF NOT EXISTS challenge_solver_presets (
+    challenge_id TEXT PRIMARY KEY REFERENCES challenges(id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    account_id TEXT,
+    provider TEXT NOT NULL DEFAULT 'codex' CHECK(provider='codex'),
+    model TEXT NOT NULL,
+    reasoning_effort TEXT NOT NULL,
+    service_tier TEXT CHECK(service_tier IS NULL OR service_tier='fast'),
+    subagents_enabled INTEGER NOT NULL DEFAULT 0 CHECK(subagents_enabled IN (0,1)),
+    ultra_escalation_mode TEXT NOT NULL DEFAULT 'off'
+        CHECK(ultra_escalation_mode IN ('ask','auto','off')),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_challenge_solver_presets_workspace
+    ON challenge_solver_presets(workspace_id,challenge_id);
 -- Sharing evidence is directional even though challenge links are not.
 -- A link alone never exports another challenge's notes, write-up or flag.
 CREATE TABLE IF NOT EXISTS challenge_evidence_shares (

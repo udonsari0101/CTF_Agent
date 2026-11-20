@@ -109,6 +109,17 @@ class UltraCardStateTests(unittest.TestCase):
         completed = self.summary({"code": "ultra_escalation_requested"}, status="completed")
         self.assertIsNone(completed["input_request_kind"])
 
+    def test_ultra_source_keeps_subagent_choice(self) -> None:
+        self.arm_ultra()
+        self.assertEqual(
+            self.coordinator.ultra_request_info(self.job_id, self.owner_id)["subagents_enabled"], 0
+        )
+        with self.coordinator._connect() as db:
+            db.execute("UPDATE solver_jobs SET subagents_enabled=1 WHERE id=?", (self.job_id,))
+        self.assertEqual(
+            self.coordinator.ultra_request_info(self.job_id, self.owner_id)["subagents_enabled"], 1
+        )
+
     def test_replaced_checkpoint_removes_approval_and_auto_pending(self) -> None:
         self.arm_ultra()
         initial = self.coordinator.get(self.job_id, self.owner_id)["ultra_escalation"]
@@ -205,10 +216,13 @@ class UltraCardStateTests(unittest.TestCase):
                         for name in ("style.css", "theme.css"))
         self.assertNotIn("</style", css.lower())
         fixture = """<!doctype html><html><head><meta charset="utf-8"><style>""" + css + """</style></head><body><pre id="result">PENDING</pre><script>
-const i18n={locale:'ko',t:value=>value};
+window.onerror=message=>document.querySelector('#result').textContent='ERROR '+message;
+const i18n={locale:'ko',t:value=>value,format:(value,args)=>value.replace('{name}',args?.name || '').replace('{n}',args?.n || 0)};
 const statuses={stopped:'중단'},solverPhases={needs_input:'추가 입력 필요'};
 const solverTerminalPhases=new Set(['needs_input']);
 const startingListSolvers=new Set();
+const selectedChallengeIds=new Set();
+const tr=value=>value;
 const esc=value=>String(value??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 const date=()=>'';
 """ + implementation + """

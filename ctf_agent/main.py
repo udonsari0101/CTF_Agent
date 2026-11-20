@@ -29,7 +29,8 @@ from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from typing import Literal
 
 from .ctfd import connection_info, description_connection_info
 from .db import Settings, connect, initialize
@@ -354,6 +355,23 @@ class ChallengeInput(BaseModel):
         return value
 
 
+class CodexCloneVariant(BaseModel):
+    """One independently configured clone, with no automatic solve side effect."""
+
+    model_config = ConfigDict(extra="forbid")
+    account_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    model: str = Field(min_length=1, max_length=200)
+    reasoning_effort: str = Field(pattern=r"^[a-z][a-z0-9_-]*$", max_length=40)
+    service_tier: Literal["fast"] | None = None
+    subagents_enabled: bool = False
+    ultra_escalation_mode: Literal["ask", "auto", "off"] = "off"
+
+
+class CodexCloneBatchInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    variants: list[CodexCloneVariant] = Field(min_length=1, max_length=6)
+
+
 class WorkspacePatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     description: str | None = Field(default=None, max_length=10_000)
@@ -587,8 +605,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.state.writeups.set_artifact_writer(publish_writeup_artifacts)
 
-    def challenge_response(db, row, *, include_writeup: bool = True) -> dict:
+    _missing_preset = object()
+
+    def challenge_response(
+        db, row, *, include_writeup: bool = True, preset=_missing_preset
+    ) -> dict:
         result = challenge_result(row)
+        if preset is _missing_preset:
+            preset = db.execute(
+                """SELECT provider,account_id,model,reasoning_effort,service_tier,
+                          subagents_enabled,ultra_escalation_mode
+                     FROM challenge_solver_presets
+                    WHERE workspace_id=? AND challenge_id=?""",
+                (row["workspace_id"], row["id"]),
+            ).fetchone()
+        result["solver_preset"] = (
+            {**dict(preset), "subagents_enabled": bool(preset["subagents_enabled"])}
+            if preset else None
+        )
         result.update(
             app.state.writeups.fields(
                 db, row["id"], include_markdown=include_writeup,
@@ -668,6 +702,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "remote_input_required": "remote_input",
             }.get(code, "other")
         result = {
+            "job_id": row["id"],
             "account_label": row["account_label"],
             "status": row["status"],
             "created_at": row["created_at"],
@@ -1223,7 +1258,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for row in db.execute("SELECT status,COUNT(*) AS total FROM challenges WHERE workspace_id=? AND deleted_at IS NULL GROUP BY status", (workspace_id,)):
                 counts[row["status"]] = row["total"]
             categories = [row[0] for row in db.execute("SELECT DISTINCT category FROM challenges WHERE workspace_id=? AND deleted_at IS NULL AND category!='' ORDER BY category", (workspace_id,))]
-            results = [challenge_response(db, row, include_writeup=False) for row in rows]
+            presets = {
+                item["challenge_id"]: item for item in db.execute(
+                    """SELECT challenge_id,provider,account_id,model,
+                              reasoning_effort,service_tier,subagents_enabled,
+                              ultra_escalation_mode
+                         FROM challenge_solver_presets WHERE workspace_id=?""",
+                    (workspace_id,),
+                )
+            }
+            results = [
+                challenge_response(
+                    db, row, include_writeup=False, preset=presets.get(row["id"])
+                )
+                for row in rows
+            ]
             for result in results:
                 result["latest_solver"] = latest_solver_summary(
                     db, workspace_id, result["id"]
@@ -1500,6 +1549,269 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             ]
         return result
+
+    @app.post(
+        "/api/workspaces/{workspace_id}/challenges/{challenge_id}/clone-batch",
+        status_code=201,
+        dependencies=[Depends(require_auth)],
+    )
+    @workspace_writer_lock
+    def clone_challenge_batch(
+        workspace_id: str, challenge_id: str, payload: CodexCloneBatchInput
+    ):
+        """Publish all independently configured copies in one DB transaction.
+
+        File copies are staged under UUID paths and covered by one disk
+        reservation. No challenge row becomes visible until every attachment
+        has been copied and the source fingerprint has been rechecked.
+        """
+
+        from .storage_budget import (
+            MAX_SQLITE_INTEGER, StorageBudgetError, storage_http_status,
+            storage_io_http_response,
+        )
+
+        variants = payload.variants
+        efforts = [variant.reasoning_effort for variant in variants]
+        if len(efforts) != len(set(efforts)):
+            raise HTTPException(422, "Choose each reasoning level only once.")
+        current_owner = owner_id()
+        for variant in variants:
+            account = app.state.accounts.get(variant.account_id, current_owner)
+            if account["provider"] != "codex":
+                raise HTTPException(422, "Batch clones require Codex accounts.")
+            if (variant.ultra_escalation_mode == "auto"
+                    and variant.reasoning_effort not in {"high", "xhigh"}):
+                raise HTTPException(
+                    422, "Automatic Ultra escalation requires high or xhigh reasoning."
+                )
+
+        core_fields = (
+            "name", "category", "description", "remote", "remote_mode",
+            "remote_origin", "canonical_name",
+        )
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            source = challenge_row(db, workspace_id, challenge_id)
+            reject_active_ctfd_refresh(db, workspace_id, challenge_id)
+            attachments = db.execute(
+                """SELECT id,original_name,stored_name,size,created_at
+                     FROM attachments
+                    WHERE workspace_id=? AND challenge_id=?
+                    ORDER BY created_at,id""",
+                (workspace_id, challenge_id),
+            ).fetchall()
+            source_fingerprint = tuple(source[field] for field in core_fields)
+            attachment_fingerprint = tuple(
+                tuple(row[field] for field in ("id", "original_name", "stored_name", "size"))
+                for row in attachments
+            )
+
+        total_bytes = sum(int(row["size"]) for row in attachments) * len(variants)
+        if total_bytes > MAX_SQLITE_INTEGER:
+            raise HTTPException(413, "The selected copies exceed the supported file size.")
+
+        layout = app.state.storage_layout
+        timestamp = now()
+        records = []
+        for variant in variants:
+            clone_id = uuid.uuid4().hex
+            copies = []
+            for attachment in attachments:
+                attachment_id = uuid.uuid4().hex
+                copies.append({
+                    "id": attachment_id,
+                    "original_name": attachment["original_name"],
+                    "size": int(attachment["size"]),
+                    "source": layout.legacy_attachment_path(
+                        workspace_id, challenge_id, attachment["stored_name"]
+                    ),
+                    "target": layout.legacy_attachment_path(
+                        workspace_id, clone_id, attachment_id, create_parent=False
+                    ),
+                })
+            records.append({
+                "id": clone_id,
+                "variant": variant,
+                "directory": layout.legacy_challenge_path(
+                    workspace_id, clone_id, create=False
+                ),
+                "copies": copies,
+                "readable_path": None,
+            })
+
+        reservation_key = f"challenge-clone-batch:{uuid.uuid4().hex}"
+        reserved = False
+        published = False
+
+        def publish_batch(connection):
+            workspace = connection.execute(
+                "SELECT 1 FROM workspaces WHERE id=? AND owner_user_id=?",
+                (workspace_id, current_owner),
+            ).fetchone()
+            current_source = connection.execute(
+                "SELECT * FROM challenges WHERE id=? AND workspace_id=? AND deleted_at IS NULL",
+                (challenge_id, workspace_id),
+            ).fetchone()
+            if not workspace or not current_source:
+                raise HTTPException(404, "The source challenge is no longer available.")
+            current_attachments = connection.execute(
+                """SELECT id,original_name,stored_name,size FROM attachments
+                    WHERE workspace_id=? AND challenge_id=?
+                    ORDER BY created_at,id""",
+                (workspace_id, challenge_id),
+            ).fetchall()
+            if (tuple(current_source[field] for field in core_fields) != source_fingerprint
+                    or tuple(tuple(row[field] for field in (
+                        "id", "original_name", "stored_name", "size"
+                    )) for row in current_attachments) != attachment_fingerprint):
+                raise HTTPException(409, "The source challenge changed during copying.")
+            family = connection.execute(
+                """SELECT family_id FROM challenge_clone_members
+                    WHERE workspace_id=? AND challenge_id=?""",
+                (workspace_id, challenge_id),
+            ).fetchone()
+            family_id = family["family_id"] if family else challenge_id
+            if family is None:
+                connection.execute(
+                    """INSERT INTO challenge_clone_members
+                       (workspace_id,challenge_id,family_id,created_at)
+                       VALUES(?,?,?,?)""",
+                    (workspace_id, challenge_id, family_id, timestamp),
+                )
+            for record in records:
+                clone_id = record["id"]
+                variant = record["variant"]
+                name = clone_challenge_name(
+                    connection, workspace_id, current_source["name"]
+                )
+                layout.reserve_challenge(connection, workspace_id, clone_id, name)
+                record["readable_path"] = layout.challenge_path(
+                    workspace_id, clone_id, db=connection, create=True
+                )
+                connection.execute(
+                    """INSERT INTO challenges(
+                           id,workspace_id,name,category,description,remote,
+                           remote_mode,remote_origin,canonical_name,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        clone_id, workspace_id, name, current_source["category"],
+                        current_source["description"], current_source["remote"],
+                        current_source["remote_mode"], current_source["remote_origin"],
+                        current_source["canonical_name"] or current_source["name"],
+                        timestamp, timestamp,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO challenge_clone_members
+                       (workspace_id,challenge_id,family_id,created_at)
+                       VALUES(?,?,?,?)""",
+                    (workspace_id, clone_id, family_id, timestamp),
+                )
+                connection.execute(
+                    """INSERT INTO challenge_solver_presets(
+                           challenge_id,workspace_id,account_id,provider,model,
+                           reasoning_effort,service_tier,subagents_enabled,
+                           ultra_escalation_mode,created_at
+                       ) VALUES(?,?,?,'codex',?,?,?,?,?,?)""",
+                    (
+                        clone_id, workspace_id, variant.account_id, variant.model,
+                        variant.reasoning_effort, variant.service_tier,
+                        int(variant.subagents_enabled), variant.ultra_escalation_mode,
+                        timestamp,
+                    ),
+                )
+                connection.executemany(
+                    """INSERT INTO attachments(
+                           id,workspace_id,challenge_id,original_name,stored_name,
+                           size,created_at
+                       ) VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        (
+                            copy["id"], workspace_id, clone_id,
+                            copy["original_name"], copy["id"], copy["size"],
+                            timestamp,
+                        )
+                        for copy in record["copies"]
+                    ),
+                )
+            for record in records:
+                sync_challenge_storage(connection, workspace_id, record["id"])
+            connection.execute(
+                "UPDATE workspaces SET updated_at=? WHERE id=?",
+                (timestamp, workspace_id),
+            )
+
+        try:
+            app.state.storage_budget.reserve(
+                reservation_key, "challenge_clone_batch", current_owner,
+                workspace_id, None, total_bytes,
+            )
+            reserved = True
+            for record in records:
+                directory = layout.legacy_challenge_path(
+                    workspace_id, record["id"], create=True
+                )
+                attachments_directory = directory / "attachments"
+                if record["copies"]:
+                    attachments_directory.mkdir(mode=0o750, exist_ok=True)
+                for copy in record["copies"]:
+                    copy_regular_snapshot(copy["source"], copy["target"], copy["size"])
+                if hasattr(os, "O_DIRECTORY"):
+                    for path in (attachments_directory, directory):
+                        if path.is_dir():
+                            descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+                            try:
+                                os.fsync(descriptor)
+                            finally:
+                                os.close(descriptor)
+            app.state.storage_budget.release(
+                reservation_key, db_update=publish_batch
+            )
+            reserved = False
+            published = True
+        except BaseException as exc:
+            if reserved:
+                try:
+                    app.state.storage_budget.release(reservation_key)
+                except Exception:
+                    audit_log.exception("challenge_clone_batch_reservation_cleanup_failed")
+            if not published:
+                for record in records:
+                    try:
+                        readable = record["readable_path"]
+                        if readable is not None and layout._marker(
+                            readable, "challenge", record["id"]
+                        ):
+                            shutil.rmtree(readable)
+                        shutil.rmtree(record["directory"], ignore_errors=True)
+                    except Exception:
+                        audit_log.exception("challenge_clone_batch_file_cleanup_failed")
+            if isinstance(exc, ChallengeCloneSourceChanged):
+                raise HTTPException(409, "A source attachment changed during copying.") from None
+            if isinstance(exc, StorageBudgetError):
+                raise HTTPException(storage_http_status(exc), str(exc)) from None
+            if isinstance(exc, OSError):
+                status, message = storage_io_http_response(exc)
+                raise HTTPException(status, message) from None
+            raise
+
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            results = []
+            for record in records:
+                clone_id = record["id"]
+                result = challenge_response(db, challenge_row(db, workspace_id, clone_id))
+                result["attachments"] = [
+                    dict(row) for row in db.execute(
+                        """SELECT id,original_name,size,created_at FROM attachments
+                            WHERE workspace_id=? AND challenge_id=?
+                            ORDER BY created_at,id""",
+                        (workspace_id, clone_id),
+                    )
+                ]
+                results.append(result)
+        return {"clones": results}
 
     @app.get("/api/workspaces/{workspace_id}/clone-groups", dependencies=[Depends(require_auth)])
     def list_clone_groups(workspace_id: str):

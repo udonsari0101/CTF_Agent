@@ -100,6 +100,54 @@ class ProgressNudgeTests(unittest.TestCase):
             "max_concurrent_threads_per_session": 2,
         })
 
+    def test_subagent_setting_overrides_reasoning_effort_in_cli_and_thread(self) -> None:
+        self.driver.command_prefix = ["codex"]
+        self.driver.challenge = self.challenge
+        self.driver.rate_limit_context = None
+        for effort, enabled in (("low", True), ("medium", True), ("high", True),
+                                ("xhigh", True), ("max", True), ("ultra", False)):
+            with self.subTest(effort=effort, enabled=enabled):
+                self.driver.configuration = ModelConfiguration("codex", "gpt-6-sol", effort)
+                self.driver.subagents_enabled = enabled
+                with patch.object(self.driver, "_uses_local_permissions", return_value=False):
+                    arguments = self.driver.command_arguments()
+                self.assertIn(f"agents.enabled={'true' if enabled else 'false'}", arguments)
+                self.assertEqual(arguments[arguments.index("multi_agent") - 1],
+                                 "--enable" if enabled else "--disable")
+
+                self.driver.thread_id = None
+                self.driver.resume_thread_id = None
+                self.manifest.configuration = self.driver.configuration
+                self.manifest.job_mode = "solve"
+                self.manifest.subagents_enabled = enabled
+                request = AsyncMock(return_value={"thread": {"id": "new-thread"}})
+                self.driver.request = request
+                with (patch.object(self.driver, "_provider_model", return_value="gpt-6-sol"),
+                      patch.object(self.driver, "_sandbox_parameters", return_value={})):
+                    self.assertEqual(asyncio.run(self.driver._thread(self.manifest)), "new-thread")
+                params = request.await_args.args[1]
+                self.assertEqual(params["config"]["features"]["multi_agent"], enabled)
+                self.assertEqual(params["config"]["agents"]["enabled"], enabled)
+
+    def test_subagent_events_are_only_accepted_when_enabled(self) -> None:
+        self.manifest.job_mode = "solve"
+        self.manifest.configuration = ModelConfiguration("codex", "gpt-6-sol", "xhigh")
+        self.manifest.subagents_enabled = False
+        self.driver.thread_id = "root-thread"
+        item = {"type": "collabAgentToolCall", "senderThreadId": "root-thread",
+                "receiverThreadIds": []}
+        with self.assertRaises(worker.WorkerRefusal) as error:
+            asyncio.run(self.driver._track_codex_agent_item(item, "root-thread", self.manifest))
+        self.assertEqual(error.exception.error.code, "unexpected_multi_agent_tool")
+        self.manifest.subagents_enabled = True
+        asyncio.run(self.driver._track_codex_agent_item(item, "root-thread", self.manifest))
+
+    def test_refinement_disables_subagents_even_if_requested(self) -> None:
+        self.assertFalse(worker._codex_subagents_enabled(
+            ModelConfiguration("codex", "gpt-6-sol", "ultra"), True,
+            job_mode="writeup_refine",
+        ))
+
     def test_offline_remote_request_gets_one_same_session_review(self) -> None:
         self.manifest.remote_mode = "none"
         self.driver.thread_id = "existing-thread"

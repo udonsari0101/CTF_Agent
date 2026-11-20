@@ -157,6 +157,22 @@ input:focus, textarea:focus, select:focus {
 #sort-order { width: 158px; }
 #category-filter { width: 128px; }
 .challenge-card-status small { color: #65c8aa; font: inherit; }
+.challenge-card.is-selected { border-color: #54d8ad; box-shadow: inset 0 0 0 1px #54d8ad, 0 13px 28px rgba(0,0,0,.45); }
+.challenge-card-select { display: inline-flex; align-items: center; gap: 7px; min-width: 0; max-width: 58%; cursor: pointer; }
+.challenge-card-select input { flex: 0 0 16px; width: 16px; height: 16px; margin: 0; accent-color: #52e5b0; cursor: pointer; }
+.challenge-card-select .challenge-category { display: block; min-width: 0; max-width: 100%; }
+.challenge-bulk-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 9px; flex-wrap: wrap; margin: 0 0 12px; padding: 9px 11px; border: 1px solid #1b3842; border-radius: 8px; background: #071018; }
+.challenge-bulk-toolbar .form-hint { flex: 1 1 240px; margin: 0; }
+.challenge-selection-count { color: #88cfbb; font: 600 10px ui-monospace,"Cascadia Code",Consolas,monospace; white-space: nowrap; }
+.challenge-bulk-toolbar button { white-space: nowrap; }
+.clone-reasoning-levels { min-width: 0; margin: 0; padding: 11px; border: 1px solid #24404d; border-radius: 8px; }
+.clone-reasoning-levels legend { padding: 0 5px; color: #9bc2ce; font-size: 11px; }
+.clone-reasoning-level-list { display: grid; gap: 5px; }
+.clone-reasoning-level-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 9px; border: 1px solid #18333f; border-radius: 6px; background: #061018; }
+.clone-reasoning-level-row label, .clone-reasoning-fast { display: inline-flex; align-items: center; gap: 7px; width: auto; margin: 0; }
+.clone-reasoning-level-row input, .clone-reasoning-fast input { width: 16px; height: 16px; margin: 0; accent-color: #52e5b0; }
+.clone-reasoning-agent-option { color: #8fb5c2; font-size: 10px; }
+@media(max-width:580px) { .challenge-bulk-toolbar { justify-content: flex-start; } .challenge-bulk-toolbar .form-hint { flex-basis: 100%; } }
 .workspace-option {
   display: inline-flex;
   grid-template-columns: none;
@@ -566,6 +582,8 @@ input:focus, textarea:focus, select:focus {
 .solver-provider-choice select { width: 100%; }
 .solver-configuration { align-content: start; }
 .solver-configuration .solver-ultracode-choice { grid-column: 1/-1; display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #315366; border-radius: 8px; background: #0b1821; color: #a4ddf5; }
+.solver-configuration .solver-subagents-choice { grid-column: 1/-1; display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #315366; border-radius: 8px; background: #0b1821; color: #a4ddf5; }
+.solver-subagents-choice input { width: auto; margin: 0; accent-color: #59c9f4; }
 .solver-configuration .solver-ultra-escalation { grid-column: 1/-1; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px; border:1px solid #315366; border-radius:8px; background:#0b1821; color:#a4ddf5; }
 .solver-ultra-escalation select { width:auto; min-width:160px; margin:0; }
 @media(max-width:580px) { .solver-configuration .solver-ultra-escalation { align-items:stretch; flex-direction:column; } .solver-ultra-escalation select { width:100%; } }

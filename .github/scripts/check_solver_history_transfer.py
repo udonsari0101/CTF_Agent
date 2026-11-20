@@ -1,5 +1,6 @@
 """Round-trip regression for versioned solver log transfer."""
 
+import hashlib
 import json
 import shutil
 import sys
@@ -130,6 +131,36 @@ def main():
         assert imported_single["solver_job_count"] == 2
         with closing(connect(settings)) as db, db:
             assert db.execute("SELECT COUNT(*) FROM solver_jobs WHERE challenge_id=? AND imported_historical=1", (imported_single["challenge_id"],)).fetchone()[0] == 2
+        # A pre-option v4 history bundle has no subagent field. Its old Ultra
+        # jobs still need the original enabled behavior after import.
+        old_v4 = root / "pre-subagents-v4.zip"
+        with zipfile.ZipFile(single) as source, zipfile.ZipFile(old_v4, "w", allowZip64=True) as target:
+            manifest = json.loads(source.read("manifest.json"))
+            entries = []
+            for raw in source.read("solver-history.jsonl").splitlines():
+                entry = json.loads(raw)
+                if entry["type"] == "job":
+                    entry["data"].pop("subagents_enabled")
+                entries.append(json.dumps(entry, ensure_ascii=False, separators=(",", ":")).encode() + b"\n")
+            payload = b"".join(entries)
+            manifest["solver_history"]["size"] = len(payload)
+            manifest["solver_history"]["sha256"] = hashlib.sha256(payload).hexdigest()
+            for name in source.namelist():
+                if name == "manifest.json":
+                    target.writestr(name, json.dumps(manifest).encode())
+                elif name == "solver-history.jsonl":
+                    target.writestr(name, payload)
+                else:
+                    target.writestr(name, source.read(name))
+        old_v4_import = import_challenge(
+            settings, layout, owner, imported["workspace_id"], old_v4, source_upload_id=uid(),
+        )
+        with closing(connect(settings)) as db:
+            imported_flags = db.execute(
+                "SELECT subagents_enabled FROM solver_jobs WHERE challenge_id=? ORDER BY created_at",
+                (old_v4_import["challenge_id"],),
+            ).fetchall()
+            assert imported_flags and all(row[0] == 1 for row in imported_flags)
         # A v1 bundle remains readable. Removing the versioned history section makes
         # the old manifest shape and preserves all challenge/file data.
         legacy = root / "legacy.zip"

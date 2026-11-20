@@ -30,7 +30,7 @@ _OPEN = {"queued", "staging", "awaiting_credential", "running", "flag_found", "w
 # native session archives, retry checkpoints, process IDs or notification state.
 JOB_FIELDS = (
     "id", "challenge_id", "job_mode", "account_label", "provider", "auth_kind",
-    "model", "reasoning_effort", "ultra_escalation_mode", "ultra_source_job_id",
+    "model", "reasoning_effort", "subagents_enabled", "ultra_escalation_mode", "ultra_source_job_id",
     "ultra_auto_attempted", "ultracode", "max_reasoning_available", "service_tier",
     "codex_version", "codex_runtime_sha256", "claude_version", "claude_runtime_sha256",
     "status", "previous_challenge_status", "last_event_sequence", "agents_json",
@@ -200,6 +200,14 @@ def inspect_history(bundle: zipfile.ZipFile, descriptor: dict[str, Any],
     event_sequences: dict[str, int] = {}
     for kind, data in _read(bundle, descriptor):
         if kind == "job":
+            if "subagents_enabled" not in data:
+                # Bundles exported before this setting existed preserve the
+                # old behavior for historical Codex Ultra jobs.
+                data["subagents_enabled"] = int(
+                    data.get("provider") == "codex"
+                    and data.get("reasoning_effort") == "ultra"
+                    and data.get("job_mode") == "solve"
+                )
             if (set(data) != set(JOB_FIELDS) or not _identifier(data.get("id"))
                     or data["id"] in jobs or data.get("challenge_id") not in challenge_ids
                     or data.get("provider") not in {"codex", "claude"}
@@ -214,7 +222,7 @@ def inspect_history(bundle: zipfile.ZipFile, descriptor: dict[str, Any],
                         "writeup_instruction", "remote_mode"
                     ))
                     or any(data.get(field) not in (0, 1) for field in (
-                        "ultra_auto_attempted", "ultracode", "max_reasoning_available",
+                        "ultra_auto_attempted", "ultracode", "subagents_enabled", "max_reasoning_available",
                         "continuation_confirmed"
                     ))
                     or isinstance(data.get("last_event_sequence"), bool)

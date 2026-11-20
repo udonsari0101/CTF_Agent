@@ -187,6 +187,8 @@ jobs:
           PY
       - name: Check workspace transfer archive contract
         run: python .github/scripts/check_workspace_transfer.py
+      - name: Check batch Codex clone contract
+        run: python .github/scripts/check_clone_batch.py
       - name: Check read-only solver history transfer
         run: python .github/scripts/check_solver_history_transfer.py
       - name: Check resumable transfer upload contract
@@ -309,6 +311,10 @@ jobs:
         run: python .github/scripts/check_solver_timing.py
       - name: Check challenge solve-time sorting
         run: python .github/scripts/check_challenge_solve_sort.py
+      - name: Check bulk challenge controls
+        run: python .github/scripts/check_bulk_reasoning_ui.py
+      - name: Check Codex subagent option
+        run: python .github/scripts/check_codex_subagents_option.py
       - name: Check Ultra and remote input card states
         run: python .github/scripts/check_ultra_card_state.py
       - name: Check solver resource policy

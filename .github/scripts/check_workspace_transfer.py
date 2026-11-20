@@ -256,6 +256,50 @@ class WorkspaceTransferTests(unittest.TestCase):
             {imported["challenge_ids"][self.first]},
         )
 
+    def test_solver_preset_round_trip_requires_new_account_selection(self):
+        old_account = uuid.uuid4().hex
+        with closing(connect(self.settings)) as db, db:
+            db.execute(
+                """INSERT INTO challenge_solver_presets(
+                       challenge_id,workspace_id,account_id,provider,model,
+                       reasoning_effort,service_tier,subagents_enabled,
+                       ultra_escalation_mode,created_at)
+                   VALUES(?,?,?,'codex','gpt-6-sol','xhigh','fast',1,'off',?)""",
+                (self.first, self.workspace_id, old_account, "2026-11-01"),
+            )
+        self.export()
+        with zipfile.ZipFile(self.archive) as bundle:
+            manifest = json.loads(bundle.read("manifest.json"))
+        self.assertEqual(len(manifest["solver_presets"]), 1)
+        self.assertNotIn("account_id", manifest["solver_presets"][0])
+        imported = import_workspace(self.settings, self.layout, self.owner, self.archive)
+        with closing(connect(self.settings)) as db:
+            preset = db.execute(
+                """SELECT account_id,provider,model,reasoning_effort,
+                          service_tier,subagents_enabled,ultra_escalation_mode
+                     FROM challenge_solver_presets WHERE challenge_id=?""",
+                (imported["challenge_ids"][self.first],),
+            ).fetchone()
+        self.assertEqual(tuple(preset), (
+            None, "codex", "gpt-6-sol", "xhigh", "fast", 1, "off",
+        ))
+        single_archive = self.archive.with_name("single-preset.zip")
+        export_challenge(
+            self.settings, self.layout, self.owner, self.workspace_id,
+            self.first, single_archive,
+        )
+        single = import_challenge(
+            self.settings, self.layout, self.owner, self.workspace_id,
+            single_archive,
+        )
+        with closing(connect(self.settings)) as db:
+            single_preset = db.execute(
+                """SELECT account_id,model,reasoning_effort,subagents_enabled
+                    FROM challenge_solver_presets WHERE challenge_id=?""",
+                (single["challenge_id"],),
+            ).fetchone()
+        self.assertEqual(tuple(single_preset), (None, "gpt-6-sol", "xhigh", 1))
+
     def test_previous_bundle_version_remains_importable(self):
         self.export()
         legacy = self.archive.with_name("legacy-v2.zip")

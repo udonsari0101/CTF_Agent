@@ -5,6 +5,7 @@ notification settings, live sessions, or worker state. Imported solver jobs
 are read-only history, not resumable provider sessions. User text, flags,
 attachments and logs may themselves be sensitive; treat the bundle as private.
 Remote endpoints are omitted unless explicitly requested.
+Solver presets retain model choices but never export account bindings.
 """
 
 from __future__ import annotations
@@ -50,6 +51,10 @@ _CHALLENGE_FIELDS = (
 _WORKSPACE_FIELDS = (
     "id", "name", "description", "flag_format",
     "open_challenge_after_create", "created_at", "updated_at",
+)
+_SOLVER_PRESET_FIELDS = (
+    "challenge_id", "provider", "model", "reasoning_effort", "service_tier",
+    "subagents_enabled", "ultra_escalation_mode",
 )
 _STAT_FIELDS = ("st_dev", "st_ino", "st_size", "st_mtime_ns") + (
     ("st_ctime_ns",) if os.name != "nt" else ()
@@ -179,6 +184,16 @@ def _snapshot(db: sqlite3.Connection, owner: str, workspace_id: str) -> dict:
             WHERE workspace_id=? ORDER BY family_id,challenge_id""",
         (workspace_id,),
     ).fetchall() if has_clone_members else []
+    has_solver_presets = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='challenge_solver_presets'"
+    ).fetchone()
+    solver_presets = db.execute(
+        """SELECT challenge_id,provider,model,reasoning_effort,service_tier,
+                  subagents_enabled,ultra_escalation_mode
+             FROM challenge_solver_presets WHERE workspace_id=?
+             ORDER BY challenge_id""",
+        (workspace_id,),
+    ).fetchall() if has_solver_presets else []
     has_shares = db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='challenge_evidence_shares'"
     ).fetchone()
@@ -198,6 +213,7 @@ def _snapshot(db: sqlite3.Connection, owner: str, workspace_id: str) -> dict:
         ],
         "relations": [dict(item) for item in relations],
         "clone_members": [dict(item) for item in clone_members],
+        "solver_presets": [dict(item) for item in solver_presets],
         "evidence_shares": [dict(item) for item in shares],
         "attachments": [
             {field: item[field] for field in (
@@ -308,6 +324,10 @@ def export_workspace(
         ]
         snapshot["relations"] = []
         snapshot["clone_members"] = []
+        snapshot["solver_presets"] = [
+            item for item in snapshot["solver_presets"]
+            if item["challenge_id"] == challenge_id
+        ]
         snapshot["evidence_shares"] = []
     if len(snapshot["attachments"]) > MAX_ENTRIES:
         raise TransferError("Too many attachments for one bundle.")
@@ -373,6 +393,10 @@ def export_workspace(
             ]
             current["relations"] = []
             current["clone_members"] = []
+            current["solver_presets"] = [
+                item for item in current["solver_presets"]
+                if item["challenge_id"] == challenge_id
+            ]
             current["evidence_shares"] = []
         if current != snapshot:
             raise TransferError("The workspace changed during export; retry.")
@@ -449,11 +473,12 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
     }
     extra = {"solver_history"} if manifest["version"] >= 2 else set()
     required = mandatory | extra
-    optional = {"evidence_shares", "clone_members"}
+    optional = {"evidence_shares", "clone_members", "solver_presets"}
     if not required <= set(manifest) or not set(manifest) <= required | optional:
         raise TransferError("Bundle manifest contains unknown metadata fields.")
     manifest.setdefault("evidence_shares", [])
     manifest.setdefault("clone_members", [])
+    manifest.setdefault("solver_presets", [])
     if manifest["version"] >= 2:
         try:
             validate_history_descriptor(bundle, manifest["solver_history"])
@@ -474,14 +499,17 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
     relations = manifest.get("relations")
     shares = manifest["evidence_shares"]
     clone_members = manifest["clone_members"]
+    solver_presets = manifest["solver_presets"]
     if (not isinstance(ws, dict) or not isinstance(challenges, list)
             or not isinstance(attachments, list) or not isinstance(relations, list)
-            or not isinstance(shares, list) or not isinstance(clone_members, list)):
+            or not isinstance(shares, list) or not isinstance(clone_members, list)
+            or not isinstance(solver_presets, list)):
         raise TransferError("Bundle metadata is incomplete.")
     if set(ws) != set(_WORKSPACE_FIELDS):
         raise TransferError("Workspace metadata has unknown fields.")
     if (len(challenges) > MAX_ENTRIES or len(relations) > MAX_ENTRIES
-            or len(shares) > MAX_ENTRIES or len(clone_members) > MAX_ENTRIES):
+            or len(shares) > MAX_ENTRIES or len(clone_members) > MAX_ENTRIES
+            or len(solver_presets) > MAX_ENTRIES):
         raise TransferError("Too many challenges, relations, or shares in bundle.")
     _identifier(ws.get("id"), "workspace ID")
     for field in ("name", "description", "created_at", "updated_at"):
@@ -526,6 +554,28 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
             raise TransferError("Orphan or duplicate clone lineage in bundle.")
         _identifier(item["family_id"], "clone family ID")
         seen_clone_members.add(challenge_id)
+    seen_solver_presets: set[str] = set()
+    for item in solver_presets:
+        if not isinstance(item, dict) or set(item) != set(_SOLVER_PRESET_FIELDS):
+            raise TransferError("Invalid solver preset in bundle.")
+        challenge_id = item["challenge_id"]
+        if challenge_id not in ids or challenge_id in seen_solver_presets:
+            raise TransferError("Orphan or duplicate solver preset in bundle.")
+        seen_solver_presets.add(challenge_id)
+        if item["provider"] != "codex":
+            raise TransferError("Only Codex solver presets can be imported.")
+        model = _string(item["model"], "preset model")
+        effort = _string(item["reasoning_effort"], "preset reasoning")
+        if not 1 <= len(model) <= 200 or not re.fullmatch(r"[a-z][a-z0-9_-]{0,39}", effort):
+            raise TransferError("Invalid solver model or reasoning level in bundle.")
+        if item["service_tier"] not in (None, "fast"):
+            raise TransferError("Invalid solver service tier in bundle.")
+        if type(item["subagents_enabled"]) is not int or item["subagents_enabled"] not in (0, 1):
+            raise TransferError("Invalid subagent option in bundle.")
+        if item["ultra_escalation_mode"] not in ("ask", "auto", "off"):
+            raise TransferError("Invalid Ultra escalation option in bundle.")
+        if item["ultra_escalation_mode"] == "auto" and effort not in ("high", "xhigh"):
+            raise TransferError("Automatic Ultra escalation requires high or xhigh reasoning.")
     expected = {"manifest.json"}
     if manifest["version"] >= 2:
         expected.add(HISTORY_ARCHIVE_PATH)
@@ -596,6 +646,27 @@ def _validate(bundle: zipfile.ZipFile) -> dict:
     if manifest.get("scope") == "challenge" and (len(challenges) != 1 or relations or shares or clone_members):
         raise TransferError("A challenge bundle must contain exactly one challenge.")
     return manifest
+
+
+def _import_solver_preset(
+    db: sqlite3.Connection, workspace_id: str, challenge_id: str,
+    preset: dict[str, Any], stamp: str,
+) -> None:
+    # Account identities and credentials belong to one installation. The
+    # recipient must explicitly choose an account before starting this copy.
+    db.execute(
+        """INSERT INTO challenge_solver_presets(
+               challenge_id,workspace_id,account_id,provider,model,
+               reasoning_effort,service_tier,subagents_enabled,
+               ultra_escalation_mode,created_at
+           ) VALUES(?,?,NULL,'codex',?,?,?,?,?,?)""",
+        (
+            challenge_id, workspace_id, preset["model"],
+            preset["reasoning_effort"], preset["service_tier"],
+            preset["subagents_enabled"], preset["ultra_escalation_mode"],
+            stamp,
+        ),
+    )
 
 
 def preview_bundle(archive: Path, *, settings: Settings | None = None,
@@ -866,6 +937,11 @@ def import_workspace(settings: Settings, layout: StorageLayout, owner_user_id: s
                         (workspace_id, challenge_ids[item["challenge_id"]],
                          family_ids[item["family_id"]], stamp),
                     )
+                for preset in manifest["solver_presets"]:
+                    _import_solver_preset(
+                        db, workspace_id, challenge_ids[preset["challenge_id"]],
+                        preset, stamp,
+                    )
                 for item in manifest["evidence_shares"]:
                     if not item["observation"]:
                         # A Flag-only approval cannot be represented safely
@@ -1027,6 +1103,10 @@ def import_challenge(settings: Settings, layout: StorageLayout, owner_user_id: s
                            challenge_id,markdown,created_at,updated_at)
                            VALUES(?,?,?,?)""",
                         (new_id, item["writeup_markdown"], stamp, stamp),
+                    )
+                for preset in manifest["solver_presets"]:
+                    _import_solver_preset(
+                        db, workspace_id, new_id, preset, stamp,
                     )
                 for file in files:
                     db.execute(

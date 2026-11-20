@@ -33,6 +33,8 @@ let writeupPrefetchRequested = new Set();
 let writeupPrefetchActive = 0;
 let writeupPrefetchGeneration = 0;
 let selectedStatus = '', selectedCategory = '', selectedSort = 'added_desc', search = '', disposeAccounts = null, importPreview = null;
+const selectedChallengeIds = new Set();
+let selectionAnchorId = '', bulkStopBusy = false;
 let disposeTelegram = null;
 let ctfdRetryId = null;
 // Per-workspace CTFd import drafts. In memory only, and never holds a token or password.
@@ -75,8 +77,9 @@ let relatedCandidates = [];
 let releaseUpdateTimer = null, releaseUpdateRequestGeneration = 0;
 let solverProvider = (() => { try { return localStorage.getItem('ctf-solver-provider') === 'claude' ? 'claude' : 'codex'; } catch { return 'codex'; } })();
 let solverAccounts = [], solverAccountId = '', solverModels = [], solverModel = '';
-let solverReasoning = '', solverServiceTier = null, solverUltracode = false, solverOptionsState = 'idle', solverOptionsError = '';
+let solverReasoning = '', solverServiceTier = null, solverUltracode = false, solverSubagentsEnabled = false, solverSubagentsTouched = false, solverOptionsState = 'idle', solverOptionsError = '';
 let solverUltraEscalationMode = 'ask';
+let solverPresetAccountConfirmed = false, solverPresetNeedsAccount = false, solverProviderChoiceTouched = false;
 let solverRetryIssues = [], solverRetryRequiresSelection = false;
 let solverConfigurationJobId = '';
 let solverOptionsGeneration = 0;
@@ -88,6 +91,7 @@ const solverCollapsedAgentIds = new Set();
 const solverConsoleCardStates = new Map();
 const noteDrafts = new Map();
 let challengeListing = null, adminView = null, resourceMeterSnapshot = null;
+let cloneReasoningAccounts = [], cloneReasoningModels = [], cloneReasoningGeneration = 0;
 const busyForms = new WeakSet();
 const ctfdJobMarkupCache = new WeakMap();
 const challengeReturnRoute = /^w\/[0-9a-f]{32}\/c\/[0-9a-f]{32}$/;
@@ -401,10 +405,11 @@ function stopSolverPolling() {
   solverListedFlag = '';
   solverSyncedWriteup = '';
   solverAccounts = []; solverAccountId = ''; solverModels = []; solverModel = '';
-  solverReasoning = ''; solverServiceTier = null; solverUltracode = false; solverOptionsState = 'idle'; solverOptionsError = '';
+  solverReasoning = ''; solverServiceTier = null; solverUltracode = false; solverSubagentsEnabled = false; solverSubagentsTouched = false; solverOptionsState = 'idle'; solverOptionsError = '';
   solverUltraEscalationMode = ['ask','auto','off'].includes(sessionUser?.ultra_escalation_default)
     ? sessionUser.ultra_escalation_default : 'ask';
   solverRetryIssues = []; solverRetryRequiresSelection = false;
+  solverPresetAccountConfirmed = false; solverPresetNeedsAccount = false; solverProviderChoiceTouched = false;
   solverConfigurationJobId = '';
   writeupRefineJob = null; writeupRefineEvents = []; writeupRefineError = null; writeupRefineInstruction = '';
 }
@@ -1419,6 +1424,7 @@ function solverRetryConfiguration(job) {
     provider:config.provider, accountId:job.account_id || '', accountLabel:job.account_label || '',
     model:config.model || '', reasoning:config.reasoning_effort || '',
     serviceTier:config.service_tier || null, ultracode:config.ultracode === true,
+    subagentsEnabled:typeof config.subagents_enabled === 'boolean' ? config.subagents_enabled : config.provider === 'codex' && config.reasoning_effort === 'ultra',
     ultraEscalationMode:job.ultra_escalation?.mode || 'off',
   };
 }
@@ -1433,12 +1439,13 @@ function solverSelectedModel() {
 
 function solverRetryWarningMarkup() {
   if (!solverRetryIssues.length) return '';
-  const canConfirm = solverOptionsState === 'ready' && Boolean(solverSelectedAccount() && solverSelectedModel() && solverReasoning);
+  const canConfirm = !solverPresetNeedsAccount && solverOptionsState === 'ready' && Boolean(solverSelectedAccount() && solverSelectedModel() && solverReasoning);
   const issues = solverRetryIssues.map(([key,values]) => i18n.format(key,values)).join(' ');
   return `<div class="notice error-notice solver-retry-warning" role="status"><p data-i18n-ignore>${esc(issues)} ${tr('아래 설정을 확인해 주세요.')}</p>${canConfirm ? '<div class="actions"><button type="button" class="small" data-action="confirm-solver-retry-settings">현재 설정으로 계속</button></div>' : ''}</div>`;
 }
 
 function clearSolverRetryWarning() {
+  if (solverPresetNeedsAccount) return;
   solverRetryIssues = [];
   solverRetryRequiresSelection = false;
 }
@@ -1460,12 +1467,15 @@ function solverConfigurationMatchesVisibleForm() {
   if (fast && fast.checked !== (solverServiceTier === 'fast')) return false;
   const ultracode = form.querySelector('#solver-ultracode-toggle');
   if (ultracode && ultracode.checked !== solverUltracode) return false;
+  const subagents = form.querySelector('#solver-subagents-toggle');
+  if (subagents && subagents.checked !== solverSubagentsEnabled) return false;
   return true;
 }
 
 function solverConfigurationReady() {
   return solverOptionsState === 'ready'
     && !solverRetryRequiresSelection
+    && !solverPresetNeedsAccount
     && Boolean(solverSelectedAccount() && solverSelectedModel() && solverReasoning)
     && solverConfigurationMatchesVisibleForm();
 }
@@ -1507,6 +1517,7 @@ function solverProviderSelector() {
     <label>모델<select id="solver-model-select" aria-label="문제 풀이 모델" ${modelOptions ? '' : 'disabled'}>${modelOptions || '<option>사용 가능한 모델 없음</option>'}</select></label>
     <label>추론 수준<select id="solver-reasoning-select" aria-label="문제 풀이 추론 수준" ${effortOptions ? '' : 'disabled'}>${effortOptions || '<option>지원 정보 없음</option>'}</select></label>
     ${supportsFast ? `<label class="solver-fast-choice"><input id="solver-fast-toggle" type="checkbox" ${solverServiceTier === 'fast' ? 'checked' : ''}>1.5배 Fast 실행</label>` : supportsUltracode ? `<label class="solver-ultracode-choice"><input id="solver-ultracode-toggle" type="checkbox" ${solverUltracode ? 'checked' : ''}>Ultracode</label>` : '<span class="solver-fast-placeholder" aria-hidden="true"></span>'}
+    ${solverProvider === 'codex' ? `<label class="solver-subagents-choice"><input id="solver-subagents-toggle" type="checkbox" ${solverSubagentsEnabled ? 'checked' : ''}>${tr('하위 에이전트 사용')}</label>` : ''}
     ${ultraChoice}
     ${solverRetryWarningMarkup()}
     <span class="form-hint solver-config-help">이번 실행에만 적용</span>
@@ -2288,12 +2299,13 @@ function challengeCardMarkup(challenge, workspaceId) {
   const needsInput = runPhase === 'needs_input';
   const inputRequestKind = latestRun?.input_request_kind;
   const canStart = !needsInput && ['pending','stopped','failed'].includes(challenge.status);
+  const importedPreset = !latestRun && challenge.solver_preset?.provider === 'codex' && !challenge.solver_preset.account_id;
   const startKey = `${workspaceId}:${challenge.id}`;
   const starting = canStart && startingListSolvers.has(startKey);
   const work = attachmentWork.get(startKey);
   const openLabel = challenge.status === 'solved' ? '결과 보기' : challenge.status === 'running' ? '진행 보기' : challenge.status === 'flag_found' ? 'Flag 확인' : '풀이 설정';
-  return `<article class="challenge-card challenge-card-${esc(challenge.status)}" data-challenge-id="${esc(challenge.id)}" role="listitem">
-    <div class="challenge-card-top"><span class="challenge-category" data-i18n-ignore>${esc(category)}</span><span class="challenge-card-status"><span class="status-dot" aria-hidden="true"></span>${esc(statusLabel)}${liveElapsed || (elapsed ? `<small title="${latestRun.elapsed_includes_queue ? '대기 포함 소요 시간' : '풀이 시간'}">· ${esc(elapsed)}</small>` : '')}</span></div>
+  return `<article class="challenge-card challenge-card-${esc(challenge.status)}${selectedChallengeIds.has(challenge.id) ? ' is-selected' : ''}" data-challenge-id="${esc(challenge.id)}" role="listitem">
+    <div class="challenge-card-top"><label class="challenge-card-select"><input type="checkbox" data-action="select-challenge" data-id="${esc(challenge.id)}" aria-label="${esc(i18n.format('{name} 선택',{name:challenge.name}))}" ${selectedChallengeIds.has(challenge.id) ? 'checked' : ''}><span class="challenge-category" data-i18n-ignore>${esc(category)}</span></label><span class="challenge-card-status"><span class="status-dot" aria-hidden="true"></span>${esc(statusLabel)}${liveElapsed || (elapsed ? `<small title="${latestRun.elapsed_includes_queue ? '대기 포함 소요 시간' : '풀이 시간'}">· ${esc(elapsed)}</small>` : '')}</span></div>
     <button type="button" class="challenge-card-title" data-i18n-ignore data-action="open-challenge" data-id="${esc(challenge.id)}" aria-label="${challengeLabel('{name} 문제 열기',challenge)}">${esc(challenge.name)}</button>
     ${challenge.description ? `<p class="challenge-card-description" data-i18n-ignore>${esc(challenge.description)}</p>` : ''}
     ${runSummary ? `<div class="challenge-run-summary" data-i18n-ignore aria-label="${esc(i18n.t('최근 실행 설정'))}">${runSummary}</div>` : ''}
@@ -2307,7 +2319,8 @@ function challengeCardMarkup(challenge, workspaceId) {
       ${canCopyWriteup ? `<button type="button" class="small ghost icon-action writeup-action" data-action="copy-list-writeup" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-writeup-stamp="${esc(writeupStamp(challenge))}" aria-label="${challengeLabel('{name} write-up 복사',challenge)}" title="write-up 복사">▤</button>` : ''}
       ${latestRun ? `<button type="button" class="small ghost session-action${liveSession ? ' live' : ''}" data-action="open-solver-session" data-id="${esc(challenge.id)}" data-live="${liveSession}" aria-label="${challengeLabel(liveSession ? '{name} 실시간 풀이 터미널 보기' : '{name} 이전 풀이 터미널 보기',challenge)}" title="${liveSession ? '실시간 풀이 터미널' : '이전 풀이 터미널'}">${liveSession ? '<span class="session-live-dot" aria-hidden="true"></span>LIVE' : '<span aria-hidden="true">&gt;_</span>'}</button>` : ''}
       ${canStart ? `<button type="button" class="small ghost complete-action" data-action="complete-list-challenge" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${challengeLabel('{name} 수동 완료',challenge)}">수동 완료</button>` : ''}
-      ${canStart ? `<button type="button" class="small primary solve-action" data-action="start-list-solver" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${challengeLabel('{name} 기본 설정으로 풀이 시작',challenge)}" title="기본 설정으로 풀이 시작" ${work ? 'data-attachment-hold ' : ''}${starting ? 'disabled aria-busy="true"' : work ? 'disabled' : ''}>${starting ? '시작 중' : '▶ 풀이 시작'}</button>` : ''}
+      ${canStart ? `<button type="button" class="small primary solve-action" data-action="start-list-solver" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${challengeLabel(importedPreset ? '{name} 계정 선택' : '{name} 기본 설정으로 풀이 시작',challenge)}" title="${tr(importedPreset ? '계정을 먼저 선택하세요.' : '기본 설정으로 풀이 시작')}" ${work ? 'data-attachment-hold ' : ''}${starting ? 'disabled aria-busy="true"' : work ? 'disabled' : ''}>${starting ? '시작 중' : importedPreset ? tr('계정 선택') : '▶ 풀이 시작'}</button>` : ''}
+      <button type="button" class="small ghost" data-action="clone-reasoning" data-id="${esc(challenge.id)}" aria-label="${esc(i18n.format('{name} 추론 수준별 복제',{name:challenge.name}))}">${tr('추론별 복제')}</button>
       <button type="button" class="small challenge-open-action" data-action="open-challenge" data-id="${esc(challenge.id)}">${openLabel} <span aria-hidden="true">↗</span></button>
     </div></footer>
   </article>`;
@@ -2336,7 +2349,70 @@ function challengeListingMarkup(result, workspaceId) {
   const total = Object.values(result.counts).reduce((a,b) => a+b,0);
   return `<div class="toolbar"><div class="filters challenge-status-strip" aria-label="상태 필터"><button class="filter ${!selectedStatus ? 'active' : ''}" data-action="filter" data-status="" aria-pressed="${!selectedStatus}">전체<span>${total}</span></button>${Object.entries(statuses).map(([key,label]) => `<button class="filter status-filter-${key} ${selectedStatus === key ? 'active' : ''}" data-action="filter" data-status="${key}" aria-pressed="${selectedStatus === key}"><i aria-hidden="true"></i>${label}<span>${result.counts[key]}</span></button>`).join('')}</div>
     <form id="search-form" class="search-wrap"><label class="sr-only" for="search-input">문제 검색</label><input id="search-input" name="q" value="${esc(search)}" placeholder="문제 이름, 설명 검색"><label class="sr-only" for="category-filter">분류</label><select id="category-filter"><option value="">모든 분류</option>${result.categories.map(c => `<option data-i18n-ignore ${c === selectedCategory ? 'selected' : ''} value="${esc(c)}">${esc(c)}</option>`).join('')}</select><label class="sr-only" for="sort-order">정렬</label><select id="sort-order" name="sort"><option value="added_desc" ${selectedSort === 'added_desc' ? 'selected' : ''}>최근 추가순</option><option value="added_asc" ${selectedSort === 'added_asc' ? 'selected' : ''}>오래된 추가순</option><option value="name_asc" ${selectedSort === 'name_asc' ? 'selected' : ''}>이름 오름차순</option><option value="name_desc" ${selectedSort === 'name_desc' ? 'selected' : ''}>이름 내림차순</option><option value="solver_desc" ${selectedSort === 'solver_desc' ? 'selected' : ''}>최근 풀이 시작순</option><option value="solver_asc" ${selectedSort === 'solver_asc' ? 'selected' : ''}>오래된 풀이 시작순</option><option value="solve_time_asc" ${selectedSort === 'solve_time_asc' ? 'selected' : ''}>풀이 시간 짧은 순</option><option value="solve_time_desc" ${selectedSort === 'solve_time_desc' ? 'selected' : ''}>풀이 시간 긴 순</option></select><button class="small" type="submit">검색</button></form></div>
+    ${result.challenges.length ? `<div class="challenge-bulk-toolbar" role="group" aria-label="${tr('문제 일괄 작업')}"><span class="form-hint">${tr('체크하거나 Shift를 누른 채 문제 이름을 클릭해 범위를 선택하세요.')}</span><span class="challenge-selection-count" role="status">${i18n.format('{n}개 선택',{n:selectedChallengeIds.size})}</span><button type="button" class="small danger ghost" data-action="stop-selected-challenges" ${selectedChallengeIds.size && !bulkStopBusy ? '' : 'disabled'}>${bulkStopBusy ? tr('중단 요청 중…') : tr('선택한 풀이 중단')}</button><button type="button" class="small ghost" data-action="clear-challenge-selection" ${selectedChallengeIds.size ? '' : 'disabled'}>${tr('선택 해제')}</button></div>` : ''}
     ${result.challenges.length ? `<div class="challenge-card-grid" role="list" aria-label="문제 목록" aria-live="polite">${result.challenges.map(c => challengeCardMarkup(c,workspaceId)).join('')}</div><div class="table-footer">${result.challenges.length}개 문제</div>` : `<div class="empty"><div class="empty-icon">▤</div><h2>${total ? '조건에 맞는 문제가 없습니다.' : '등록된 문제가 없습니다.'}</h2>${total ? '<button data-action="clear-filter">필터 초기화</button>' : '<button class="primary" data-action="new-challenge">＋ 문제 추가</button>'}</div>`}<p id="challenge-live-state" class="sr-only" role="status" aria-live="polite"></p>`;
+}
+
+function syncChallengeSelection() {
+  const area = document.querySelector('#challenge-area');
+  if (!area) return;
+  for (const card of area.querySelectorAll('.challenge-card[data-challenge-id]')) {
+    const selected = selectedChallengeIds.has(card.dataset.challengeId);
+    card.classList.toggle('is-selected',selected);
+    const checkbox = card.querySelector('[data-action="select-challenge"]');
+    if (checkbox) checkbox.checked = selected;
+  }
+  const count = area.querySelector('.challenge-selection-count');
+  if (count) count.textContent = i18n.format('{n}개 선택',{n:selectedChallengeIds.size});
+  const stop = area.querySelector('[data-action="stop-selected-challenges"]');
+  if (stop) { stop.disabled = !selectedChallengeIds.size || bulkStopBusy; stop.textContent = bulkStopBusy ? i18n.t('중단 요청 중…') : i18n.t('선택한 풀이 중단'); }
+  const clear = area.querySelector('[data-action="clear-challenge-selection"]');
+  if (clear) clear.disabled = !selectedChallengeIds.size;
+}
+
+function selectChallenge(id, {range = false, toggle = true} = {}) {
+  const visible = challengeListing?.result.challenges.map(challenge => challenge.id) || [];
+  if (!visible.includes(id)) return;
+  if (range && visible.includes(selectionAnchorId)) {
+    const start = visible.indexOf(selectionAnchorId), end = visible.indexOf(id);
+    for (const item of visible.slice(Math.min(start,end),Math.max(start,end) + 1)) selectedChallengeIds.add(item);
+  } else {
+    if (toggle && selectedChallengeIds.has(id)) selectedChallengeIds.delete(id);
+    else selectedChallengeIds.add(id);
+    selectionAnchorId = id;
+  }
+  syncChallengeSelection();
+}
+
+async function stopSelectedChallenges() {
+  if (bulkStopBusy || !currentWorkspace || !challengeListing) return;
+  const workspaceId = currentWorkspace.id;
+  const selected = challengeListing.result.challenges.filter(challenge => selectedChallengeIds.has(challenge.id));
+  const active = selected.filter(challenge => challenge.status === 'running' || ['queued','staging','awaiting_credential','validating','running','writing','cleanup_blocked'].includes(challenge.latest_solver?.status));
+  if (!active.length) { toast(i18n.t('선택한 문제에 진행 중인 풀이가 없습니다.')); return; }
+  if (!await siteConfirm(i18n.format('선택한 {n}개 풀이를 중단할까요? 발견한 Flag와 저장된 결과는 유지됩니다.',{n:active.length}), i18n.t('선택한 풀이 중단'), i18n.t('중단'))) return;
+  if (currentWorkspace?.id !== workspaceId) return;
+  bulkStopBusy = true; syncChallengeSelection();
+  const errors = []; let requested = 0, alreadyStopped = 0;
+  try {
+    for (const challenge of active) {
+      try {
+        // Re-read the latest job; the list may have changed while the confirmation was open.
+        const result = await api(`${path(challenge.id,workspaceId)}/solver`);
+        const job = normalizeSolverPayload(result).job;
+        const jobId = solverJobId(job);
+        if (!jobId || !solverIsActive(job)) { alreadyStopped++; selectedChallengeIds.delete(challenge.id); continue; }
+        await api(`/api/solver/jobs/${encodeURIComponent(jobId)}/cancel`,{method:'POST'});
+        requested++; selectedChallengeIds.delete(challenge.id);
+      } catch (error) { errors.push(`${challenge.name}: ${error.message || i18n.t('중단 요청에 실패했습니다.')}`); }
+    }
+  } finally {
+    bulkStopBusy = false;
+    if (currentWorkspace?.id === workspaceId) { await refreshChallenges().catch(() => {}); syncChallengeSelection(); }
+  }
+  if (requested) toast(i18n.format('{n}개 풀이 중단을 요청했습니다.',{n:requested}));
+  if (alreadyStopped) toast(i18n.format('{n}개는 이미 중단되어 있었습니다.',{n:alreadyStopped}));
+  if (errors.length) toast(errors.join(' / '),true);
 }
 
 function writeupStamp(challenge) {
@@ -2487,6 +2563,9 @@ function paintChallengeListing(result, workspaceId, patchOnly = false) {
   const challenges = Array.isArray(result?.challenges) ? result.challenges : [];
   const counts = result?.counts && typeof result.counts === 'object' ? result.counts : {};
   const categories = Array.isArray(result?.categories) ? result.categories : [];
+  const visibleIds = new Set(challenges.map(challenge => challenge.id));
+  for (const id of selectedChallengeIds) if (!visibleIds.has(id)) selectedChallengeIds.delete(id);
+  if (!visibleIds.has(selectionAnchorId)) selectionAnchorId = '';
   const total = Object.values(counts).reduce((sum,value) => sum + Number(value || 0),0);
   challengeListing = {workspaceId,result:{challenges,counts,categories}};
   reconcileWriteupCopies(challenges,workspaceId);
@@ -2590,6 +2669,12 @@ async function startListSolver(button) {
   const workspaceId = button.dataset.workspaceId, challengeId = button.dataset.id;
   if (!currentWorkspace || currentWorkspace.id !== workspaceId) throw new Error(i18n.t('문제 목록을 다시 불러와 주세요.'));
   requireNoAttachmentWork(workspaceId,challengeId);
+  const challenge = challengeListing?.result.challenges.find(item => item.id === challengeId);
+  if (!challenge?.latest_solver && challenge?.solver_preset?.provider === 'codex' && !challenge.solver_preset.account_id) {
+    await openChallenge(challengeId);
+    toast(i18n.t('가져온 복제 문제는 Codex 계정을 다시 선택해야 합니다.'));
+    return;
+  }
   const key = `${workspaceId}:${challengeId}`, name = button.dataset.name;
   if (startingListSolvers.has(key)) return;
   startingListSolvers.add(key);
@@ -2599,8 +2684,14 @@ async function startListSolver(button) {
   button.textContent = '시작 중';
   let started = false;
   try {
+    // An untouched clone starts with its saved variant even from the list card.
+    // A retry follows the prior run's own continuation settings instead.
+    const preset = !challenge?.latest_solver && challenge?.solver_preset?.provider === 'codex'
+      ? challenge.solver_preset : null;
     const payload = await api(`${path(challengeId,workspaceId)}/solver`,{
-      method:'POST',body:{provider:solverProvider,writeup_locale:i18n.locale},
+      method:'POST',body:preset
+        ? {...preset,writeup_locale:i18n.locale}
+        : {provider:solverProvider,writeup_locale:i18n.locale},
     });
     started = true;
     if (payload.capacity?.warning && payload.capacity.warning_message) toast(payload.capacity.warning_message);
@@ -3897,7 +3988,7 @@ function challengeDetailMarkup(c, displayedNotes, restored) {
   const refreshingFromCTFd = activeCTFdChallengeRefreshes.has(refreshKey);
   const ctfdRefreshButton = c.ctfd_id !== null && c.ctfd_id !== undefined && c.ctfd_url
     ? `<button class="small ghost icon-action" data-action="refresh-ctfd-challenge" aria-label="CTFd 원본에서 문제 새로고침" title="CTFd 원본에서 문제 새로고침" aria-describedby="ctfd-refresh-help" ${refreshingFromCTFd ? 'disabled aria-busy="true"' : ''}>${refreshingFromCTFd ? '…' : '↻'}</button>` : '';
-  return `<div class="dialog-head"><div class="detail-heading"><div class="eyebrow" data-i18n-ignore>${esc(c.category || 'CHALLENGE')}</div><h2 id="challenge-title" title="${esc(c.name)}" data-i18n-ignore>${esc(c.name)}</h2><div class="detail-full-name" data-name="${esc(c.name)}" aria-hidden="true"></div><p data-i18n-ignore>${esc(currentWorkspace.name)}</p></div><div class="line-actions"><div class="detail-head-actions">${ctfdRefreshButton}<button class="small" data-action="receive-challenge-direct" title="${tr('이 작업공간에 문제 직접 받기')}">${tr('직접 받기')}</button><button class="small" data-action="send-challenge-direct">${tr('직접 보내기')}</button><button class="small" data-action="import-challenge-transfer" title="${tr('이 작업공간에 문제 ZIP 가져오기')}">${tr('ZIP 가져오기')}</button><button class="small" data-action="export-challenge-transfer">${tr('ZIP 내보내기')}</button><button class="small icon-action" data-action="clone-challenge" aria-label="문제 복제" title="문제 복제">⧉</button><button class="small icon-action" data-action="edit-challenge" aria-label="문제 수정" title="문제 수정">✎</button></div><button class="icon-btn icon-action" data-action="close-detail" aria-label="문제 닫기" title="문제 닫기">×</button></div></div>
+  return `<div class="dialog-head"><div class="detail-heading"><div class="eyebrow" data-i18n-ignore>${esc(c.category || 'CHALLENGE')}</div><h2 id="challenge-title" title="${esc(c.name)}" data-i18n-ignore>${esc(c.name)}</h2><div class="detail-full-name" data-name="${esc(c.name)}" aria-hidden="true"></div><p data-i18n-ignore>${esc(currentWorkspace.name)}</p></div><div class="line-actions"><div class="detail-head-actions">${ctfdRefreshButton}<button class="small" data-action="receive-challenge-direct" title="${tr('이 작업공간에 문제 직접 받기')}">${tr('직접 받기')}</button><button class="small" data-action="send-challenge-direct">${tr('직접 보내기')}</button><button class="small" data-action="import-challenge-transfer" title="${tr('이 작업공간에 문제 ZIP 가져오기')}">${tr('ZIP 가져오기')}</button><button class="small" data-action="export-challenge-transfer">${tr('ZIP 내보내기')}</button><button class="small" data-action="clone-reasoning" data-id="${esc(c.id)}">${tr('추론별 복제')}</button><button class="small icon-action" data-action="clone-challenge" aria-label="문제 복제" title="문제 복제">⧉</button><button class="small icon-action" data-action="edit-challenge" aria-label="문제 수정" title="문제 수정">✎</button></div><button class="icon-btn icon-action" data-action="close-detail" aria-label="문제 닫기" title="문제 닫기">×</button></div></div>
     <div class="detail-grid"><div class="detail-main">${c.description ? `<h3>문제 설명</h3><div class="description" data-i18n-ignore>${esc(c.description)}</div>` : ''}
     ${c.remote_mode === 'endpoint' && c.remote ? `<h3>원격 접속 정보</h3><div class="description"><code>${esc(c.remote)}</code></div>` : c.remote_mode === 'none' ? '<span class="tag muted">원격 대상 없음</span>' : '<span class="tag muted">원격 정보 미등록</span>'}
     <div class="section-head"><h3>풀이 노트</h3><span class="tag muted">MARKDOWN</span></div>
@@ -3927,6 +4018,118 @@ async function cloneChallenge() {
   if (currentWorkspace?.id === workspaceId && currentWorkspace.open_challenge_after_create) {
     await openChallenge(cloned.id);
   }
+}
+
+async function showCloneReasoning(challengeId) {
+  const workspaceId = currentWorkspace?.id;
+  const source = currentChallenge?.id === challengeId ? currentChallenge
+    : challengeListing?.result.challenges.find(item => item.id === challengeId);
+  if (!workspaceId || !source) throw new Error(i18n.t('복제할 문제를 다시 불러와 주세요.'));
+  const generation = ++cloneReasoningGeneration;
+  cloneReasoningAccounts = []; cloneReasoningModels = [];
+  openModal(i18n.t('추론 수준별 복제'), source.name,
+    `<p class="form-hint">${tr('선택한 추론 수준마다 복제 문제를 하나씩 만듭니다. 원본은 변경되지 않으며 풀이도 자동 시작하지 않습니다.')}</p>
+     <label>${tr('Codex 계정')}<select id="clone-reasoning-account" disabled><option>${tr('불러오는 중…')}</option></select></label>
+     <label>${tr('모델')}<select id="clone-reasoning-model" disabled><option>${tr('계정을 먼저 선택하세요.')}</option></select></label>
+     <fieldset class="clone-reasoning-levels"><legend>${tr('추론 수준과 하위 에이전트')}</legend><div id="clone-reasoning-level-list" class="clone-reasoning-level-list"><p class="form-hint">${tr('모델을 불러오는 중입니다.')}</p></div></fieldset>
+     <label class="clone-reasoning-fast"><input id="clone-reasoning-fast" type="checkbox" disabled>${tr('1.5배 Fast 실행')}</label>
+     <p class="form-hint">${tr('복제본의 자동 Ultra 전환은 꺼집니다. 각 추론 수준을 그대로 비교할 수 있습니다.')}</p>
+     <p id="clone-reasoning-status" class="form-hint" role="status"></p>`,
+    `<button type="button" data-action="close-modal">${tr('취소')}</button><button type="submit" class="primary" disabled>${tr('선택한 설정으로 복제')}</button>`,
+    'clone-reasoning-form');
+  modal.dataset.kind = 'clone-reasoning'; modal.dataset.workspaceId = workspaceId;
+  const form = modal.querySelector('form');
+  form.dataset.challengeId = challengeId;
+  try {
+    const payload = await api('/api/accounts');
+    if (generation !== cloneReasoningGeneration || modal.dataset.kind !== 'clone-reasoning' || modal.dataset.workspaceId !== workspaceId || modal.querySelector('form') !== form) return;
+    cloneReasoningAccounts = (payload.accounts || []).filter(account => account?.provider === 'codex' && account.snapshot?.status === 'authenticated');
+    const accountSelect = form.querySelector('#clone-reasoning-account');
+    if (!cloneReasoningAccounts.length) {
+      form.querySelector('#clone-reasoning-status').textContent = i18n.t('로그인된 Codex 계정이 없습니다. 에이전트에서 계정을 연결하세요.');
+      return;
+    }
+    const preferred = cloneReasoningAccounts.find(account => account.id === solverAccountId)
+      || cloneReasoningAccounts.find(account => account.selected) || cloneReasoningAccounts[0];
+    accountSelect.innerHTML = cloneReasoningAccounts.map(account => `<option value="${esc(account.id)}" data-i18n-ignore ${account.id === preferred.id ? 'selected' : ''}>${esc(account.label)}</option>`).join('');
+    accountSelect.disabled = false;
+    await loadCloneReasoningModels(form);
+    if (modal.querySelector('form') === form) form.dataset.initial = formSnapshot(form);
+  } catch (error) {
+    if (generation === cloneReasoningGeneration && modal.querySelector('form') === form) form.querySelector('#clone-reasoning-status').textContent = error.message || i18n.t('계정 설정을 불러오지 못했습니다.');
+  }
+}
+
+async function loadCloneReasoningModels(form) {
+  if (!form || !form.isConnected || modal.dataset.kind !== 'clone-reasoning') return;
+  const generation = ++cloneReasoningGeneration;
+  const accountId = form.querySelector('#clone-reasoning-account')?.value;
+  const modelSelect = form.querySelector('#clone-reasoning-model');
+  const status = form.querySelector('#clone-reasoning-status');
+  modelSelect.disabled = true; modelSelect.innerHTML = `<option>${tr('불러오는 중…')}</option>`;
+  form.querySelector('#clone-reasoning-level-list').innerHTML = '';
+  form.querySelector('button[type="submit"]').disabled = true;
+  status.textContent = '';
+  try {
+    const catalog = await api(`/api/accounts/${encodeURIComponent(accountId)}/models`);
+    if (generation !== cloneReasoningGeneration || modal.querySelector('form') !== form) return;
+    if (catalog?.status !== 'available' || !Array.isArray(catalog.models)) throw new Error(i18n.t('선택한 계정의 모델 목록을 사용할 수 없습니다.'));
+    cloneReasoningModels = catalog.models.filter(model => typeof (model?.model || model?.id) === 'string' && Array.isArray(model?.supportedReasoningEfforts) && model.supportedReasoningEfforts.length);
+    const account = cloneReasoningAccounts.find(item => item.id === accountId);
+    const preferred = cloneReasoningModels.find(model => (model.model || model.id) === account?.model)
+      || cloneReasoningModels.find(model => model.isDefault || model.default) || cloneReasoningModels[0];
+    if (!preferred) throw new Error(i18n.t('이 계정에서 복제에 사용할 모델을 찾지 못했습니다.'));
+    modelSelect.innerHTML = cloneReasoningModels.map(model => { const id = model.model || model.id; return `<option value="${esc(id)}" data-i18n-ignore ${id === (preferred.model || preferred.id) ? 'selected' : ''}>${esc(model.displayName || id)}</option>`; }).join('');
+    modelSelect.disabled = false;
+    paintCloneReasoningLevels(form);
+  } catch (error) {
+    if (generation === cloneReasoningGeneration && modal.querySelector('form') === form) {
+      cloneReasoningModels = [];
+      modelSelect.innerHTML = `<option>${tr('모델을 불러오지 못했습니다.')}</option>`;
+      status.textContent = error.message || i18n.t('모델을 불러오지 못했습니다.');
+    }
+  }
+}
+
+function paintCloneReasoningLevels(form) {
+  const modelId = form.querySelector('#clone-reasoning-model')?.value;
+  const model = cloneReasoningModels.find(item => (item.model || item.id) === modelId);
+  const efforts = [...new Set((model?.supportedReasoningEfforts || []).map(item => item?.reasoningEffort).filter(Boolean))];
+  form.querySelector('#clone-reasoning-level-list').innerHTML = efforts.map(level => `<div class="clone-reasoning-level-row"><label><input type="checkbox" name="reasoning_levels" value="${esc(level)}">${esc(level)}</label><label class="clone-reasoning-agent-option"><input type="checkbox" name="subagents_${esc(level)}" ${level === 'ultra' ? 'checked' : ''}>${tr('하위 에이전트')}</label></div>`).join('') || `<p class="form-hint">${tr('선택 가능한 추론 수준이 없습니다.')}</p>`;
+  const fast = form.querySelector('#clone-reasoning-fast');
+  fast.disabled = !(model?.serviceTiers || []).some(item => item?.id === 'fast');
+  const account = cloneReasoningAccounts.find(item => item.id === form.querySelector('#clone-reasoning-account')?.value);
+  fast.checked = !fast.disabled && account?.service_tier === 'fast';
+  syncCloneReasoningSubmit(form);
+}
+
+function syncCloneReasoningSubmit(form) {
+  const submit = form?.querySelector('button[type="submit"]');
+  if (submit) submit.disabled = !form.querySelector('input[name="reasoning_levels"]:checked');
+}
+
+async function submitCloneReasoning(form) {
+  const workspaceId = form.dataset.workspaceId, challengeId = form.dataset.challengeId;
+  if (modal.querySelector('form') !== form || modal.dataset.kind !== 'clone-reasoning' || currentWorkspace?.id !== workspaceId) throw new Error(i18n.t('복제할 문제를 다시 불러와 주세요.'));
+  const accountId = form.querySelector('#clone-reasoning-account').value;
+  const model = form.querySelector('#clone-reasoning-model').value;
+  const catalogModel = cloneReasoningModels.find(item => (item.model || item.id) === model);
+  if (!cloneReasoningAccounts.some(account => account.id === accountId) || !catalogModel) throw new Error(i18n.t('Codex 계정과 모델을 다시 선택하세요.'));
+  const supported = new Set(catalogModel.supportedReasoningEfforts.map(item => item?.reasoningEffort));
+  const selected = [...form.querySelectorAll('input[name="reasoning_levels"]:checked')].map(input => input.value);
+  if (!selected.length || selected.some(level => !supported.has(level))) throw new Error(i18n.t('복제할 추론 수준을 하나 이상 선택하세요.'));
+  const variants = selected.map(level => ({
+    account_id:accountId, model, reasoning_effort:level,
+    service_tier:form.querySelector('#clone-reasoning-fast').checked ? 'fast' : null,
+    subagents_enabled:form.elements.namedItem(`subagents_${level}`)?.checked === true,
+    ultra_escalation_mode:'off',
+  }));
+  const payload = await api(`${path(challengeId,workspaceId)}/clone-batch`,{method:'POST',body:{variants}});
+  if (currentWorkspace?.id !== workspaceId || modal.querySelector('form') !== form) return;
+  const count = Array.isArray(payload?.clones) ? payload.clones.length : 0;
+  modal.close();
+  await refreshChallenges();
+  toast(i18n.format('{n}개 복제 문제를 만들었습니다.',{n:count}));
 }
 
 async function openSolverSession(button) {
@@ -4209,10 +4412,13 @@ function repaintSolverConfiguration(workspaceId, challengeId, generation) {
 async function loadSolverConfiguration(workspaceId, challengeId, generation, preferredAccountId = '', retryJob = null) {
   const ticket = ++solverOptionsGeneration;
   const retry = solverRetryConfiguration(retryJob);
+  const preset = !retry && !solverProviderChoiceTouched && currentChallenge?.id === challengeId && currentChallenge?.solver_preset?.provider === 'codex'
+    ? currentChallenge.solver_preset : null;
   const issues = [];
   solverConfigurationJobId = solverJobId(currentSolverJob);
   clearSolverRetryWarning();
   if (retry) solverProvider = retry.provider;
+  else if (preset) solverProvider = 'codex';
   solverOptionsState = 'loading'; solverOptionsError = '';
   repaintSolverConfiguration(workspaceId,challengeId,generation);
   try {
@@ -4220,6 +4426,8 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
     if (!solverContext(workspaceId,challengeId,generation) || ticket !== solverOptionsGeneration) return;
     solverAccounts = Array.isArray(payload?.accounts) ? payload.accounts.filter(account => account && typeof account.id === 'string') : [];
     const available = solverAccounts.filter(account => account.provider === solverProvider && account.snapshot?.status === 'authenticated');
+    solverPresetNeedsAccount = Boolean(preset && !solverPresetAccountConfirmed && !available.some(account => account.id === preset.account_id));
+    if (solverPresetNeedsAccount) issues.push(['가져온 복제 문제는 Codex 계정을 다시 선택해야 합니다.']);
     if (retry) {
       const previous = solverAccounts.find(item => item.id === retry.accountId);
       const label = retry.accountLabel || i18n.t('이전 계정');
@@ -4227,13 +4435,13 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
       else if (!previous || previous.provider !== retry.provider) issues.push(['이전 실행 계정({label})을 찾을 수 없습니다.',{label}]);
       else if (previous.snapshot?.status !== 'authenticated') issues.push(['이전 실행 계정({label})에 다시 로그인해야 합니다.',{label}]);
     }
-    const preferred = preferredAccountId || retry?.accountId || solverAccountId;
+    const preferred = preferredAccountId || retry?.accountId || preset?.account_id || solverAccountId;
     const account = available.find(item => item.id === preferred)
       || available.find(item => item.selected === true)
       || available[0]
       || null;
     solverAccountId = account?.id || '';
-    solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null; solverUltracode = false;
+    solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null; solverUltracode = false; solverSubagentsEnabled = false; solverSubagentsTouched = false;
     if (!account) {
       solverRetryIssues = issues;
       solverRetryRequiresSelection = issues.length > 0;
@@ -4245,7 +4453,7 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
     if (!solverContext(workspaceId,challengeId,generation) || ticket !== solverOptionsGeneration) return;
     if (catalog?.status !== 'available' || !Array.isArray(catalog.models)) throw new Error(i18n.t('선택한 계정의 모델 목록을 사용할 수 없습니다.'));
     solverModels = catalog.models.filter(item => item && typeof (item.model || item.id) === 'string');
-    const chosen = solverModels.find(item => (item.model || item.id) === (retry?.model || account.model))
+    const chosen = solverModels.find(item => (item.model || item.id) === (retry?.model || preset?.model || account.model))
       || solverModels.find(item => (item.model || item.id) === account.model)
       || solverModels.find(item => item.isDefault === true || item.default === true)
       || solverModels[0]
@@ -4255,16 +4463,21 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
     const efforts = Array.isArray(chosen?.supportedReasoningEfforts)
       ? chosen.supportedReasoningEfforts.map(item => item?.reasoningEffort).filter(Boolean) : [];
     solverReasoning = retry?.reasoning && efforts.includes(retry.reasoning) ? retry.reasoning
+      : preset?.reasoning_effort && efforts.includes(preset.reasoning_effort) ? preset.reasoning_effort
       : efforts.includes(account.reasoning_effort) ? account.reasoning_effort
       : efforts.includes(chosen?.defaultReasoningEffort) ? chosen.defaultReasoningEffort
       : efforts[0] || '';
     if (retry?.reasoning && solverReasoning !== retry.reasoning) issues.push(['이전 추론 수준({label})을 현재 모델에서 사용할 수 없습니다.',{label:retry.reasoning}]);
     const tiers = Array.isArray(chosen?.serviceTiers) ? chosen.serviceTiers.map(item => item?.id).filter(Boolean) : [];
     solverServiceTier = retry ? (retry.serviceTier === 'fast' && tiers.includes('fast') ? 'fast' : null)
+      : preset ? (preset.service_tier === 'fast' && tiers.includes('fast') ? 'fast' : null)
       : account.service_tier === 'fast' && tiers.includes('fast') ? 'fast' : null;
     if (retry?.serviceTier === 'fast' && solverServiceTier !== 'fast') issues.push(['이전 Fast 티어를 현재 모델에서 사용할 수 없습니다.']);
     solverUltracode = solverProvider === 'claude' && chosen?.supportsUltracode === true
       && (retry ? retry.ultracode : (chosen.model || chosen.id) === account.model && account.ultracode === true);
+    solverSubagentsEnabled = solverProvider === 'codex' && (retry ? retry.subagentsEnabled
+      : preset ? preset.subagents_enabled === true : solverReasoning === 'ultra');
+    solverSubagentsTouched = Boolean(retry || preset);
     if (retry?.ultracode && !solverUltracode) issues.push(['이전 Ultracode 설정을 현재 모델에서 사용할 수 없습니다.']);
     if (retry) {
       solverUltraEscalationMode = ['ask','auto','off'].includes(retry.ultraEscalationMode) ? retry.ultraEscalationMode : 'off';
@@ -4277,7 +4490,7 @@ async function loadSolverConfiguration(workspaceId, challengeId, generation, pre
     solverOptionsState = 'ready';
   } catch (error) {
     if (!solverContext(workspaceId,challengeId,generation) || ticket !== solverOptionsGeneration) return;
-    solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null; solverUltracode = false;
+    solverModels = []; solverModel = ''; solverReasoning = ''; solverServiceTier = null; solverUltracode = false; solverSubagentsEnabled = false; solverSubagentsTouched = false;
     solverOptionsState = 'error';
     solverOptionsError = error.message || '계정 설정을 불러오지 못했습니다.';
     solverRetryIssues = issues;
@@ -4333,6 +4546,7 @@ async function startSolver() {
     const payload = await api(`/api/workspaces/${workspaceId}/challenges/${challengeId}/solver`,{method:'POST',body:{
       provider:solverProvider, account_id:solverAccountId, model:solverModel,
       reasoning_effort:solverReasoning, service_tier:solverServiceTier, ultracode:solverUltracode,
+      ...(solverProvider === 'codex' ? {subagents_enabled:solverSubagentsEnabled} : {}),
       ultra_escalation_mode:solverUltraEscalationEligible() ? solverUltraEscalationMode : 'off',
       writeup_locale:i18n.locale,
     }});
@@ -5695,6 +5909,13 @@ document.addEventListener('click', event => {
   // A link to the failed route itself fires no hashchange, so it would do nothing.
   const link = event.target.closest('a[href^="#"]');
   if (link?.getAttribute('href') === (location.hash || '#') && document.querySelector('[data-action="retry-page"]')) { run(pageRetry); return; }
+  const selectionCard = event.target.closest('.challenge-card[data-challenge-id]');
+  if (selectionCard && (event.shiftKey || event.ctrlKey || event.metaKey)
+      && !event.target.closest('.challenge-card-actions,.challenge-card-select,a,input,select,textarea')) {
+    event.preventDefault();
+    selectChallenge(selectionCard.dataset.challengeId,{range:event.shiftKey,toggle:!event.shiftKey});
+    return;
+  }
   const button = event.target.closest('[data-action]');
   if (!button || button.disabled) return;
   const action = button.dataset.action;
@@ -5706,7 +5927,7 @@ document.addEventListener('click', event => {
       catch (error) { if (!signedOut) throw error; }
       finally { signingOut = false; }
       // A poll can see the session end first. The form it opened may already hold typed text.
-      sessionPersistent = false; if (!signedOut) showLogin(); noteDrafts.clear(); ctfdDrafts.clear(); detail.innerHTML = ''; modal.innerHTML = '';
+      sessionPersistent = false; if (!signedOut) showLogin(); noteDrafts.clear(); ctfdDrafts.clear(); selectedChallengeIds.clear(); selectionAnchorId = ''; detail.innerHTML = ''; modal.innerHTML = '';
     },
     'retry-page': async () => { await pageRetry?.(); document.querySelector('[data-action="retry-page"]')?.focus(); },
     'toggle-session-persistence': async () => {
@@ -5798,6 +6019,7 @@ document.addEventListener('click', event => {
     },
     'new-challenge': () => challengeForm(), 'edit-challenge': async () => { const c = currentChallenge; await saveNotes(true); if (currentChallenge === c && currentWorkspace?.id === c.workspace_id) await challengeForm(true); },
     'clone-challenge': () => cloneChallenge(),
+    'clone-reasoning': () => showCloneReasoning(button.dataset.id),
     'add-relation': () => changeRelation(),
     'install-release-update': () => installReleaseUpdate(button),
     'refresh-release-update': () => refreshReleaseUpdatePanel(true),
@@ -5850,6 +6072,9 @@ document.addEventListener('click', event => {
       detail.close();
     },
     'open-challenge': () => openChallenge(button.dataset.id),
+    'select-challenge': () => selectChallenge(button.dataset.id,{range:event.shiftKey,toggle:true}),
+    'clear-challenge-selection': () => { selectedChallengeIds.clear(); selectionAnchorId = ''; syncChallengeSelection(); },
+    'stop-selected-challenges': () => stopSelectedChallenges(),
     'open-solver-session': () => openSolverSession(button),
     'copy-list-flag': async () => { const flag = challengeFlags.get(button.dataset.id); if (!flag || currentWorkspace?.id !== button.dataset.workspaceId) throw new Error(i18n.t('Flag를 다시 불러와 주세요.')); const result = await copyText(flag); copyToast(result, flag); },
     'copy-list-writeup': () => copyChallengeWriteup(button),
@@ -5931,7 +6156,7 @@ document.addEventListener('submit', event => {
     return;
   }
   if (!form.id) return;
-  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-preferences-form','admin-log-export-form','solver-guidance-form','solver-console-guidance-form','solver-peer-evidence-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-preview-form','ctfd-refresh-auth-form','ctfd-submit-connection-form','related-evidence-form'];
+  const known = ['login-form','setup-form','new-workspace-form','edit-workspace-form','new-challenge-form','edit-challenge-form','clone-reasoning-form','search-form','password-form','username-form','new-user-form','reset-user-form','solver-capacity-form','solver-preferences-form','admin-log-export-form','solver-guidance-form','solver-console-guidance-form','solver-peer-evidence-form','ctfd-preview-form','ctfd-import-form','ctfd-sync-form','ctfd-refresh-preview-form','ctfd-refresh-auth-form','ctfd-submit-connection-form','related-evidence-form'];
   if (!known.includes(form.id)) return;
   event.preventDefault();
   const challengeFiles = form.id === 'new-challenge-form' ? [...selectedChallengeFiles(form)] : [];
@@ -5946,6 +6171,8 @@ document.addEventListener('submit', event => {
       sessionStarted(); csrf = result.csrf_token; sessionUser = result.user; sessionPersistent = false; form.reset(); await render();
     } else if (form.id === 'login-form') {
       const result = await api('/api/auth/login',{method:'POST',body:{username:body.username,password:body.password,remember:data.has('remember')}}); sessionStarted(); csrf = result.csrf_token; if (sessionUser && sessionUser.id !== result.user.id) { noteDrafts.clear(); ctfdDrafts.clear(); clearAccountsReturnTarget(); } sessionUser = result.user; sessionPersistent = result.session_persistent === true; form.reset(); await render();
+    } else if (form.id === 'clone-reasoning-form') {
+      await submitCloneReasoning(form);
     } else if (form.id === 'related-evidence-form') {
       const target = currentChallenge;
       if (!target || target.id !== form.dataset.challengeId || target.workspace_id !== form.dataset.workspaceId) throw new Error(i18n.t('문제를 다시 선택하세요.'));
@@ -6079,6 +6306,9 @@ document.addEventListener('submit', event => {
 
 document.addEventListener('change', event => {
   const input = event.target;
+  if (input.id === 'clone-reasoning-account') run(() => loadCloneReasoningModels(input.form));
+  if (input.id === 'clone-reasoning-model') paintCloneReasoningLevels(input.form);
+  if (input.name === 'reasoning_levels' && input.form?.id === 'clone-reasoning-form') syncCloneReasoningSubmit(input.form);
   if (input.id === 'admin-log-workspace') run(() => adminLogChallenges(input.value));
   if (input.closest?.('#admin-log-export-form')) {
     const form = input.closest('form');
@@ -6112,6 +6342,7 @@ document.addEventListener('change', event => {
   if (input.matches?.('.challenge-inline-input select[name="remote_mode"]')) syncInlineInput(input.form);
   if (input.id === 'solver-provider-select') {
     solverProvider = input.value === 'claude' ? 'claude' : 'codex';
+    solverProviderChoiceTouched = true;
     try { localStorage.setItem('ctf-solver-provider',solverProvider); } catch {}
     solverAccountId = '';
     if (currentWorkspace && currentChallenge) run(() => loadSolverConfiguration(
@@ -6120,6 +6351,7 @@ document.addEventListener('change', event => {
   }
   if (input.id === 'solver-account-select') {
     solverAccountId = input.value;
+    solverPresetAccountConfirmed = true; solverPresetNeedsAccount = false;
     if (currentWorkspace && currentChallenge) run(() => loadSolverConfiguration(
       currentWorkspace.id,currentChallenge.id,solverRendering,solverAccountId
     ));
@@ -6133,6 +6365,7 @@ document.addEventListener('change', event => {
     solverReasoning = efforts.includes(solverReasoning) ? solverReasoning
       : efforts.includes(chosen?.defaultReasoningEffort) ? chosen.defaultReasoningEffort
       : efforts[0] || '';
+    if (solverProvider === 'codex' && !solverSubagentsTouched) solverSubagentsEnabled = solverReasoning === 'ultra';
     const supportsFast = Array.isArray(chosen?.serviceTiers) && chosen.serviceTiers.some(item => item?.id === 'fast');
     if (!supportsFast) solverServiceTier = null;
     if (solverProvider !== 'claude' || chosen?.supportsUltracode !== true) solverUltracode = false;
@@ -6141,6 +6374,13 @@ document.addEventListener('change', event => {
   if (input.id === 'solver-reasoning-select') {
     clearSolverRetryWarning();
     solverReasoning = input.value;
+    if (solverProvider === 'codex' && !solverSubagentsTouched) solverSubagentsEnabled = solverReasoning === 'ultra';
+    repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
+  }
+  if (input.id === 'solver-subagents-toggle') {
+    clearSolverRetryWarning();
+    solverSubagentsEnabled = input.checked;
+    solverSubagentsTouched = true;
     repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);
   }
   if (input.id === 'solver-fast-toggle') {
@@ -6328,7 +6568,7 @@ window.addEventListener('hashchange', event => {
   accountsReturnPending = false;
   const returnRoute = accountsReturnRoute();
   if (returnRoute && location.hash === `#${returnRoute}`) clearAccountsReturnTarget();
-  rememberNotes(); pauseStagedUploads(); stopSolverPolling(); stopResourcePolling(); stopChallengeListPolling(); ++challengeRendering; ++listRendering; ++modalRendering; challengeFlags.clear(); selectedStatus=''; selectedCategory=''; selectedSort='added_desc'; search=''; if (solverConsoleDialog?.open) solverConsoleDialog.close(); detail.close(); modal.close(); if (csrf) run(render);
+  rememberNotes(); pauseStagedUploads(); stopSolverPolling(); stopResourcePolling(); stopChallengeListPolling(); ++challengeRendering; ++listRendering; ++modalRendering; challengeFlags.clear(); selectedChallengeIds.clear(); selectionAnchorId = ''; selectedStatus=''; selectedCategory=''; selectedSort='added_desc'; search=''; if (solverConsoleDialog?.open) solverConsoleDialog.close(); detail.close(); modal.close(); if (csrf) run(render);
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') { stopResourcePolling(); stopChallengeListPolling(); }
