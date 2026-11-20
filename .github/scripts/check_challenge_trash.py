@@ -76,14 +76,48 @@ def run() -> None:
                            VALUES(?,?,?,?,?,7,?,'agent','correct',0,?,?)""",
                            (uuid.uuid4().hex,workspace,challenge,owner,'test',
                             hashlib.sha256(b'flag').hexdigest(),'2026-11-08','2026-11-08'))
-            assert client.delete(base).status_code == 200
+            active_job_id = uuid.uuid4().hex
+            with connect(settings) as db:
+                db.execute("""INSERT INTO solver_jobs
+                           (id,owner_user_id,workspace_id,challenge_id,account_id,
+                            provider,model,reasoning_effort,status,created_at,updated_at)
+                           VALUES(?,?,?,?,?,'codex','test','high','running',2,2)""",
+                           (active_job_id,owner,workspace,challenge,uuid.uuid4().hex))
+            blocked = client.delete(base + "?if_idle=1")
+            assert blocked.status_code == 409, blocked.text
+            with connect(settings) as db:
+                assert db.execute("SELECT deleted_at FROM challenges WHERE id=?", (challenge,)).fetchone()[0] is None
+                job = db.execute("SELECT status,cancel_requested FROM solver_jobs WHERE id=?", (active_job_id,)).fetchone()
+                assert tuple(job) == ("running", 0), tuple(job)
+                assert db.execute("SELECT COUNT(*) FROM ctfd_submit_blocks WHERE challenge_id=?", (challenge,)).fetchone()[0] == 0
+                db.execute("UPDATE solver_jobs SET status='completed' WHERE id=?", (active_job_id,))
+            uploading = client.post(base + "/uploads", json={"name": "unfinished.bin", "size": 10})
+            assert uploading.status_code == 201, uploading.text
+            assert client.delete(base + "?if_idle=1").status_code == 409
+            with connect(settings) as db:
+                assert db.execute("SELECT status FROM upload_sessions WHERE id=?", (uploading.json()["id"],)).fetchone()[0] == "uploading"
+            assert client.delete(f"/api/uploads/{uploading.json()['id']}").status_code == 200
+            submitting_id = uuid.uuid4().hex
+            with connect(settings) as db:
+                db.execute("""INSERT INTO ctfd_submit_jobs
+                           (id,workspace_id,challenge_id,owner_user_id,connection_generation,
+                            ctfd_id,flag_digest,completion_source,status,next_attempt_at,
+                            created_at,updated_at)
+                           VALUES(?,?,?,?,?,8,?,'agent','running',0,?,?)""",
+                           (submitting_id,workspace,challenge,owner,'test',
+                            hashlib.sha256(b'other-flag').hexdigest(),'2026-11-08','2026-11-08'))
+            assert client.delete(base + "?if_idle=1").status_code == 409
+            with connect(settings) as db:
+                assert db.execute("SELECT status FROM ctfd_submit_jobs WHERE id=?", (submitting_id,)).fetchone()[0] == "running"
+                db.execute("UPDATE ctfd_submit_jobs SET status='correct' WHERE id=?", (submitting_id,))
+            assert client.delete(base + "?if_idle=1").status_code == 200
             assert client.get(base).status_code == 404
             assert [item["id"] for item in client.get(f"/api/workspaces/{workspace}/challenges").json()["challenges"]] == [clone_id]
             trash = client.get(f"/api/workspaces/{workspace}/trash").json()["challenges"]
             assert len(trash) == 1 and trash[0]["id"] == challenge
             with connect(settings) as db:
                 assert db.execute("SELECT COUNT(*) FROM solver_job_events WHERE job_id=?", (history_job_id,)).fetchone()[0] == 1
-                assert db.execute("SELECT COUNT(*) FROM ctfd_submit_jobs WHERE challenge_id=?", (challenge,)).fetchone()[0] == 1
+                assert db.execute("SELECT COUNT(*) FROM ctfd_submit_jobs WHERE challenge_id=?", (challenge,)).fetchone()[0] == 2
                 assert db.execute("SELECT markdown FROM challenge_writeups WHERE challenge_id=?", (challenge,)).fetchone()[0] == '# Preserved write-up'
             with connect(settings) as db:
                 db.execute("UPDATE challenges SET name='Renamed copy' WHERE id=?", (clone_id,))
@@ -99,7 +133,7 @@ def run() -> None:
             assert restored_file.status_code == 200 and restored_file.content == payload
             with connect(settings) as db:
                 assert db.execute("SELECT COUNT(*) FROM solver_job_events WHERE job_id=?", (history_job_id,)).fetchone()[0] == 1
-                assert db.execute("SELECT COUNT(*) FROM ctfd_submit_jobs WHERE challenge_id=?", (challenge,)).fetchone()[0] == 1
+                assert db.execute("SELECT COUNT(*) FROM ctfd_submit_jobs WHERE challenge_id=?", (challenge,)).fetchone()[0] == 2
             assert client.delete(base).status_code == 200
             assert client.delete(f"/api/workspaces/{workspace}/trash/{challenge}").status_code == 200
             assert client.get(f"/api/workspaces/{workspace}/trash").json()["challenges"] == []

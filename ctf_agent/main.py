@@ -421,7 +421,25 @@ class CodexCloneVariant(BaseModel):
 
 class CodexCloneBatchInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    variants: list[CodexCloneVariant] = Field(min_length=1, max_length=6)
+    variants: list[CodexCloneVariant] = Field(min_length=1, max_length=12)
+
+
+class CodexChallengeBatchInput(BaseModel):
+    """Create an original challenge and configured variants in one publish."""
+
+    model_config = ConfigDict(extra="forbid")
+    challenge: ChallengeInput
+    variants: list[CodexCloneVariant] = Field(min_length=1, max_length=12)
+    staged_file_ids: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("staged_file_ids")
+    @classmethod
+    def unique_staged_files(cls, value: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"[0-9a-f]{32}", item) for item in value):
+            raise ValueError("A staged-file ID is invalid.")
+        if len(value) != len(set(value)):
+            raise ValueError("Choose each staged file only once.")
+        return value
 
 
 class WorkspacePatch(BaseModel):
@@ -1602,22 +1620,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ]
         return result
 
-    async def validate_clone_batch_configuration(
-        workspace_id: str, challenge_id: str,
-        payload: CodexCloneBatchInput, user=Depends(require_auth),
-    ) -> CodexCloneBatchInput:
-        """Check every preset against its account catalog before file staging."""
-
-        with database() as db:
-            challenge_row(db, workspace_id, challenge_id)
-        efforts = [variant.reasoning_effort for variant in payload.variants]
-        if len(efforts) != len(set(efforts)):
-            raise HTTPException(422, "Choose each reasoning level only once.")
-
+    async def validate_codex_variants(variants, user) -> None:
+        """Check each preset against its owner's current account catalog."""
         from .providers.codex import ProviderError
 
         catalogs: dict[str, list] = {}
-        for variant in payload.variants:
+        for variant in variants:
             account = app.state.accounts.get(variant.account_id, user["id"])
             if account["provider"] != "codex":
                 raise HTTPException(422, "Batch clones require Codex accounts.")
@@ -1671,6 +1679,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(
                     422, "Automatic Ultra escalation requires high or xhigh reasoning and an Ultra-capable model."
                 )
+
+    async def validate_clone_batch_configuration(
+        workspace_id: str, challenge_id: str,
+        payload: CodexCloneBatchInput, user=Depends(require_auth),
+    ) -> CodexCloneBatchInput:
+        """Check every preset against its account catalog before file staging."""
+
+        with database() as db:
+            challenge_row(db, workspace_id, challenge_id)
+        await validate_codex_variants(payload.variants, user)
+        return payload
+
+    async def validate_challenge_batch_configuration(
+        workspace_id: str, payload: CodexChallengeBatchInput,
+        user=Depends(require_auth),
+    ) -> CodexChallengeBatchInput:
+        require_workspace_owner(workspace_id, user)
+        await validate_codex_variants(payload.variants, user)
         return payload
 
     @app.post(
@@ -1696,9 +1722,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
         variants = payload.variants
-        efforts = [variant.reasoning_effort for variant in variants]
-        if len(efforts) != len(set(efforts)):
-            raise HTTPException(422, "Choose each reasoning level only once.")
         current_owner = owner_id()
         for variant in variants:
             account = app.state.accounts.get(variant.account_id, current_owner)
@@ -1936,6 +1959,273 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ]
                 results.append(result)
         return {"clones": results}
+
+    @app.post(
+        "/api/workspaces/{workspace_id}/challenges/batch",
+        status_code=201,
+        dependencies=[Depends(require_auth)],
+    )
+    @workspace_writer_lock
+    def create_challenge_batch(
+        workspace_id: str,
+        payload: CodexChallengeBatchInput = Depends(validate_challenge_batch_configuration),
+    ):
+        """Publish a new challenge, its variants, and all selected files together.
+
+        The browser finalizes local uploads as staged files first.  The staged
+        files remain available for later use; independent challenge snapshots
+        are copied before any challenge row becomes visible.
+        """
+
+        from .storage_budget import (
+            MAX_SQLITE_INTEGER, StorageBudgetError, storage_http_status,
+            storage_io_http_response,
+        )
+
+        current_owner = owner_id()
+        layout = app.state.storage_layout
+        staged = app.state.staged_files
+        # Model validation runs before the workspace writer lock. An account
+        # can be removed while that catalog request is in flight.
+        for variant in payload.variants:
+            account = app.state.accounts.get(variant.account_id, current_owner)
+            if account["provider"] != "codex":
+                raise HTTPException(422, "Batch creation requires Codex accounts.")
+        source_files = []
+        for file_id in payload.staged_file_ids:
+            row = staged.row(workspace_id, file_id, CURRENT_USER.get())
+            if row["status"] != "ready":
+                raise HTTPException(409, "Finish the selected file upload before creating challenges.")
+            source = staged.path(row, "ready")
+            details = staged.verified_stat(source, row["size"])
+            if staged.fingerprint(details) != (
+                row["verified_dev"], row["verified_ino"], row["verified_mtime_ns"]
+            ):
+                digest, details = staged.hash_stable_file(source, row["size"])
+                if digest != row["sha256"]:
+                    raise HTTPException(409, "A staged file changed. Upload it again.")
+            source_files.append({
+                "id": file_id, "name": row["name"], "size": int(row["size"]),
+                "source": source,
+                "fingerprint": (
+                    details.st_dev, details.st_ino, details.st_size,
+                    details.st_mtime_ns, details.st_ctime_ns,
+                ),
+            })
+
+        total_bytes = sum(item["size"] for item in source_files) * len(payload.variants)
+        if total_bytes > MAX_SQLITE_INTEGER:
+            raise HTTPException(413, "The selected files exceed the supported copy size.")
+
+        timestamp = now()
+        remote_mode, remote = normalize_challenge_remote(
+            payload.challenge.remote_mode, payload.challenge.remote,
+            payload.challenge.description,
+        )
+        remote_origin = "description" if remote and not payload.challenge.remote else "explicit"
+        records = []
+        for variant in payload.variants:
+            challenge_id = uuid.uuid4().hex
+            copies = []
+            for item in source_files:
+                attachment_id = staged.attachment_id(item["id"], challenge_id)
+                copies.append({
+                    "staged_id": item["id"], "id": attachment_id,
+                    "name": item["name"], "size": item["size"],
+                    "source": item["source"],
+                    "target": layout.legacy_attachment_path(
+                        workspace_id, challenge_id, attachment_id,
+                        create_parent=False,
+                    ),
+                })
+            records.append({
+                "id": challenge_id, "variant": variant, "copies": copies,
+                "directory": layout.legacy_challenge_path(
+                    workspace_id, challenge_id, create=False,
+                ),
+                "readable_path": None,
+            })
+
+        reservation_key = f"challenge-create-batch:{uuid.uuid4().hex}"
+        reserved = False
+        published = False
+
+        def publish_batch(connection):
+            workspace = connection.execute(
+                "SELECT 1 FROM workspaces WHERE id=? AND owner_user_id=?",
+                (workspace_id, current_owner),
+            ).fetchone()
+            if not workspace:
+                raise HTTPException(404, "Workspace is no longer available.")
+            for item in source_files:
+                fresh = connection.execute(
+                    """SELECT status FROM workspace_staged_files
+                        WHERE id=? AND workspace_id=? AND owner_user_id=?""",
+                    (item["id"], workspace_id, current_owner),
+                ).fetchone()
+                if not fresh or fresh["status"] != "ready":
+                    raise HTTPException(409, "A selected staged file is no longer ready.")
+                details = staged.verified_stat(item["source"], item["size"])
+                current = (
+                    details.st_dev, details.st_ino, details.st_size,
+                    details.st_mtime_ns, details.st_ctime_ns,
+                )
+                if current != item["fingerprint"]:
+                    raise HTTPException(409, "A selected staged file changed during copying.")
+            root_id = records[0]["id"]
+            if len(records) > 1:
+                family_id = root_id
+            for index, record in enumerate(records):
+                challenge_id = record["id"]
+                variant = record["variant"]
+                name = (
+                    payload.challenge.name if index == 0
+                    else clone_challenge_name(connection, workspace_id, payload.challenge.name)
+                )
+                layout.reserve_challenge(connection, workspace_id, challenge_id, name)
+                record["readable_path"] = layout.challenge_path(
+                    workspace_id, challenge_id, db=connection, create=True,
+                )
+                flag = payload.challenge.flag or None if index == 0 else None
+                connection.execute(
+                    """INSERT INTO challenges(
+                           id,workspace_id,name,category,description,remote,
+                           remote_mode,remote_origin,canonical_name,flag,status,
+                           created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        challenge_id, workspace_id, name,
+                        payload.challenge.category, payload.challenge.description,
+                        remote, remote_mode, remote_origin,
+                        None if index == 0 else payload.challenge.name,
+                        flag, "flag_found" if flag else "pending",
+                        timestamp, timestamp,
+                    ),
+                )
+                if len(records) > 1:
+                    connection.execute(
+                        """INSERT INTO challenge_clone_members
+                           (workspace_id,challenge_id,family_id,created_at)
+                           VALUES(?,?,?,?)""",
+                        (workspace_id, challenge_id, family_id, timestamp),
+                    )
+                connection.execute(
+                    """INSERT INTO challenge_solver_presets(
+                           challenge_id,workspace_id,account_id,provider,model,
+                           reasoning_effort,service_tier,subagents_enabled,
+                           ultra_escalation_mode,created_at
+                       ) VALUES(?,?,?,'codex',?,?,?,?,?,?)""",
+                    (
+                        challenge_id, workspace_id, variant.account_id,
+                        variant.model, variant.reasoning_effort,
+                        variant.service_tier, int(variant.subagents_enabled),
+                        variant.ultra_escalation_mode, timestamp,
+                    ),
+                )
+                connection.executemany(
+                    """INSERT INTO attachments(
+                           id,workspace_id,challenge_id,original_name,
+                           stored_name,size,created_at
+                       ) VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        (
+                            copy["id"], workspace_id, challenge_id,
+                            copy["name"], copy["id"], copy["size"], timestamp,
+                        ) for copy in record["copies"]
+                    ),
+                )
+                connection.executemany(
+                    """INSERT INTO workspace_staged_attachments
+                       (staged_file_id,attachment_id,challenge_id,storage_mode)
+                       VALUES(?,?,?,'copy')""",
+                    (
+                        (copy["staged_id"], copy["id"], challenge_id)
+                        for copy in record["copies"]
+                    ),
+                )
+                sync_challenge_storage(connection, workspace_id, challenge_id)
+            connection.execute(
+                "UPDATE workspaces SET updated_at=? WHERE id=?",
+                (timestamp, workspace_id),
+            )
+
+        try:
+            if total_bytes:
+                app.state.storage_budget.reserve(
+                    reservation_key, "challenge_create_batch", current_owner,
+                    workspace_id, None, total_bytes,
+                )
+                reserved = True
+            for record in records:
+                directory = layout.legacy_challenge_path(
+                    workspace_id, record["id"], create=True,
+                )
+                attachments_directory = directory / "attachments"
+                if record["copies"]:
+                    attachments_directory.mkdir(mode=0o750, exist_ok=True)
+                for copy in record["copies"]:
+                    copy_regular_snapshot(copy["source"], copy["target"], copy["size"])
+                if hasattr(os, "O_DIRECTORY"):
+                    for path in (attachments_directory, directory):
+                        if path.is_dir():
+                            descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+                            try:
+                                os.fsync(descriptor)
+                            finally:
+                                os.close(descriptor)
+            app.state.storage_budget.release(
+                reservation_key, db_update=publish_batch,
+            )
+            reserved = False
+            published = True
+        except BaseException as exc:
+            if reserved:
+                try:
+                    app.state.storage_budget.release(reservation_key)
+                except Exception:
+                    audit_log.exception("challenge_create_batch_reservation_cleanup_failed")
+            if not published:
+                for record in records:
+                    try:
+                        readable = record["readable_path"]
+                        if readable is not None and layout._marker(
+                            readable, "challenge", record["id"],
+                        ):
+                            shutil.rmtree(readable)
+                        shutil.rmtree(record["directory"], ignore_errors=True)
+                    except Exception:
+                        audit_log.exception("challenge_create_batch_file_cleanup_failed")
+            if isinstance(exc, ChallengeCloneSourceChanged):
+                raise HTTPException(409, "A selected staged file changed during copying.") from None
+            if isinstance(exc, StorageBudgetError):
+                raise HTTPException(storage_http_status(exc), str(exc)) from None
+            if isinstance(exc, OSError):
+                status, message = storage_io_http_response(exc)
+                raise HTTPException(status, message) from None
+            raise
+
+        if payload.challenge.flag:
+            flag_committed(
+                current_owner, workspace_id, records[0]["id"],
+                payload.challenge.flag, "manual",
+            )
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            results = []
+            for record in records:
+                result = challenge_response(
+                    db, challenge_row(db, workspace_id, record["id"]),
+                )
+                result["attachments"] = [
+                    dict(row) for row in db.execute(
+                        """SELECT id,original_name,size,created_at FROM attachments
+                            WHERE workspace_id=? AND challenge_id=?
+                            ORDER BY created_at,id""",
+                        (workspace_id, record["id"]),
+                    )
+                ]
+                results.append(result)
+        return {"challenges": results}
 
     @app.get("/api/workspaces/{workspace_id}/clone-groups", dependencies=[Depends(require_auth)])
     def list_clone_groups(workspace_id: str):
@@ -2208,7 +2498,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.delete("/api/workspaces/{workspace_id}/challenges/{challenge_id}", dependencies=[Depends(require_auth)])
     @workspace_writer_lock
-    def delete_challenge(workspace_id: str, challenge_id: str):
+    def delete_challenge(workspace_id: str, challenge_id: str, if_idle: bool = False):
+        if if_idle:
+            # Bulk trash must never cancel work that started after the list was
+            # rendered. Check and delete under the same database write lock.
+            with database() as db:
+                db.execute("BEGIN IMMEDIATE")
+                challenge_row(db, workspace_id, challenge_id)
+                reject_active_solver(db, workspace_id, challenge_id)
+                reject_active_ctfd_import(db, workspace_id)
+                if db.execute(
+                    """SELECT 1 FROM upload_sessions
+                       WHERE workspace_id=? AND challenge_id=? AND owner_user_id=?
+                         AND status='uploading' LIMIT 1""",
+                    (workspace_id, challenge_id, owner_id()),
+                ).fetchone():
+                    raise HTTPException(409, "A file upload is in progress.")
+                submit_jobs = getattr(app.state, "ctfd_submit", None)
+                if submit_jobs:
+                    if db.execute(
+                        """SELECT 1 FROM ctfd_submit_jobs j
+                           LEFT JOIN ctfd_submit_worker_claim c ON c.job_id=j.id
+                           WHERE j.workspace_id=? AND j.challenge_id=?
+                             AND j.owner_user_id=?
+                             AND (j.status IN ('queued','retry','running')
+                                  OR c.job_id IS NOT NULL) LIMIT 1""",
+                        (workspace_id, challenge_id, owner_id()),
+                    ).fetchone():
+                        raise HTTPException(409, "A CTFd submission is in progress.")
+                    db.execute(
+                        """INSERT OR IGNORE INTO ctfd_submit_blocks
+                           (workspace_id,challenge_id,owner_user_id,created_at)
+                           VALUES(?,?,?,?)""",
+                        (workspace_id, challenge_id, owner_id(), now()),
+                    )
+                timestamp = now()
+                db.execute(
+                    """UPDATE challenges SET deleted_at=?,updated_at=?,
+                           status=CASE WHEN status='running' THEN 'stopped' ELSE status END
+                       WHERE workspace_id=? AND id=? AND deleted_at IS NULL""",
+                    (timestamp, timestamp, workspace_id, challenge_id),
+                )
+            return {"ok": True, "in_trash": True}
         with database() as db:
             challenge_row(db, workspace_id, challenge_id)
         solver_jobs = getattr(app.state, "solver_jobs", None)

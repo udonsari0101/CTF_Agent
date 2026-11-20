@@ -313,6 +313,12 @@ jobs:
         run: python .github/scripts/check_challenge_solve_sort.py
       - name: Check bulk challenge controls
         run: python .github/scripts/check_bulk_reasoning_ui.py
+      - name: Check configured challenge creation
+        run: python .github/scripts/check_configured_challenge_creation_ui.py
+      - name: Check challenge multi-selection
+        run: python .github/scripts/check_challenge_multiselect_ui.py
+      - name: Check configured form change tracking
+        run: python .github/scripts/check_variant_form_dirty_ui.py
       - name: Check Codex subagent option
         run: python .github/scripts/check_codex_subagents_option.py
       - name: Check Ultra and remote input card states

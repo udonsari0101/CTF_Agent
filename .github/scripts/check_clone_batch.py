@@ -197,7 +197,6 @@ def run() -> None:
                  "service_tier": None, "subagents_enabled": True,
                  "ultra_escalation_mode": "ask"},
             ]
-            assert client.post(endpoint, json={"variants": variants + variants[:1]}).status_code == 422
             assert client.post(endpoint, json={"variants": [
                 {**variants[0], "account_id": claude}
             ]}).status_code == 422
@@ -331,7 +330,94 @@ def run() -> None:
                 ).fetchone()[0] == 0
             assert {path.name for path in canonical_parent.iterdir()} == before_paths
             assert {path.name for path in readable_parent.iterdir()} == before_readable
-    print("PASS: Codex clone batch presets, lineage, files and atomic rollback")
+            create_batch = f"/api/workspaces/{workspace}/challenges/batch"
+            input_challenge = {
+                "name": "new variants", "category": "Web",
+                "description": "nc example.test 31337", "remote_mode": "unknown",
+            }
+            batch_variants = [variants[0], {**variants[0], "subagents_enabled": True}, variants[1]]
+            body = {
+                "challenge": input_challenge,
+                "variants": batch_variants,
+                "staged_file_ids": [file.json()["id"]],
+            }
+            with connect(settings) as db:
+                before_batch = db.execute("SELECT COUNT(*) FROM challenges").fetchone()[0]
+            assert client.post(create_batch, json={
+                **body, "staged_file_ids": [file.json()["id"]] * 2,
+            }).status_code == 422
+            assert client.post(create_batch, json={
+                **body, "variants": [{**variants[0], "model": "unknown-model"}],
+            }).status_code == 422
+            assert client.post(create_batch, json={
+                **body, "staged_file_ids": ["0" * 32],
+            }).status_code == 404
+            with connect(settings) as db:
+                assert db.execute("SELECT COUNT(*) FROM challenges").fetchone()[0] == before_batch
+
+            created = client.post(create_batch, json=body)
+            assert created.status_code == 201, created.text
+            created_challenges = created.json()["challenges"]
+            assert len(created_challenges) == 3
+            assert created_challenges[0]["name"] == "new variants"
+            assert all(item["canonical_name"] == "new variants" for item in created_challenges[1:])
+            assert len({item["name"] for item in created_challenges}) == 3
+            assert all(item["remote_mode"] == "endpoint" for item in created_challenges)
+            for item, variant in zip(created_challenges, batch_variants):
+                assert item["solver_preset"]["account_id"] == variant["account_id"]
+                assert item["solver_preset"]["reasoning_effort"] == variant["reasoning_effort"]
+                assert item["solver_preset"]["subagents_enabled"] == variant["subagents_enabled"]
+                assert len(item["attachments"]) == 1
+                assert client.get(
+                    f"/api/workspaces/{workspace}/challenges/{item['id']}"
+                    f"/attachments/{item['attachments'][0]['id']}"
+                ).content == content
+            new_family = next(group for group in client.get(
+                f"/api/workspaces/{workspace}/clone-groups"
+            ).json()["groups"] if group["id"] == created_challenges[0]["id"])
+            assert {item["id"] for item in new_family["members"]} == {
+                item["id"] for item in created_challenges
+            }
+            variant_attachment = app.state.storage_layout.legacy_attachment_path(
+                workspace, created_challenges[1]["id"],
+                created_challenges[1]["attachments"][0]["id"],
+            )
+            variant_attachment.write_bytes(b"independent variant file")
+            assert client.get(
+                f"/api/workspaces/{workspace}/challenges/{created_challenges[0]['id']}"
+                f"/attachments/{created_challenges[0]['attachments'][0]['id']}"
+            ).content == content
+
+            with connect(settings) as db:
+                before_batch = db.execute("SELECT COUNT(*) FROM challenges").fetchone()[0]
+                before_members = db.execute("SELECT COUNT(*) FROM challenge_clone_members").fetchone()[0]
+            before_paths = {path.name for path in canonical_parent.iterdir()}
+            before_readable = {path.name for path in readable_parent.iterdir()}
+            calls = 0
+
+            def fail_second_variant(source_path, target_path, size):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError(errno.EIO, "simulated batch file failure")
+                return copy_regular_snapshot(source_path, target_path, size)
+
+            with patch("ctf_agent.main.copy_regular_snapshot", fail_second_variant):
+                failed = client.post(create_batch, json={
+                    **body, "challenge": {**input_challenge, "name": "failed batch"},
+                })
+            assert failed.status_code == 503, failed.text
+            with connect(settings) as db:
+                assert db.execute("SELECT COUNT(*) FROM challenges").fetchone()[0] == before_batch
+                assert db.execute("SELECT COUNT(*) FROM challenge_clone_members").fetchone()[0] == before_members
+                assert db.execute("SELECT COUNT(*) FROM storage_reservations").fetchone()[0] == 0
+            assert {path.name for path in canonical_parent.iterdir()} == before_paths
+            assert {path.name for path in readable_parent.iterdir()} == before_readable
+
+            duplicated = client.post(endpoint, json={"variants": variants + variants[:1]})
+            assert duplicated.status_code == 201, duplicated.text
+            assert len(duplicated.json()["clones"]) == 3
+    print("PASS: Codex create/clone batches, presets, files and atomic rollback")
 
 
 if __name__ == "__main__":
