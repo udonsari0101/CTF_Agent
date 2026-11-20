@@ -4,21 +4,136 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import os
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from local_test_client import TestClient
 
 from ctf_agent.db import Settings, connect
-from ctf_agent.main import clone_challenge_name, copy_regular_snapshot, create_app
+import ctf_agent.main as main_module
+from ctf_agent.main import (
+    ChallengeCloneSourceChanged, clone_challenge_name, copy_regular_snapshot,
+    create_app,
+)
+
+
+def check_copy_modes(root: Path) -> None:
+    """Exercise the CoW fallback and failure boundaries without a special FS."""
+
+    folder = root / "copy-modes"
+    folder.mkdir()
+    source = folder / "source.bin"
+    content = b"original attachment bytes" * 32
+    source.write_bytes(content)
+    target = folder / "copy.bin"
+
+    def successful_clone(target_fd, request, source_fd):
+        assert request == main_module.FICLONE
+        assert os.read(source_fd, len(content)) == content
+        assert os.write(target_fd, content) == len(content)
+        return 0
+
+    with patch.object(main_module, "fcntl", SimpleNamespace(ioctl=successful_clone)):
+        copy_regular_snapshot(source, target, len(content))
+    assert target.read_bytes() == content
+    assert target.stat().st_ino != source.stat().st_ino
+    source.write_bytes(b"source changed after cloning")
+    assert target.read_bytes() == content
+    source.write_bytes(content)
+    target.write_bytes(b"copy changed after cloning")
+    assert source.read_bytes() == content
+    target.unlink()
+
+    def unsupported_after_partial_write(target_fd, request, source_fd):
+        assert request == main_module.FICLONE
+        assert source_fd >= 0
+        os.write(target_fd, b"incomplete clone")
+        raise OSError(errno.EOPNOTSUPP, "reflink unavailable")
+
+    with patch.object(
+        main_module, "fcntl", SimpleNamespace(ioctl=unsupported_after_partial_write)
+    ):
+        copy_regular_snapshot(source, target, len(content))
+    assert target.read_bytes() == content
+    assert target.stat().st_ino != source.stat().st_ino
+    target.write_bytes(b"changed copy")
+    assert source.read_bytes() == content
+    target.unlink()
+
+    with patch.object(
+        main_module, "fcntl", SimpleNamespace(ioctl=lambda *_: 0)
+    ):
+        try:
+            copy_regular_snapshot(source, target, len(content))
+        except ChallengeCloneSourceChanged:
+            pass
+        else:
+            raise AssertionError("an incomplete successful ioctl was accepted")
+    assert not target.exists()
+
+    def failed_permission(*_):
+        raise OSError(errno.EPERM, "permission denied")
+
+    with patch.object(main_module, "fcntl", SimpleNamespace(ioctl=failed_permission)):
+        try:
+            copy_regular_snapshot(source, target, len(content))
+        except OSError as exc:
+            assert exc.errno == errno.EPERM
+        else:
+            raise AssertionError("unexpected reflink error was hidden by fallback")
+    assert not target.exists()
+
+    target.write_bytes(b"preexisting target")
+    try:
+        copy_regular_snapshot(source, target, len(content))
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("existing target was overwritten")
+    assert target.read_bytes() == b"preexisting target"
+    target.unlink()
+
+    symlink = folder / "source-link.bin"
+    try:
+        symlink.symlink_to(source)
+    except (OSError, NotImplementedError):  # Windows may deny unprivileged links.
+        pass
+    else:
+        try:
+            copy_regular_snapshot(symlink, target, len(content))
+        except ChallengeCloneSourceChanged:
+            pass
+        else:
+            raise AssertionError("symlink source was accepted")
+        assert not target.exists()
+
+    original_fsync = os.fsync
+
+    def mutate_source_after_write(fd):
+        original_fsync(fd)
+        source.write_bytes(b"changed while cloning".ljust(len(content), b"!"))
+
+    with patch.object(main_module, "fcntl", None), patch.object(
+        main_module.os, "fsync", side_effect=mutate_source_after_write
+    ):
+        try:
+            copy_regular_snapshot(source, target, len(content))
+        except ChallengeCloneSourceChanged:
+            pass
+        else:
+            raise AssertionError("concurrent source mutation went undetected")
+    assert not target.exists()
 
 
 def run() -> None:
     with TemporaryDirectory(ignore_cleanup_errors=True) as temp:
         root = Path(temp)
+        check_copy_modes(root)
         settings = Settings(
             root / "data", root / "db", root / "config", root / "logs",
             storage_min_free_bytes=0, auth_mode="nologin",
@@ -38,6 +153,24 @@ def run() -> None:
                 ).fetchone()[0]
             codex = app.state.accounts.create("codex", "test Codex", owner)["id"]
             claude = app.state.accounts.create("claude", "test Claude", owner)["id"]
+            catalog = {"status": "available", "models": [{
+                "id": "gpt-6-sol", "model": "gpt-6-sol",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": effort}
+                    for effort in ("medium", "high", "xhigh", "ultra")
+                ],
+                "serviceTiers": [{"id": "fast"}],
+            }]}
+            catalog_calls = 0
+
+            async def account_models(account_id, owner_id):
+                nonlocal catalog_calls
+                assert (account_id, owner_id) == (codex, owner)
+                catalog_calls += 1
+                return catalog
+
+            # The endpoint must validate without reaching a live provider.
+            app.state.accounts.models = account_models
             content = b"one immutable source attachment"
             staged = f"/api/workspaces/{workspace}/staged-files"
             file = client.post(staged, json={
@@ -71,13 +204,40 @@ def run() -> None:
             assert client.post(endpoint, json={"variants": [{
                 **variants[0], "reasoning_effort": "medium", "ultra_escalation_mode": "auto"
             }]}).status_code == 422
+            catalog["status"] = "unavailable"
+            assert client.post(endpoint, json={"variants": variants}).status_code == 503
+            catalog["status"] = "available"
+            saved_models = catalog["models"]
+            catalog["models"] = None
+            assert client.post(endpoint, json={"variants": variants}).status_code == 503
+            catalog["models"] = saved_models
+            assert client.post(endpoint, json={"variants": [{
+                **variants[0], "model": "not-in-account-catalog"
+            }]}).status_code == 422
+            assert client.post(endpoint, json={"variants": [{
+                **variants[0], "reasoning_effort": "low"
+            }]}).status_code == 422
+            catalog["models"][0]["serviceTiers"] = []
+            assert client.post(endpoint, json={"variants": [variants[0]]}).status_code == 422
+            catalog["models"][0]["serviceTiers"] = [{"id": "fast"}]
+            catalog["models"][0]["supportedReasoningEfforts"] = [
+                {"reasoningEffort": effort} for effort in ("medium", "high", "xhigh")
+            ]
+            assert client.post(endpoint, json={"variants": [{
+                **variants[1], "ultra_escalation_mode": "auto"
+            }]}).status_code == 422
+            catalog["models"][0]["supportedReasoningEfforts"].append(
+                {"reasoningEffort": "ultra"}
+            )
             with connect(settings) as db:
                 assert db.execute("SELECT COUNT(*) FROM challenges").fetchone()[0] == 1
 
+            catalog_calls_before = catalog_calls
             response = client.post(endpoint, json={"variants": variants})
             assert response.status_code == 201, response.text
             clones = response.json()["clones"]
             assert len(clones) == 2
+            assert catalog_calls == catalog_calls_before + 1
             assert len({item["id"] for item in clones}) == 2
             assert all(item["canonical_name"] == "analyze" for item in clones)
             assert all(item["status"] == "pending" and not item["flag"] for item in clones)

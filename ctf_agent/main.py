@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import hmac
 import importlib
@@ -30,7 +31,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
-from typing import Literal
+from typing import Literal, Mapping
+
+try:  # Linux filesystems may support copy-on-write reflinks.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows uses the streaming fallback
+    fcntl = None
 
 from .ctfd import connection_info, description_connection_info
 from .db import Settings, connect, initialize
@@ -44,6 +50,11 @@ COOKIE = "ctf_session"
 STATUSES = ("pending", "running", "stopped", "failed", "flag_found", "solved")
 REMOTE_MODES = ("unknown", "none", "endpoint")
 CLONE_COPY_CHUNK_BYTES = 8 * 1024 * 1024
+FICLONE = 0x40049409  # linux/fs.h: clone source data into the target fd
+REFLINK_UNSUPPORTED_ERRNOS = {
+    errno.EINVAL, errno.ENOSYS, errno.ENOTTY, errno.EXDEV,
+    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+}
 
 
 class ChallengeCloneSourceChanged(RuntimeError):
@@ -69,35 +80,20 @@ def clone_challenge_name(connection, workspace_id: str, source_name: str) -> str
 
 
 def copy_regular_snapshot(source: Path, target: Path, expected_size: int) -> None:
-    """Copy one attachment while rejecting symlinks and concurrent mutation."""
+    """Copy one attachment, preferring CoW without linking mutable inodes."""
 
     source_flags = os.O_RDONLY
     target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         source_flags |= os.O_NOFOLLOW
         target_flags |= os.O_NOFOLLOW
+    source_details = source.lstat()
+    if not stat.S_ISREG(source_details.st_mode):
+        raise ChallengeCloneSourceChanged
     source_descriptor = os.open(source, source_flags)
     target_descriptor = None
     try:
         before = os.fstat(source_descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_size != expected_size:
-            raise ChallengeCloneSourceChanged
-        target_descriptor = os.open(target, target_flags, 0o640)
-        with os.fdopen(source_descriptor, "rb", closefd=False) as input_file, os.fdopen(
-            target_descriptor, "wb", closefd=False
-        ) as output_file:
-            remaining = expected_size
-            while remaining:
-                chunk = input_file.read(min(CLONE_COPY_CHUNK_BYTES, remaining))
-                if not chunk:
-                    raise ChallengeCloneSourceChanged
-                output_file.write(chunk)
-                remaining -= len(chunk)
-            if input_file.read(1):
-                raise ChallengeCloneSourceChanged
-            output_file.flush()
-            os.fsync(output_file.fileno())
-        after = os.fstat(source_descriptor)
         fingerprint = lambda details: (
             details.st_dev,
             details.st_ino,
@@ -105,13 +101,69 @@ def copy_regular_snapshot(source: Path, target: Path, expected_size: int) -> Non
             details.st_mtime_ns,
             details.st_ctime_ns,
         )
-        if fingerprint(before) != fingerprint(after):
+        path_identity = lambda details: (
+            details.st_dev,
+            details.st_ino,
+            details.st_size,
+            details.st_mtime_ns,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size != expected_size
+            # Windows path.stat and fstat can report different ctime meanings.
+            or path_identity(source_details) != path_identity(before)
+        ):
+            raise ChallengeCloneSourceChanged
+        target_descriptor = os.open(target, target_flags, 0o640)
+        with os.fdopen(source_descriptor, "rb", closefd=False) as input_file, os.fdopen(
+            target_descriptor, "wb", closefd=False
+        ) as output_file:
+            reflinked = False
+            if fcntl is not None:
+                try:
+                    fcntl.ioctl(target_descriptor, FICLONE, source_descriptor)
+                    reflinked = True
+                except OSError as exc:
+                    if exc.errno not in REFLINK_UNSUPPORTED_ERRNOS:
+                        raise
+            if not reflinked:
+                # Unsupported clone ioctls can leave the target modified.
+                output_file.truncate(0)
+                output_file.seek(0)
+                input_file.seek(0)
+                remaining = expected_size
+                while remaining:
+                    chunk = input_file.read(min(CLONE_COPY_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        raise ChallengeCloneSourceChanged
+                    output_file.write(chunk)
+                    remaining -= len(chunk)
+                if input_file.read(1):
+                    raise ChallengeCloneSourceChanged
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        after = os.fstat(source_descriptor)
+        target_after = os.fstat(target_descriptor)
+        try:
+            source_after = source.lstat()
+        except FileNotFoundError:
+            raise ChallengeCloneSourceChanged from None
+        if (
+            fingerprint(before) != fingerprint(after)
+            or fingerprint(source_details) != fingerprint(source_after)
+            or path_identity(before) != path_identity(source_after)
+            or not stat.S_ISREG(target_after.st_mode)
+            or target_after.st_size != expected_size
+        ):
             raise ChallengeCloneSourceChanged
     except BaseException:
-        try:
-            target.unlink()
-        except FileNotFoundError:
-            pass
+        if target_descriptor is not None:
+            os.close(target_descriptor)
+            target_descriptor = None
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
         raise
     finally:
         if target_descriptor is not None:
@@ -1550,6 +1602,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ]
         return result
 
+    async def validate_clone_batch_configuration(
+        workspace_id: str, challenge_id: str,
+        payload: CodexCloneBatchInput, user=Depends(require_auth),
+    ) -> CodexCloneBatchInput:
+        """Check every preset against its account catalog before file staging."""
+
+        with database() as db:
+            challenge_row(db, workspace_id, challenge_id)
+        efforts = [variant.reasoning_effort for variant in payload.variants]
+        if len(efforts) != len(set(efforts)):
+            raise HTTPException(422, "Choose each reasoning level only once.")
+
+        from .providers.codex import ProviderError
+
+        catalogs: dict[str, list] = {}
+        for variant in payload.variants:
+            account = app.state.accounts.get(variant.account_id, user["id"])
+            if account["provider"] != "codex":
+                raise HTTPException(422, "Batch clones require Codex accounts.")
+            if variant.account_id not in catalogs:
+                try:
+                    async with app.state.accounts.lock(variant.account_id):
+                        catalog = await app.state.accounts.models(
+                            variant.account_id, user["id"]
+                        )
+                except (HTTPException, ProviderError):
+                    # A failed catalog lookup cannot establish that a preset
+                    # is supported. Leave the source untouched for a retry.
+                    raise HTTPException(
+                        503, "The selected account's model catalog is unavailable."
+                    ) from None
+                if (not isinstance(catalog, Mapping)
+                        or catalog.get("status") != "available"
+                        or not isinstance(catalog.get("models"), list)):
+                    raise HTTPException(
+                        503, "The selected account's model catalog is unavailable."
+                    )
+                catalogs[variant.account_id] = catalog["models"]
+            chosen = next((item for item in catalogs[variant.account_id]
+                           if isinstance(item, Mapping)
+                           and variant.model in (item.get("id"), item.get("model"))), None)
+            if chosen is None:
+                raise HTTPException(
+                    422, "The selected model is not available for this account."
+                )
+            efforts = {
+                item.get("reasoningEffort")
+                for item in (chosen.get("supportedReasoningEfforts") or [])
+                if isinstance(item, Mapping)
+            }
+            if variant.reasoning_effort not in efforts:
+                raise HTTPException(
+                    422, "The selected reasoning level is not supported by this model."
+                )
+            tiers = {
+                item.get("id")
+                for item in (chosen.get("serviceTiers") or [])
+                if isinstance(item, Mapping)
+            }
+            if variant.service_tier and variant.service_tier not in tiers:
+                raise HTTPException(
+                    422, "Fast mode is not available for this account and model."
+                )
+            if (variant.ultra_escalation_mode == "auto"
+                    and (variant.reasoning_effort not in {"high", "xhigh"}
+                         or "ultra" not in efforts)):
+                raise HTTPException(
+                    422, "Automatic Ultra escalation requires high or xhigh reasoning and an Ultra-capable model."
+                )
+        return payload
+
     @app.post(
         "/api/workspaces/{workspace_id}/challenges/{challenge_id}/clone-batch",
         status_code=201,
@@ -1557,7 +1680,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     @workspace_writer_lock
     def clone_challenge_batch(
-        workspace_id: str, challenge_id: str, payload: CodexCloneBatchInput
+        workspace_id: str, challenge_id: str,
+        payload: CodexCloneBatchInput = Depends(validate_clone_batch_configuration),
     ):
         """Publish all independently configured copies in one DB transaction.
 
