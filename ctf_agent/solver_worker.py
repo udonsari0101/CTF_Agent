@@ -8029,7 +8029,7 @@ class SolverWorker:
                 auth_kind=manifest.auth_kind,
             )
             if isinstance(driver, CodexAppServer):
-                driver.subagents_enabled = manifest.subagents_enabled
+                driver.subagents_enabled = getattr(manifest, "subagents_enabled", None)
             if isinstance(driver, (CodexAppServer, ClaudePrintDriver)):
                 driver.continuation_event = lambda code: writer.emit("progress", code=code)
                 if isinstance(driver, CodexAppServer):
