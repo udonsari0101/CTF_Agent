@@ -1517,7 +1517,7 @@ function solverProviderSelector() {
     <label>모델<select id="solver-model-select" aria-label="문제 풀이 모델" ${modelOptions ? '' : 'disabled'}>${modelOptions || '<option>사용 가능한 모델 없음</option>'}</select></label>
     <label>추론 수준<select id="solver-reasoning-select" aria-label="문제 풀이 추론 수준" ${effortOptions ? '' : 'disabled'}>${effortOptions || '<option>지원 정보 없음</option>'}</select></label>
     ${supportsFast ? `<label class="solver-fast-choice"><input id="solver-fast-toggle" type="checkbox" ${solverServiceTier === 'fast' ? 'checked' : ''}>1.5배 Fast 실행</label>` : supportsUltracode ? `<label class="solver-ultracode-choice"><input id="solver-ultracode-toggle" type="checkbox" ${solverUltracode ? 'checked' : ''}>Ultracode</label>` : '<span class="solver-fast-placeholder" aria-hidden="true"></span>'}
-    ${solverProvider === 'codex' ? `<label class="solver-subagents-choice"><input id="solver-subagents-toggle" type="checkbox" ${solverSubagentsEnabled ? 'checked' : ''}>${tr('하위 에이전트 사용')}</label>` : ''}
+    ${solverProvider === 'codex' ? `<label class="solver-subagents-choice"><input id="solver-subagents-toggle" type="checkbox" ${solverSubagentsEnabled ? 'checked' : ''}>${tr('필요할 때 하위 에이전트 허용')}</label>` : ''}
     ${ultraChoice}
     ${solverRetryWarningMarkup()}
     <span class="form-hint solver-config-help">이번 실행에만 적용</span>
@@ -4032,6 +4032,7 @@ async function showCloneReasoning(challengeId) {
      <label>${tr('Codex 계정')}<select id="clone-reasoning-account" disabled><option>${tr('불러오는 중…')}</option></select></label>
      <label>${tr('모델')}<select id="clone-reasoning-model" disabled><option>${tr('계정을 먼저 선택하세요.')}</option></select></label>
      <fieldset class="clone-reasoning-levels"><legend>${tr('추론 수준과 하위 에이전트')}</legend><div id="clone-reasoning-level-list" class="clone-reasoning-level-list"><p class="form-hint">${tr('모델을 불러오는 중입니다.')}</p></div></fieldset>
+     <p class="form-hint">${tr('허용해도 모델이 필요하다고 판단할 때만 하위 에이전트를 만듭니다.')}</p>
      <label class="clone-reasoning-fast"><input id="clone-reasoning-fast" type="checkbox" disabled>${tr('1.5배 Fast 실행')}</label>
      <p class="form-hint">${tr('복제본의 자동 Ultra 전환은 꺼집니다. 각 추론 수준을 그대로 비교할 수 있습니다.')}</p>
      <p id="clone-reasoning-status" class="form-hint" role="status"></p>`,
@@ -4095,7 +4096,7 @@ function paintCloneReasoningLevels(form) {
   const modelId = form.querySelector('#clone-reasoning-model')?.value;
   const model = cloneReasoningModels.find(item => (item.model || item.id) === modelId);
   const efforts = [...new Set((model?.supportedReasoningEfforts || []).map(item => item?.reasoningEffort).filter(Boolean))];
-  form.querySelector('#clone-reasoning-level-list').innerHTML = efforts.map(level => `<div class="clone-reasoning-level-row"><label><input type="checkbox" name="reasoning_levels" value="${esc(level)}">${esc(level)}</label><label class="clone-reasoning-agent-option"><input type="checkbox" name="subagents_${esc(level)}" ${level === 'ultra' ? 'checked' : ''}>${tr('하위 에이전트')}</label></div>`).join('') || `<p class="form-hint">${tr('선택 가능한 추론 수준이 없습니다.')}</p>`;
+  form.querySelector('#clone-reasoning-level-list').innerHTML = efforts.map(level => `<div class="clone-reasoning-level-row"><label><input type="checkbox" name="reasoning_levels" value="${esc(level)}">${esc(level)}</label><label class="clone-reasoning-agent-option"><input type="checkbox" name="subagents_${esc(level)}" ${level === 'ultra' ? 'checked' : ''}>${tr('필요 시 하위 에이전트 허용')}</label></div>`).join('') || `<p class="form-hint">${tr('선택 가능한 추론 수준이 없습니다.')}</p>`;
   const fast = form.querySelector('#clone-reasoning-fast');
   fast.disabled = !(model?.serviceTiers || []).some(item => item?.id === 'fast');
   const account = cloneReasoningAccounts.find(item => item.id === form.querySelector('#clone-reasoning-account')?.value);

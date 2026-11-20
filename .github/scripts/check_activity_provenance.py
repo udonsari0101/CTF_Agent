@@ -80,6 +80,59 @@ def create_job_db(db_path):
 
 
 class ActivityProvenanceTests(unittest.TestCase):
+    def test_enabled_xhigh_child_is_persisted_in_job_agent_tree(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            active = Path(temp)
+            writer = EventWriter(active, JOB_ID)
+            db_path = active / "ledger.sqlite3"
+            create_job_db(db_path)
+            with contextlib.closing(sqlite3.connect(db_path)) as db, db:
+                db.execute(
+                    "UPDATE solver_jobs SET subagents_enabled=1 WHERE id=?", (JOB_ID,)
+                )
+            driver = CodexAppServer(active, active, command_prefix=["codex"])
+            driver.thread_id = "root-thread"
+
+            async def report_child(**details):
+                writer.emit("agent", **details)
+
+            driver.agent_reporter = report_child
+            manifest = SimpleNamespace(
+                configuration=SimpleNamespace(
+                    provider="codex", model="gpt-6-sol", reasoning_effort="xhigh",
+                ),
+                subagents_enabled=True, job_mode="solve",
+            )
+
+            async def run():
+                await driver._track_codex_agent_item({
+                    "type": "collabAgentToolCall", "senderThreadId": "root-thread",
+                    "receiverThreadIds": ["child-thread"],
+                }, "root-thread", manifest)
+                await driver._track_codex_agent_item({
+                    "type": "subAgentActivity", "agentThreadId": "child-thread",
+                    "kind": "completed",
+                }, "root-thread", manifest)
+
+            asyncio.run(run())
+            self.assertEqual(writer.sequence, 2)
+            coordinator = make_coordinator(db_path)
+            coordinator.deliver_global_hooks = False
+            job = {
+                "id": JOB_ID, "workspace_id": "workspace-1",
+                "challenge_id": "challenge-1", "last_event_sequence": 0,
+            }
+            self.assertTrue(coordinator._ingest_events(job, active))
+            with contextlib.closing(sqlite3.connect(db_path)) as db:
+                saved = json.loads(db.execute(
+                    "SELECT agents_json FROM solver_jobs WHERE id=?", (JOB_ID,)
+                ).fetchone()[0])
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]["parent_id"], "root")
+            self.assertEqual(saved[0]["provider"], "codex")
+            self.assertEqual(saved[0]["status"], "completed")
+            self.assertTrue(saved[0]["id"].startswith("codex:"))
+
     def test_repeated_root_shell_result_is_a_private_next_turn_hint(self):
         driver = make_driver(activity_count=MAX_LIVE_ACTIVITY_EVENTS)
         driver._solve_repeat_observer = SolveRepeatObserver()

@@ -142,6 +142,100 @@ class ProgressNudgeTests(unittest.TestCase):
         self.manifest.subagents_enabled = True
         asyncio.run(self.driver._track_codex_agent_item(item, "root-thread", self.manifest))
 
+    def test_enabled_lower_effort_records_child_lifecycle_and_activity(self) -> None:
+        async def run(effort: str) -> None:
+            driver = worker.CodexAppServer(
+                self.challenge, self.challenge,
+                ModelConfiguration("codex", "gpt-6-sol", effort),
+                command_prefix=["codex"],
+            )
+            nodes: list[dict[str, object]] = []
+            activities: list[dict[str, object]] = []
+
+            async def report_node(**event: object) -> None:
+                nodes.append(event)
+
+            async def report_activity(**event: object) -> None:
+                activities.append(event)
+
+            async def start_thread(_manifest: object) -> str:
+                driver.thread_id = "root-thread"
+                return "root-thread"
+
+            async def request(method: str, _params: object) -> dict[str, object]:
+                self.assertEqual(method, "turn/start")
+                return {"turn": {"id": "turn-1"}}
+
+            async def progress(_code: str) -> None:
+                pass
+
+            driver.agent_reporter = report_node
+            driver.activity_reporter = report_activity
+            driver._thread = start_thread
+            driver.request = request
+            driver._sandbox_parameters = lambda *_args, **_kwargs: {}
+            manifest = SimpleNamespace(
+                configuration=driver.configuration, job_mode="solve",
+                subagents_enabled=True, network_enabled=True,
+            )
+            child_thread = "child-thread"
+            dispatch = {
+                "id": "dispatch-1", "type": "collabAgentToolCall",
+                "senderThreadId": "root-thread",
+                "receiverThreadIds": [child_thread],
+                "prompt": "Independently inspect the local fixture.",
+            }
+            child_started = {
+                "id": "child-start", "type": "subAgentActivity",
+                "agentThreadId": child_thread, "kind": "started",
+            }
+            child_completed = {
+                "id": "child-done", "type": "subAgentActivity",
+                "agentThreadId": child_thread, "kind": "completed",
+            }
+            command = {
+                "id": "child-command", "type": "commandExecution",
+                "command": "printf fixture", "aggregatedOutput": "fixture",
+                "exitCode": 0,
+            }
+            for method, source, item in (
+                ("item/started", "root-thread", dispatch),
+                ("item/completed", "root-thread", dispatch),
+                ("item/started", "root-thread", child_started),
+                ("item/completed", "root-thread", child_started),
+                ("item/started", child_thread, command),
+                ("item/completed", child_thread, command),
+                ("item/started", "root-thread", child_completed),
+                ("item/completed", "root-thread", child_completed),
+            ):
+                driver.notifications.put_nowait({
+                    "method": method, "params": {"threadId": source, "item": item},
+                })
+            driver.notifications.put_nowait({
+                "method": "turn/completed",
+                "params": {"threadId": "root-thread", "turn": {
+                    "id": "turn-1", "status": "completed",
+                }},
+            })
+            self.assertEqual(
+                await driver._turn(manifest, "offline fixture", None, asyncio.Event(), progress),
+                {},
+            )
+            child_id = worker._provider_agent_id("codex", child_thread)
+            self.assertIsNotNone(child_id)
+            self.assertEqual([node["status"] for node in nodes], ["running", "completed"])
+            self.assertTrue(all(node["agent_id"] == child_id for node in nodes))
+            self.assertTrue(all(node["parent_id"] == "root" for node in nodes))
+            self.assertEqual(driver.agent_nodes[child_id]["status"], "completed")
+            child_shell = [event for event in activities
+                           if event.get("agent_id") == child_id and event.get("tool") == "shell"]
+            self.assertEqual([event["phase"] for event in child_shell], ["started", "completed"])
+            self.assertEqual(child_shell[-1]["output"], "fixture")
+
+        for effort in ("medium", "xhigh"):
+            with self.subTest(effort=effort):
+                asyncio.run(run(effort))
+
     def test_refinement_disables_subagents_even_if_requested(self) -> None:
         self.assertFalse(worker._codex_subagents_enabled(
             ModelConfiguration("codex", "gpt-6-sol", "ultra"), True,
