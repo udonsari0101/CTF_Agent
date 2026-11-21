@@ -23,6 +23,7 @@ from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 MAX_STEPS = 100
 MAX_EVENTS = 200
+INITIAL_EVENTS = 40
 MAX_BODY = 16000
 MAX_EVENT_TEXT = 1000
 MAX_ACTION_RESULT = 4000
@@ -167,7 +168,19 @@ def _summary(page, observations: dict, actions: list[dict]) -> dict:
         "console": observations["console"],
         "network": observations["network"],
         "dropped_events": observations["dropped_events"],
+        "network_dropped_events": observations["network_dropped_events"],
+        "console_dropped_events": observations["console_dropped_events"],
     }
+
+
+def _record_event(observations: dict, kind: str, event: dict) -> None:
+    target = observations[kind]
+    if len(target) >= MAX_EVENTS:
+        # Keep page setup and the most recent action observations.
+        del target[INITIAL_EVENTS]
+        observations["dropped_events"] += 1
+        observations[f"{kind}_dropped_events"] += 1
+    target.append(event)
 
 
 def _run_browser(arguments: argparse.Namespace) -> int:
@@ -193,14 +206,13 @@ def _run_browser(arguments: argparse.Namespace) -> int:
             runtime = guard._persistent_runtime(workdir, arguments.session)
             session_lock = guard._lock_session(runtime)
         guard._ensure_private_directory(runtime / "downloads")
-        observations = {"console": [], "network": [], "dropped_events": 0}
+        observations = {
+            "console": [], "network": [], "dropped_events": 0,
+            "network_dropped_events": 0, "console_dropped_events": 0,
+        }
 
         def add(kind: str, event: dict) -> None:
-            target = observations[kind]
-            if len(target) < MAX_EVENTS:
-                target.append(event)
-            else:
-                observations["dropped_events"] += 1
+            _record_event(observations, kind, event)
 
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(

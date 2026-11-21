@@ -1387,6 +1387,14 @@ def normalize_provider_failure(
             category="provider",
             retryable=False,
         )
+    if code == "codex_exec_unavailable":
+        return SolverError(
+            code="codex_exec_unavailable",
+            message="Codex의 명령 실행 프로세스를 반복해서 시작하지 못했습니다. 실행 환경을 확인한 뒤 이어서 풀어 주세요.",
+            stage=stage,
+            category="temporary",
+            retryable=False,
+        )
 
     fragments = [value for value in (code, category, provider_code, message_value, error_type) if isinstance(value, (str, int))]
     diagnostic = " ".join(str(value) for value in fragments)[:65_536]

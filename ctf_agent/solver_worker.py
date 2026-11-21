@@ -114,6 +114,7 @@ DRIVER_CLOSE_TIMEOUT_SECONDS = 15
 MODEL_WAIT_HEARTBEAT_SECONDS = 60
 MAX_PROVIDER_RETRY_SECONDS = 180
 MAX_PROVIDER_RETRY_EVENTS = 8
+MAX_CONSECUTIVE_CODEX_EXEC_CREATE_FAILURES = 3
 TERMINAL_PROVIDER_SIGNAL_GRACE_SECONDS = 0.5
 MAX_TERMINAL_PROVIDER_SIGNAL_EVENTS = 32
 # Each completed Flag-less model turn consumes one nudge slot. The default is
@@ -2371,6 +2372,7 @@ _CODEX_HTTP_ERROR_KINDS = frozenset({
 })
 _SAFE_CODEX_WORKER_FAILURE_CODES = frozenset({
     "auth_required",
+    "codex_exec_unavailable",
     "codex_attestation_unavailable",
     "daybreak_route_rejected",
     "invalid_response",
@@ -2418,6 +2420,24 @@ def safe_codex_failure(payload: object) -> dict[str, Any]:
     if isinstance(payload, Mapping) and type(payload.get("retryable")) is bool:
         result["retryable"] = payload["retryable"]
     return result
+
+
+def _codex_exec_create_failed(item: object) -> bool:
+    """Recognize a failed Codex exec *launcher*, not a command's own ENOENT.
+
+    The command did not run when app-server reports exit -1 and this fixed
+    launcher diagnostic. Never inspect a command or general shell stderr for
+    this decision: a challenge can legitimately print the same words.
+    """
+
+    if not isinstance(item, Mapping) or type(item.get("exitCode")) is not int or item["exitCode"] != -1:
+        return False
+    output = item.get("aggregatedOutput")
+    return (
+        isinstance(output, str)
+        and len(output) <= 1024
+        and output.strip().startswith("Failed to create unified exec process:")
+    )
 
 
 def safe_provider_failure_diagnostic(payload: object, driver: object) -> dict[str, Any]:
@@ -3086,6 +3106,8 @@ class CodexAppServer:
         self._discovery_command_execution_seen = False
         self._solve_tool_count = 0
         self._first_solve_tool_at: float | None = None
+        self._consecutive_exec_create_failures = 0
+        self._exec_create_failure_keys: set[tuple[object, object]] = set()
         self._solve_repeat_observer = SolveRepeatObserver()
         self.guidance_mailbox: GuidanceMailbox | None = None
         self.activity_reporter: Callable[..., Awaitable[None]] | None = None
@@ -4625,6 +4647,20 @@ print(json.dumps(result,separators=(",",":")))
                 self._current_event_agent_id = source_agent_id
                 item = values.get("item")
                 item_type = item.get("type") if isinstance(item, dict) else None
+                exec_create_failure = (
+                    method == "item/completed" and item_type == "commandExecution"
+                    and _codex_exec_create_failed(item)
+                )
+                if method == "item/completed" and item_type == "commandExecution":
+                    if exec_create_failure:
+                        event_id = item.get("id")
+                        key = (source_thread_id, event_id if isinstance(event_id, str) else None)
+                        if key not in self._exec_create_failure_keys:
+                            self._consecutive_exec_create_failures += 1
+                            self._exec_create_failure_keys.add(key)
+                    else:
+                        self._consecutive_exec_create_failures = 0
+                        self._exec_create_failure_keys.clear()
                 if item_type == "contextCompaction":
                     await _emit_context_usage(
                         self, source_agent_id,
@@ -4638,6 +4674,7 @@ print(json.dumps(result,separators=(",",":")))
                 if (
                     method == "item/completed" and source_agent_id == "root"
                     and item_type in {"commandExecution", "webSearch"}
+                    and not exec_create_failure
                 ):
                     self._solve_tool_count += 1
                     if self._first_solve_tool_at is None:
@@ -4714,6 +4751,11 @@ print(json.dumps(result,separators=(",",":")))
                         duration_ms=item.get("durationMs") if isinstance(item, Mapping) else None,
                         activity_id=item_activity_id,
                     )
+                    if self._consecutive_exec_create_failures >= MAX_CONSECUTIVE_CODEX_EXEC_CREATE_FAILURES:
+                        # Activity is durable first. The ordinary worker error
+                        # path then captures notes, solver.py, and a continuation
+                        # snapshot before releasing the failed job.
+                        raise AppServerFailure({"code": "codex_exec_unavailable", "retryable": False})
                 elif item_type == "webSearch":
                     await self._report_activity(
                         "started" if method == "item/started" else "completed",
@@ -4873,6 +4915,8 @@ print(json.dumps(result,separators=(",",":")))
         self._discovery_command_execution_seen = False
         self._solve_tool_count = 0
         self._first_solve_tool_at = None
+        self._consecutive_exec_create_failures = 0
+        self._exec_create_failure_keys = set()
         configuration = getattr(manifest, "configuration", None)
         self.effective_reasoning_effort = getattr(
             configuration, "reasoning_effort", None
@@ -8574,7 +8618,16 @@ class SolverWorker:
                         )
                 if cleanup_error is not None:
                     try:
-                        writer.emit("error", error=cleanup_error.public(), terminal=False)
+                        # Keep the original solve failure visible while this
+                        # worker restarts to clear an unsafe scratch tree.
+                        # The cleanup fault remains explicit in state and the
+                        # worker status; it must not replace the primary error
+                        # that explains why the solve stopped.
+                        writer.emit(
+                            "error",
+                            error=release_payload.get("error") or cleanup_error.public(),
+                            terminal=False,
+                        )
                         writer.state(
                             status="cleanup_blocked", outcome=release_status, terminal=False,
                             private_notes=bounded_checkpoint_notes(notes),

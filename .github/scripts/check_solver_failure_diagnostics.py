@@ -29,6 +29,105 @@ from ctf_agent.solver_worker import (  # noqa: E402
 
 
 class SolverFailureDiagnosticTests(unittest.TestCase):
+    def test_exec_create_failures_stop_one_turn_without_leaking_output(self) -> None:
+        async def scenario(items: list[dict]) -> tuple[dict | None, dict | None, int, int]:
+            driver = CodexAppServer(Path("/tmp/codex-home"), Path("/tmp/challenge"))
+            evidence: list[dict] = []
+
+            async def record_evidence(**entry):
+                evidence.append(entry)
+
+            driver.evidence_reporter = record_evidence
+
+            async def thread(_manifest):
+                return "root-thread"
+
+            async def request(method, _params):
+                self.assertEqual(method, "turn/start")
+                return {"turn": {"id": "turn-1"}}
+
+            async def progress(_code):
+                return None
+
+            driver._thread = thread
+            driver.request = request
+            driver._sandbox_parameters = lambda *_args, **_kwargs: {}
+            for item in items:
+                driver.notifications.put_nowait({
+                    "method": "item/completed",
+                    "params": {"threadId": "root-thread", "item": item},
+                })
+            driver.notifications.put_nowait({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "root-thread",
+                    "turn": {"id": "turn-1", "status": "completed"},
+                },
+            })
+            manifest = SimpleNamespace(
+                configuration=SimpleNamespace(
+                    model="gpt-6-sol", reasoning_effort="high", service_tier=None,
+                ),
+                job_mode="solve", network_enabled=True,
+            )
+            try:
+                result = await driver._turn(
+                    manifest, "fixture prompt", None, asyncio.Event(), progress,
+                )
+            except AppServerFailure as exc:
+                return None, exc.payload, driver._solve_tool_count, len(evidence)
+            return result, None, driver._solve_tool_count, len(evidence)
+
+        launcher_error = "Failed to create unified exec process: No such file or directory (os error 2)"
+
+        def command(identifier, output, exit_code):
+            return {
+                "id": identifier, "type": "commandExecution",
+                "command": "printf fixture", "aggregatedOutput": output,
+                "exitCode": exit_code,
+            }
+
+        result, failure, tools, evidence = asyncio.run(scenario([
+            command("a", launcher_error, -1),
+            command("b", launcher_error, -1),
+            command("c", launcher_error, -1),
+        ]))
+        self.assertIsNone(result)
+        self.assertEqual(failure, {"code": "codex_exec_unavailable", "retryable": False})
+        self.assertEqual(tools, 0)
+        self.assertEqual(evidence, 3)
+        public = normalize_provider_failure(failure, stage="solve").public()
+        self.assertEqual(public["code"], "codex_exec_unavailable")
+        self.assertFalse(public["retryable"])
+        self.assertNotIn("No such file", json.dumps(public))
+
+        # The command itself can fail to find a file, and may print the same
+        # phrase. Neither case indicates an app-server exec launcher failure.
+        result, failure, tools, evidence = asyncio.run(scenario([
+            command("a", launcher_error, 127),
+            command("b", "cat: missing: No such file or directory", -1),
+            command("c", launcher_error, -1),
+        ]))
+        self.assertEqual(result, {})
+        self.assertIsNone(failure)
+        self.assertEqual(tools, 2)
+        self.assertEqual(evidence, 3)
+
+        # Distinct consecutive failures are required; a working command
+        # resets the streak, and duplicate notifications do not inflate it.
+        result, failure, tools, evidence = asyncio.run(scenario([
+            command("a", launcher_error, -1),
+            command("a", launcher_error, -1),
+            command("b", launcher_error, -1),
+            command("ok", "ready", 0),
+            command("c", launcher_error, -1),
+            command("d", launcher_error, -1),
+        ]))
+        self.assertEqual(result, {})
+        self.assertIsNone(failure)
+        self.assertEqual(tools, 1)
+        self.assertEqual(evidence, 6)
+
     def test_nonretryable_unknown_provider_error_stays_nonretryable(self) -> None:
         payload = failure_with_rate_limit(
             {"code": "provider_error", "retryable": False, "message": "secret"},

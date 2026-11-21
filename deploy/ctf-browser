@@ -136,15 +136,19 @@ def browser_command(arguments: list[str], runtime: Path) -> list[str]:
 
 
 def browser_environment(runtime: Path) -> dict[str, str]:
+    # Chromium binds a Unix-domain SingletonSocket below TMPDIR.  The absolute
+    # path to a writable solve workdir can exceed sockaddr_un's 108-byte limit;
+    # the browser inherits our cwd, so a relative path keeps the socket short.
+    browser_tmp = os.path.relpath(runtime / "tmp", Path.cwd())
     environment = {
         "HOME": str(runtime / "home"),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "PATH": os.environ.get(
             "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         ),
-        "TMP": str(runtime / "tmp"),
-        "TEMP": str(runtime / "tmp"),
-        "TMPDIR": str(runtime / "tmp"),
+        "TMP": browser_tmp,
+        "TEMP": browser_tmp,
+        "TMPDIR": browser_tmp,
         "TZ": os.environ.get("TZ", "Asia/Seoul"),
         "XDG_CACHE_HOME": str(runtime / "xdg-cache"),
         "XDG_CONFIG_HOME": str(runtime / "xdg-config"),
@@ -155,13 +159,18 @@ def browser_environment(runtime: Path) -> dict[str, str]:
     return environment
 
 
+def _runtime_parent(workdir: Path) -> Path:
+    # Commands are allowed to write in codex-workdir, but the job root is
+    # read-only in the solve sandbox. Keep browser state out of snapshots.
+    temporary = workdir / "tmp"
+    _ensure_private_directory(temporary)
+    parent = temporary / "cache"
+    _ensure_private_directory(parent)
+    return parent
+
+
 def _make_runtime(workdir: Path) -> Path:
-    # Chromium creates a SingletonSocket below TMPDIR. Keep this job-local but
-    # close to /solver-scratch so the Unix socket stays below Linux's 108-byte
-    # sockaddr_un limit even when the challenge workdir is deeply nested.
-    parent = workdir.parents[2]
-    if not _real_directory(parent):
-        raise ValueError("the solve job temporary directory is unsafe")
+    parent = _runtime_parent(workdir)
     runtime = Path(tempfile.mkdtemp(prefix=".ctf-browser-", dir=parent))
     _ensure_runtime_directories(runtime)
     return runtime
@@ -200,13 +209,9 @@ def _persistent_runtime(workdir: Path, session: str) -> Path:
 
     if not SESSION_NAME.fullmatch(session):
         raise ValueError("ctf-browser session name is invalid")
-    job_root = workdir.parents[2]
-    if not _real_directory(job_root):
-        raise ValueError("the solve job temporary directory is unsafe")
-    # Chromium's TMPDIR/SingletonSocket must fit Linux's short Unix-socket
-    # path limit. Keep the runtime path short even when the user-facing name is
-    # long; the hash also prevents path punctuation from changing its shape.
-    sessions = job_root / ".b"
+    # The hash prevents path punctuation and long user-facing names from
+    # changing the runtime path shape.
+    sessions = _runtime_parent(workdir) / ".b"
     _ensure_private_directory(sessions)
     runtime = sessions / _session_key(session)
     _ensure_private_directory(runtime)

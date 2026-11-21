@@ -2,6 +2,11 @@
 
 Fingerprint the framework, learn its **safe default idiom** (auth decorator, ORM parametrization, autoescape, signed session), then find the ONE handler that opts out. The bug is the outlier against its neighbors — diff, don't CVE-grep. Everything below is web-specific tactics + the tools to run them; base.md owns the solve loop, submission/POISON, belief≠proof, local→remote/PoW, and the `notes/` model.
 
+## Evidence budget on a live target
+Map the goal, trust boundary, controlled input, and one cheapest falsifying test before probing. The tactics below are candidates, not a checklist to run in full; choose only those supported by a route, response, source line, or browser behavior. Distinguish user and admin-bot contexts, and record which context produced each observation.
+
+Treat a 429, repeated timeout, challenge reset, or temporary hide as a change in target availability. Respect `Retry-After` and contest limits; pause or reduce requests instead of repeating the same probe. If a browser helper fails before navigation because of its own runtime, report the tool failure and use a different observation path; it is not evidence that the payload failed. At the review point described in base.md, compare the shortest remaining path to the Flag against the last verified observation, and stop repeating variants that have no discriminating result.
+
 ## Source-first when source ships
 Map the supplied source quickly. If a target endpoint is supplied, check one normal response against it before expanding the analysis. When there is no endpoint, use a runnable local copy or the supplied code as the observation. Reading every file before the first observation or fuzzing blindly wastes time.
 1. **Stack** from manifests: `requirements.txt`/`Pipfile`, `package.json`, `composer.json`, `Gemfile`, `go.mod`, framework imports, pinned versions (record in `notes/ANALYSIS.md` — version decides which gadget/escape works).
@@ -64,7 +69,7 @@ No source? Map the app first: capture one normal request/response per feature, t
 - **SSRF/Host**: `http.Get("http://"+r.Host+"/...")` → Host header controls target.
 - **Parser mismatch**: proxy vs `net/http` normalize paths differently → 403 bypass.
 
-### Cross-stack always-check
+### Cross-stack candidates when the observed surface fits
 IDOR (increment/swap IDs & UUIDs; try all-zero `00000000-…`/default admin id) · SSRF (`http://127.0.0.1`, `169.254.169.254` metadata, `file://`, `gopher://`) · path traversal (`../../etc/passwd`, `%2e%2e%2f`, double-encode, null byte on legacy) · JWT/session (decode, `alg:none`, crack HS256, tamper) · CORS / open redirect / Host-header if flag is auth/origin-gated · **parser disagreement** (proxy vs app, URL-parser vs fetcher, sanitizer vs browser, serializer vs filter — the classic CTF web bug).
 
 ## Recon & OOB
@@ -214,16 +219,7 @@ flask-unsign --sign --cookie "{'user':'admin','admin':True}" --secret 'FOUND'
 Bypass ext/MIME: double-ext `shell.png.php`, `.phtml`/`.phar`, `.htaccess` (`AddType application/x-httpd-php .lol`), null-byte, MIME spoof + magic bytes (PNG/PHP polyglot: `<?php` after `IEND`). ZIP upload with `.php` inside → extract to web dir. `disable_functions` on → `scandir('/')`+`file_get_contents('/flag')`. Python arbitrary write → drop `.so`/overwrite `.pyc` for import RCE. Symlink-in-zip (ZipSlip) → read/write outside dir.
 
 ### Race / TOCTOU
-Double-spend, coupon/gift-card reuse, one-time token replay, balance underflow, registration collision: fire **20–50 identical requests in parallel** to beat the check→use window.
-```python
-import asyncio, httpx
-async def hit(c): return (await c.post("/redeem", data={"code":"X"})).status_code
-async def main():
-    async with httpx.AsyncClient(base_url="https://TARGET") as c:
-        print(await asyncio.gather(*[hit(c) for _ in range(40)]))
-asyncio.run(main())
-```
-Tighter timing → Turbo Intruder or the HTTP/2 single-packet attack (all requests in one frame).
+For double-spend, one-time token, or check-then-use behavior, confirm the state transition locally or with a small number of remote requests first. Increase concurrency only when the observed race window and contest rules justify it. Bound the total requests and stop on 429 or service degradation; use a local harness for high-volume timing experiments. A race is a hypothesis until a controlled replay shows the expected state change.
 
 ### SSRF bypass ladder (allowlist / regex defeats)
 | Rung | Payload |

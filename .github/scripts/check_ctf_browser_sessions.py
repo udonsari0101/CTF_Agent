@@ -68,8 +68,8 @@ class BrowserSessionTests(unittest.TestCase):
         self.assertFalse((another_job / "profile" / "cookie-marker").exists())
 
     def test_unsafe_existing_session_path_is_rejected(self) -> None:
-        sessions = self.workdir.parents[2] / ".b"
-        sessions.mkdir()
+        sessions = browser._runtime_parent(self.workdir) / ".b"
+        sessions.mkdir(mode=0o700)
         (sessions / browser._session_key("file")).write_text("unsafe", encoding="ascii")
         with self.assertRaises(ValueError):
             browser._persistent_runtime(self.workdir, "file")
@@ -112,7 +112,10 @@ class BrowserSessionTests(unittest.TestCase):
         self.assertEqual(profiles[1], profiles[2])
         self.assertEqual(seen_markers, [False, False, True])
         self.assertTrue((profiles[1] / "marker").exists())
-        self.assertTrue((self.workdir.parents[2] / ".b" / browser._session_key("login")).exists())
+        named_runtime = self.workdir / "tmp" / "cache" / ".b" / browser._session_key("login")
+        self.assertEqual(profiles[1], named_runtime / "profile")
+        self.assertTrue(named_runtime.exists())
+        self.assertFalse((self.workdir.parents[2] / ".b").exists())
 
     @unittest.skipUnless(os.name == "posix", "flock is specific to the Linux worker")
     def test_same_session_is_locked_without_deleting_active_state(self) -> None:

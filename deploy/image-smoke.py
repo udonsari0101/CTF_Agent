@@ -476,6 +476,11 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         "<main>browser-ready</main>",
         encoding="utf-8",
     )
+    # Model the Codex command sandbox: the job tree is readable, while only
+    # codex-workdir (and its tmp directory) is writable by challenge tools.
+    browser_job_root = browser_workdir.parents[2]
+    browser_job_mode = browser_job_root.stat().st_mode & 0o777
+    browser_job_root.chmod(0o500)
     browser_result = subprocess.run(
         [
             str(ctf_browser),
@@ -492,12 +497,23 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     assert browser_result.returncode == 0, browser_result.stderr.strip()
     assert browser_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert not list(browser_workdir.parents[2].glob(".ctf-browser-*"))
+    assert not list((browser_workdir / "tmp" / "cache").glob(".ctf-browser-*"))
 
     browser_cookies_seen = []
     browser_submissions = []
 
     class BrowserSessionHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/event-burst?i="):
+                self.send_response(204)
+                self.end_headers()
+                return
+            if self.path == "/late-xhr?token=private":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"late-response")
+                return
             if self.path == "/action":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -610,11 +626,40 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         )
         assert reused.returncode == 0, reused.stderr.strip()[-3000:]
         assert json.loads(reused.stdout)["body"].strip().splitlines()[-1] == "1"
+
+        burst_steps = browser_workdir / "tmp" / "burst.json"
+        burst_steps.write_text(json.dumps([{"action": "evaluate", "expression": (
+            "(async()=>{for(let i=0;i<120;i++) await fetch('/event-burst?i='+i);"
+            "await new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();"
+            "xhr.open('GET','/late-xhr?token=private');xhr.onload=resolve;"
+            "xhr.onerror=reject;xhr.send()});return 'done'})()"
+        )}]), encoding="utf-8")
+        burst = subprocess.run(
+            [str(ctf_browser_act), "--steps=tmp/burst.json",
+             f"http://127.0.0.1:{browser_server.server_port}/action"],
+            capture_output=True, text=True, timeout=45,
+            cwd=browser_workdir, env=tool_env,
+        )
+        assert burst.returncode == 0, burst.stderr.strip()[-3000:]
+        burst_result = json.loads(burst.stdout)
+        assert burst_result["actions"][-1]["result"] == "done"
+        assert len(burst_result["network"]) == 200
+        assert burst_result["network_dropped_events"] >= 40
+        assert burst_result["dropped_events"] == (
+            burst_result["network_dropped_events"]
+            + burst_result["console_dropped_events"]
+        )
+        assert any("/action" in event["url"] for event in burst_result["network"][:40])
+        assert any(event.get("status") == 200 and "/late-xhr?" in event["url"]
+                   for event in burst_result["network"])
+        assert "private" not in burst.stdout
     finally:
         browser_server.shutdown()
         browser_server.server_close()
         browser_thread.join(timeout=5)
+    browser_job_root.chmod(browser_job_mode)
     assert not list(browser_workdir.parents[2].glob(".ctf-browser-*"))
+    assert not list((browser_workdir / "tmp" / "cache").glob(".ctf-browser-*"))
     print("Pinned ctf_agent CTF toolchain passed functional checks")
 
     async def protocol_check():

@@ -88,7 +88,8 @@ jobs:
           [[ "$image_bytes" =~ ^[1-9][0-9]*$ ]]
           # Keep stdin attached so Python executes the smoke script. Provide
           # the same writable home/scratch paths the solver has in Compose.
-          docker run --rm -i --network none \
+          docker run --rm -i --network none --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
             --tmpfs /data:uid=10001,gid=10001,mode=0700 \
             --tmpfs /solver-scratch:uid=10001,gid=10001,mode=0700 \
             --entrypoint python "$app_tag" - < deploy/image-smoke.py
