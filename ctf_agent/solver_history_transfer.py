@@ -38,7 +38,8 @@ JOB_FIELDS = (
     "continuation_mode", "continuation_source_job_id", "continuation_confirmed",
     "writeup_instruction", "writeup_locale", "source_writeup_sha256",
     "source_solver_job_id", "challenge_input_sha256", "challenge_base_sha256",
-    "challenge_description", "remote_mode", "flag_rejected_at", "error_json",
+    "challenge_description", "remote_mode", "remote_absence_confirmed",
+    "flag_rejected_at", "error_json",
     "created_at", "claimed_at", "staged_at", "running_at", "first_activity_at",
     "flag_at", "writeup_at", "updated_at", "released_at",
 )
@@ -88,7 +89,15 @@ def _emit(db: sqlite3.Connection, owner: str, workspace_id: str,
             query += " AND j.challenge_id=?"
             params += (challenge_id,)
         for job in db.execute(query + " ORDER BY j.created_at,j.id", params):
-            write("job", {field: job[field] for field in JOB_FIELDS})
+            # Older databases may be exported while the solver schema upgrade
+            # is still pending. Their jobs predate this option and mean false.
+            exported = {field: job[field] for field in JOB_FIELDS
+                        if field != "remote_absence_confirmed"}
+            exported["remote_absence_confirmed"] = (
+                job["remote_absence_confirmed"]
+                if "remote_absence_confirmed" in job.keys() else 0
+            )
+            write("job", exported)
             for event in db.execute(
                 "SELECT sequence,kind,event_json,created_at FROM solver_job_events "
                 "WHERE job_id=? ORDER BY sequence", (job["id"],),
@@ -208,6 +217,9 @@ def inspect_history(bundle: zipfile.ZipFile, descriptor: dict[str, Any],
                     and data.get("reasoning_effort") == "ultra"
                     and data.get("job_mode") == "solve"
                 )
+            if "remote_absence_confirmed" not in data:
+                # Existing v4 archives did not record this per-job choice.
+                data["remote_absence_confirmed"] = 0
             if (set(data) != set(JOB_FIELDS) or not _identifier(data.get("id"))
                     or data["id"] in jobs or data.get("challenge_id") not in challenge_ids
                     or data.get("provider") not in {"codex", "claude"}
@@ -225,6 +237,8 @@ def inspect_history(bundle: zipfile.ZipFile, descriptor: dict[str, Any],
                         "ultra_auto_attempted", "ultracode", "subagents_enabled", "max_reasoning_available",
                         "continuation_confirmed"
                     ))
+                    or type(data.get("remote_absence_confirmed")) is not int
+                    or data["remote_absence_confirmed"] not in (0, 1)
                     or isinstance(data.get("last_event_sequence"), bool)
                     or not isinstance(data.get("last_event_sequence"), int)
                     or data["last_event_sequence"] < 0
@@ -311,6 +325,10 @@ def import_history(db: sqlite3.Connection, bundle: zipfile.ZipFile,
             data["continuation_confirmed"] = 0
         data["ultra_escalation_mode"] = "off"
         data["ultra_auto_attempted"] = 1
+        if "remote_absence_confirmed" not in columns:
+            # A pre-upgrade destination has no column to retain this display
+            # field. Its schema upgrade will default historical jobs to false.
+            data.pop("remote_absence_confirmed")
         names = list(data)
         db.execute(
             f"INSERT INTO solver_jobs({','.join(names)}) VALUES({','.join('?' for _ in names)})",

@@ -36,6 +36,14 @@ def main():
         initialize(settings)
         with closing(connect(settings)) as db, db:
             db.executescript(SCHEMA)
+            if "remote_absence_confirmed" not in {
+                row[1] for row in db.execute("PRAGMA table_info(solver_jobs)")
+            }:
+                # This check also runs against a pre-upgrade checkout.
+                db.execute(
+                    "ALTER TABLE solver_jobs ADD COLUMN remote_absence_confirmed "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(remote_absence_confirmed IN (0,1))"
+                )
             owner = db.execute("SELECT id FROM users LIMIT 1").fetchone()[0]
             ws, ch, job, followup_job, orphan_job, guidance = uid(), uid(), uid(), uid(), uid(), uid()
             source_account = "source_account_" + uid()
@@ -65,9 +73,9 @@ def main():
                 (guidance, job, owner, "Try another path", "next_turn", "queued", now - 20),
             )
             db.execute(
-                "INSERT INTO solver_jobs(id,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,model,reasoning_effort,status,created_at,updated_at,continuation_mode,continuation_source_job_id,source_solver_job_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO solver_jobs(id,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,model,reasoning_effort,status,created_at,updated_at,continuation_mode,continuation_source_job_id,source_solver_job_id,remote_absence_confirmed) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (followup_job, owner, ws, ch, source_account, "account label", "codex", "gpt-6-sol", "ultra", "completed", now - 10, now,
-                 "session", job, job),
+                 "session", job, job, 1),
             )
             db.execute(
                 "INSERT INTO solver_jobs(id,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,model,reasoning_effort,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -96,6 +104,14 @@ def main():
                 assert "database space" in str(exc)
         with zipfile.ZipFile(whole) as bundle:
             assert source_account.encode() not in bundle.read("solver-history.jsonl")
+            exported_jobs = [
+                json.loads(raw)["data"]
+                for raw in bundle.read("solver-history.jsonl").splitlines()
+                if json.loads(raw)["type"] == "job"
+            ]
+            assert {row["id"]: row["remote_absence_confirmed"] for row in exported_jobs} == {
+                job: 0, followup_job: 1,
+            }
         upload_id = uid()
         imported = import_workspace(settings, layout, owner, whole, source_upload_id=upload_id)
         assert imported == import_workspace(settings, layout, owner, whole, source_upload_id=upload_id)
@@ -117,6 +133,7 @@ def main():
             continuation = db.execute("SELECT * FROM solver_jobs WHERE challenge_id=? AND status='completed'", (imported_challenge,)).fetchone()
             assert continuation and continuation["continuation_source_job_id"] == historical["id"]
             assert continuation["id"] != followup_job and continuation["imported_historical"] == 1
+            assert continuation["remote_absence_confirmed"] == 1
         coordinator = SolverExchangeCoordinator(
             settings.database_path, settings.data_dir, settings.data_dir / "accounts",
             settings.data_dir / "solver-exchange", accept_new_jobs=False,
@@ -141,6 +158,7 @@ def main():
                 entry = json.loads(raw)
                 if entry["type"] == "job":
                     entry["data"].pop("subagents_enabled")
+                    entry["data"].pop("remote_absence_confirmed")
                 entries.append(json.dumps(entry, ensure_ascii=False, separators=(",", ":")).encode() + b"\n")
             payload = b"".join(entries)
             manifest["solver_history"]["size"] = len(payload)
@@ -157,10 +175,10 @@ def main():
         )
         with closing(connect(settings)) as db:
             imported_flags = db.execute(
-                "SELECT subagents_enabled FROM solver_jobs WHERE challenge_id=? ORDER BY created_at",
+                "SELECT subagents_enabled,remote_absence_confirmed FROM solver_jobs WHERE challenge_id=? ORDER BY created_at",
                 (old_v4_import["challenge_id"],),
             ).fetchall()
-            assert imported_flags and all(row[0] == 1 for row in imported_flags)
+            assert imported_flags and all(row[0] == 1 and row[1] == 0 for row in imported_flags)
         # A v1 bundle remains readable. Removing the versioned history section makes
         # the old manifest shape and preserves all challenge/file data.
         legacy = root / "legacy.zip"
