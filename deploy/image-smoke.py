@@ -14,6 +14,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 
 from fastapi.testclient import TestClient
 
@@ -501,9 +502,29 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
 
     browser_cookies_seen = []
     browser_submissions = []
+    browser_rate_requests = []
+    browser_slow_requests = []
 
     class BrowserSessionHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/limited?") or self.path.startswith("/limited-unsafe?"):
+                browser_rate_requests.append(self.path)
+                self.send_response(429)
+                self.send_header("Retry-After", (
+                    "7" if self.path.startswith("/limited?") else "private-unsafe-value"
+                ))
+                self.end_headers()
+                self.wfile.write(b"rate limited")
+                return
+            if self.path.startswith("/slow-initial?"):
+                browser_slow_requests.append(self.path)
+                time.sleep(2)
+                try:
+                    self.send_response(200)
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             if self.path.startswith("/event-burst?i="):
                 self.send_response(204)
                 self.end_headers()
@@ -626,6 +647,49 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         )
         assert reused.returncode == 0, reused.stderr.strip()[-3000:]
         assert json.loads(reused.stdout)["body"].strip().splitlines()[-1] == "1"
+
+        limited_json = browser_workdir / "tmp" / "limited.json"
+        limited = subprocess.run(
+            [str(ctf_browser_act), "--output=tmp/limited.json",
+             f"http://127.0.0.1:{browser_server.server_port}/limited?token=private"],
+            capture_output=True, text=True, timeout=30,
+            cwd=browser_workdir, env=tool_env,
+        )
+        assert limited.returncode == 0, limited.stderr.strip()[-3000:]
+        limited_result = json.loads(limited.stdout)
+        assert limited_result["actions"][0]["result"] == 429
+        assert any(event.get("status") == 429 and event.get("retry_after") == "7"
+                   for event in limited_result["network"])
+        assert browser_rate_requests == ["/limited?token=private"]
+        assert "private" not in limited.stdout + limited_json.read_text()
+
+        unsafe = subprocess.run(
+            [str(ctf_browser_act),
+             f"http://127.0.0.1:{browser_server.server_port}/limited-unsafe?token=private"],
+            capture_output=True, text=True, timeout=30,
+            cwd=browser_workdir, env=tool_env,
+        )
+        assert unsafe.returncode == 0, unsafe.stderr.strip()[-3000:]
+        unsafe_result = json.loads(unsafe.stdout)
+        assert unsafe_result["actions"][0]["result"] == 429
+        assert not any("retry_after" in event for event in unsafe_result["network"])
+        assert "private-unsafe-value" not in unsafe.stdout
+
+        partial_json = browser_workdir / "tmp" / "partial-navigation.json"
+        slow = subprocess.run(
+            [str(ctf_browser_act), "--timeout=1000",
+             "--output=tmp/partial-navigation.json",
+             f"http://127.0.0.1:{browser_server.server_port}/slow-initial?token=private"],
+            capture_output=True, text=True, timeout=30,
+            cwd=browser_workdir, env=tool_env,
+        )
+        assert slow.returncode == 2
+        partial = json.loads(slow.stdout)
+        assert partial == json.loads(partial_json.read_text(encoding="utf-8"))
+        assert partial["actions"][0]["stage"] == "initial_navigation"
+        assert partial["actions"][0]["error"] == "navigation_timeout"
+        assert browser_slow_requests == ["/slow-initial?token=private"]
+        assert "private" not in slow.stdout + slow.stderr + partial_json.read_text()
 
         burst_steps = browser_workdir / "tmp" / "burst.json"
         burst_steps.write_text(json.dumps([{"action": "evaluate", "expression": (
