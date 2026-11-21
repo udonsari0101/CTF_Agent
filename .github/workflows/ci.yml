@@ -307,6 +307,10 @@ jobs:
         run: python .github/scripts/check_solver_continuation_contract.py
       - name: Check evidence-gated solve continuation
         run: python .github/scripts/check_solver_progress_nudges.py
+      - name: Check explicit offline continuation
+        run: python .github/scripts/check_solver_no_remote_continue.py
+      - name: Check flag handoff options
+        run: python .github/scripts/check_submit_flag_sentinels.py
       - name: Check solver timing milestones
         run: python .github/scripts/check_solver_timing.py
       - name: Check challenge solve-time sorting

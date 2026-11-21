@@ -43,6 +43,8 @@ class SolveInput(BaseModel):
     subagents_enabled: bool | None = None
     ultra_escalation_mode: Literal["ask", "auto", "off"] = "ask"
     writeup_locale: Literal["ko", "en"] = "ko"
+    # Explicit one-shot answer to a request from an already offline challenge.
+    confirm_no_remote: bool = False
 
 
 class WriteupRefineInput(SolveInput):
@@ -1020,6 +1022,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         max_reasoning_available=max_reasoning_available,
                         ultra_escalation_mode=ultra_mode,
                         subagents_enabled=payload.subagents_enabled,
+                        confirm_no_remote=payload.confirm_no_remote,
                         writeup_locale=payload.writeup_locale,
                     )
                     service.runtime_ready, service.runtime_error = True, None
@@ -1038,6 +1041,7 @@ def register_solver(app, require_auth, require_admin, settings, database):
                         configuration_override=configuration_override,
                         expected_account_id=expected_account_id,
                         max_reasoning_available=max_reasoning_available,
+                        confirm_no_remote=payload.confirm_no_remote,
                         writeup_locale=payload.writeup_locale,
                     )
             service.notify()

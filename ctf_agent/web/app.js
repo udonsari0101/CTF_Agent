@@ -1590,12 +1590,13 @@ function solverPanelMarkup(job, events = [], loading = false) {
   const modelText = [job.account_label, model.provider, model.model, model.reasoning_effort && `${i18n.t('추론')} ${model.reasoning_effort}`, model.ultracode ? 'Ultracode' : null, model.service_tier === 'fast' ? 'Fast 1.5×' : null].filter(Boolean).join(' · ');
   const flag = typeof job.flag === 'string' && job.flag ? job.flag : '';
   const usableFlag = flag && !job.flag_rejected;
+  const noRemoteConfirmable = job.confirm_no_remote_eligible === true;
   const controls = active
     ? `<button class="danger" data-action="cancel-solver" ${job.cancel_requested ? 'disabled' : ''}>${job.cancel_requested ? '중단 처리 중' : '풀이 중단'}</button>`
     : job.error?.code === 'ultra_escalation_requested'
       ? `${job.ultra_escalation?.started_job_id ? '<span class="form-hint">Ultra 작업으로 이어가는 중</span>' : job.ultra_escalation?.auto_pending ? '<span class="form-hint">Ultra 전환 준비 중</span>' : job.ultra_escalation?.eligible ? `<button class="primary" data-action="approve-ultra-escalation" ${solverAttachmentHold() ? 'data-attachment-hold disabled' : ''}>Ultra로 이어가기</button>` : '<span class="form-hint">이전 Ultra 요청이 만료됐습니다. 현재 설정으로 다시 풀 수 있습니다.</span>'}<button data-action="start-solver" ${solverStartAttributes()}>현재 설정으로 다시 풀기</button>`
     : job.phase === 'needs_input'
-      ? `<button data-action="edit-challenge">문제 입력 수정</button>${currentChallenge?.remote_mode === 'endpoint' || job.input_ready_to_retry === true ? `<button class="primary" data-action="start-solver" ${solverStartAttributes()}>계속 풀기</button>` : '<span class="form-hint">요청된 접속 정보나 파일을 먼저 추가하세요.</span>'}`
+      ? `<button data-action="edit-challenge">문제 입력 수정</button>${currentChallenge?.remote_mode === 'endpoint' || job.input_ready_to_retry === true ? `<button class="primary" data-action="start-solver" ${solverStartAttributes()}>계속 풀기</button>` : noRemoteConfirmable ? `<button class="primary" data-action="confirm-no-remote" ${solverStartAttributes()}>${tr('원격 정보 없음 확인 후 계속 풀기')}</button>` : '<span class="form-hint">요청된 접속 정보나 파일을 먼저 추가하세요.</span>'}`
       : job.flag_rejected
       ? `<button class="primary" data-action="start-solver" ${solverStartAttributes()}>오답을 제외하고 다시 풀기</button>`
       : job.phase === 'completed'
@@ -2254,6 +2255,7 @@ function challengeInputMarkup(challenge, workspaceId) {
     <label><span class="sr-only">원격 대상</span><select name="remote_mode" aria-label="원격 대상"><option value="endpoint" ${mode === 'endpoint' ? 'selected' : ''}>접속 정보</option><option value="none" ${mode === 'none' ? 'selected' : ''}>원격 대상 없음</option></select></label>
     <label class="challenge-inline-remote${mode === 'none' ? ' is-disabled' : ''}"><span class="sr-only">원격 접속 정보</span><input name="remote" value="${esc(challenge.remote || '')}" maxlength="2000" placeholder="URL 또는 nc host port" aria-label="원격 접속 정보" ${mode === 'endpoint' ? 'required' : 'disabled'}></label>
     <button type="submit" class="small primary" ${held ? 'data-attachment-hold ' : ''}${held || waitingForCorrection ? 'disabled' : ''}>계속 풀기</button>
+    ${waitingForCorrection && challenge.latest_solver?.confirm_no_remote_eligible === true ? `<button type="button" class="small primary" data-action="confirm-list-no-remote" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" ${held ? 'data-attachment-hold disabled' : ''}>${tr('원격 정보 없음 확인 후 계속 풀기')}</button>` : ''}
   </form>`;
 }
 
@@ -2742,7 +2744,7 @@ async function completeListChallenge(button) {
   toast('수동 완료로 기록했습니다.');
 }
 
-async function startListSolver(button) {
+async function startListSolver(button, confirmNoRemote = false) {
   const workspaceId = button.dataset.workspaceId, challengeId = button.dataset.id;
   if (!currentWorkspace || currentWorkspace.id !== workspaceId) throw new Error(i18n.t('문제 목록을 다시 불러와 주세요.'));
   requireNoAttachmentWork(workspaceId,challengeId);
@@ -2764,7 +2766,7 @@ async function startListSolver(button) {
       toast(i18n.t('로그인한 계정과 모델·추론 수준을 선택해 주세요.'),true);
       return;
     }
-    await startSolver();
+    await startSolver(confirmNoRemote);
     started = true;
     if (currentWorkspace?.id === workspaceId) await refreshChallenges().catch(() => {});
     toast(i18n.t('“{name}” 풀이를 시작했습니다.').replace('{name}',() => name || i18n.t('문제')));
@@ -4718,7 +4720,7 @@ function repaintSolverConfiguration(workspaceId, challengeId, generation) {
     for (const child of children.slice(index + 1)) current.append(child);
   } else if (!focused) current.replaceWith(next);
   // A focused field absent from the new state updates when focus leaves.
-  panel.querySelectorAll('[data-action="start-solver"]').forEach(button => {
+  panel.querySelectorAll('[data-action="start-solver"],[data-action="confirm-no-remote"]').forEach(button => {
     button.disabled = !solverConfigurationReady() || button.hasAttribute('data-attachment-hold');
   });
 }
@@ -4845,10 +4847,15 @@ async function loadSolver(workspaceId, challengeId) {
   await loadWriteupRefinement(workspaceId,challengeId,generation);
 }
 
-async function startSolver() {
+async function startSolver(confirmNoRemote = false) {
   const challenge = currentChallenge, workspaceId = challenge.workspace_id, challengeId = challenge.id;
   requireNoAttachmentWork(workspaceId,challengeId);
   if (!solverConfigurationReady()) throw new Error(i18n.t('로그인된 계정과 모델·추론 수준을 선택해 주세요.'));
+  if (confirmNoRemote && !(
+    challenge.remote_mode === 'none' && currentSolverJob?.phase === 'needs_input'
+    && currentSolverJob?.error?.code === 'remote_input_required'
+    && currentSolverJob?.confirm_no_remote_eligible === true
+  )) throw new Error(i18n.t('확인할 원격 정보 요청이 없습니다. 문제 상태를 다시 불러와 주세요.'));
   if (solverPollTimer) clearTimeout(solverPollTimer);
   const generation = ++solverRendering;
   solverPollTimer = null; currentSolverJob = null; currentSolverEvents = []; currentSolverGuidance = []; solverEventCursor = 0; solverGuidanceDraft = ''; solverListedFlag = ''; solverSyncedWriteup = '';
@@ -4863,6 +4870,7 @@ async function startSolver() {
       ...(solverProvider === 'codex' ? {subagents_enabled:solverSubagentsEnabled} : {}),
       ultra_escalation_mode:solverUltraEscalationEligible() ? solverUltraEscalationMode : 'off',
       writeup_locale:i18n.locale,
+      ...(confirmNoRemote ? {confirm_no_remote:true} : {}),
     }});
     if (payload.capacity?.warning && payload.capacity.warning_message) {
       toast(payload.capacity.warning_message);
@@ -5271,6 +5279,11 @@ function syncInlineInput(form) {
   remote.closest('label').classList.toggle('is-disabled',!enabled);
   const submit = form.querySelector('button[type="submit"]');
   submit.disabled = submit.hasAttribute('data-attachment-hold') || inlineInputWaiting(form);
+  const confirm = form.querySelector('[data-action="confirm-list-no-remote"]');
+  if (confirm) {
+    confirm.hidden = !inlineInputWaiting(form);
+    confirm.disabled = confirm.hasAttribute('data-attachment-hold');
+  }
 }
 
 // Runs on every chunk, so it patches what is there: a rebuilt card would lose focus.
@@ -5284,16 +5297,18 @@ function paintCardAttachmentWork(card, work) {
   if (start) { start.toggleAttribute('data-attachment-hold',held); start.disabled = held || start.hasAttribute('aria-busy'); }
   const submit = card.querySelector('.challenge-inline-input button[type="submit"]');
   if (submit) { submit.toggleAttribute('data-attachment-hold',held); submit.disabled = held || inlineInputWaiting(submit.form); }
+  const confirm = card.querySelector('[data-action="confirm-list-no-remote"]');
+  if (confirm) { confirm.toggleAttribute('data-attachment-hold',held); confirm.disabled = held; }
 }
 
 function paintSolverStartHold() {
   const panel = detail.querySelector('#solver-panel');
   if (!panel) return;
   const held = solverAttachmentHold();
-  const controls = [...panel.querySelectorAll('[data-action="start-solver"],[data-action="approve-ultra-escalation"]')];
+  const controls = [...panel.querySelectorAll('[data-action="start-solver"],[data-action="confirm-no-remote"],[data-action="approve-ultra-escalation"]')];
   for (const control of controls) {
     control.toggleAttribute('data-attachment-hold',held);
-    control.disabled = held || (control.dataset.action === 'start-solver' && !solverConfigurationReady());
+    control.disabled = held || (control.dataset.action !== 'approve-ultra-escalation' && !solverConfigurationReady());
   }
   const hint = panel.querySelector(':scope > .solver-attachment-hold');
   if (!held || !controls.length) hint?.remove();
@@ -6390,12 +6405,14 @@ document.addEventListener('click', event => {
     'copy-list-writeup': () => copyChallengeWriteup(button),
     'complete-list-challenge': () => completeListChallenge(button),
     'start-list-solver': () => startListSolver(button),
+    'confirm-list-no-remote': () => startListSolver(button,true),
     'filter': async () => { selectedStatus = button.dataset.status; await refreshChallenges(); },
     'clear-filter': () => clearChallengeFilters(),
     'save-notes': () => saveNotes(),
     'copy-notes': async () => { const notes = document.querySelector('#notes-editor').value; const result = await copyText(notes); copyToast(result, notes); },
     'copy-flag': async () => { const flag = currentChallenge.flag || ''; const result = await copyText(flag); copyToast(result, flag); },
     'start-solver': () => startSolver(),
+    'confirm-no-remote': () => startSolver(true),
     'confirm-solver-retry-settings': () => {
       clearSolverRetryWarning();
       repaintSolverConfiguration(currentWorkspace?.id,currentChallenge?.id,solverRendering);

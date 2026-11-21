@@ -739,14 +739,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def latest_solver_summary(db, workspace_id: str, challenge_id: str) -> dict | None:
         """Return the current owner's newest safe run metadata for list cards."""
 
-        from .solver_exchange import remote_input_ready_to_retry
+        from .solver_exchange import remote_absence_confirmation_available, remote_input_ready_to_retry
 
         row = db.execute(
             """SELECT j.id,j.job_mode,j.owner_user_id,j.workspace_id,j.challenge_id,
                        j.continuation_source_job_id,j.account_label,j.provider,j.model,
                        j.reasoning_effort,j.service_tier,j.status,j.flag,j.flag_rejected_at,
                        j.created_at,j.updated_at,j.released_at,
-                       j.released_ingested,j.error_json,j.challenge_input_sha256,
+                       j.released_ingested,j.imported_historical,j.error_json,j.challenge_input_sha256,
                        j.remote_mode,cp.source_job_id AS current_retry_source_job_id
                FROM solver_jobs j
                LEFT JOIN solver_retry_checkpoints cp
@@ -780,6 +780,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # the provider's error text or requested connection details here.
             "input_request_kind": input_request_kind,
             "input_ready_to_retry": remote_input_ready_to_retry(db, row),
+            "confirm_no_remote_eligible": remote_absence_confirmation_available(db, row),
             "configuration": {
                 "provider": row["provider"],
                 "model": row["model"],

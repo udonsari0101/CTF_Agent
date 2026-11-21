@@ -16,7 +16,7 @@ const implementation = [
   section('async function startSolver(', 'async function approveUltraEscalation('),
 ].join('\n');
 
-async function scenario(configurationReady, provider) {
+async function scenario(configurationReady, provider, confirmNoRemote = false) {
   const calls = [];
   const notices = [];
   let opened = false;
@@ -48,7 +48,8 @@ async function scenario(configurationReady, provider) {
     async openChallenge(id, waitForConfiguration) {
       assert.equal(id,'c'); assert.equal(waitForConfiguration,true);
       opened = true;
-      context.currentChallenge = {id:'c',workspace_id:'w'};
+      context.currentChallenge = {id:'c',workspace_id:'w',remote_mode:confirmNoRemote ? 'none' : 'unknown'};
+      if (confirmNoRemote) context.currentSolverJob = {phase:'needs_input',error:{code:'remote_input_required'},confirm_no_remote_eligible:true};
       context.detail.open = true;
     },
     solverConfigurationReady:()=>configurationReady,
@@ -72,7 +73,7 @@ async function scenario(configurationReady, provider) {
   };
   vm.createContext(context);
   vm.runInContext(implementation,context);
-  await vm.runInContext('startListSolver(button)',Object.assign(context,{button}));
+  await vm.runInContext(`startListSolver(button,${confirmNoRemote})`,Object.assign(context,{button}));
   return {calls,notices,opened,refreshes,button,context};
 }
 
@@ -102,5 +103,8 @@ async function scenario(configurationReady, provider) {
   assert.equal(missing.context.detail.open,true);
   assert.equal(missing.notices.some(notice=>notice.error),true);
   assert.equal(missing.button.disabled,false);
+  const offline = await scenario(true,'codex',true);
+  assert.equal(offline.calls.length,1);
+  assert.equal(offline.calls[0].confirm_no_remote,true);
   console.log('PASS: list start uses validated account/model settings and opens detail on missing configuration');
 })().catch(error=>{console.error(error);process.exitCode=1;});

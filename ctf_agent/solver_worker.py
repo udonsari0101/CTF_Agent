@@ -69,6 +69,7 @@ from .solver_retry import (
     solver_artifact_from_bytes,
 )
 from .request_remote import MAX_REQUEST_BYTES
+from .submit_flag import InvalidCandidate, validate_candidate
 from .solve_repeat import SolveRepeatObserver
 from .writeup_publication import (
     contains_internal_operation,
@@ -690,6 +691,7 @@ class JobManifest:
     # None is reserved for pre-upgrade manifests and direct test fixtures.
     # Those retain the former Ultra-only default.
     subagents_enabled: bool | None = None
+    remote_absence_confirmed: bool = False
     writeup_locale: str = "ko"
     related_context: str = field(default="", repr=False)
     network_enabled: bool = False
@@ -720,6 +722,7 @@ class JobManifest:
             "flag_format",
             "remote",
             "remote_mode",
+            "remote_absence_confirmed",
             "provider",
             "model",
             "reasoning_effort",
@@ -756,6 +759,7 @@ class JobManifest:
         flag_format = payload.get("flag_format", "")
         remote = payload.get("remote", "")
         remote_mode = payload.get("remote_mode", "endpoint" if remote else "unknown")
+        remote_absence_confirmed = payload.get("remote_absence_confirmed", False)
         digest = payload.get("auth_sha256")
         challenge_input_sha256 = payload.get("challenge_input_sha256", "")
         if not isinstance(challenge_input_sha256, str) or (
@@ -800,6 +804,8 @@ class JobManifest:
             or ((remote_mode == "endpoint") != bool(remote))
         ):
             raise WorkerRefusal("invalid_manifest", "The remote mode and endpoint do not match.")
+        if type(remote_absence_confirmed) is not bool or (remote_absence_confirmed and remote_mode != "none"):
+            raise WorkerRefusal("invalid_manifest", "The remote absence confirmation is invalid.")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise WorkerRefusal("invalid_manifest", "인증 파일 무결성 값을 확인할 수 없습니다.")
         if not isinstance(codex_version, str) or not _VERSION.fullmatch(codex_version):
@@ -920,6 +926,11 @@ class JobManifest:
             retry_checkpoint = None if raw_checkpoint is None else parse_checkpoint(raw_checkpoint)
         except (TypeError, ValueError) as exc:
             raise WorkerRefusal("invalid_manifest", "이전 오답 풀이 기록을 확인할 수 없습니다.") from exc
+        if remote_absence_confirmed and (
+            job_mode != "solve" or retry_checkpoint is None
+            or retry_checkpoint.reason != "needs_remote"
+        ):
+            raise WorkerRefusal("invalid_manifest", "The remote absence confirmation has no matching checkpoint.")
         resume_flag = payload.get("resume_flag")
         if resume_flag is not None and (
             job_mode != "solve"
@@ -1012,6 +1023,7 @@ class JobManifest:
             flag_format=flag_format.strip(),
             remote=remote.strip(),
             remote_mode=remote_mode,
+            remote_absence_confirmed=remote_absence_confirmed,
             configuration=configuration,
             max_reasoning_available=max_reasoning_available,
             codex_version=codex_version,
@@ -1840,13 +1852,9 @@ def _validated_flag_candidate(path: Path) -> str | None:
     if candidate is None:
         return None
     candidate = candidate.strip()
-    if (
-        not candidate
-        or len(candidate) > 4000
-        or "\n" in candidate
-        or "\r" in candidate
-        or _CONTROL.search(candidate)
-    ):
+    try:
+        validate_candidate(candidate)
+    except InvalidCandidate:
         raise WorkerRefusal(
             "invalid_flag_candidate",
             "submit-flag 결과를 확인할 수 없습니다.",
@@ -5015,6 +5023,17 @@ the emulator differs from the intended environment; first determine whether
 the supplied files contain the verifier or another offline route. Do not invent
 an endpoint or loop over the same local work.
 """
+            if getattr(manifest, "remote_absence_confirmed", False):
+                remote_instruction += """
+
+The operator reviewed the previous missing-remote request and explicitly
+confirmed that no remote endpoint or additional input is available. Continue
+from the saved analysis in this solve; do not repeat that same request or
+invent connection details or a flag. Prioritize a distinct offline path and
+verify any candidate against the supplied artifacts. Request input again only
+if a new concrete observation identifies a different indispensable missing
+resource; otherwise record the unresolved blocker instead of looping.
+"""
         elif remote_mode == "endpoint":
             remote_instruction = """
 
@@ -5164,6 +5183,12 @@ is a fresh isolated job; do not repeat completed work.
         if remote_mode == "none" and remote_request_reviewed is None:
             remote_request_reviewed = asyncio.Event()
             self.remote_request_reviewed = remote_request_reviewed
+        if remote_mode == "none" and getattr(manifest, "remote_absence_confirmed", False) and remote_request_reviewed is not None:
+            # This job resumes a request already reviewed by the operator.
+            # An unchanged request must not immediately stop the new attempt.
+            remote_request_reviewed.set()
+            self.remote_request_review_tool_count = self._solve_tool_count
+            self.remote_request_review_notes = _solver_notes(challenge)
         while MAX_SOLVE_NUDGES == 0 or attempt <= last_allowed_attempt:
             current_attempt = attempt
             attempt += 1

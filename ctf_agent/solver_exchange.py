@@ -202,6 +202,7 @@ CREATE TABLE IF NOT EXISTS solver_jobs (
     challenge_base_sha256 TEXT,
     challenge_description TEXT,
     remote_mode TEXT NOT NULL DEFAULT 'unknown',
+    remote_absence_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(remote_absence_confirmed IN (0,1)),
     flag_rejected_at REAL,
     error_json TEXT,
     flag_hooked INTEGER NOT NULL DEFAULT 0 CHECK(flag_hooked IN (0,1)),
@@ -954,6 +955,11 @@ class SolverExchangeCoordinator:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN challenge_description TEXT")
             if "remote_mode" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN remote_mode TEXT NOT NULL DEFAULT 'unknown'")
+            if "remote_absence_confirmed" not in columns:
+                db.execute(
+                    "ALTER TABLE solver_jobs ADD COLUMN remote_absence_confirmed "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(remote_absence_confirmed IN (0,1))"
+                )
             if "flag_rejected_at" not in columns:
                 db.execute("ALTER TABLE solver_jobs ADD COLUMN flag_rejected_at REAL")
             if "account_label" not in columns:
@@ -1176,6 +1182,7 @@ class SolverExchangeCoordinator:
         job_mode: str = "solve",
         writeup_instruction: str | None = None,
         writeup_locale: str = "ko",
+        confirm_no_remote: bool = False,
     ) -> dict[str, Any]:
         _require_id(workspace_id, "workspace")
         _require_id(challenge_id, "challenge")
@@ -1187,6 +1194,8 @@ class SolverExchangeCoordinator:
             )
         if writeup_locale not in {"ko", "en"}:
             raise ExchangeError("invalid_writeup_locale", "지원하지 않는 write-up 언어입니다.", category="output")
+        if type(confirm_no_remote) is not bool or (confirm_no_remote and job_mode != "solve"):
+            raise ExchangeError("invalid_remote_confirmation", "원격 정보 없음 확인 요청을 확인할 수 없습니다.", category="input")
         instruction = normalize_writeup_refinement_instruction(writeup_instruction)
         if job_mode == "solve" and instruction:
             raise ExchangeError(
@@ -1517,6 +1526,12 @@ class SolverExchangeCoordinator:
                        WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?""",
                     (owner_user_id, workspace_id, challenge_id),
                 ).fetchone()
+                if confirm_no_remote and not checkpoint_row:
+                    raise ExchangeError(
+                        "remote_confirmation_unavailable",
+                        "확인할 원격 정보 요청이 없습니다. 문제 상태를 다시 불러와 주세요.",
+                        category="input",
+                    )
                 retry_checkpoint_json = None
                 if checkpoint_row and job_mode == "solve":
                     try:
@@ -1536,6 +1551,41 @@ class SolverExchangeCoordinator:
                             checkpoint_row["base_input_sha256"], challenge_base_sha256
                         )
                     )
+                    if confirm_no_remote:
+                        source = db.execute(
+                            """SELECT id,status,released_ingested,error_json,remote_mode,
+                                      challenge_input_sha256,job_mode,flag,imported_historical
+                               FROM solver_jobs WHERE id=? AND owner_user_id=?
+                                 AND workspace_id=? AND challenge_id=?""",
+                            (checkpoint_row["source_job_id"], owner_user_id,
+                             workspace_id, challenge_id),
+                        ).fetchone()
+                        latest = db.execute(
+                            """SELECT id FROM solver_jobs WHERE owner_user_id=? AND workspace_id=?
+                                 AND challenge_id=? AND job_mode='solve'
+                               ORDER BY created_at DESC,id DESC LIMIT 1""",
+                            (owner_user_id, workspace_id, challenge_id),
+                        ).fetchone()
+                        if not (
+                            checkpoint and checkpoint.reason == "needs_remote"
+                            and remote_mode == "none"
+                            and checkpoint_row["source_remote_mode"] == "none"
+                            and exact_input and same_base
+                            and source and latest and latest["id"] == source["id"]
+                            and source["job_mode"] == "solve"
+                            and source["remote_mode"] == "none"
+                            and source["status"] == "needs_input"
+                            and source["released_ingested"]
+                            and not source["imported_historical"]
+                            and source["flag"] is None
+                            and source["challenge_input_sha256"] == challenge_input_sha256
+                            and _optional_json(source["error_json"]).get("code") == "remote_input_required"
+                        ):
+                            raise ExchangeError(
+                                "remote_confirmation_unavailable",
+                                "원격 정보 없음 확인 대상이 변경됐습니다. 문제 상태를 다시 확인해 주세요.",
+                                category="input",
+                            )
                     description_resume = False
                     if checkpoint and checkpoint.reason == "needs_remote" and not same_base:
                         checkpoint_source = db.execute(
@@ -1583,6 +1633,7 @@ class SolverExchangeCoordinator:
                                 remote_mode == "none"
                                 and checkpoint_row["source_remote_mode"] == "none"
                                 and exact_input
+                                and not confirm_no_remote
                             )
                         )
                     ):
@@ -1745,13 +1796,13 @@ class SolverExchangeCoordinator:
                        (id,job_mode,owner_user_id,workspace_id,challenge_id,account_id,account_label,provider,auth_kind,model,
                          reasoning_effort,subagents_enabled,ultra_escalation_mode,ultra_source_job_id,ultracode,max_reasoning_available,service_tier,codex_version,codex_runtime_sha256,claude_version,claude_runtime_sha256,
                          retry_checkpoint_json,continuation_mode,continuation_source_job_id,writeup_instruction,writeup_locale,source_writeup_sha256,source_solver_job_id,
-                        challenge_input_sha256,challenge_base_sha256,challenge_description,remote_mode,status,previous_challenge_status,flag,private_notes,
+                        challenge_input_sha256,challenge_base_sha256,challenge_description,remote_mode,remote_absence_confirmed,status,previous_challenge_status,flag,private_notes,
                         solver_artifact_json,flag_hooked,created_at,updated_at)
                        VALUES(:id,:job_mode,:owner_user_id,:workspace_id,:challenge_id,:account_id,
                                 :account_label,:provider,:auth_kind,:model,:reasoning_effort,:subagents_enabled,:ultra_escalation_mode,:ultra_source_job_id,:ultracode,:max_reasoning_available,:service_tier,:codex_version,
                                :codex_runtime_sha256,:claude_version,:claude_runtime_sha256,:retry_checkpoint_json,:continuation_mode,:continuation_source_job_id,
                               :writeup_instruction,:writeup_locale,:source_writeup_sha256,:source_solver_job_id,
-                              :challenge_input_sha256,:challenge_base_sha256,:challenge_description,:remote_mode,'queued',:previous_challenge_status,:flag,
+                              :challenge_input_sha256,:challenge_base_sha256,:challenge_description,:remote_mode,:remote_absence_confirmed,'queued',:previous_challenge_status,:flag,
                               :private_notes,:solver_artifact_json,:flag_hooked,:created_at,:updated_at)""",
                     {
                         "id": job_id,
@@ -1789,6 +1840,7 @@ class SolverExchangeCoordinator:
                         "challenge_base_sha256": challenge_base_sha256,
                         "challenge_description": challenge["description"],
                         "remote_mode": remote_mode,
+                        "remote_absence_confirmed": int(confirm_no_remote),
                         "previous_challenge_status": (
                             challenge["status"] if job_mode == "solve" else None
                         ),
@@ -1922,9 +1974,11 @@ class SolverExchangeCoordinator:
             elapsed_origin = continuation_start(db, row)
             solve_clock = continuation_elapsed(db, row)
             input_ready_to_retry = remote_input_ready_to_retry(db, row)
+            no_remote_confirmable = remote_absence_confirmation_available(db, row)
         result = _public_job(row, events, position, guidance=guidance)
         result["event_cursor"] = event_cursor
         result["input_ready_to_retry"] = input_ready_to_retry and not bool(row["imported_historical"])
+        result["confirm_no_remote_eligible"] = no_remote_confirmable
         if elapsed_origin is not None:
             result["continuation_started_at"] = elapsed_origin[0]
             result["continuation_started_running"] = elapsed_origin[1]
@@ -4018,6 +4072,7 @@ class SolverExchangeCoordinator:
                     "flag_format": record.get("workspace_flag_format") or "",
                     "remote": "" if is_refinement else (record.get("remote") or ""),
                     "remote_mode": "none" if is_refinement else (record.get("remote_mode") or "unknown"),
+                    "remote_absence_confirmed": bool(job["remote_absence_confirmed"]),
                     **configuration.public(),
                     "subagents_enabled": bool(job["subagents_enabled"]),
                     "max_reasoning_available": bool(job["max_reasoning_available"]),
@@ -6180,6 +6235,52 @@ def remote_input_ready_to_retry(db: sqlite3.Connection, job: Mapping[str, Any]) 
     )
 
 
+def remote_absence_confirmation_available(db: sqlite3.Connection, job: Mapping[str, Any]) -> bool:
+    """Expose the exact offline checkpoint that may be resumed without new input."""
+
+    if (
+        job["job_mode"] != "solve" or job["status"] != "needs_input"
+        or not job["released_ingested"] or job["imported_historical"]
+        or job["remote_mode"] != "none" or job["flag"] is not None
+        or job["current_retry_source_job_id"] != job["id"]
+        or _optional_json(job["error_json"]).get("code") != "remote_input_required"
+    ):
+        return False
+    checkpoint_row = db.execute(
+        """SELECT checkpoint_json,input_sha256,base_input_sha256,
+                  source_remote_mode,source_job_id FROM solver_retry_checkpoints
+           WHERE owner_user_id=? AND workspace_id=? AND challenge_id=?""",
+        (job["owner_user_id"], job["workspace_id"], job["challenge_id"]),
+    ).fetchone()
+    if not checkpoint_row or checkpoint_row["source_job_id"] != job["id"] or checkpoint_row["source_remote_mode"] != "none":
+        return False
+    try:
+        checkpoint = decode_checkpoint(checkpoint_row["checkpoint_json"])
+        current = _challenge_input_payload(
+            db, job["owner_user_id"], job["workspace_id"], job["challenge_id"],
+            include_remote=True,
+        )
+    except (TypeError, ValueError, ExchangeError):
+        return False
+    if checkpoint is None or checkpoint.reason != "needs_remote" or current["remote_mode"] != "none":
+        return False
+    current_digest = hashlib.sha256(_json_bytes(current)).hexdigest()
+    if not isinstance(job["challenge_input_sha256"], str) or not secrets.compare_digest(job["challenge_input_sha256"], current_digest):
+        return False
+    if checkpoint_row["input_sha256"] and not secrets.compare_digest(checkpoint_row["input_sha256"], current_digest):
+        return False
+    base_digest = _challenge_base_sha256(db, job["owner_user_id"], job["workspace_id"], job["challenge_id"])
+    if not checkpoint_row["base_input_sha256"] or not secrets.compare_digest(checkpoint_row["base_input_sha256"], base_digest):
+        return False
+    latest = db.execute(
+        """SELECT id FROM solver_jobs WHERE owner_user_id=? AND workspace_id=?
+             AND challenge_id=? AND job_mode='solve'
+           ORDER BY created_at DESC,id DESC LIMIT 1""",
+        (job["owner_user_id"], job["workspace_id"], job["challenge_id"]),
+    ).fetchone()
+    return bool(latest and latest["id"] == job["id"])
+
+
 def _challenge_base_sha256(
     db: sqlite3.Connection,
     owner_user_id: str,
@@ -6566,6 +6667,7 @@ def _public_job(
         "runtime_version": row["claude_version"] if row["provider"] == "claude" else row["codex_version"],
         "runtime_sha256": row["claude_runtime_sha256"] if row["provider"] == "claude" else row["codex_runtime_sha256"],
         "remote_mode": row["remote_mode"],
+        "remote_absence_confirmed": bool(row["remote_absence_confirmed"]),
         "network_policy": (
             "offline" if row["job_mode"] == "writeup_refine" else "general_internet"
         ),
@@ -7634,4 +7736,4 @@ def _utc_stamp(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
 
 
-__all__ = ["ExchangeError", "SolverExchangeCoordinator", "SolverCoordinatorPool", "remote_input_ready_to_retry"]
+__all__ = ["ExchangeError", "SolverExchangeCoordinator", "SolverCoordinatorPool", "remote_input_ready_to_retry", "remote_absence_confirmation_available"]

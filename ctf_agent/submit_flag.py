@@ -17,6 +17,7 @@ from typing import Sequence
 
 MAX_CANDIDATE_LENGTH = 4_000
 _CANDIDATE_NAME = ".flag-candidate"
+_CLI_HELP_TOKENS = {"-h", "--help", "--version", "-v"}
 
 
 class InvalidCandidate(ValueError):
@@ -28,6 +29,10 @@ def validate_candidate(candidate: str) -> None:
 
     if not candidate or len(candidate) > MAX_CANDIDATE_LENGTH:
         raise InvalidCandidate("invalid candidate")
+    # A solver may invoke ``submit-flag --help`` to inspect the CLI.  That
+    # command must never become a discovered flag or trigger a write-up.
+    if candidate.casefold() in _CLI_HELP_TOKENS:
+        raise InvalidCandidate("CLI option is not a flag")
     if any(not character.isprintable() for character in candidate):
         raise InvalidCandidate("invalid candidate")
     try:
