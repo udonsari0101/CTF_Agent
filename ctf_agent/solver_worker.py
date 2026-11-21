@@ -18,6 +18,7 @@ import asyncio
 import base64
 import binascii
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -2440,6 +2441,69 @@ def _codex_exec_create_failed(item: object) -> bool:
     )
 
 
+def _exec_path_state(path: Path) -> dict[str, bool | str | None]:
+    """Collect only fixed path facts; never retain a path or exception text."""
+
+    try:
+        details = path.stat()
+    except OSError as exc:
+        category = {
+            errno.ENOENT: "missing",
+            errno.ENOTDIR: "not_directory",
+            errno.EACCES: "permission",
+            errno.EPERM: "permission",
+            errno.ELOOP: "symlink_loop",
+        }.get(exc.errno, "other")
+        return {
+            "exists": False if category in {"missing", "not_directory"} else None,
+            "directory": None,
+            "executable": None,
+            "stat_error": category,
+        }
+    return {
+        "exists": True,
+        "directory": stat.S_ISDIR(details.st_mode),
+        "executable": bool(os.access(path, os.X_OK)),
+        "stat_error": "none",
+    }
+
+
+def probe_codex_exec_paths(cwd: Path, codex_home: Path) -> dict[str, dict[str, bool | str | None]]:
+    """Snapshot trusted launcher prerequisites at the first create failure."""
+
+    arg0 = codex_home / "tmp" / "arg0"
+    paths = {
+        "cwd": cwd,
+        "cwd_parent": cwd.parent,
+        "bash": Path("/usr/bin/bash"),
+        "codex_tmp": codex_home / "tmp",
+        "arg0_dir": arg0,
+    }
+    result = {name: _exec_path_state(path) for name, path in paths.items()}
+    helper = _exec_path_state(arg0 / "codex-arg0-unavailable" / "codex-linux-sandbox")
+    if result["arg0_dir"]["exists"] is True:
+        try:
+            with os.scandir(arg0) as entries:
+                for index, entry in enumerate(entries):
+                    if index >= 64:
+                        break
+                    if not entry.name.startswith("codex-arg0"):
+                        continue
+                    candidate = _exec_path_state(Path(entry.path) / "codex-linux-sandbox")
+                    if candidate["exists"] is True:
+                        helper = candidate
+                        break
+        except OSError as exc:
+            helper = _exec_path_state(arg0)
+            if helper["stat_error"] == "none":
+                helper = {
+                    "exists": None, "directory": None, "executable": None,
+                    "stat_error": "permission" if exc.errno in {errno.EACCES, errno.EPERM} else "other",
+                }
+    result["arg0_helper"] = helper
+    return result
+
+
 def safe_provider_failure_diagnostic(payload: object, driver: object) -> dict[str, Any]:
     """Summarize a failed Codex turn without retaining provider prose or tokens."""
 
@@ -2462,6 +2526,10 @@ def safe_provider_failure_diagnostic(payload: object, driver: object) -> dict[st
     exit_code = getattr(process, "returncode", None)
     if type(exit_code) is int and -255 <= exit_code <= 255:
         diagnostic["cli_exit_code"] = exit_code
+    if isinstance(payload, Mapping) and payload.get("code") == "codex_exec_unavailable":
+        path_probe = getattr(driver, "exec_launch_probe", None)
+        if isinstance(path_probe, Mapping):
+            diagnostic["exec_paths"] = path_probe
     return diagnostic
 
 
@@ -3108,6 +3176,7 @@ class CodexAppServer:
         self._first_solve_tool_at: float | None = None
         self._consecutive_exec_create_failures = 0
         self._exec_create_failure_keys: set[tuple[object, object]] = set()
+        self.exec_launch_probe: dict[str, dict[str, bool | str | None]] | None = None
         self._solve_repeat_observer = SolveRepeatObserver()
         self.guidance_mailbox: GuidanceMailbox | None = None
         self.activity_reporter: Callable[..., Awaitable[None]] | None = None
@@ -4658,9 +4727,14 @@ print(json.dumps(result,separators=(",",":")))
                         if key not in self._exec_create_failure_keys:
                             self._consecutive_exec_create_failures += 1
                             self._exec_create_failure_keys.add(key)
+                            if self.exec_launch_probe is None:
+                                self.exec_launch_probe = probe_codex_exec_paths(
+                                    self.challenge, self.codex_home
+                                )
                     else:
                         self._consecutive_exec_create_failures = 0
                         self._exec_create_failure_keys.clear()
+                        self.exec_launch_probe = None
                 if item_type == "contextCompaction":
                     await _emit_context_usage(
                         self, source_agent_id,
@@ -4917,6 +4991,7 @@ print(json.dumps(result,separators=(",",":")))
         self._first_solve_tool_at = None
         self._consecutive_exec_create_failures = 0
         self._exec_create_failure_keys = set()
+        self.exec_launch_probe = None
         configuration = getattr(manifest, "configuration", None)
         self.effective_reasoning_effort = getattr(
             configuration, "reasoning_effort", None

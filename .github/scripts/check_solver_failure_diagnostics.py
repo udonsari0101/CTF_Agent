@@ -16,7 +16,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from ctf_agent.solver import normalize_provider_failure  # noqa: E402
+from ctf_agent.solver import normalize_provider_diagnostic, normalize_provider_failure  # noqa: E402
 from ctf_agent.solver_exchange import EXCHANGE_PROTOCOL, ExchangeError, _validate_event  # noqa: E402
 from ctf_agent.solver_worker import (  # noqa: E402
     AppServerFailure,
@@ -25,6 +25,7 @@ from ctf_agent.solver_worker import (  # noqa: E402
     SolverWorker,
     failure_with_rate_limit,
     safe_provider_failure_diagnostic,
+    probe_codex_exec_paths,
 )
 
 
@@ -127,6 +128,44 @@ class SolverFailureDiagnosticTests(unittest.TestCase):
         self.assertIsNone(failure)
         self.assertEqual(tools, 1)
         self.assertEqual(evidence, 6)
+
+    def test_exec_probe_contains_only_fixed_path_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cwd = root / "job" / "work"
+            cwd.mkdir(parents=True)
+            home = root / "home"
+            helper = home / "tmp" / "arg0" / "codex-arg0fixture" / "codex-linux-sandbox"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"fixture")
+            paths = probe_codex_exec_paths(cwd, home)
+            self.assertEqual(paths["cwd"]["exists"], True)
+            self.assertEqual(paths["cwd"]["directory"], True)
+            self.assertEqual(paths["cwd_parent"]["exists"], True)
+            self.assertEqual(paths["codex_tmp"]["exists"], True)
+            self.assertEqual(paths["arg0_helper"]["exists"], True)
+            self.assertNotIn(str(root), json.dumps(paths))
+            diagnostic = normalize_provider_diagnostic({"exec_paths": paths})
+            self.assertEqual(diagnostic, {"exec_paths": paths})
+            driver = SimpleNamespace(exec_launch_probe=paths)
+            failure = {"code": "codex_exec_unavailable", "retryable": False}
+            public = replace(
+                normalize_provider_failure(failure, stage="solve"),
+                diagnostic=safe_provider_failure_diagnostic(failure, driver),
+            ).public()
+            event = {
+                "protocol": EXCHANGE_PROTOCOL, "job_id": "a" * 32,
+                "sequence": 1, "kind": "error", "created_at": time.time(),
+                "error": public, "terminal": False,
+            }
+            self.assertEqual(_validate_event(event, "a" * 32, 1), event)
+            self.assertNotIn(str(root), json.dumps(event))
+            poisoned = {**paths, "cwd": {**paths["cwd"], "path": "secret"}}
+            self.assertIsNone(normalize_provider_diagnostic({"exec_paths": poisoned}))
+            cwd.rmdir()
+            missing = probe_codex_exec_paths(cwd, home)
+            self.assertEqual(missing["cwd"]["exists"], False)
+            self.assertEqual(missing["cwd"]["stat_error"], "missing")
 
     def test_nonretryable_unknown_provider_error_stays_nonretryable(self) -> None:
         payload = failure_with_rate_limit(

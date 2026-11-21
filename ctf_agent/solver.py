@@ -576,6 +576,34 @@ class RefusingAdapter:
         return None
 
 
+_EXEC_PATH_NAMES = frozenset({
+    "cwd", "cwd_parent", "bash", "codex_tmp", "arg0_dir", "arg0_helper",
+})
+_EXEC_PATH_ERRORS = frozenset({
+    "none", "missing", "not_directory", "permission", "symlink_loop", "other",
+})
+
+
+def _normalize_exec_path_probe(value: object) -> dict[str, dict[str, bool | str | None]] | None:
+    if not isinstance(value, Mapping) or set(value) != _EXEC_PATH_NAMES:
+        return None
+    result: dict[str, dict[str, bool | str | None]] = {}
+    for name in sorted(_EXEC_PATH_NAMES):
+        state = value[name]
+        if not isinstance(state, Mapping) or set(state) != {
+            "exists", "directory", "executable", "stat_error",
+        }:
+            return None
+        if any(type(state[key]) not in (bool, type(None)) for key in (
+            "exists", "directory", "executable",
+        )):
+            return None
+        if not isinstance(state["stat_error"], str) or state["stat_error"] not in _EXEC_PATH_ERRORS:
+            return None
+        result[name] = dict(state)
+    return result
+
+
 def normalize_provider_diagnostic(value: object) -> dict[str, Any] | None:
     """Keep only fixed, non-secret provider failure discriminators."""
 
@@ -596,6 +624,9 @@ def normalize_provider_diagnostic(value: object) -> dict[str, Any] | None:
         result["same_session_retry"] = value["same_session_retry"]
     if type(value.get("cli_exit_code")) is int and -255 <= value["cli_exit_code"] <= 255:
         result["cli_exit_code"] = value["cli_exit_code"]
+    exec_paths = _normalize_exec_path_probe(value.get("exec_paths"))
+    if exec_paths is not None:
+        result["exec_paths"] = exec_paths
     return result or None
 
 
