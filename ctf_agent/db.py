@@ -258,6 +258,10 @@ def initialize(settings: Settings) -> None:
             connection.execute(
                 "ALTER TABLE users ADD COLUMN ultra_escalation_default TEXT NOT NULL DEFAULT 'ask'"
             )
+        if "solver_variant_defaults" not in user_columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN solver_variant_defaults TEXT NOT NULL DEFAULT '[]'"
+            )
         if "avatar_seed" not in user_columns:
             connection.execute("ALTER TABLE users ADD COLUMN avatar_seed TEXT NOT NULL DEFAULT ''")
         for table, column in (("sessions", "user_id"), ("workspaces", "owner_user_id")):

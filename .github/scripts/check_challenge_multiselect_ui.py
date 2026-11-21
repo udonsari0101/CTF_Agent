@@ -29,6 +29,9 @@ def browser_path() -> str | None:
 
 
 def main() -> int:
+    if 'data-action="select-challenge"' in SOURCE or 'Ctrl/Cmd+click' in SOURCE:
+        print("FAIL: challenge checkboxes or persistent selection hint remain")
+        return 1
     browser = browser_path()
     if not browser:
         print("SKIP: Chrome/Chromium is not installed")
@@ -39,7 +42,7 @@ def main() -> int:
     implementation = SOURCE[start:end]
     fixture = """<!doctype html><html><body>
 <main id="challenge-area">
- <div class="challenge-bulk-toolbar">
+ <div class="challenge-bulk-toolbar" hidden>
   <span class="challenge-selection-count"></span>
   <button data-action="select-visible-challenges">Select all</button>
   <button data-action="stop-selected-challenges">Stop selected</button>
@@ -47,10 +50,10 @@ def main() -> int:
   <button data-action="clear-challenge-selection">Clear selection</button>
  </div>
  <div class="challenge-card-grid">
-  <article class="challenge-card" data-challenge-id="a"><input type="checkbox" data-action="select-challenge"><h3>A</h3><div class="challenge-card-actions"><button>Action</button></div></article>
-  <article class="challenge-card" data-challenge-id="b"><input type="checkbox" data-action="select-challenge"><h3>B</h3></article>
-  <article class="challenge-card" data-challenge-id="c"><input type="checkbox" data-action="select-challenge"><h3>C</h3></article>
-  <article class="challenge-card" data-challenge-id="d"><input type="checkbox" data-action="select-challenge"><h3>D</h3></article>
+  <article class="challenge-card" data-challenge-id="a"><h3>A</h3><div class="challenge-card-actions"><button>Action</button></div></article>
+  <article class="challenge-card" data-challenge-id="b"><h3>B</h3></article>
+  <article class="challenge-card" data-challenge-id="c"><h3>C</h3></article>
+  <article class="challenge-card" data-challenge-id="d"><h3>D</h3></article>
  </div>
 </main><pre id="result">PENDING</pre><script>
 const i18n={t:s=>s,format:(s,values)=>s.replace(/\\{(\\w+)\\}/g,(_,key)=>values[key]??'')};
@@ -76,9 +79,9 @@ function click(id,opts={},target='h3'){
 document.querySelector('#challenge-area').addEventListener('click',event=>selectChallengeFromModifiedClick(event));
 try{
  syncChallengeSelection();
- assert(selected()===''&&document.querySelector('[data-action="stop-selected-challenges"]').disabled,'initial toolbar disables bulk stop');
+ assert(selected()===''&&document.querySelector('.challenge-bulk-toolbar').hidden,'initial toolbar is hidden');
  click('a',{ctrlKey:true});
- assert(selected()==='a'&&card('a').classList.contains('is-selected')&&card('a').querySelector('input').checked,'Ctrl selects card');
+ assert(selected()==='a'&&card('a').classList.contains('is-selected')&&!document.querySelector('.challenge-bulk-toolbar').hidden,'Ctrl selects card and reveals toolbar');
  click('c',{shiftKey:true});
  assert(selected()==='a,b,c','Shift selects contiguous range from anchor');
  assert(!document.querySelector('[data-action="stop-selected-challenges"]').disabled,'active selected can stop');
@@ -89,7 +92,7 @@ try{
  click('b',{shiftKey:true});
  assert(selected()==='a,b,c,d','Shift range uses latest unmodified anchor');
  selectChallenge('c');
- assert(selected()==='a,b,d','checkbox toggles selected card');
+ assert(selected()==='a,b,d','selection API toggles selected card');
  const before=selected();
  click('a',{ctrlKey:true},'.challenge-card-actions button');
  assert(selected()===before,'action buttons do not change selection');
@@ -97,7 +100,7 @@ try{
  assert(selected()===before,'ordinary card click leaves selection unchanged');
  assert(document.querySelector('.challenge-selection-count').textContent.includes('3'),'selection count updates');
  selectedChallengeIds.clear();selectionAnchorId='';syncChallengeSelection();
- assert(selected()===''&&document.querySelector('[data-action="clear-challenge-selection"]').disabled,'clear selection updates toolbar');
+ assert(selected()===''&&document.querySelector('.challenge-bulk-toolbar').hidden,'clear selection hides toolbar');
  result.textContent='PASS';
 }catch(error){result.textContent='ERROR '+error.stack}
 </script></body></html>"""

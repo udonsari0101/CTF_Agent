@@ -53,6 +53,7 @@ const size=n=>`${n} B`;
 const modal=document.querySelector('#modal'),busyForms=new WeakSet();
 const MAX_SOLVER_VARIANTS=12;
 let variantEditorGeneration=0,solverAccountId='account-a',currentWorkspace={id:'ws',open_challenge_after_create:false};
+let sessionUser={solver_variant_defaults:[]};
 let currentChallenge=null,challengeListing={result:{challenges:[{id:'source',name:'Source'}]}};
 let submitted=null,refreshed=0,uploadCalls=[],batchCalls=0,mockUploadFailure=false;const toasts=[];
 function path(id,ws){return `/api/workspaces/${ws}/challenges${id?'/'+id:''}`}

@@ -24,12 +24,25 @@ def main() -> None:
             assert response.status_code == 200, response.text
             assert client.get("/api/auth/state").json()["user"]["ultra_escalation_default"] == "auto"
             assert client.patch("/api/auth/preferences", json={"ultra_escalation_default": "invalid"}).status_code == 422
+            preset = {
+                "account_id": "a" * 32, "model": "gpt-6-sol", "reasoning_effort": "xhigh",
+                "service_tier": None, "subagents_enabled": True,
+                "ultra_escalation_mode": "ask",
+            }
+            response = client.patch("/api/auth/preferences", json={"solver_variant_defaults": [preset, preset]})
+            assert response.status_code == 200, response.text
+            assert response.json()["ultra_escalation_default"] == "auto"
+            assert response.json()["solver_variant_defaults"] == [preset, preset]
+            assert client.get("/api/auth/state").json()["user"]["solver_variant_defaults"] == [preset, preset]
+            assert client.patch("/api/auth/preferences", json={"solver_variant_defaults": [preset] * 13}).status_code == 422
+            assert client.patch("/api/auth/preferences", json={"solver_variant_defaults": [{**preset, "model": ""}]}).status_code == 422
+            assert client.patch("/api/auth/preferences", json={"solver_variant_defaults": []}).json()["solver_variant_defaults"] == []
             first = client.post("/api/auth/avatar/refresh").json()["avatar_seed"]
             second = client.post("/api/auth/avatar/refresh").json()["avatar_seed"]
             assert len(first) == 32 and first != second
             assert client.get("/api/auth/state").json()["user"]["avatar_seed"] == second
         gc.collect()
-    print("PASS: Ultra default and avatar rotation persist")
+    print("PASS: Ultra and variant defaults, plus avatar rotation, persist")
 
 
 if __name__ == "__main__":

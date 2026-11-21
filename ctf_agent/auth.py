@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import inspect
 import ipaddress
+import json
 import re
 import secrets
 import sqlite3
@@ -37,10 +38,18 @@ def stamp():
 
 
 def safe_user(row):
-    return {key: row[key] for key in (
+    result = {key: row[key] for key in (
         "id", "username", "role", "active", "created_at", "last_login_at",
         "ultra_escalation_default", "avatar_seed",
     )}
+    try:
+        stored_variants = row["solver_variant_defaults"]
+        result["solver_variant_defaults"] = (
+            stored_variants if isinstance(stored_variants, list) else json.loads(stored_variants)
+        )
+    except (ValueError, TypeError, KeyError, IndexError):
+        result["solver_variant_defaults"] = []
+    return result
 
 
 def username_value(value):
@@ -71,8 +80,18 @@ class SessionPreference(BaseModel):
     remember: bool
 
 
+class SolverVariantDefault(BaseModel):
+    account_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    model: str = Field(min_length=1, max_length=200)
+    reasoning_effort: str = Field(pattern=r"^[a-z][a-z0-9_-]*$", max_length=40)
+    service_tier: Literal["fast"] | None = None
+    subagents_enabled: bool = False
+    ultra_escalation_mode: Literal["ask", "auto", "off"] = "off"
+
+
 class SolverPreference(BaseModel):
-    ultra_escalation_default: Literal["ask", "auto", "off"]
+    ultra_escalation_default: Literal["ask", "auto", "off"] | None = None
+    solver_variant_defaults: list[SolverVariantDefault] | None = Field(default=None, max_length=12)
 
 
 class FirstAdmin(BaseModel):
@@ -365,10 +384,16 @@ def register_auth(app, settings, database, make_hash, verify_hash, user_context)
     @app.patch("/api/auth/preferences")
     def update_solver_preference(payload: SolverPreference, user=Depends(require_auth)):
         with database() as db:
-            db.execute(
-                "UPDATE users SET ultra_escalation_default=? WHERE id=?",
-                (payload.ultra_escalation_default, user["id"]),
-            )
+            if payload.ultra_escalation_default is not None:
+                db.execute(
+                    "UPDATE users SET ultra_escalation_default=? WHERE id=?",
+                    (payload.ultra_escalation_default, user["id"]),
+                )
+            if payload.solver_variant_defaults is not None:
+                db.execute(
+                    "UPDATE users SET solver_variant_defaults=? WHERE id=?",
+                    (json.dumps([item.model_dump() for item in payload.solver_variant_defaults], separators=(",", ":")), user["id"]),
+                )
             current = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         return safe_user(current)
 

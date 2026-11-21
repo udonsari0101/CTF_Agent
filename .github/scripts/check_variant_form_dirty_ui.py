@@ -52,6 +52,7 @@ const tr=s=>s,esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('"','&quot
 const size=n=>`${n} B`;
 const modal=document.querySelector('#modal'),busyForms=new WeakSet(),MAX_SOLVER_VARIANTS=12;
 let variantEditorGeneration=0,solverAccountId='account-a';
+let sessionUser={solver_variant_defaults:[]};
 let currentWorkspace={id:'ws',open_challenge_after_create:false},currentChallenge=null;
 let challengeListing={result:{challenges:[{id:'source',name:'Source'}]}};
 function selectedChallengeFiles(form){return form._challengeFiles||[]}

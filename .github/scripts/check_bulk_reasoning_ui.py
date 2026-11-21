@@ -44,6 +44,7 @@ const tr=s=>s,esc=s=>String(s).replaceAll('&','&amp;').replaceAll('"','&quot;').
 const modal=document.querySelector('#modal'),busyForms=new WeakSet();
 const MAX_SOLVER_VARIANTS=12;
 let variantEditorGeneration=0,solverAccountId='account-a';
+let sessionUser={solver_variant_defaults:[]};
 let currentWorkspace={id:'ws'},currentChallenge=null,challengeListing={result:{challenges:[{id:'challenge',name:'Original'}]}};
 let submitted=null,refreshed=0; const toasts=[];
 function path(id,ws){return `/api/workspaces/${ws}/challenges/${id}`}
@@ -100,6 +101,39 @@ function tick(){return new Promise(resolve=>setTimeout(resolve,0))}
  assert(v[1].account_id==='account-b'&&v[1].model==='model-b'&&v[1].reasoning_effort==='high'&&v[1].subagents_enabled===true&&v[1].service_tier===null,'second variant');
  assert(v[2].account_id==='account-a'&&v[2].reasoning_effort==='low','same reasoning allowed in separate row');
  assert(refreshed===1,'list refreshed');
+ sessionUser.solver_variant_defaults=[
+  {account_id:'account-a',model:'model-a',reasoning_effort:'low',service_tier:null,subagents_enabled:true,ultra_escalation_mode:'off'},
+  {account_id:'account-b',model:'model-b',reasoning_effort:'max',service_tier:null,subagents_enabled:false,ultra_escalation_mode:'off'}
+ ];
+ await showCloneReasoning('challenge');
+ const defaultsForm=modal.querySelector('#clone-reasoning-form');
+ assert(variantRows(defaultsForm).length===2,'saved defaults fill both rows');
+ assert(defaultsForm.querySelectorAll('[data-variant-row]')[0].querySelector('.variant-tier').value==='','explicit standard tier retained');
+ const restored=selectedVariants(defaultsForm);
+ assert(restored[0].reasoning_effort==='low'&&restored[0].service_tier===null&&restored[0].subagents_enabled,'first default restored');
+ assert(restored[1].account_id==='account-b'&&restored[1].model==='model-b'&&restored[1].reasoning_effort==='max','second default restored');
+ const savedFirst=variantRows(defaultsForm)[0];
+ savedFirst.querySelector('.variant-reasoning').value='high';
+ savedFirst.querySelector('.variant-reasoning').dispatchEvent(new Event('change',{bubbles:true}));
+ assert(savedFirst.querySelector('.variant-subagents').checked,'explicit subagent default survives reasoning edit');
+ modal.close();
+ sessionUser.solver_variant_defaults=[{account_id:'account-b',model:'model-b',reasoning_effort:'max',service_tier:'fast',subagents_enabled:false,ultra_escalation_mode:'off'}];
+ await showCloneReasoning('challenge');
+ const staleFast=modal.querySelector('#clone-reasoning-form'),staleFastRow=variantRows(staleFast)[0];
+ assert(staleFastRow.querySelector('.variant-tier').value==='invalid','unsupported saved fast tier shown');
+ assert(staleFast.querySelector('button[type="submit"]').disabled,'unsupported saved fast tier blocks submit');
+ staleFastRow.querySelector('.variant-tier').value='';
+ staleFastRow.querySelector('.variant-tier').dispatchEvent(new Event('change',{bubbles:true}));
+ assert(!staleFast.querySelector('button[type="submit"]').disabled,'reselecting standard tier enables submit');
+ modal.close();
+ sessionUser.solver_variant_defaults=[{account_id:'account-b',model:'model-b',reasoning_effort:'ultra',service_tier:null,subagents_enabled:false,ultra_escalation_mode:'off'}];
+ await showCloneReasoning('challenge');
+ const staleEffort=modal.querySelector('#clone-reasoning-form'),staleEffortRow=variantRows(staleEffort)[0];
+ assert(staleEffortRow.querySelector('.variant-reasoning').value==='','unsupported saved reasoning shown');
+ assert(staleEffort.querySelector('button[type="submit"]').disabled,'unsupported saved reasoning blocks submit');
+ staleEffortRow.querySelector('.variant-reasoning').value='high';
+ staleEffortRow.querySelector('.variant-reasoning').dispatchEvent(new Event('change',{bubbles:true}));
+ assert(!staleEffort.querySelector('button[type="submit"]').disabled,'reselecting reasoning enables submit');
  result.textContent='PASS';
 })().catch(error=>{result.textContent='ERROR '+error.stack});
 </script></body></html>"""
