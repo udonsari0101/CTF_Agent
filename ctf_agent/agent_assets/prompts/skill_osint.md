@@ -6,19 +6,16 @@ Field manual for OSINT: follow a public-data trail across platforms to a person,
 
 ## Identify the unknown first
 Before chasing, name what you're holding — the challenge often hands you a bare string:
-- 40 hex → SHA-1 (**Tor relay fingerprint**); 64 hex → SHA-256; 32 hex → MD5; `AA:BB:..` colon-hex → SSH/TLS fingerprint (→ Shodan, below).
+- 40/64/32 hex characters may be a SHA-1/SHA-256/MD5 digest or an unrelated identifier; use context before treating one as a Tor relay or SSH/TLS fingerprint.
 - `4V FH 246 677`-style → **MGRS** grid → online converter → lat/long. `XXXX+XX`-style (alphabet `23456789CFGHJMPQRVWX`, always a `+`) → **Google Plus Code**. `word.word.word` → **What3Words** (3m square).
 - Big numeric ID → a **snowflake** (platform user/post ID, timestamped — decode below).
 - Challenge title is usually a hint ("Linked Traces"→LinkedIn, "On The Grid"→MGRS, a name→search it verbatim in quotes).
 
 ## Username / handle enumeration
-The core loop: one handle → find every account that reuses it → each may link to the next.
-```bash
-curl -s "https://whatsmyname.app/api/lookup?username=<user>"   # 700+ sites, headless
-```
-Also `namechk.com`, `sherlock <user>` (CLI), and `"<user>"` quoted on each platform's own search. **Priority platforms:** X/Twitter, Tumblr, GitHub, Reddit, BlueSky, Mastodon, Spotify, SoundCloud, Steam, Keybase, **Strava/Garmin/MapMyRun (GPS → physical location)**, Pastebin, LinkedIn, TikTok, bio-links (linktr.ee, bio.link, about.me).
-- **Mine the handle itself:** trailing digits = ZIP/postal (`LinXiayu35170`→Bruz FR), birth year, area/country code — cross-ref a gazetteer.
-- **Chain on rename:** a discovered alias → re-enumerate ALL platforms again; repeat until the platform holding the flag. Persistent numeric IDs survive renames (below).
+The core loop: one handle → check the few platforms suggested by the brief and observed links → follow a confirmed alias. The original [WhatsMyName dataset](https://github.com/WebBreacher/WhatsMyName) is archived; it provides site-checking rules, not a stable `whatsmyname.app/api/lookup` endpoint. If you choose a username-enumeration tool, check that it is installed and verify each hit against the actual profile body; do not fan out to hundreds of sites without a lead.
+Also try `"<user>"` quoted on a relevant platform's own search. Platforms such as X/Twitter, Tumblr, GitHub, Reddit, BlueSky, Mastodon, Spotify, Steam, and bio-links are candidates only when the clue points there.
+- **Mine the handle itself:** trailing digits can encode a year, location, or arbitrary suffix. Treat an interpretation as a lead until independently corroborated.
+- **Chain on rename:** check a confirmed alias on the relevant linked platforms. Persistent numeric IDs can survive renames (below).
 - **Flag hiding spots per platform:** Spotify playlist name/description or artist bio, BlueSky post text, Tumblr avatar image (visual stego) or post text, Reddit comment, SoundCloud track description.
 
 **Platform false positives** (return 200 with no real profile — verify body, don't trust status): Telegram `t.me/USER` (always 200; check "View" vs "Contact @" in title), TikTok ("Couldn't find this account"), Smule ("Not Found"), Instagram (login wall), linkin.bio (redirects to Later.com).
@@ -29,7 +26,7 @@ Also `namechk.com`, `sherlock <user>` (CLI), and `"<user>"` quoted on each platf
 # Twitter/X: epoch 1288834974657 ; Discord: epoch 1420070400000
 unix_ms = (ID >> 22) + EPOCH
 ```
-- **X/Twitter:** permanent numeric ID → `x.com/i/user/<id>` works after any rename. Find the ID + creation date + old usernames in Wayback JSON-LD (`"author":{"identifier"}`) and in `t.co` redirect targets (they encode the username at post time). Read tweets without login via Nitter (`nitter.poast.org/USER`) or syndication API (`syndication.twitter.com/srv/timeline-profile/screen-name/USER`). `memory.lol` / `twitter.lolarchiver.com` track handle history. **Twitter strips EXIF on upload** — don't stego its images.
+- **X/Twitter:** a numeric account ID can survive a rename; cross-check an old handle against archived pages and profile content. Unofficial mirrors and syndication endpoints may be unavailable or stale: try one bounded request, then pivot rather than retrying a blocked service. **Twitter strips EXIF on upload** — do not rely on EXIF from its served images.
 - **BlueSky (public API, no auth):**
   ```bash
   curl -s "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=<q>&sort=latest" | jq '.posts[].record.text'
@@ -48,7 +45,7 @@ No EXIF? Geolocate from pixels. **The engine step is `[human]` (browser):** crop
 Headless prep and cross-checks you CAN do:
 ```bash
 exiftool image.jpg          # GPS, serial, maker — do this before assuming pixel-geolocation
-convert input.jpg -flop flipped.jpg    # un-mirror reflected sign text (water/glass), then search the readable prefix quoted
+python3 -c 'from PIL import Image,ImageOps; ImageOps.mirror(Image.open("input.jpg")).save("flipped.jpg")' # Pillow is installed; un-mirror reflected text
 curl "http://ip-api.com/json/<ip>"      # IP → coarse geo/ASN ; ipinfo.io/<ip>/json
 ```
 - **Country-ID shortcuts:** Kanji+blue highway signs→Japan · Cyrillic+wide boulevards/brutalist panel blocks→Russia/CIS · white X crossing sign→Canada · yellow diamond warnings→US/Canada · green autobahn→Germany · left-hand traffic→JP/UK/AU. Named business/brand in frame → search `"<brand>" locations` → cross-ref coastline/terrain to the exact branch.
@@ -81,9 +78,9 @@ whois domain.com            # registrant/creation-date timeline; whois <ip> → 
 
 **De-anon a service by fingerprint (real IP behind Tor/CDN):** SSH host keys and TLS certs are unique per host — if a hidden/CDN-fronted service also exposes SSH or the same cert, its fingerprint on Shodan/Censys reveals the origin IP.
 ```bash
-ssh-keyscan -t rsa target.onion 2>/dev/null | ssh-keygen -lf - -E md5   # get the fingerprint
-shodan search 'ssh.fingerprint:"ab:cd:ef:..."'      # or ssl.cert.fingerprint:"<sha256>"
-shodan search 'hostname:target.com' ; shodan host <ip>
+command -v shodan     # optional CLI and account; check before using it
+# A .onion address needs a Tor-capable transport; ssh-keyscan cannot resolve it directly.
+# For an in-scope reachable SSH service, inspect its host key or supplied certificate first.
 ```
 **Fake service banner:** never trust the port number — a "22/SSH" may be a custom banner holding the flag. `nmap -sV -sC -p <port> host` (version detection), or just `nc host port` / `echo | nc -w3 host port` to read the raw banner.
 
@@ -104,4 +101,4 @@ shodan search 'hostname:target.com' ; shodan host <ip>
 - The trail becomes an active/exploitable HTTP service → `../../skills/web.md`.
 - You recovered an encoded/encrypted blob that isn't the flag → decode reflexively (base64/32/85, hex, ROT13) and re-`file`; if it's real crypto → `../../skills/crypto.md`.
 
-A flag from any local build is fake (base §1).
+A flag may be genuine in a supplied local artifact. Verify its provenance against the brief and artifact; only local test placeholders are fake (base §5).

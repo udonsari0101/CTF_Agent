@@ -58,7 +58,7 @@ timeout -k 5s 90s ghidra_headless tmp/ghidra-project rev -import ./chal \
 ghidra_headless tmp/ghidra-project rev -process chal -noanalysis \
   -postScript DecompileFn.java <next-function> tmp/next.c
 ```
-Use the actual Ghidra entry address, which can differ from the ELF file offset. A timeout returns 124; check the exit code and output file before reading C. `DecompileAll.java` is a deliberate later choice for a small target, not the default first pass. `r2 -q -c 's entry0; af; pdf' ./chal` or a bounded `objdump -d -M intel ./chal` is a quicker first look at a static binary.
+Use the actual Ghidra entry address, which can differ from the ELF file offset. `DecompileFn.java` accepts a discovered function name or a hexadecimal entry address with or without `0x`; for an address, copy the decompiler's address, not an ELF offset. A timeout returns 124; check the exit code and output file before reading C. `DecompileAll.java` is a deliberate later choice for a small target, not the default first pass. `r2 -q -c 's entry0; af; pdf' ./chal` or a bounded `objdump -d -M intel ./chal` is a quicker first look at a static binary.
 
 ## Pick the cheapest tool that fits (do NOT read every instruction)
 Classify the check, then solve at the lowest tier that works:
@@ -66,7 +66,8 @@ Classify the check, then solve at the lowest tier that works:
 |---|---|
 | Each byte checked independently (`flag[i]^k == c[i]`) | per-byte Python, no solver — O(N·95) |
 | You fully understand the transform | reimplement the inverse in `solver.py` — usually fastest |
-| Coupled but algebraic (sums, perms, matrix mix, hash-like) | **z3** |
+| Coupled but tractable custom arithmetic (sums, perms, matrix mix) | **z3** after reproducing a small slice concretely |
+| Standard cryptographic hash/HMAC of an unconstrained input | Look for a restricted input space, leaked state, protocol oracle, or another weakness; a full digest alone is not a practical z3 inversion target |
 | Stateful transform / path explosion / opaque predicates | **angr** symbolic exec |
 | One self-contained opaque routine you'd rather run than read | **unicorn** emulate it as a black box |
 

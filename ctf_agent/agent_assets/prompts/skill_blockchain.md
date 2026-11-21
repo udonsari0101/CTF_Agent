@@ -1,26 +1,26 @@
 # Skill Module: blockchain (smart contract)
 
-Field manual for EVM/Solidity (and Vyper — same bytecode) CTF. Working files, by role: **contract mechanics & state layout → `notes/ANALYSIS.md`**; **the vuln + verbatim `isSolved()` win-condition + storage-slot map → `notes/VULN.md`**; **dead-ends, remote tx hashes, next moves → `notes/NEXT.md`**; **the exploit → `solver.py`**. Foundry (`forge`/`cast`/`anvil`) and Python `web3` are optional, not preinstalled; check availability and acquire a pinned job-local tool if transaction signing or a fork is required. Installed `curl` and Python `requests` can make read-only JSON-RPC calls immediately. Scratch → `tmp/`.
+Field manual for EVM/Solidity (and Vyper, which also targets EVM) CTF. Working files, by role: **contract mechanics & state layout → `notes/ANALYSIS.md`**; **the vulnerability, observed win condition and relevant storage slots → `notes/VULN.md`**; **dead-ends, remote tx hashes, next moves → `notes/NEXT.md`**; **the exploit → `solver.py`**. Foundry (`forge`/`cast`/`anvil`) and Python `web3` are optional, not preinstalled; check availability and acquire a pinned job-local tool if transaction signing or a fork is required. Installed `curl` and Python `requests` can make read-only JSON-RPC calls immediately. Scratch → `tmp/`.
 
-## Canonical shape — the win is on-chain state, not a crash
+## Identify the actual win condition
 
-Nearly every EVM CTF ships this skeleton:
+One common EVM challenge shape is:
 - A **`Setup` contract** that deploys the target(s) in its constructor (often seeding ETH/tokens) and exposes **`isSolved() → bool`** (aka `solved()`/`isComplete()`).
 - A **target contract** holding the bug.
-- `../chal_desc.md` gives you **RPC URL, chain id, a funded private key, the Setup address**, and a **flag endpoint** (`nc host port` / `GET /flag`) that returns the flag *only once `Setup.isSolved()` reads true on-chain*.
+- `../chal_desc.md` may supply an **RPC URL, chain id, funded private key, Setup address**, and a **flag endpoint** (`nc host port` / `GET /flag`) that checks on-chain state.
 
-Many frameworks (paradigm/eth-challenge-base/kctf) instead give a **launcher socket**: `nc host port` presents a menu — `1` spins up a private instance and prints RPC/chain-id/privkey/Setup, `2` returns the flag after you solve. Launch first, capture those values into `notes/ANALYSIS.md`.
+Some frameworks instead give a **launcher socket** that starts a private instance and later returns the flag. Use it only when the brief actually supplies one; record the observed connection details in `notes/ANALYSIS.md` without copying a private key into notes.
 
-Your job: read `isSolved()`, work backward to the state it checks, find the one path an unprivileged caller can force it through, execute against the remote RPC, then poke the flag endpoint.
+Read the actual success predicate and work backward from its required state. A supplied local artifact may contain the genuine flag or a complete offline solver. Do not infer a missing RPC, private key, or flag endpoint merely from an `isSolved()` function; use a remote only when the brief or observed behavior establishes one.
 
 ### First moves
 ```bash
 command -v cast || true     # Foundry is optional; do not assume it is installed
 ls                        # *.sol under src/? out/ artifacts? foundry.toml?
 ```
-Record RPC/CHAIN_ID/PK/SETUP/flag endpoint in `notes/ANALYSIS.md`. Put the **verbatim `isSolved()` body** in `notes/VULN.md` — it is your spec. Pull only `isSolved()` and the target's state-mutating functions — never whole contracts.
+Record the supplied RPC/chain id/Setup/flag endpoint when present, and keep any private key in its existing protected source or job-local secret file rather than duplicating it in exported notes. Put the **verbatim success predicate**, if one exists, in `notes/VULN.md`. Pull only that predicate and the relevant state-mutating functions first.
 
-## `isSolved()` is the spec — decompile your goal from it (→ `notes/VULN.md`)
+## If present, `isSolved()` is the spec — work backward from it (→ `notes/VULN.md`)
 
 | `isSolved()` checks | You must |
 | --- | --- |
@@ -139,6 +139,6 @@ cast call $SETUP "isSolved()(bool)" --rpc-url $RPC
 ## Category pitfalls
 
 - **Read slots/selectors/hashes with `cast` — never type an address, storage value, or selector you haven't observed** (`cast storage`/`cast code`/`cast call`/`cast selectors`).
-- **Fork-first.** Prove `isSolved()==true` on anvil before any remote tx; remote gas/nonces are real and often one-shot.
-- **The flag comes from the endpoint, not the chain.** After `isSolved()` flips on the *real* RPC, hit the flag endpoint / launcher option / web login — it re-verifies on-chain and returns the flag. Keep a second hypothesis (raw vs. wrapped output) if the format looks off.
-- Fork state is *real* remote state — a value read there is not a fake flag. The only fake flag is a placeholder from a local build.
+- **Fork-first when feasible.** Rehearse a state-changing exploit on a fork if the challenge supplies a usable RPC and a fork preserves the relevant conditions. Compare the live nonce, block-dependent state, and gas before sending; a fork is not proof that the live transaction will succeed.
+- **Find the actual flag source.** Some challenges return it through a launcher or web endpoint after on-chain success; others encode it in a supplied artifact, transaction data, event, or storage. Follow observed evidence rather than assuming an endpoint.
+- A fork can mirror real remote state, but output from a local test harness may still be a placeholder. Verify the final Flag's provenance against the brief and target (base §5).

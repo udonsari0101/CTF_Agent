@@ -1,19 +1,22 @@
 # Skill Module: forensics
 
-Read-only playbook for forensics/stego — file / disk / memory / network. Usually **one artifact (or bundle) with one hidden channel**: identify it by bytes, hypothesize *where the flag hides*, extract that one channel. base.md owns the loop / submission / belief≠proof / per-file decomposition / anti-fabrication — this is only tactics+tools.
+Read-only playbook for forensics/stego — file / disk / memory / network. Inventory the supplied artifacts, identify them by bytes, and test the most plausible hiding channel first. Several artifacts or channels may matter. base.md owns the loop / submission / belief≠proof / per-file decomposition / anti-fabrication — this is only tactics+tools.
 
 Files by role: extraction/recovery script → `solver.py`; artifact inventory + what each held → `notes/ANALYSIS.md`; the carrier + exactly how to extract it → `notes/VULN.md`; dead-ends + the next channel to try → `notes/NEXT.md`; carved/scratch/decoded files → `tmp/`; when an extracted payload is really another category (crypto/rev/web) → `../../skills/<cat>.md`.
 
 The image includes Binwalk, ExifTool, pngcheck, Pillow, StegSeek, Steghide, SoX, FFmpeg, TShark, Volatility 3, John and Sleuth Kit. `zsteg`, `bkcrack`, `hashcat`, `outguess`, ImageMagick, Aircrack-ng and GUI/online tools below are optional. Check availability before a command; use the installed byte/bit-level tools first, and acquire a specialized tool only when the artifact calls for it. No `rockyou.txt` wordlist is bundled.
 
 ## Triage — extensions lie, identify by bytes
-Run the cheap tools, then extract the ONE hypothesized channel (metadata / appended-EOF / LSB / packet-metadata / deleted-file / macro / leftover-history). Every extracted output is a NEW artifact — re-run `file` on it; 3–4 nested wrappers is normal.
+Check file sizes and free scratch space before a scan. On a multi-GB disk, RAM image, VM image or capture, start with metadata, partition/protocol inventory and a few targeted signatures; do not recursively extract the entire image or duplicate it by default. Test the best-supported channel (metadata / appended-EOF / LSB / packet-metadata / deleted-file / macro / leftover-history) and pivot when evidence changes. Every extracted output is a new artifact — re-run `file` on it.
 ```
+stat -c '%s %n' suspect.*; df -h tmp/
 file suspect.*
 xxd suspect.bin | head -8                                    # magic bytes = ground truth
+exiftool suspect.*                                            # media/office/pdf metadata
+# For small artifacts or a relevant slice, then try strings and binwalk:
 strings -n8 -a suspect.bin | grep -iaE 'flag|ctf\{|pass|secret|BEGIN'
 strings -e l suspect.bin ; strings -e b suspect.bin          # UTF-16 LE/BE that ascii strings misses
-binwalk suspect.bin ; exiftool suspect.*                     # embedded sigs; media/office/pdf metadata
+binwalk suspect.bin                                           # candidate embedded signatures
 ```
 Flag format is in `../chal_desc.md`.
 
@@ -23,14 +26,14 @@ Flag format is in `../chal_desc.md`.
 | suspicious image (generic) | `file`, `exiftool`, `binwalk`, `pngcheck`, then inspect likely channel | Aperi'solve/stegsolve are optional external services or GUI tools |
 | PNG/BMP/GIF | `pngcheck -v` and Pillow channel/LSB inspection; optional `zsteg -a` | data after `IEND`; IHDR-height brute vs stored CRC; alpha plane; PLTE |
 | JPEG | `exiftool`, `steghide`; `stegseek img.jpg tmp/words.txt` only with a prepared wordlist | optional `outguess -r`; ELA; `exiftool -b -ThumbnailImage`; **not** zsteg |
-| WAV/audio | `sox -n spectrogram` / `ffmpeg showspectrumpic` | LSB; `multimon-ng` DTMF/Morse; SSTV; `sox … oops` (L−R); MP3Stego/DeepSound; `minimodem`/`fldigi` |
-| video | `ffprobe` ALL streams (0:0 is a decoy) | subtitle/attachment stream; `np.maximum` frame composite |
+| WAV/audio | `sox in.wav -n spectrogram -o tmp/spec.png` / `ffmpeg showspectrumpic` | LSB; DTMF/Morse; SSTV; stereo difference; inspect optional decoders before use |
+| video | `ffprobe` all streams | inspect subtitle/attachment streams if present; use a frame composite when the clue suggests flashes |
 | RF-IQ / logic capture | `inspectrum` · `rtl_433` · URH | `sigrok-cli` UART/I2C/SPI; check Manchester |
-| .pcap | `--export-objects` + `-z credentials` FIRST | `-z io,phs` smallest = carrier; follow-stream; plot metadata |
+| .pcap | `capinfos` and `tshark -q -z io,phs` to identify protocols and scale | follow a relevant stream; export only the protocol/object set suggested by evidence; inspect credentials when relevant |
 | USB pcap | HID keycodes / mass-storage SCSI carve | mouse dx/dy plot; Caps-Lock-LED Morse |
-| RAM dump | `windows.clipboard` FIRST | `malfind`; `filescan`+`dumpfiles`; Linux → raw scan / `aeskeyfind` |
+| RAM dump | Identify OS and inspect processes/command lines with an installed Volatility 3 plugin | targeted `filescan`+`dumpfiles`, network/malware plugins or bounded raw scan as evidence suggests; `windows.clipboard` is not bundled in Volatility 3 |
 | .vmem / .vmss+.vmem | `vmss2core -W snap.vmss snap.vmem` → raw | then Volatility |
-| disk.img | `mmls` / `gdisk -l` → mount RO | `fls`/`icat`/`tsk_recover`; fsck+`lsdel`; carve slack |
+| disk.img | `mmls` / `gdisk -l` → inspect partition offsets | `fls`/`icat` targeted recovery; mount read-only only if permitted; repair only a separate copy |
 | .docm/.xlsm | `olevba` | `oledump.py`; unzip XML |
 | .pdf | `pdfid.py` / `pdf-parser.py` | dump stream; `pdfdetach` |
 | locked archive | list; obvious pw; `zip2john`/`john` if present | optional `bkcrack` when ZipCrypto known plaintext exists; fix hdr len@26/28 |
@@ -47,11 +50,11 @@ printf '\x89' | dd of=broken.png bs=1 seek=0 count=1 conv=notrunc
 ## Carving (appended / embedded / polyglot / nested)
 The #1 stego move: data glued after a valid image's EOF, or a ZIP appended. A JPEG/PNG that `unzip` opens is a polyglot. Nested layers are the norm — carve, re-`file`/`binwalk` each output.
 ```
-binwalk --dd='.*' -M suspect.png               # recursive: extract EVERY signature, follow nesting
-foremost -o out/ suspect.dd                     # header/footer carve
-dd if=suspect.png of=hidden.zip bs=1 skip=<offset> 2>/dev/null   # manual, offset from binwalk
+binwalk suspect.png                             # inspect candidate offsets before extraction
+dd if=suspect.png of=tmp/hidden.zip bs=1 skip=<offset> 2>/dev/null  # carve a supported candidate
 unzip suspect.jpg                               # polyglot test
 ```
+Use recursive Binwalk extraction or `foremost` only for a small, relevant artifact after checking expected output size and free space. Signatures in compressed or random bytes can be false positives.
 `photorec` / `bulk_extractor` when signatures are damaged (also auto-pulls emails/URLs/base64/PGP). docx/xlsx/apk/jar/epub/3mf are ZIPs; PDFs/PNGs commonly carry data after `%%EOF`/`IEND`.
 
 ## Images & stego
@@ -86,13 +89,13 @@ multimon-ng -a DTMF -a MORSE_CW in.wav          # touch-tones / Morse in a tone 
 - **SDR/RF**: `inspectrum recording.cfile` to measure symbol rate; `rtl_433 -r cap.cu8` for ISM sensors/remotes; **URH** auto-demods ASK/FSK/PSK (433 MHz fobs, Flipper `.sub`). Logic captures → `PulseView`/`sigrok-cli` with stacked UART→I2C→SPI decoders; a doubled "UART" with no idle gaps is **Manchester** (transition = bit); sweep baud + try inverted polarity.
 
 ## PCAP / network
-Corrupt/truncated → `pcapfix -d cap.pcap` first. Multi-file → `mergecap`/`reordercap`; huge → `editcap` split. Then **`--export-objects` + `-z credentials` FIRST** — may hand you the whole file / cleartext logins.
+Corrupt/truncated → use `pcapfix` on a copy if needed. Multi-file → `mergecap`/`reordercap`; huge → `editcap` split only the time or packet range you need. Start with `capinfos` and the protocol hierarchy, then target a likely stream or object type. Exporting every object can multiply disk use; credentials are relevant only if the capture contains an authentication exchange.
 ```
-tshark -r cap.pcap --export-objects http,out/  # also smb/ftp/tftp/imf; NetworkMiner GUI carves non-HTTP
-tshark -r cap.pcap -q -z credentials            # auto-dump FTP/HTTP/IMAP/POP creds
 capinfos cap.pcap                               # counts, duration
-tshark -r cap.pcap -q -z io,phs                 # protocol hierarchy — SMALLEST-count proto = the carrier
+tshark -r cap.pcap -q -z io,phs                 # protocol hierarchy, not a ranking of flag carriers
 tshark -r cap.pcap -q -z follow,tcp,ascii,0     # reconstruct stream N (…,raw,N | xxd -r -p to carve a binary)
+mkdir -p tmp/http-objects && tshark -r cap.pcap --export-objects http,tmp/http-objects/  # only when HTTP objects matter
+tshark -r cap.pcap -q -z credentials            # only when credentials matter
 ```
 - HTTP map: `-Y http.request -T fields -e http.host -e http.request.uri`. A "TLS" stream whose raw bytes start `50 4b` (PK) is a disguised ZIP — check raw hex of "encrypted" streams. Many equal-size MD5-named HTTP files + one smaller = split archive fragments; order by the in-capture dir-listing, `cat`, extract.
 
@@ -116,11 +119,12 @@ tshark -r usb.pcap -Y 'usbhid.data' -T fields -e usbhid.data            # altern
 Build the keymap/plot in `solver.py`. Other classes: **mass storage** — carve SCSI READ(10)/WRITE(10) bulk data into a mountable image; **LED Morse** — host→device SET_REPORT toggling Caps-Lock, the on/off durations (>300 ms = dash) are Morse; 6+ simultaneous keycodes = steno chording (Plover dict); isochronous (`-e usb.iso.data`) = raw PCM audio; Bluetooth `btrfcomm` fragments — sort by order byte, strip header, concat.
 
 ## Memory (Volatility 3)
-Vol3 auto-detects OS (no profile). Scan → find the ONE interesting PID/file → dump *only that*. **Run `windows.clipboard` first.**
+Volatility 3 can identify a supported OS and does not use Volatility 2 profiles. Inspect the installed plugin list with `vol --help`; do not assume a Volatility 2 plugin such as `clipboard` exists. Start with OS/process context, then dump only a supported candidate file or process.
 ```
 vol -f mem.raw windows.info                     # confirm OS/build
-vol -f mem.raw windows.clipboard                # FIRST: pasted flags/passwords
-vol -f mem.raw windows.pslist ; windows.pstree ; windows.cmdline
+vol -f mem.raw windows.pslist
+vol -f mem.raw windows.pstree
+vol -f mem.raw windows.cmdline
 vol -f mem.raw windows.malfind                  # RWX region, NO file backing = injected code/flag
 vol -f mem.raw windows.filescan | grep -iE 'flag|desktop|\.txt|\.png'
 vol -f mem.raw windows.dumpfiles --virtaddr <addr>      # or --pid <pid>
@@ -137,11 +141,12 @@ For a crypto target: anchor on a nearby path string (e.g. `enc_key.bin`), slide 
 
 ## Disk & filesystem recovery
 ```
-mmls disk.img                                   # partition map → start sector (gdisk -l for GPT, kpartx -av to map)
-mount -o ro,loop,offset=$((START*512)) disk.img /mnt/x   # ALWAYS read-only
+mmls disk.img                                   # partition map → start sector
+START=PUT_START_SECTOR_HERE                      # replace with the partition's start sector from mmls
+fls -o "$START" disk.img                        # inspect files without a mount
 ```
-Deleted files: `fls -rd disk.img` → `icat disk.img <inode> > out`; `tsk_recover -e disk.img out/`. Sleuth Kit (`fls/icat/fsstat/istat`) is scriptable — faster than Autopsy for one file. Slack/unallocated: `blkls disk.img | strings | grep -i flag`. FS-specific undelete:
-- **ext**: `e2fsck -y` reconnects orphans to `/lost+found`; `debugfs`→`lsdel`, or `extundelete`.
+If a mount is needed and permitted, use a read-only loop mount; for ext filesystems also disable journal replay (`-o ro,noload,loop,offset=...`). Never mount or run a repairing fsck on the original evidence. Deleted files: `fls -rd -o "$START" disk.img` → `icat -o "$START" disk.img <inode> > tmp/out`; `tsk_recover -e` can create many files, so use it only after checking space. Sleuth Kit (`fls/icat/fsstat/istat`) is scriptable. Slack/unallocated: target likely regions before a full `blkls` scan. FS-specific undelete:
+- **ext**: `debugfs`→`lsdel`, or `extundelete`; if repair is necessary, run `e2fsck` only on a separate working copy.
 - **btrfs/APFS**: deleted data persists in COW snapshots — `btrfs subvolume list -a` / scan for `APSB` magic then `icat -f apfs`.
 - **FAT**: read clusters whose FAT entry == `0x0000` (freed but not zeroed). **RAID5**: rebuild the missing member by XOR-ing parity.
 - **NTFS ADS**: `fls -r | grep ':'` then `icat` (Zone.Identifier is the tell); timestomp = `$STANDARD_INFORMATION` older than `$FILE_NAME`; `$Recycle.Bin` pairs `$I<rand>` (metadata) with `$R<rand>` (content).

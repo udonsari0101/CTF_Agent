@@ -7,8 +7,20 @@ import ghidra.program.model.listing.Function;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.Locale;
 
 public class DecompileFn extends GhidraScript {
+    private static String hexAddress(String value) {
+        String candidate = value.trim();
+        if (candidate.startsWith("0x") || candidate.startsWith("0X")) {
+            candidate = candidate.substring(2);
+        }
+        if (!candidate.matches("[0-9A-Fa-f]+")) {
+            return null;
+        }
+        return candidate.replaceFirst("^0+(?!$)", "").toLowerCase(Locale.ROOT);
+    }
+
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
@@ -16,8 +28,11 @@ public class DecompileFn extends GhidraScript {
             throw new IllegalArgumentException("Usage: -postScript DecompileFn.java <function-name-or-address> [output-path]");
         }
         Function target = null;
+        String requestedAddress = hexAddress(args[0]);
         for (Function function : currentProgram.getFunctionManager().getFunctions(true)) {
-            if (function.getName().equals(args[0]) || function.getEntryPoint().toString().equalsIgnoreCase(args[0])) {
+            String entry = function.getEntryPoint().toString();
+            if (function.getName().equals(args[0]) || entry.equalsIgnoreCase(args[0])
+                    || (requestedAddress != null && requestedAddress.equals(hexAddress(entry)))) {
                 target = function;
                 break;
             }
@@ -44,6 +59,7 @@ public class DecompileFn extends GhidraScript {
         } finally {
             decompiler.dispose();
         }
-        println("Decompiled " + target.getName() + " to " + output.getAbsolutePath());
+        println("Decompiled " + target.getName() + " @ " + target.getEntryPoint()
+                + " to " + output.getAbsolutePath());
     }
 }

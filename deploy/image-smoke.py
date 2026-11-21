@@ -402,10 +402,14 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     )
     assert ghidra_result.returncode == 0, (ghidra_result.stdout + ghidra_result.stderr)[-3000:]
     assert "main(" in ghidra_output.read_text(encoding="utf-8")
+    entry_match = re.search(r"Decompiled main @ ([0-9a-fA-F]+) to ",
+                            ghidra_result.stdout + ghidra_result.stderr)
+    assert entry_match, (ghidra_result.stdout + ghidra_result.stderr)[-3000:]
+    prefixed_entry = "0x" + (entry_match.group(1).lstrip("0") or "0")
     reused_output = tool_tmp / "tmp" / "main-reused.c"
     reused_result = subprocess.run(
         ["ghidra_headless", str(ghidra_project), "smoke-project", "-process", native_binary.name,
-         "-noanalysis", "-postScript", "DecompileFn.java", "main", str(reused_output)],
+         "-noanalysis", "-postScript", "DecompileFn.java", prefixed_entry, str(reused_output)],
         capture_output=True, text=True, timeout=90, cwd=tool_tmp, env=tool_env,
     )
     assert reused_result.returncode == 0, (reused_result.stdout + reused_result.stderr)[-3000:]

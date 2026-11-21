@@ -5,13 +5,14 @@ Category is unknown. Turn the first cheap observations into a provisional catego
 ## Cheap signal sweep (before anything expensive)
 
 ```sh
-ls -la                                 # every file incl. dotfiles
-file *                                 # magic bytes (extensions lie — trust file(1))
+ls -la                                 # see names including dotfiles
+find . -maxdepth 1 -type f -print0 | xargs -0 -r file --  # magic bytes, including hidden files
 # per interesting file:
 wc -c <f>                              # tiny → key/ciphertext; huge → pcap/disk/media/model
 head -c 64 <f> | xxd                   # magic when file(1) is unsure
 strings -n 8 <f> | head -50            # cheap smell; never dump the whole thing
-binwalk <f>; unzip -l <f>              # containers / trailing appended data
+binwalk <f>                             # when appended/embedded data is plausible
+unzip -l <f>                            # only for ZIP-like files
 exiftool <img>                         # metadata / GPS (osint vs. in-file stego)
 ```
 

@@ -1,6 +1,6 @@
 # Skill Module: crypto
 
-Crypto is won by finding the **one broken parameter** — the deviation from the safe idiom (e=65537, unique nonce, random key, constant-time pad check) — then *proving recovery on the given numbers*. Almost never brute force; classify by shape, pick the attack, gate it behind a check.
+Classify the primitive and the actual win condition first. The weakness may be a parameter, implementation, protocol, reused state, or leaked information; do not assume there is exactly one bad constant. Choose a testable hypothesis, use the cheapest matching attack, and prove recovery on the supplied numbers or oracle.
 
 **Where crypto artifacts go** (base owns the loop/phases): extract the real `n,e,c,IV,sig,curve,outputs…` by variable name into `notes/ANALYSIS.md` and classify there (never paste 4096-bit ints into prose); write the deviation as one line (`e=3 + no pad → cube root`) **plus the recovered primitive** (factors / keystream / RNG state / ECDSA `d`) into `notes/VULN.md`; log dead-end attacks + POISON in `notes/NEXT.md`; put the decrypt in `solver.py`, scratch in `tmp/`; cross-category → `../../skills/<cat>.md`.
 
@@ -8,28 +8,27 @@ Crypto is won by finding the **one broken parameter** — the deviation from the
 
 | Observation | Scheme / next step |
 |---|---|
-| 32 / 40 / 64 / 96 / 128 hex chars | MD5 / SHA1 / SHA256 / SHA384 / SHA512 — `hashcat`/`john`/crackstation only if input is weak |
+| 32 / 40 / 64 / 96 / 128 hex chars | Compatible with common digest lengths, but also keys, tags or random bytes; establish what was hashed before trying a weak-input dictionary |
 | Two huge decimal ints + small third (`n,e,c`) | RSA → RSA tree |
-| Ciphertext len multiple of 16, high entropy | AES/DES block — ECB (repeated blocks) vs CBC vs CTR |
-| Repeated 32-hex (16-byte) chunk in ciphertext | **ECB** → byte-at-a-time / cut-and-paste |
+| Ciphertext len multiple of 16, high entropy | Possibly a padded block cipher; confirm the format, block size and mode from source or controlled queries |
+| Repeated aligned 16-byte ciphertext block under one key | ECB is a candidate; test with repeated controlled plaintext before a byte-at-a-time or cut-and-paste attack |
 | Low entropy, printable, len == plaintext | classical / XOR / stream keystream reuse |
 | `(r,s,z)` tuples, point coords, named curve | ECDSA / ECC |
 | Sequence of 32-bit ints, or `getrandbits`/`random()` in source | PRNG (MT19937 / LCG) |
 | Bit/keystream from XOR-shift-rotate-CRC only | **linear over GF(2)** (see reflex) |
-| `H(secret ‖ msg)` MAC + you control appended data | hash length-extension |
+| Raw Merkle–Damgård hash `H(secret ‖ msg)` used as a MAC, and you can append data | consider length-extension; HMAC, SHA-3 and a suffix-secret construction do not follow this recipe |
 | base64/hex wrapper | decode first (`base64 -d`, `xxd -r -p`), then re-classify |
 
 Quick check: `python3 -c "d=open('f','rb').read();print(len(d),len(set(d)))"`; `file`, `xxd | head`.
 
 ## Reflex — is the primitive secretly LINEAR or broken-by-construction? (two cheap checks first)
 
-**Linear over GF(2).** Any custom hash / PRNG / MAC / "cipher" built ONLY from XOR, shifts, rotates, bit-permutations, CRC is an **affine map over GF(2)** — solve it, don't iterate. Feed the `n` unit vectors `e_i` (one bit set) through the black box, stack outputs as columns → matrix `M`; constant is `f(0)`. Then `f(x)=M·x ⊕ f(0)`; `M.solve_right(...)` / kernel over `GF(2)` gives forged preimages / recovered key in one shot. Same tell for a custom AES-like round with a stuck/known key schedule (GF(2^8) MixColumns is GF(2)-linear).
+**Linear over GF(2), when the entire relevant transformation is affine.** Fixed XORs, fixed shifts/rotates, bit permutations and CRC steps qualify; data-dependent shifts, modular addition, AND of unknown bits and S-boxes do not. First test `f(x ⊕ y) ⊕ f(0) == (f(x) ⊕ f(0)) ⊕ (f(y) ⊕ f(0))` on several distinct inputs. If it holds and the input width is tractable, feed the `n` unit vectors `e_i` through the black box, stack outputs as columns → matrix `M`; then `f(x)=M·x ⊕ f(0)`. Solve the matrix and verify the result against the original primitive. AES MixColumns alone is linear, but a full AES round with SubBytes is not, even with a known key schedule.
 
-**Broken-by-construction — one-liner checks:**
-- **Groth16 / pairing SNARK**: `vk_delta_2 == vk_gamma_2` (or either is identity) → forge a proof for ANY public input, no witness. (Also: unconstrained nullifier → replay.)
-- **ElGamal**: published `B = p−1` (`g^x=−1`) → `x=(p−1)/2`. `A=0`/`A=n` in SRP-style → shared secret 0.
-- **Matrix / LFSR schemes** (`state ← A·state`): diagonalize via **Jordan form** → `A^k` closed-form.
-- **ECC / RSA textbook params** → run `factor(E.order())` / discriminant / `factordb` *before* any lattice.
+**Cheap structural checks, only when the supplied scheme warrants them:**
+- **ElGamal / SRP-style protocols**: verify the group order, point validation and exceptional values. A public value equal to `−1 mod p` may constrain an exponent, but is not by itself proof that its exact exponent is `(p−1)/2` for the chosen generator.
+- **Matrix / LFSR schemes** (`state ← A·state`): model fixed transitions as matrix powers and test against observed outputs before seeking a closed form.
+- **ECC / RSA**: inspect discriminants and small or obviously structured group orders; bound factorization attempts rather than spending the whole solve on a large generic order.
 
 ## Tooling fast-path
 
@@ -83,10 +82,10 @@ d=inverse(e,(p-1)*(q-1)); print(long_to_bytes(pow(c,d,n)))
 ## AES / block-cipher — tells and attacks
 
 - **ECB** (repeated pt→repeated ct): controlled prefix on block boundary → **byte-at-a-time** (brute one unknown byte/query) and **cut-and-paste** (rearrange ct blocks to splice an `admin` block).
-- **CBC bit-flipping**: flip byte `i` of `C_{k−1}` → flips byte `i` of `P_k` (garbles block `k−1`). `P_k[i]^=(old^new)`. IV bit-flip edits block 0. Flip `role=user`→`admin` with no key.
+- **CBC bit-flipping**: flip byte `i` of `C_{k−1}` → flips byte `i` of `P_k` (garbles block `k−1`). `P_k[i]^=(old^new)`. IV bit-flip edits block 0. A same-length substitution such as `role=guest`→`role=admin` may work if the positions and block boundaries are known and no integrity check rejects the ciphertext.
 - **CBC/PKCS7 padding oracle** (server distinguishes bad-pad from other errors — incl. UnicodeDecodeError/length side-channels) → recover plaintext byte-from-tail (~128 q/byte) and **encrypt arbitrary plaintext** via chosen IVs. The single most common AES CTF. Tools: PadBuster, `padding-oracle`.
 - **CTR/stream nonce reuse** (same key,nonce → same keystream): `C1^C2=P1^P2`. Crib-drag / known-plaintext to peel keystream. Never brute the key.
-- **GCM nonce reuse**: two msgs under one (key,nonce) leak auth key `H` → **forge tags**. Solve the two GHASH equations over `GF(2^128)` (modulus `x^128+x^7+x^2+x+1`) for `H`, then tag the forged ct. Tool: `nonce-disrespect`.
+- **GCM nonce reuse**: ciphertexts under the same key and nonce reveal the XOR of plaintexts. If authenticated message/tag pairs and their lengths are known, analyze the GHASH equations for candidate authentication keys, then verify a forged tag against the oracle; two arbitrary ciphertexts alone do not guarantee a unique key recovery. Tool: `nonce-disrespect` when the instance fits its assumptions.
 - **reduced-round AES** → integral/**square attack** (256-pt Λ-set, XOR-sum=0 distinguisher); modified/degenerate S-box (`len(set(sbox))<256`) → per-position key recovery.
 
 ```python
@@ -135,17 +134,19 @@ d=((s1*k-z1)*inverse(r,n))%n
 
 ## Hashes
 
-- **Length extension** (`H(secret‖msg)`, MD5/SHA1/SHA256): append data + forge MAC without the secret. `hashpump -s <sig> -d <known> -a <append> -k <secret_len>` (or `hashpumpy`).
-- **Collisions**: reuse published pairs — MD5 chosen-prefix (`fastcoll`/`fastcol`), SHA1 SHAttered. Don't generate novel collisions under time pressure. **CRC** is linear → append 4 bytes to force any target (forge `CRC(msg‖secret)`).
+- **Length extension** (`H(secret‖msg)`, MD5/SHA1/SHA256): append data + forge MAC without the secret. The image includes Python `hashpumpy`, not the `hashpump` CLI; check `import hashpumpy` and use its `hashpump` function with the correct secret-length guess. This does not apply to HMAC or SHA-3.
+- **Collisions**: reuse published pairs when the challenge structure permits. FastColl makes MD5 identical-prefix collisions; HashClash's `cpc.sh` handles chosen-prefix MD5 collisions (not bundled). SHA-1 SHAttered is a published collision pair, not a general chosen-prefix tool. **CRC** is linear, but a suffix-forging calculation depends on the exact CRC parameters and message layout.
 
 ## PRNG
 
-- **MT19937 (Python `random`)**: 624 consecutive 32-bit outputs → full state → all past/future. `randcrack` (feed 624). Truncated/float outputs → z3 / `mt19937predictor` / GF(2) magic-matrix (`not_random`).
-- **LCG** (`x=a·x+c mod m`): recover `m` from gcd of products of differences, then `a=(x2−x1)/(x1−x0)`, `c` follows. Truncated → HNP/lattice. z3 handles modular constraints cleanly.
-- **V8 `Math.random()`** = **xorshift128+** (`xs128p`): collect 5–10 consecutive doubles served **in reverse (LIFO)** → *reverse your sample order*, recover 128-bit state with **z3** (`QF_BV`), roll forward. Tool: `v8_rand_buster`.
-- **time-seeded key/IV** (`random.seed(time())`/`srand(time())`) → tiny seed space; **the challenge file's mtime IS often the seed** — `stat` it, try that value first, then brute a ±window. C `rand()` ≠ Python: call libc directly via `ctypes.CDLL('libc.so.6').srand/rand`.
+- **MT19937 (Python `random`)**: 624 consecutive full 32-bit outputs can reveal the state and predict future outputs. Confirm the call pattern and output truncation before using `randcrack`; past outputs need separate state reversal. Truncated/float outputs need additional equations or samples.
+- **LCG** (`x=a·x+c mod m`): infer a candidate `m` from differences, then solve `a(x1−x0) ≡ x2−x1 (mod m)`; ordinary modular division works only when the denominator is invertible modulo `m`. Check every recovered parameter against further outputs. Truncated outputs may need lattice/SMT methods.
+- **V8 `Math.random()`**: inspect the target's runtime version and architecture before modelling its PRNG. Versions using xorshift128+ can be modeled with bit-vector constraints, but observed output order matters: current 64-bit V8 generates values on each call, while its 32-bit path uses a refill cache. Do not reverse samples by default; predict and verify the next real output before trusting recovered state.
+- **time-seeded key/IV** (`random.seed(time())`/`srand(time())`) → bounded candidate timestamps when source or output timing supports it. File mtime is a candidate only if there is evidence that generation and file writing coincided; do not assume it is the seed. C `rand()` ≠ Python: if needed, reproduce the target libc implementation rather than Python's PRNG.
 
 ```python
+# Optional package: `python3 -c 'import randcrack'` before using this example;
+# install it in job-local scratch only when full 32-bit outputs justify it.
 from randcrack import RandCrack
 rc=RandCrack()
 for out in outputs_624: rc.submit(out)       # 624 consecutive getrandbits(32)

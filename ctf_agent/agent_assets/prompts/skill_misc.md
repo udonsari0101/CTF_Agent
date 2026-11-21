@@ -138,22 +138,28 @@ Never answer a prompting server by hand — a 2s timer beats manual netcat. **Ea
 ```python
 import hashlib, itertools
 def solve_bits(prefix: bytes, nbits: int, alg="sha256") -> bytes:   # N leading zero BITS
+    width = hashlib.new(alg).digest_size * 8
+    if not 0 <= nbits <= width:
+        raise ValueError("nbits exceeds the digest width")
     for i in itertools.count():
         s = str(i).encode()
-        if int.from_bytes(hashlib.new(alg, prefix+s).digest(),"big") >> (256-nbits) == 0:
+        if int.from_bytes(hashlib.new(alg, prefix+s).digest(),"big") >> (width-nbits) == 0:
             return s
 def solve_zeros(prefix: bytes, nzeros: int, alg="sha256") -> bytes:  # hex digest starts N '0' nibbles
+    if not 0 <= nzeros <= hashlib.new(alg).digest_size * 2:
+        raise ValueError("nzeros exceeds the digest width")
     for i in itertools.count():
         s = str(i).encode()
         if hashlib.new(alg, prefix+s).hexdigest().startswith("0"*nzeros):
             return s
 ```
-Match the exact wording: some hash `S+prefix`, want hex/the digest, or a different order. redpwn/kctf `pow.py` (`s.AAA… ...`): don't reimplement — run `curl -sSfL https://pwn.red/pow | sh -s <challenge>` or `pip install pow; pow <challenge>`. Timed arithmetic gauntlet → parse the expression and `ast.literal_eval`/safe-eval it.
+Match the exact wording: some hash `S+prefix`, want hex/the digest, or a different order. Estimate `2**nbits` or `16**nzeros` trials against the deadline before starting a large search. For a supplied redpwn/kCTF PoW helper, inspect and run the challenge-provided script in scratch instead of guessing the protocol. Timed arithmetic gauntlet → parse only the allowed numeric grammar; `ast.literal_eval` does not evaluate arithmetic expressions, and raw `eval` runs arbitrary Python from the remote.
 
 ```python
 from pwn import *
 from hashlib import sha256
 from itertools import count
+import re
 
 io = remote("chal.host", 1337)          # host/port from ../chal_desc.md
 # context.log_level = "debug"           # while developing
@@ -167,9 +173,12 @@ for n in count():                       # PoW: find suffix so sha256 has 5 hex z
 while True:                             # then loop the real protocol
     line = io.recvline(timeout=5)
     if not line: break
-    if b"?" in line:
-        io.sendline(str(eval(line.split(b"=")[0])).encode())   # parse precisely, don't guess
-    if b"CTF{" in line: log.success(line.decode(errors="replace"))
+    match = re.search(rb"(-?\d+)\s*([+*\-])\s*(-?\d+)\s*=\s*\?", line)
+    if match:
+        a, op, b = int(match[1]), match[2], int(match[3])
+        answer = a + b if op == b"+" else a - b if op == b"-" else a * b
+        io.sendline(str(answer).encode())  # extend only when the prompt proves another operation
+    print(line.decode(errors="replace"), end="")  # inspect the actual flag format in ../chal_desc.md
 io.close()
 ```
 

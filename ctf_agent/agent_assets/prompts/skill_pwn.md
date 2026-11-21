@@ -21,15 +21,15 @@ Mitigation → what it forces on you:
 
 | checksec says | Consequence |
 |---|---|
-| **No canary** | straight stack BOF to saved RIP; no leak needed for control |
+| **No canary** | a reachable stack overwrite need not preserve a canary; PIE/ASLR may still require an address leak |
 | **Canary** | leak it first (fmt/OOB read/partial), or overwrite a non-canary target; a wrong canary = deterministic crash, not flakiness |
 | **NX enabled** (default) | no stack shellcode → ROP / ret2libc |
 | **NX disabled** | shellcode-on-stack viable if you can jump to it |
 | **PIE** | every code address needs a leak; base = leak − known_offset |
 | **No PIE** | `.text`/PLT/GOT fixed — read them straight from the ELF |
-| **RELRO: Partial** | GOT writable → GOT overwrite; also ret2dlresolve viable |
-| **RELRO: Full** | GOT read-only → pivot to `_IO_FILE`/FSOP / return address |
-| **Static** | no libc; hunt syscall gadgets → SROP / ret2syscall / ORW |
+| **RELRO: Partial** | GOT may be writable; consider an overwrite or ret2dlresolve only if the needed primitive and resolver path are present |
+| **RELRO: Full** | GOT read-only; choose a reachable writable target or return-address path, not an automatic FSOP pivot |
+| **Static** | no separate dynamic libc to base from a leak; inspect the statically linked code and syscall gadgets |
 
 Disassemble the *target function*, not the whole binary:
 ```
@@ -71,8 +71,8 @@ Find where attacker input lands, then match it. The bug is the one call that dev
 ```python
 from pwn import *
 context.binary = elf = ELF('./chall')
-p = process('./chall'); p.sendline(cyclic(400)); p.wait()
-off = cyclic_find(p.corefile.read(p.corefile.rsp, 8), n=8)   # n=8 for 64-bit; hardcode result
+p = process('./chall'); p.sendline(cyclic(400, n=8)); p.wait()
+off = cyclic_find(p.corefile.read(p.corefile.rsp, 8), n=8)   # match the generator's n=8; verify the crash and offset
 ```
 2. **Leak** — defeat ASLR/PIE/canary (one good leak usually unlocks the rest).
 3. **AAR / AAW** — read-what-where / write-what-where.
@@ -103,33 +103,25 @@ Get the version (`strings libc.so.6 | grep 'GNU C Library'` or the Ubuntu tag); 
 
 | glibc | What changes | Move |
 |---|---|---|
-| **2.26+** | tcache: 7 chunks/bin, `fd`-linked, near-zero checks | double-free/UAF → overwrite `fd` → malloc your target. Easiest arbitrary alloc |
-| **2.29+** | tcache `key` field detects trivial double-free | clear/edit `key`, or cycle through fastbin to dup |
-| **2.32+** | **safe-linking**: `fd = ptr ^ (chunk_addr >> 12)` | write `masked = target ^ (pos >> 12)`, never a raw ptr. The **first** freed chunk in a bin has `fd = 0 ^ (chunk>>12)` → leaking that fd is a free **heap leak**: `heap_base = fd << 12`. tcache double-free still legal |
-| **2.34+** | `__free_hook`/`__malloc_hook` **removed** | pivot to FSOP — **House of Apple 2** (below), or `setcontext`, or `__run_exit_handlers`/`__call_tls_dtors` (defeat `pointer_guard`) |
+| **2.26–2.28** | default tcache: up to 7 chunks/bin, `next`-linked | UAF/double-free can poison a suitable bin; later versions add checks and pointer encoding |
+| **2.29+** | tcache `key` detects a repeated free in the same bin | verify whether a UAF write, alternate bin route or different primitive can bypass the check; do not assume a double-free survives |
+| **2.32+** | **safe-linking**: the stored `next` is `ptr ^ (storage_address >> 12)` | Encode a target with the address of the `next` field, not an assumed heap base. The first freed entry's `next` can reveal that entry's page (`encoded_next << 12`), **not necessarily the heap base**. A second free of the same entry may still be rejected by the tcache key check; verify the actual bin state before choosing a bypass. |
+| **2.34+** | `__free_hook`/`__malloc_hook` no longer provide working hook targets | re-evaluate reachable control targets and checks; FILE/exit-handler techniques are conditional, not automatic substitutes |
 
 Version-independent staples: **unsorted bin** — a freed chunk's `fd`/`bk` points into `main_arena`, so a UAF read there is a reliable **libc leak** (unsorted-bin *attack* writes `main_arena+88` pre-2.29); **fastbin dup** — the size-field check lets you alloc near a fake size field. Named houses when tcache is poisoned/constrained: **Einherjar** (null-byte off-by-one → `prev_size`/`PREV_INUSE` → backward consolidation/overlap), **Orange** (top-chunk resize + unsorted → old-style `_IO_list_all` FSOP), **Force** (unbounded top-chunk size → alloc anywhere; pre-2.29).
 
-### House of Apple 2 (glibc ≥2.34, hooks gone) — RCE from one arbitrary write to a stdio pointer
-When hooks and hook-based one_gadgets are gone and you can control `_IO_list_all` (or any FILE the flush walks):
-1. Forge a fake `_IO_FILE`; set `_IO_list_all` → it.
-2. `vtable = _IO_wfile_jumps` (a *real* libc vtable → passes the post-2.28 vtable-range check).
-3. Point `fp->_wide_data` at a fake wide struct whose `_wide_vtable->__doallocate` slot = `system`. The overflow path calls `fp->_wide_data->_wide_vtable->__doallocate(fp)` with **`rdi = fp`**.
-4. Set flags/`_IO_write_base`/`_IO_buf_base` so the write path reaches `_IO_wdoallocbuf`: keep `_IO_NO_WRITES` clear in `_flags`, and set `_wide_data->_IO_write_base = 0`, `_wide_data->_IO_buf_base = 0`.
-5. `rdi = fp`, so the command lives at the FILE's start (`/bin/sh`); many exploits place the string via an offset/alternate command since `_flags`+0 must still pass flag checks.
-6. Trigger: `exit`/`__run_exit_handlers` → `_IO_flush_all_lockp`, or any `fclose`/`fwrite`/`puts` that walks `_IO_list_all`.
-
-**setcontext (RDI/full-register control, hooks-gone):** point the `__doallocate` slot at `setcontext+61` instead of `system` — it loads *every* register from the struct at `rdx` (`rdx=fp->_wide_data`: `RSP←[rdx+0xa0]`, `RIP←[rdx+0xa8]`, `RDI←[rdx+0x68]`), pivoting straight into a ROP chain. **SUID-root target:** `system("/bin/sh")` fails (dash drops privs when `uid!=euid`) → setcontext-pivot to `setuid(0)` then `system("/bin/sh")`.
+### FILE/exit-handler techniques when hooks are unavailable
+Only pursue a FILE path such as House of Apple 2 when the primitive can reach a relevant FILE pointer, controlled structures can be placed at known addresses, and a matching flush/call trigger is reachable. Derive `_IO_FILE`, wide-data and vtable field offsets from the **supplied libc** and prove the call path in GDB; offsets and register assumptions from another glibc build are not reusable. A `setcontext` pivot likewise needs a measured call site and the actual calling convention. For SUID targets, check whether the invoked shell preserves effective privileges; otherwise set the required IDs before launching it.
 
 ## Stack-return gotchas & no-leak returns
 | Symptom / constraint | Fix |
 |---|---|
 | SIGSEGV at a `movaps` inside `system`/libc | stack not 16-byte aligned → prepend one extra bare `ret` gadget before the call |
-| Need a clean frame to loop / re-enter | return to the **`call vuln`** (or `call main`) instruction, not the prologue — keeps `rsp` aligned, re-enters cleanly |
+| Need a clean frame to loop / re-enter | consider a call site or function entry, then verify the actual `rsp` alignment and callee setup in GDB |
 | `read(0,buf,N)` return value lands in `rax` | send **exactly** N bytes so `rax=N`; a short read changes `rax` (matters when `rax` is the SROP/syscall number — e.g. `stub_execveat`=0x142) |
 | Overflow too small for a full chain | **stack pivot** to a controlled buffer: `leave;ret` (set `rbp=fake-8`), `add rsp,N; ret`, or `xchg eax,esp; ret` (needs `pop rax`). Double `leave;ret` walks rsp to BSS |
-| Partial RELRO and **no leak at all** | **ret2dlresolve**: forge `Elf64_Rela`+`Elf64_Sym`+string, call `PLT[0]` with your reloc index → resolver runs `system` for you |
-| No `pop rsi`/`pop rdx` gadget | **ret2csu** (`__libc_csu_init`): set `rbx/rbp/r12-r15`, gadget loads `rsi=r14, rdx=r13`, calls `[r12+rbx*8]` |
+| Partial RELRO and **no leak at all** | consider **ret2dlresolve** if a usable resolver/PLT entry, writable staging area and control of the call sequence are present |
+| No `pop rsi`/`pop rdx` gadget | inspect for **ret2csu** gadgets in the actual binary; `__libc_csu_init` and the classic gadget pair are absent in some newer builds |
 | **Forking server** (canary/PIE constant across forks) | brute the canary **byte-by-byte**: correct byte = no crash; ≤256×8 tries, no leak needed. Same trick recovers saved-RIP low bytes |
 
 ```python
@@ -161,7 +153,7 @@ Use the supplied source or binary disassembly to establish the filter. The insta
 |---|---|
 | `execve` (59) only | `execveat` (322), or just ORW (`openat`+`read`+`write`) |
 | exact `nr==59`, native ABI only | **x32 ABI**: `rax = 0x40000000 \| 59` — an exact-59 (64-bit) match misses the x32 invocation, which still execs |
-| `open`/`openat` | `openat2` (**437**), or read the file via `readv`/`preadv2` |
+| `open`/`openat` | Check whether `openat2` (**437**) is actually allowed, then supply a valid `open_how`. `readv`/`preadv2` only help if a descriptor for the file is already open; they cannot open a path. |
 | `write` | `sendfile`, `writev`, `pwrite64` |
 | arch not pinned to x86-64 | switch ABI (i386/x32) via a `retfq` to a 32-bit CS if the filter only guards `AUDIT_ARCH_X86_64` |
 
@@ -182,7 +174,7 @@ zcat rootfs.cpio | cpio -idv               # edit init → root shell for local 
 # run.sh usually has -s (gdbstub :1234); add -S to pause at boot
 gdb-multiarch vmlinux -ex 'target remote :1234'    # gef: kbase / ksymaddr
 ```
-Escalation targets (first two need no ASLR leak):
+Potential escalation targets depend on the supplied kernel version, configuration, protections and reachable write/call primitive. A kernel symbol address still needs to be established when KASLR is enabled:
 
 | Target | Win |
 |---|---|
@@ -198,12 +190,12 @@ Heap spray — **match the vulnerable object's `kmalloc` cache size** to the spr
 | `tty_struct` (kmalloc-1024) | `open("/dev/ptmx")` | fake `ops` vtable → kROP / stack pivot |
 | `msg_msg` (kmalloc-64..4096, elastic) | `msgsnd`/`msgrcv` | OOB → arbitrary read, spray |
 | `user_key_payload` (variable) | `add_key` | leak / spray arbitrary bytes |
-| `pipe_buffer` (kmalloc-1024) | `pipe()` | UAF page → `->ops` control (Dirty Pipe-ish) |
+| `pipe_buffer` (allocation size varies with pipe capacity/kernel) | `pipe()` | potential `->ops` control when a matching allocation can be reclaimed |
 | `setxattr` buf (kmalloc-32..1024, transient) | `setxattr()` | momentary controlled-value write (file must exist on remote) |
 
 - **KASLR leak** then everything else; **KPTI**: return to userland via the `swapgs`/`iretq` trampoline, not a raw ret; **SMEP/SMAP**: no ret2usr — ROP fully in kernel text.
 - **Cross-cache** (SLUB per-CPU free → empty slab back to buddy allocator) escapes even a dedicated `kmem_cache_create()` cache.
-- **addr_limit bypass:** a module that sets `KERNEL_DS` but skips restore on an error path → force the error, then userspace `read`/`write` reaches kernel memory.
+- **Historical `addr_limit` bypass:** only consider `KERNEL_DS`/`set_fs` on a kernel that still implements that mechanism; verify the supplied build before searching for it.
 - Widen a race window: **`userfaultfd`**/**FUSE** (your handler stalls a `copy_from_user`) or **`MADV_DONTNEED`** to force a re-fault — classic for double-fetch / TOCTOU / UAF races.
 
 ## Apple-Silicon (arm64 host)
@@ -217,14 +209,18 @@ import os, sys, hashlib, itertools
 
 context.binary = elf = ELF('./chall')
 context.log_level = 'info'                 # 'debug' to see wire bytes
-libc = ELF('./libc.so.6') if os.path.exists('./libc.so.6') else elf.libc
+libc = ELF('./libc.so.6') if os.path.exists('./libc.so.6') else None
+# Do not treat elf.libc (the solver host's libc) as the remote libc.
 HOST, PORT = 'REMOTE_HOST', 0              # from ../chal_desc.md
 OFFSET = 0                                 # measure with cyclic; never guess
 
-def solve_bits(prefix, nbits, alg='sha256'):     # sha256(prefix+S) has >=nbits leading zero bits
+def solve_bits(prefix, nbits, alg='sha256'):     # hash(prefix+S) has >=nbits leading zero bits
+    width = hashlib.new(alg).digest_size * 8
+    if not 0 <= nbits <= width:
+        raise ValueError('nbits exceeds digest width')
     for i in itertools.count():
         s = str(i).encode()
-        if int.from_bytes(hashlib.new(alg, prefix + s).digest(), 'big') >> (256 - nbits) == 0:
+        if int.from_bytes(hashlib.new(alg, prefix + s).digest(), 'big') >> (width - nbits) == 0:
             return s
 
 def handle_pow(io):                          # adapt parse to the EXACT line the server prints
@@ -242,7 +238,9 @@ io = start()
 # === leak stage ===
 io.recvuntil(b'> ')
 io.sendline(payload_leak)
-leak = u64(io.recvline().strip().ljust(8, b'\x00'))
+leak_bytes = io.recvline().removesuffix(b'\n')  # only for a line-framed leak; use recvn/exact framing for raw bytes
+leak = u64(leak_bytes.ljust(8, b'\x00'))
+assert libc is not None, 'identify the target libc before using symbol offsets'
 libc.address = leak - libc.sym['puts']
 log.success('libc base = %#x', libc.address)
 assert libc.address & 0xfff == 0, 'leak misaligned — parse is wrong'
@@ -258,7 +256,7 @@ io.interactive()                           # cat the flag from the REMOTE socket
 
 ## Remote / PoW / submission
 - Each `bash` call is a **fresh process** — for any stateful service write a `pwntools`/socket script, don't chain `nc` calls. For raw binaries over `nc`: `stty raw -echo`.
-- **PoW:** the `solve_bits` above handles sha256 leading-zero-*bits* gates; a hex-*nibble* variant checks `hexdigest().startswith('0'*n)`. redpwn/kctf gates print a token → run `curl -sSfL https://pwn.red/pow | sh -s <challenge>` or `pip install pow` then `pow <arg>`. Solve the PoW before anything else on connect.
+- **PoW:** the `solve_bits` above handles leading-zero-*bits* gates for the specified hash; a hex-*nibble* variant checks `hexdigest().startswith('0'*n)`. Inspect the actual challenge protocol and any supplied helper before using it. If a helper is necessary, verify its source and run it in job-local scratch rather than piping an unexamined network response into a shell. Solve the PoW before proceeding with the service protocol.
 - **Missing address:** if evidence from the binary or local execution proves that the real flag requires a remote service absent from `../chal_desc.md`, record the evidence and exact needed connection details in `notes/NEXT.md`, then run `request-remote "<what you need>"` once and stop this attempt. This includes a brief configured as "none" when evidence contradicts it. An unverified guess is insufficient. Re-read the brief before any later connection — the operator may add or change the address.
 - Submission is human-verified: you print the flag, the operator submits (`submit-flag "CTF{...}"`). No auto-submit.
 
