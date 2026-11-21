@@ -78,13 +78,18 @@ INITIAL_GOAL = (
 )
 
 NUDGE = (
-    "Status check. Do NOT blind-repeat a failing approach. If you're stuck: write 3 "
-    "falsifiable hypotheses in notes/NEXT.md for WHY it's failing and test each with "
-    "a specific experiment (ask the debugger a precise question, not 'why doesn't "
-    "this work?'). Re-scan the primitives you already hold for one you overlooked and "
-    "try re-chaining them a different way. Then VARY the tactic — name the dead end "
-    "in notes/NEXT.md and switch vuln class / tool / primitive (grep -> script, "
-    "reason -> run/fuzz, local -> remote). Otherwise keep going."
+    "Status check. Do not repeat an unchanged failing approach. Classify the "
+    "blocker from evidence before changing tactics: a tool/runtime failure, "
+    "target unavailability (429, timeout, reset), or a falsified hypothesis. "
+    "For a tool failure, record the error and try a different observation path "
+    "or stop this attempt; it does not disprove the exploit. For target "
+    "unavailability, compare one normal control when permitted, honor "
+    "Retry-After and contest limits, and pause instead of hammering the target. "
+    "For a falsified hypothesis, record the discriminating result in "
+    "notes/NEXT.md and choose the single cheapest test that separates the "
+    "remaining explanations. Reuse verified primitives; switch a vulnerability "
+    "class, tool, or primitive only when evidence warrants it. Keep going when "
+    "a test has a clear expected result."
 )
 
 POISON_REGOAL = (
