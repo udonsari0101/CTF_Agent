@@ -29,6 +29,7 @@ def main() -> None:
             # A direct file write or an older CLI must be checked again at the
             # worker boundary before any flag event can be published.
             candidate.write_text(option, encoding="utf-8")
+            candidate.chmod(0o600)
             try:
                 _validated_flag_candidate(candidate)
             except WorkerRefusal as error:
