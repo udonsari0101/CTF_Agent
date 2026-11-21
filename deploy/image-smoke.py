@@ -535,6 +535,14 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
                 self.end_headers()
                 self.wfile.write(b"late-response")
                 return
+            if self.path == "/api-json?token=private":
+                body = b'{"answer":"observed","count":2}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path == "/action":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -639,6 +647,27 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         assert "private" not in result.stdout and "private" not in action_json.read_text()
         assert "CTF browser action check" in action_html.read_text()
         assert action_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        assert "api_json" not in action
+        api_steps = browser_workdir / "tmp" / "api.json"
+        api_steps.write_text(json.dumps([{"action": "evaluate", "expression": (
+            "(async()=>{const r=await fetch('/api-json?token=private');"
+            "return (await r.json()).answer})()"
+        )}]), encoding="utf-8")
+        api_capture = subprocess.run(
+            [str(ctf_browser_act), "--capture-api-json", "--steps=tmp/api.json",
+             f"http://127.0.0.1:{browser_server.server_port}/action"],
+            capture_output=True, text=True, timeout=30,
+            cwd=browser_workdir, env=tool_env,
+        )
+        assert api_capture.returncode == 0, api_capture.stderr.strip()[-3000:]
+        captured = json.loads(api_capture.stdout)
+        assert captured["actions"][-1]["result"] == "observed"
+        assert captured["api_json"] == [{
+            "method": "GET", "status": 200,
+            "url": f"http://127.0.0.1:{browser_server.server_port}/api-json?token=%3Credacted%3E",
+            "body": {"answer": "observed", "count": 2},
+        }]
+        assert "private" not in api_capture.stdout
         reused = subprocess.run(
             [str(ctf_browser_act), "--session=action",
              f"http://127.0.0.1:{browser_server.server_port}/action"],

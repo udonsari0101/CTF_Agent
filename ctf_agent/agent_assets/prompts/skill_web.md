@@ -1,17 +1,19 @@
 # Skill Module: web (web exploitation)
 
-Fingerprint the framework, learn its **safe default idiom** (auth decorator, ORM parametrization, autoescape, signed session), then find the ONE handler that opts out. The bug is the outlier against its neighbors — diff, don't CVE-grep. Everything below is web-specific tactics + the tools to run them; base.md owns the solve loop, submission/POISON, belief≠proof, local→remote/PoW, and the `notes/` model.
+Start with the supplied goal and a normal control request. When source is available, trace the user-controlled input through the reachable route to the relevant sink; compare neighboring handlers where useful. Do not assume there is exactly one vulnerable handler or that every challenge uses a framework deviation. The recipes below are options, not a sequence to exhaust. base.md owns the solve loop, submission/POISON, belief≠proof, local→remote/PoW, and the `notes/` model.
 
 ## Evidence budget on a live target
 Map the goal, trust boundary, controlled input, and one cheapest falsifying test before probing. The tactics below are candidates, not a checklist to run in full; choose only those supported by a route, response, source line, or browser behavior. Distinguish user and admin-bot contexts, and record which context produced each observation.
+
+Before a broad path search, generated payload sweep, key-guessing run, or concurrent request batch, state the observation that justifies it, the expected result that would confirm or reject the hypothesis, and a bounded cost (requests, candidates, or seconds). Start with the smallest batch that can distinguish alternatives, using local reproduction where possible. If it only produces more of the same negative result, summarize it in `notes/NEXT.md` and change the hypothesis rather than expanding the list. Long work is justified by new verified observations, not by the number of probes made.
 
 Treat a 429, repeated timeout, challenge reset, or temporary hide as a change in target availability. Respect `Retry-After` and contest limits; pause or reduce requests instead of repeating the same probe. If a browser helper fails before navigation because of its own runtime, report the tool failure and use a different observation path; it is not evidence that the payload failed. At the review point described in base.md, compare the shortest remaining path to the Flag against the last verified observation, and stop repeating variants that have no discriminating result.
 
 ## Source-first when source ships
 Map the supplied source quickly. If a target endpoint is supplied, check one normal response against it before expanding the analysis. When there is no endpoint, use a runnable local copy or the supplied code as the observation. Reading every file before the first observation or fuzzing blindly wastes time.
 1. **Stack** from manifests: `requirements.txt`/`Pipfile`, `package.json`, `composer.json`, `Gemfile`, `go.mod`, framework imports, pinned versions (record in `notes/ANALYSIS.md` — version decides which gadget/escape works).
-2. **Routes → relevant handlers**; identify the one path that controls the likely Flag route, then follow its sink. Expand to other handlers only when the first observation calls for it.
-3. **Establish the norm**: how do the *other* handlers auth/query/render/deserialize? The vuln handler differs by one line.
+2. **Routes → relevant handlers**; identify a reachable path toward the Flag, then follow its input and sink. Expand when an observation points to another path.
+3. **Compare nearby behavior when useful**: check how related handlers authorize, query, render, or deserialize. A deviation may be a clue, but the vulnerability need not be a one-line exception.
 4. Trace user input → sink (dataflow), not names.
 
 ```bash
@@ -45,7 +47,7 @@ No source? Map the app first: capture one normal request/response per feature, t
 - **Auth**: route mounted without the `requireAuth` middleware.
 - **Injection**: template-literal SQL vs `?`; `child_process.exec(input)` vs `execFile([args])`.
 - **Deserialize/eval**: `node-serialize.unserialize` (`_$$ND_FUNC$$_` IIFE payload), `vm.runInThisContext`, `eval`, `Function(input)`.
-- **Prototype pollution**: recursive `merge`/`extend`/`_.defaultsDeep`/`Object.assign`/`set(obj,path,v)` from parsed JSON. Probe `{"__proto__":{"polluted":"x"}}`; gadget → authz bypass (`isAdmin`) / RCE (child_process `shell`,`NODE_OPTIONS`, EJS/pug template opts). Try `__proto__` on JSON endpoints even when the bug looks like something else.
+- **Prototype pollution**: recursive `merge`/`extend`/`_.defaultsDeep`/`Object.assign`/`set(obj,path,v)` from parsed JSON. When source or a response shows an object merge across a trust boundary, probe `{"__proto__":{"polluted":"x"}}` and verify a changed property before pursuing an authz or execution gadget.
 - **JWT**: `alg:none` accepted, HS256 weak secret, or `jwt.decode` used instead of `jwt.verify` (no sig check). RS256→HS256 confusion if pubkey known — see recipe.
 - **SSRF/path**: `sendFile(req.query.f)`, server `fetch/axios(userUrl)` no allowlist.
 - **VM sandbox escape**: `this.constructor.constructor("return process")().mainModule.require('child_process')`.
@@ -76,7 +78,7 @@ IDOR (increment/swap IDs & UUIDs; try all-zero `00000000-…`/default admin id) 
 Script requests in `solver.py`, don't drive a GUI proxy.
 The image has `curl`, `ffuf`, `sqlmap`, `nmap`, `ctf-browser`, `ctf-browser-act` (Playwright with job-local Chromium), Python `httpx` and `flask-unsign`. It does not bundle a web wordlist. Build `tmp/paths.txt`/`tmp/params.txt` from the supplied routes, JavaScript and framework conventions before fuzzing; use a bigger list only when justified. Other named scanners, callback/tunnel clients, Puppeteer and dalfox below are optional, so check availability first.
 
-For a JavaScript-heavy page, use `ctf-browser-act` to click, fill, upload and inspect what the browser actually requested. Steps run in order in one live tab. `--session NAME` reuses cookies and localStorage between calls within this solve job; leave it off for a fresh profile. The result includes bounded page text, console messages and request method/URL/status (query values are redacted). Save the final DOM or PNG separately when needed. Files referenced by steps must be in this solve job.
+For a JavaScript-heavy page, use `ctf-browser-act` to click, fill, upload and inspect what the browser actually requested. Steps run in order in one live tab. `--session NAME` reuses cookies and localStorage between calls within this solve job; leave it off for a fresh profile. The result includes bounded page text, console messages and request method/URL/status (query values are redacted). Save the final DOM or PNG separately when needed. Files referenced by steps must be in this solve job. When a UI action triggers an opaque JSON API response, add `--capture-api-json` for that run: it records at most eight completed same-origin XHR/fetch JSON bodies of up to 4 KiB each, avoiding a second request that might lose browser state. This is opt-in because response bodies can contain target-provided secrets; keep the output in this job and do not paste it into the write-up without review. Cross-origin, large, and non-JSON bodies are skipped.
 ```bash
 cat > tmp/browser-steps.json <<'JSON'
 [
@@ -94,9 +96,9 @@ For uploads use `{"action":"upload","selector":"input[type=file]","files":["atta
 curl -sSi https://TARGET/ | sed -n '1,25p'           # headers, cookies, server, framework tells
 curl -sS https://TARGET/robots.txt https://TARGET/sitemap.xml https://TARGET/.well-known/
 printf '%s\n' admin api login static uploads backup > tmp/paths.txt # expand from observed routes
-ffuf -u https://TARGET/FUZZ -w tmp/paths.txt -mc 200,301,302,403 -t 40
+ffuf -u https://TARGET/FUZZ -w tmp/paths.txt -mc 200,301,302,403 -t 4 -rate 5 -maxtime 30
 printf '%s\n' id user page file name token > tmp/params.txt # expand from observed client/source
-ffuf -u 'https://TARGET/item?FUZZ=1' -w tmp/params.txt -fs 0
+ffuf -u 'https://TARGET/item?FUZZ=1' -w tmp/params.txt -fs 0 -t 4 -rate 5 -maxtime 30
 ```
 Installed: **ffuf** (path/parameter probing), Python **httpx** (HTTP client). Optional extras: feroxbuster, katana, nuclei, the httpx CLI, git-dumper and PayloadsAllTheThings. A Python `httpx` import does not provide the `httpx` CLI. Reusable client:
 ```python
@@ -293,14 +295,14 @@ Shared parent domain → set `domain=.site.tld` cookie from a sibling subdomain 
 - **Jinja sandbox** (SandboxedEnvironment) blocks `__globals__`/`__subclasses__` — pivot via `|attr`, `request`, config/namespace gadgets.
 - **JWT libs**: many accept `alg:none` only if you pass `algorithms=['none']`; the classic bug is `decode` without `algorithms=` pinned, or trusting the header `alg`.
 - **AngularJS <1.6** has a bypassable expression sandbox (`charAt`→`trim` override); 1.6+ removed it entirely.
-- **Banner/version → CVE**: match a pinned dep or `Server`/`x-powered-by` string against a public CVE with `nuclei`; e.g. WeasyPrint `<a rel=attachment href=file:///flag>` (CVE-2024-28184), React Server Components Flight RCE (CVE-2025-55182). This is the 1-day path — do it after the deviation hunt, not instead.
+- **Banner/version → CVE**: if a pinned dependency, reachable route, and affected version support a known issue, verify its preconditions locally or with the smallest live test. Choose this early when it is the cheapest discriminating hypothesis; a banner alone is not proof.
 
 ## Finding the flag
 Flags sit behind the vuln: DB table/row (`flag`,`flags`,`secret`), a file (`/flag`, `/flag.txt`, app root, `/proc/self/environ`), an env var, an admin-only view, or a hidden DOM node / `data-*` attr. After RCE/LFI check `cat /flag*`, `env`, app config, DB. Match `../chal_desc.md`'s flag format before submitting. When a sink is confirmed, record it in `notes/VULN.md` (`sink: <route> param <x> → <class>`, with the measured primitive); park dead ends/POISON in `notes/NEXT.md`. Cross-category pivot: RCE→memory-corruption/seccomp `../../skills/pwn.md`, token math/custom MAC `../../skills/crypto.md`, contract frontend `../../skills/blockchain.md`.
 
 ## Web-specific anti-patterns
 - Blind fuzzing before reading shipped source; driving a GUI proxy instead of scripting in `solver.py`.
-- Chasing a CVE name instead of the codebase's own deviation.
+- Treating a CVE name or a version banner as proof without checking reachability and the affected code path.
 - Escalating on an unproven primitive; jumping to RCE before `{{7*7}}` reflects, or building an XSS chain before a marker `img.src` confirms your JS runs in the bot.
 - Declaring a blind bug dead without an OOB callback — no reflection ≠ no vuln.
 - Fighting CSP to exfil externally when a same-origin self-upload/store would leak it with zero egress.

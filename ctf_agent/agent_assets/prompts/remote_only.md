@@ -40,7 +40,7 @@ Infer category from the captured bytes and switch into that playbook:
 |---|---|
 | Numbered menu over TCP; "how many bytes?", format-string echo, raw addresses | pwn → `../../skills/pwn.md` |
 | "encrypt/decrypt/sign" + hex/base64 blobs | crypto → `../../skills/crypto.md` — grab ciphertexts for known plaintexts; length+entropy ⇒ ECB/CBC/stream/RSA |
-| `Server:`/`X-Powered-By`, `session=` cookies, CSRF fields, template/stack errors | web → `../../skills/web.md` — fingerprint framework, hunt the handler that breaks its own safe idiom |
+| `Server:`/`X-Powered-By`, `session=` cookies, CSRF fields, template/stack errors | web → `../../skills/web.md` — record a normal request, then trace the relevant input and reachable behavior |
 | Prompt asking for a number/guess | PRNG/logic → capture an output sequence to model the generator |
 | Response echoes your input verbatim | injection (fmt-string/SSTI/cmd/SQL) → build the classifier offline first |
 

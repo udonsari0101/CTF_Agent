@@ -109,11 +109,45 @@ _DESCRIPTION_HOST_PORT = re.compile(
     r"(?<![\w./@-])(?P<host>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+|(?:\d{1,3}\.){3}\d{1,3}):(?P<port>\d{1,5})(?!\d)",
     re.I,
 )
+_DESCRIPTION_LABELLED_HOST_PORT = re.compile(
+    r"(?i)(?<!\w)host\s*:\s*(?P<host>[A-Za-z0-9][A-Za-z0-9.-]{0,253})\s*"
+    r"[,;]?\s*port\s*:\s*(?P<port>\d{1,5})(?!\d)"
+)
 _NON_SERVICE_PATH = re.compile(r"\.(?:zip|7z|tar|gz|pdf|md|txt|png|jpe?g|gif|svg)(?:$|[?#])", re.I)
 _REFERENCE_URL_CONTEXT = re.compile(
     r"(?i)(?:\b(?:tool|utility|website)\s+(?:like|such as)|"
-    r"\b(?:docs|documentation|tutorial|write[- ]?up|guide|reference)\s*(?:at|on|:)?|"
-    r"\[(?:[^]]*\b)?(?:tool|utility|docs|documentation|tutorial|guide|reference)\])\s*\(?\s*$"
+    r"\b(?:docs|documentation|tutorial|write[- ]?up|guide|reference|"
+    r"source(?:\s+code)?|repository|repo|attachment|download|file)(?:\s+is)?\s*(?:at|on|:)?|"
+    r"\[[^]]*\b(?:tool|utility|docs|documentation|tutorial|guide|reference|"
+    r"source|repository|repo|attachment|download)\b[^]]*\])\s*\(?\s*$"
+)
+_SERVICE_URL_CONTEXT = re.compile(
+    r"(?i)(?:\b(?:remote|service|server|target|instance|connect(?:ion)?|"
+    r"visit|open|play|launch|application)\b|"
+    r"\b(?:web(?:\s+app|site|app)?|app|url|site)\s*(?:url\s*)?:|"
+    r"\[(?:start(?:\s+challenge)?)\]\(|"
+    r"(?:원격|접속|서버|서비스|인스턴스))[^.!?;\n]{0,40}$"
+)
+_REFERENCE_HOST = re.compile(r"^(?:docs?|documentation|help|wiki)\.", re.I)
+_REFERENCE_PATH = re.compile(
+    r"/(?:docs?|documentation|guide|guides|tutorials?|reference|manual|write[-_]?ups?)(?:/|$)",
+    re.I,
+)
+_CTFD_PLATFORM_PATH = re.compile(
+    r"^/(?:challenges|scoreboard|users|teams|api/v\d+|pages|login|register|files|uploads)(?:/|$)",
+    re.I,
+)
+_ANCHOR_HREF_CONTEXT = re.compile(r"<a\b[^>]{0,300}\bhref\s*=\s*['\"]?$", re.I)
+_ANCHOR_LABEL = re.compile(r"^['\"]?[^>]{0,120}>(.*?)</a\s*>", re.I | re.S)
+_REFERENCE_LINK_LABEL = re.compile(
+    r"\b(?:docs?|documentation|guide|tutorial|reference|manual|write[- ]?up|source|repository|repo)\b",
+    re.I,
+)
+_SERVICE_LINK_LABEL = re.compile(
+    r"\b(?:service|server|instance|target|connect|visit|open|play|launch|"
+    r"start(?:\s+challenge)?|application|app|website)\b|"
+    r"(?:접속|서버|서비스|인스턴스)",
+    re.I,
 )
 _EXPLICITLY_OFFLINE = re.compile(
     r"(?i)(?:\b(?:no|without)\s+(?:remote|network|server|service)\b|"
@@ -133,6 +167,7 @@ def description_connection_info(description: str, site_url: str = "") -> tuple[s
     if not isinstance(description, str):
         return "", False
     source = html.unescape(description)
+    explicitly_offline = bool(_EXPLICITLY_OFFLINE.search(source))
     site = urlsplit(site_url)
     source_host = (site.hostname or "").lower()
     source_port = site.port or (443 if site.scheme == "https" else 80)
@@ -143,11 +178,34 @@ def description_connection_info(description: str, site_url: str = "") -> tuple[s
         if 0 < port <= 65535:
             candidates.add(f"nc {host} {port}")
             possible = True
+    for match in _DESCRIPTION_LABELLED_HOST_PORT.finditer(source):
+        host, port = match.group("host"), int(match.group("port"))
+        if 0 < port <= 65535:
+            candidates.add(f"{host}:{port}")
+            possible = True
     for match in _DESCRIPTION_URL.finditer(source):
         # A URL cited as an analysis aid is not a challenge endpoint. Limit
         # this check to the text immediately before the URL so an earlier
         # reference does not suppress a later service address.
-        if _REFERENCE_URL_CONTEXT.search(source[max(0, match.start() - 120):match.start()]):
+        context = source[max(0, match.start() - 120):match.start()]
+        anchor_prefix = _ANCHOR_HREF_CONTEXT.search(context)
+        # HTML attributes such as target="_blank" are not prose describing
+        # a service. Only text before the anchor and its visible label count.
+        cue_context = context[:anchor_prefix.start()] if anchor_prefix else context
+        if _REFERENCE_URL_CONTEXT.search(cue_context):
+            continue
+        local_context = re.split(r"[.!?;\n]", cue_context)[-1]
+        service_cue = bool(_SERVICE_URL_CONTEXT.search(local_context))
+        if _EXPLICITLY_OFFLINE.search(local_context):
+            service_cue = False
+        if anchor_prefix:
+            anchor = _ANCHOR_LABEL.match(source[match.end():match.end() + 320])
+            if anchor:
+                label = re.sub(r"<[^>]+>", "", anchor.group(1)).strip()
+                if _REFERENCE_LINK_LABEL.search(label):
+                    continue
+                service_cue = service_cue or bool(_SERVICE_LINK_LABEL.search(label))
+        if explicitly_offline and not service_cue:
             continue
         url = match.group().rstrip(".,;:!?)]}")
         parsed = urlsplit(url)
@@ -157,13 +215,26 @@ def description_connection_info(description: str, site_url: str = "") -> tuple[s
         except ValueError:
             possible = True
             continue
-        if not host or (host == source_host and target_port == source_port) or host in {"github.com", "www.github.com"}:
+        if not host or host in {"github.com", "www.github.com"}:
             continue
         if _NON_SERVICE_PATH.search(parsed.path):
             continue
+        # A guide or documentation link is not a service merely because it is
+        # the only URL in the brief. An explicit target cue can still name a
+        # challenge whose route happens to be called /guide.
+        if not service_cue and (_REFERENCE_HOST.search(host) or _REFERENCE_PATH.search(parsed.path)):
+            continue
+        if host == source_host and target_port in {source_port, 80, 443} and _CTFD_PLATFORM_PATH.search(parsed.path):
+            continue
+        if host == source_host and target_port == source_port:
+            # CTFd and the challenge can share an origin behind a reverse
+            # proxy. Promote only an explicitly labelled service path, never
+            # the platform's own navigation/API links.
+            if not service_cue or parsed.path in {"", "/"}:
+                continue
         possible = True
-        # A port or a connection cue is strong evidence. A single bare URL is
-        # also common CTFd challenge text, but multiple URLs are ambiguous.
+        # A single external URL is common challenge text, but multiple service
+        # candidates remain ambiguous and are not guessed from ordering.
         candidates.add(url)
     for match in _DESCRIPTION_HOST_PORT.finditer(source):
         host, port = match.group("host"), int(match.group("port"))

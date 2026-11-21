@@ -88,6 +88,18 @@ def run() -> None:
                 description="Maybe try a tool like https://dogbolt.org/ to inspect the binary.",
             )
             assert (reference["remote_mode"], reference["remote"]) == ("none", "")
+            guide = create(
+                "guide only", remote_mode="none",
+                description="Read https://example.org/guide before analyzing the file.",
+            )
+            assert (guide["remote_mode"], guide["remote"]) == ("none", "")
+            service = create(
+                "same origin service", remote_mode="none",
+                description="Service: https://ctf.example.org/proxy/one",
+            )
+            assert (service["remote_mode"], service["remote"]) == (
+                "endpoint", "https://ctf.example.org/proxy/one"
+            )
             print("PASS: manual body endpoint create/edit persistence and override")
 
 

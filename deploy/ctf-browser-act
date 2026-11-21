@@ -31,6 +31,10 @@ MAX_BODY = 16000
 MAX_EVENT_TEXT = 1000
 MAX_ACTION_RESULT = 4000
 MAX_WAIT_MS = 30000
+MAX_API_JSON_EVENTS = 8
+INITIAL_API_JSON_EVENTS = 2
+MAX_API_JSON_BYTES = 4096
+MAX_API_PENDING_REQUESTS = 128
 
 
 def _load_browser_guard():
@@ -178,7 +182,7 @@ def _summary(page, observations: dict, actions: list[dict]) -> dict:
         title = page.title()
     except PlaywrightError:
         title = ""
-    return {
+    result = {
         "url": _url(page.url),
         "title": _text(title, 300),
         "body": body[:MAX_BODY],
@@ -190,6 +194,10 @@ def _summary(page, observations: dict, actions: list[dict]) -> dict:
         "network_dropped_events": observations["network_dropped_events"],
         "console_dropped_events": observations["console_dropped_events"],
     }
+    if "api_json" in observations:
+        result["api_json"] = observations["api_json"]
+        result["api_json_dropped_events"] = observations["api_json_dropped_events"]
+    return result
 
 
 def _response_event(response) -> dict:
@@ -202,6 +210,81 @@ def _response_event(response) -> dict:
         if retry_after is not None:
             event["retry_after"] = retry_after
     return event
+
+
+def _origin(value: str) -> tuple[str, str, int] | None:
+    """Compare effective HTTP origins, including default ports."""
+    try:
+        parts = urlsplit(value)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return None
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        return parts.scheme, parts.hostname.lower(), port
+    except ValueError:
+        return None
+
+
+def _record_api_json(observations: dict, request, initiator_url: str) -> None:
+    """Observe only completed, small, same-origin XHR/fetch JSON responses."""
+    request_origin = _origin(request.url)
+    if (request.resource_type not in ("xhr", "fetch") or request_origin is None
+            or request_origin != _origin(initiator_url)):
+        return
+    try:
+        response = request.response()
+        if response is None:
+            return
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].lower().strip()
+        if content_type != "application/json" and not content_type.endswith("+json"):
+            return
+        size = request.sizes().get("responseBodySize")
+        if not isinstance(size, int) or size > MAX_API_JSON_BYTES or size < 0:
+            return
+        length = response.headers.get("content-length")
+        if length is not None and (not length.isdecimal() or int(length) > MAX_API_JSON_BYTES):
+            return
+        body = response.body()
+        if len(body) > MAX_API_JSON_BYTES:
+            return
+        value = json.loads(body.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, PlaywrightError):
+        # Observation must never make a browser action fail.
+        return
+    events = observations["api_json"]
+    if len(events) == MAX_API_JSON_EVENTS:
+        # Keep the first bootstrap observations and the most recent actions;
+        # SPA polling can otherwise erase the response that explains the flow.
+        del events[INITIAL_API_JSON_EVENTS]
+        observations["api_json_dropped_events"] += 1
+    events.append({"method": request.method, "status": response.status,
+                   "url": _url(response.url), "body": value})
+
+
+def _attach_api_capture(context, observations: dict) -> None:
+    """Bind each response to the page that initiated it, even after a popup opens."""
+    initiators: dict[object, str] = {}
+
+    def on_request(request) -> None:
+        if request.resource_type not in ("xhr", "fetch"):
+            return
+        try:
+            initiator_url = request.frame.url
+        except PlaywrightError:  # Service-worker requests do not have a frame.
+            return
+        if _origin(initiator_url) is None:
+            return
+        if len(initiators) >= MAX_API_PENDING_REQUESTS:
+            del initiators[next(iter(initiators))]
+        initiators[request] = initiator_url
+
+    def on_finished(request) -> None:
+        initiator_url = initiators.pop(request, None)
+        if initiator_url is not None:
+            _record_api_json(observations, request, initiator_url)
+
+    context.on("request", on_request)
+    context.on("requestfinished", on_finished)
+    context.on("requestfailed", lambda request: initiators.pop(request, None))
 
 
 def _record_event(observations: dict, kind: str, event: dict) -> None:
@@ -241,6 +324,9 @@ def _run_browser(arguments: argparse.Namespace) -> int:
             "console": [], "network": [], "dropped_events": 0,
             "network_dropped_events": 0, "console_dropped_events": 0,
         }
+        if arguments.capture_api_json:
+            observations["api_json"] = []
+            observations["api_json_dropped_events"] = 0
 
         def add(kind: str, event: dict) -> None:
             _record_event(observations, kind, event)
@@ -289,6 +375,8 @@ def _run_browser(arguments: argparse.Namespace) -> int:
                     "resource": request.resource_type, "url": _url(request.url),
                 }))
                 context.on("response", lambda response: add("network", _response_event(response)))
+                if arguments.capture_api_json:
+                    _attach_api_capture(context, observations)
                 context.on("requestfailed", lambda request: add("network", {
                     "event": "failure", "method": request.method,
                     "url": _url(request.url), "reason": _text(request.failure),
@@ -372,6 +460,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--html", help="save final DOM to a job-local file")
     parser.add_argument("--screenshot", help="save final PNG to a job-local file")
     parser.add_argument("--timeout", type=int, default=20000, help="per-action timeout in ms")
+    parser.add_argument(
+        "--capture-api-json", action="store_true",
+        help="include up to 8 completed same-origin XHR/fetch JSON bodies (4 KiB each)",
+    )
     arguments = parser.parse_args(argv)
     try:
         return _run_browser(arguments)
