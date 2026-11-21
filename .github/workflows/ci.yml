@@ -315,6 +315,8 @@ jobs:
         run: python .github/scripts/check_bulk_reasoning_ui.py
       - name: Check configured challenge creation
         run: python .github/scripts/check_configured_challenge_creation_ui.py
+      - name: Check challenge list solver start
+        run: node .github/scripts/check_list_solver_start.js
       - name: Check challenge multi-selection
         run: python .github/scripts/check_challenge_multiselect_ui.py
       - name: Check configured form change tracking

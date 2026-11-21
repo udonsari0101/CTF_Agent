@@ -2746,12 +2746,6 @@ async function startListSolver(button) {
   const workspaceId = button.dataset.workspaceId, challengeId = button.dataset.id;
   if (!currentWorkspace || currentWorkspace.id !== workspaceId) throw new Error(i18n.t('문제 목록을 다시 불러와 주세요.'));
   requireNoAttachmentWork(workspaceId,challengeId);
-  const challenge = challengeListing?.result.challenges.find(item => item.id === challengeId);
-  if (!challenge?.latest_solver && challenge?.solver_preset?.provider === 'codex' && !challenge.solver_preset.account_id) {
-    await openChallenge(challengeId);
-    toast(i18n.t('가져온 복제 문제는 Codex 계정을 다시 선택해야 합니다.'));
-    return;
-  }
   const key = `${workspaceId}:${challengeId}`, name = button.dataset.name;
   if (startingListSolvers.has(key)) return;
   startingListSolvers.add(key);
@@ -2761,17 +2755,17 @@ async function startListSolver(button) {
   button.textContent = '시작 중';
   let started = false;
   try {
-    // An untouched clone starts with its saved variant even from the list card.
-    // A retry follows the prior run's own continuation settings instead.
-    const preset = !challenge?.latest_solver && challenge?.solver_preset?.provider === 'codex'
-      ? challenge.solver_preset : null;
-    const payload = await api(`${path(challengeId,workspaceId)}/solver`,{
-      method:'POST',body:preset
-        ? {...preset,writeup_locale:i18n.locale}
-        : {provider:solverProvider,writeup_locale:i18n.locale},
-    });
+    // List summaries omit the account ID and validated model catalog. Load
+    // the same configuration as the detail action before starting, including
+    // clone presets and the exact account/provider for a retry.
+    await openChallenge(challengeId,true);
+    if (currentWorkspace?.id !== workspaceId || currentChallenge?.id !== challengeId || !detail.open) return;
+    if (!solverConfigurationReady() || solverIsActive(currentSolverJob)) {
+      toast(i18n.t('로그인한 계정과 모델·추론 수준을 선택해 주세요.'),true);
+      return;
+    }
+    await startSolver();
     started = true;
-    if (payload.capacity?.warning && payload.capacity.warning_message) toast(payload.capacity.warning_message);
     if (currentWorkspace?.id === workspaceId) await refreshChallenges().catch(() => {});
     toast(i18n.t('“{name}” 풀이를 시작했습니다.').replace('{name}',() => name || i18n.t('문제')));
   } finally {
