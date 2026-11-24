@@ -547,6 +547,13 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path == "/popup?token=private":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"<!doctype html><title>popup</title><p id=popup>popup</p>"
+                                 b"<script>console.log('popup-ready')</script>")
+                return
             if self.path == "/action":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -555,8 +562,10 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
                 self.wfile.write(
                     b"<!doctype html><title>CTF browser action check</title><body>"
                     b"<input id=user><input id=upload type=file><button id=send>Send</button>"
+                    b"<button id=open>Open popup</button>"
                     b"<div id=state></div><div id=result></div><script>"
                     b"console.log('browser-action-ready');"
+                    b"document.querySelector('#open').onclick=()=>window.open('/popup?token=private');"
                     b"document.querySelector('#state').textContent=localStorage.getItem('action_smoke')||'0';"
                     b"document.querySelector('#send').onclick=async()=>{"
                     b"const f=await document.querySelector('#upload').files[0].text();"
@@ -652,6 +661,34 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         assert "CTF browser action check" in action_html.read_text()
         assert action_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
         assert "api_json" not in action
+
+        popup_steps = browser_workdir / "tmp" / "popup.json"
+        popup_steps.write_text(json.dumps([
+            {"action": "click", "selector": "#open"},
+            {"action": "wait_for", "selector": "#popup"},
+            {"action": "list_pages"},
+            {"action": "evaluate", "expression": "document.title"},
+            {"action": "switch_page", "index": 0},
+            {"action": "evaluate", "expression": "document.title"},
+            {"action": "switch_page", "index": 1},
+            {"action": "evaluate", "expression": "document.title"},
+        ]), encoding="utf-8")
+        popup_run = subprocess.run(
+            [str(ctf_browser_act), "--steps=tmp/popup.json",
+             f"http://127.0.0.1:{browser_server.server_port}/action"],
+            capture_output=True, text=True, timeout=30,
+            cwd=browser_workdir, env=tool_env,
+        )
+        assert popup_run.returncode == 0, popup_run.stderr.strip()[-3000:]
+        popup_result = json.loads(popup_run.stdout)
+        assert [item["active"] for item in popup_result["actions"][3]["result"]] == [False, True]
+        assert [item["result"] for item in popup_result["actions"] if item["action"] == "evaluate"] == [
+            "popup", "CTF browser action check", "popup",
+        ]
+        assert popup_result["title"] == "popup"
+        assert any(event["text"] == "popup-ready" for event in popup_result["console"])
+        assert "private" not in popup_run.stdout
+
         api_steps = browser_workdir / "tmp" / "api.json"
         api_steps.write_text(json.dumps([{"action": "evaluate", "expression": (
             "(async()=>{const r=await fetch('/api-json?token=private');"

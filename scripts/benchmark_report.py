@@ -243,7 +243,9 @@ def _cluster_interval(differences: list[float], *, seed: int = 0,
 
 def _arm_metrics(rows: list[dict[str, Any]], arm: str) -> dict[str, Any]:
     selected = [row for row in rows if row["arm"] == arm]
-    times = [float(row["solve_wall_seconds"]) for row in selected]
+    accepted_times = [float(row["solve_wall_seconds"]) for row in selected
+                      if row["oracle"]["verdict"] == "accepted"]
+    attempt_times = [float(row["solve_wall_seconds"]) for row in selected]
     tokens = [row["input_tokens"] + row["output_tokens"] for row in selected
               if row["input_tokens"] is not None]
     costs = [float(row["cost_usd"]) for row in selected if row["cost_usd"] is not None]
@@ -251,8 +253,13 @@ def _arm_metrics(rows: list[dict[str, Any]], arm: str) -> dict[str, Any]:
     return {
         "trials": len(selected),
         "oracle_accepted": sum(row["oracle"]["verdict"] == "accepted" for row in selected),
-        "solve_wall_median_seconds": round(statistics.median(times), 3),
-        "solve_wall_p90_seconds": round(_quantile(times, 0.9), 3),
+        "solve_wall_median_seconds": (
+            round(statistics.median(accepted_times), 3) if accepted_times else None
+        ),
+        "solve_wall_p90_seconds": (
+            round(_quantile(accepted_times, 0.9), 3) if accepted_times else None
+        ),
+        "attempt_wall_median_seconds": round(statistics.median(attempt_times), 3),
         "tokens_reported_trials": len(tokens),
         "tokens_median": statistics.median(tokens) if len(tokens) == len(selected) else None,
         "cost_reported_trials": len(costs),

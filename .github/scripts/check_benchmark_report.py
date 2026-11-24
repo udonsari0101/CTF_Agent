@@ -80,6 +80,24 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(split["harness"]["oracle_accepted"], 1)
         self.assertIsNone(split["paired_task_success_95pct_interval"])
         self.assertIsNone(split["harness"]["tokens_median"])
+        self.assertIsNone(split["baseline"]["solve_wall_median_seconds"])
+        self.assertEqual(split["harness"]["solve_wall_median_seconds"], 25.0)
+
+    def test_fast_failure_does_not_count_as_fast_solve(self):
+        manifest, rows = sample(2)
+        rows[0]["oracle"] = {"verdict": "accepted", "source": "private_judge",
+                              "evidence_sha256": digest("baseline-success")}
+        rows[0]["flag_provenance"] = "remote"
+        rows[0]["solve_wall_seconds"] = 100.0
+        rows[2]["run_status"] = "failed"
+        rows[2]["solve_wall_seconds"] = 1.0
+        rows[2]["failure_code"] = "runtime_failure"
+        for row in (rows[1], rows[3]):
+            row["solve_wall_seconds"] = 30.0
+        split = build_report(manifest, rows)["splits"]["development"]
+        self.assertEqual(split["baseline"]["solve_wall_median_seconds"], 100.0)
+        self.assertEqual(split["harness"]["solve_wall_median_seconds"], 30.0)
+        self.assertEqual(split["baseline"]["attempt_wall_median_seconds"], 50.5)
 
     def test_no_evidence_no_verified_success(self):
         rows = copy.deepcopy(self.rows)
