@@ -163,6 +163,27 @@ class FakeTransport:
         raise AssertionError(f"Unexpected remote request: {method} {path}")
 
 
+class ProfileForbiddenTransport(FakeTransport):
+    def __init__(self, mode: str = "html", *, challenges_forbidden: bool = False):
+        super().__init__(mode)
+        self.challenges_forbidden = challenges_forbidden
+
+    def __call__(self, target, headers, maximum, timeout, deadline, **kwargs) -> Response:
+        path = urlsplit(target.url).path
+        method = kwargs.get("method", "GET")
+        if method == "GET" and path == "/api/v1/users/me":
+            self.requests.append({"method": method, "path": path, "headers": dict(headers)})
+            if self.mode == "html":
+                assert headers.get("Cookie") == "session=html-cookie"
+            return Response(403, {"content-type": "application/json"},
+                            b'{"message":"Profile API disabled"}')
+        if method == "GET" and path == "/api/v1/challenges" and self.challenges_forbidden:
+            self.requests.append({"method": method, "path": path, "headers": dict(headers)})
+            return Response(403, {"content-type": "application/json"},
+                            b'{"message":"Competition not open"}')
+        return super().__call__(target, headers, maximum, timeout, deadline, **kwargs)
+
+
 def client_for(mode: str) -> tuple[CTFdClient, FakeTransport]:
     transport = FakeTransport(mode)
     auth = {"token": {"auth_type": "token", "token": "offline-token"},
@@ -216,6 +237,39 @@ class CTFdClientContract(unittest.TestCase):
         self.assertIn("/api/v1/users/me", paths)
         self.assertNotIn("/api/v1/challenges", paths)
         self.assertEqual(paths.count("/api/v1/challenges/attempt"), 1)
+
+    def test_password_session_can_validate_when_profile_api_is_forbidden(self):
+        transport = ProfileForbiddenTransport()
+        client = CTFdClient(
+            SITE, auth_type="password", username="offline-user",
+            password="offline-password", resolver=fake_resolver, transport=transport,
+        )
+        self.assertEqual(client.submission_readiness(), (True, ""))
+        paths = [request["path"] for request in transport.requests]
+        self.assertIn("/api/v1/users/me", paths)
+        self.assertIn("/api/v1/challenges", paths)
+        self.assertEqual(client.submit(17, FLAG)["status"], "correct")
+
+    def test_profile_fallback_rejects_closed_list_and_token_auth(self):
+        transport = ProfileForbiddenTransport(challenges_forbidden=True)
+        client = CTFdClient(
+            SITE, auth_type="password", username="offline-user",
+            password="offline-password", resolver=fake_resolver, transport=transport,
+        )
+        with self.assertRaises(CTFdError):
+            client.submission_readiness()
+
+        token_transport = ProfileForbiddenTransport("token")
+        token_client = CTFdClient(
+            SITE, auth_type="token", token="offline-token",
+            resolver=fake_resolver, transport=token_transport,
+        )
+        with self.assertRaises(CTFdError):
+            token_client.validate()
+        self.assertNotIn(
+            "/api/v1/challenges",
+            [request["path"] for request in token_transport.requests],
+        )
 
     def test_json_password_is_import_only_without_session_nonce(self):
         client, transport = client_for("json")

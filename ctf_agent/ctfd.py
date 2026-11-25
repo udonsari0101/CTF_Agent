@@ -804,10 +804,14 @@ class CTFdClient:
 
     def _json(self, url: str):
         content = self._get(url, self.limits.json_bytes, api=True)
+        return self._json_content(content)
+
+    @staticmethod
+    def _json_content(content: bytes):
         try:
             payload = json.loads(content)
         except (ValueError, UnicodeError) as exc:
-                raise CTFdError("The site did not return a CTFd JSON response. Check the base URL and selected authentication method.") from exc
+            raise CTFdError("The site did not return a CTFd JSON response. Check the base URL and selected authentication method.") from exc
         if not isinstance(payload, dict) or payload.get("success") is not True or "data" not in payload:
             raise CTFdError("The site returned an unsuccessful or unsupported CTFd response.")
         return payload["data"]
@@ -816,7 +820,26 @@ class CTFdClient:
         """Validate authentication without importing data or mutating CTFd."""
 
         self.authenticate()
-        current = self._json(self.url + "/api/v1/users/me")
+        account_url = self.url + "/api/v1/users/me"
+        response, _ = self._request(
+            account_url, self.limits.json_bytes, api=True,
+            allow_error_status=True,
+        )
+        if response.status == 403 and self.auth_type == "password":
+            # Some CTFd sites forbid profile API reads while allowing an
+            # authenticated password session to read challenges. The login
+            # redirect was checked by authenticate(); require the protected
+            # challenge API too before accepting this fallback.
+            listing = self._json(self.url + "/api/v1/challenges")
+            if not isinstance(listing, list):
+                raise CTFdError("The CTFd challenge list has an unsupported format.")
+            return
+        if response.status != 200:
+            # Preserve _request's precise auth, contest-closed, and rate-limit
+            # errors for all other responses and for API-token credentials.
+            self._json(account_url)
+            raise CTFdError("The CTFd account check did not succeed.")
+        current = self._json_content(response.content)
         if not isinstance(current, dict):
             raise CTFdError("The site returned an unsupported CTFd account response.")
 
