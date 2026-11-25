@@ -560,6 +560,7 @@ class CTFdClient:
         self.password = password if self.auth_type == "password" else ""
         if self.auth_type == "password" and (not self.username or not self.password or len(self.username) > 256 or len(self.password) > 4096):
             raise CTFdError("Enter a CTFd username and password.")
+        self.login_identifier = self.username
         self.cookies = http.cookiejar.CookieJar()
         self.csrf_nonce = ""
         self.logged_in = self.auth_type != "password"
@@ -574,7 +575,7 @@ class CTFdClient:
         self.rate_limit_until = 0.0
 
     def clear_credentials(self):
-        self.token = self.username = self.password = ""
+        self.token = self.username = self.password = self.login_identifier = ""
         self.csrf_nonce = ""
         self.cookies.clear()
 
@@ -828,8 +829,9 @@ class CTFdClient:
         if response.status == 403 and self.auth_type == "password":
             # Some CTFd sites forbid profile API reads while allowing an
             # authenticated password session to read challenges. The login
-            # redirect was checked by authenticate(); require the protected
-            # challenge API too before accepting this fallback.
+            # redirect was checked by authenticate(); verify the account shown
+            # in settings and require the protected challenge API as well.
+            self._validate_settings_identity()
             listing = self._json(self.url + "/api/v1/challenges")
             if not isinstance(listing, list):
                 raise CTFdError("The CTFd challenge list has an unsupported format.")
@@ -842,6 +844,26 @@ class CTFdClient:
         current = self._json_content(response.content)
         if not isinstance(current, dict):
             raise CTFdError("The site returned an unsupported CTFd account response.")
+
+    def _validate_settings_identity(self) -> None:
+        expected = self.login_identifier.strip().casefold()
+        settings_url = self.url + "/settings"
+        response, final_url = self._request(
+            settings_url, self.limits.json_bytes, same_origin=True,
+            allow_error_status=True,
+        )
+        if (not expected or response.status != 200 or
+                urlsplit(final_url).path.rstrip("/") != urlsplit(settings_url).path.rstrip("/")):
+            raise CTFdError("The site did not confirm the authenticated CTFd session.")
+        parser = LoginForm()
+        parser.feed(response.content.decode("utf-8", errors="replace"))
+        for form in parser.forms:
+            fields = form["fields"]
+            if form["method"] != "post" or not {"name", "email"} <= fields.keys():
+                continue
+            if expected in {str(fields[key]).strip().casefold() for key in ("name", "email")}:
+                return
+        raise CTFdError("The site did not confirm the authenticated CTFd session.")
 
     def submission_readiness(self) -> tuple[bool, str]:
         """Check account credentials and password-session CSRF without posting.

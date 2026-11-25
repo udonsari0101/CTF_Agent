@@ -164,9 +164,11 @@ class FakeTransport:
 
 
 class ProfileForbiddenTransport(FakeTransport):
-    def __init__(self, mode: str = "html", *, challenges_forbidden: bool = False):
+    def __init__(self, mode: str = "html", *, challenges_forbidden: bool = False,
+                 settings_identity: str = "offline-user"):
         super().__init__(mode)
         self.challenges_forbidden = challenges_forbidden
+        self.settings_identity = settings_identity
 
     def __call__(self, target, headers, maximum, timeout, deadline, **kwargs) -> Response:
         path = urlsplit(target.url).path
@@ -177,6 +179,13 @@ class ProfileForbiddenTransport(FakeTransport):
                 assert headers.get("Cookie") == "session=html-cookie"
             return Response(403, {"content-type": "application/json"},
                             b'{"message":"Profile API disabled"}')
+        if method == "GET" and path == "/settings" and self.mode == "html":
+            self.requests.append({"method": method, "path": path, "headers": dict(headers)})
+            assert headers.get("Cookie") == "session=html-cookie"
+            html = ('<form method="post">'
+                    f'<input name="name" value="{self.settings_identity}">'
+                    '<input name="email" value="user@example.test"></form>')
+            return Response(200, {"content-type": "text/html"}, html.encode("utf-8"))
         if method == "GET" and path == "/api/v1/challenges" and self.challenges_forbidden:
             self.requests.append({"method": method, "path": path, "headers": dict(headers)})
             return Response(403, {"content-type": "application/json"},
@@ -247,6 +256,7 @@ class CTFdClientContract(unittest.TestCase):
         self.assertEqual(client.submission_readiness(), (True, ""))
         paths = [request["path"] for request in transport.requests]
         self.assertIn("/api/v1/users/me", paths)
+        self.assertIn("/settings", paths)
         self.assertIn("/api/v1/challenges", paths)
         self.assertEqual(client.submit(17, FLAG)["status"], "correct")
 
@@ -269,6 +279,19 @@ class CTFdClientContract(unittest.TestCase):
         self.assertNotIn(
             "/api/v1/challenges",
             [request["path"] for request in token_transport.requests],
+        )
+
+    def test_profile_fallback_rejects_a_different_signed_in_account(self):
+        transport = ProfileForbiddenTransport(settings_identity="another-user")
+        client = CTFdClient(
+            SITE, auth_type="password", username="offline-user",
+            password="offline-password", resolver=fake_resolver, transport=transport,
+        )
+        with self.assertRaises(CTFdError):
+            client.validate()
+        self.assertNotIn(
+            "/api/v1/challenges",
+            [request["path"] for request in transport.requests],
         )
 
     def test_json_password_is_import_only_without_session_nonce(self):
