@@ -58,7 +58,9 @@ let solverRetryRequiresSelection=false;
 let solverPresetNeedsAccount=false,solverPresetAccountConfirmed=false;
 let solverSubagentsEnabled=false,solverSubagentsTouched=false;
 let solverUltraEscalationMode='ask',solverAccounts=[{id:'a1'}],solverModels=[{model:'m2'}];
+let writeupRefineJob=null;
 let currentSolverJob=null,currentSolverEvents=[],nextConfig='';
+const tr=value=>value;
 function solverSelectedAccount(){return solverAccounts.find(x=>x.id===solverAccountId)}
 function solverSelectedModel(){return solverModels.find(x=>x.model===solverModel)}
 function solverContext(){return true}
@@ -76,6 +78,11 @@ replaceSolverPanelPreservingConfiguration(panel,
 const poll=panel.querySelector('#solver-model-select')===model&&model.isConnected
  &&document.activeElement===model&&model.value==='m2'
  &&panel.textContent.includes('new state');
+const refinement=document.createElement('div');refinement.id='writeup-refine-container';
+refinement.innerHTML='<details open><summary>Write-up</summary><textarea>Draft</textarea>'
+ +'<div class="actions"><button data-action="refine-writeup" disabled>Refine</button></div>'
+ +'<p id="writeup-refine-status">Choose model</p></details>';
+panel.append(refinement);
 solverModel='m3';solverReasoning='high';solverModels=[{model:'m3'}];
 nextConfig='<div class="solver-configuration">'
  +'<label>Provider<select id="solver-provider-select"><option value="codex">Codex</option></select></label>'
@@ -86,10 +93,15 @@ nextConfig='<div class="solver-configuration">'
 repaintSolverConfiguration('w','c',1);
 const staleBlocked=panel.querySelector('#solver-model-select')===model&&model.isConnected
  &&document.activeElement===model&&!solverConfigurationReady()
- &&panel.querySelector('[data-action="start-solver"]').disabled;
+ &&panel.querySelector('[data-action="start-solver"]').disabled
+ &&panel.querySelector('[data-action="refine-writeup"]').disabled;
 document.querySelector('#outside').focus();repaintSolverConfiguration('w','c',1);
 const aligned=panel.querySelector('#solver-model-select').value==='m3'
  &&solverConfigurationReady()&&!panel.querySelector('[data-action="start-solver"]').disabled;
+const refineReady=!panel.querySelector('[data-action="refine-writeup"]').disabled
+ &&panel.querySelector('#writeup-refine-container details').open
+ &&panel.querySelector('#writeup-refine-container textarea').value==='Draft'
+ &&!panel.querySelector('#writeup-refine-status');
 const oldLog=document.createElement('details');oldLog.className='solver-session-log';
 oldLog.innerHTML='<summary>Session</summary><div class="solver-live-console"><ol><li>first</li></ol></div>';
 panel.append(oldLog);
@@ -105,8 +117,8 @@ replaceSolverPanelPreservingConfiguration(activePanel,
  '<div>still running</div><details class="solver-session-log"><summary>Session</summary><div class="solver-live-console"></div></details>',true);
 const activeLogRetained=activePanel.querySelector('.solver-session-log')===activeLog
  &&activePanel.querySelector('.solver-live-console li')?.textContent==='running';
-document.querySelector('#result').textContent=initial&&poll&&staleBlocked&&aligned&&logRetained&&activeLogRetained?'PASS':'FAIL '
- +JSON.stringify({initial,poll,staleBlocked,aligned,logRetained,activeLogRetained});
+document.querySelector('#result').textContent=initial&&poll&&staleBlocked&&aligned&&refineReady&&logRetained&&activeLogRetained?'PASS':'FAIL '
+ +JSON.stringify({initial,poll,staleBlocked,aligned,refineReady,logRetained,activeLogRetained});
 </script></body></html>"""
     with tempfile.TemporaryDirectory(prefix="ctf-agent-selector-") as temp:
         root = Path(temp)

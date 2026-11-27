@@ -4723,6 +4723,26 @@ function repaintSolverConfiguration(workspaceId, challengeId, generation) {
   panel.querySelectorAll('[data-action="start-solver"],[data-action="confirm-no-remote"]').forEach(button => {
     button.disabled = !solverConfigurationReady() || button.hasAttribute('data-attachment-hold');
   });
+  // The write-up action is painted before account/model loading finishes.
+  // Update it with the configuration without replacing an open details or draft.
+  const refineButton = panel.querySelector('#writeup-refine-container [data-action="refine-writeup"]');
+  if (refineButton) {
+    const ready = solverConfigurationReady() && !solverIsActive(writeupRefineJob);
+    refineButton.disabled = !ready;
+    if (!writeupRefineJob?.phase) {
+      let hint = panel.querySelector('#writeup-refine-status');
+      if (ready) hint?.remove();
+      else if (hint) hint.textContent = tr('계정·모델·추론 수준을 선택하세요.');
+      else {
+        hint = document.createElement('p');
+        hint.id = 'writeup-refine-status';
+        hint.className = 'form-hint';
+        hint.setAttribute('role','status');
+        hint.textContent = tr('계정·모델·추론 수준을 선택하세요.');
+        refineButton.closest('.actions')?.after(hint);
+      }
+    }
+  }
 }
 
 async function loadSolverConfiguration(workspaceId, challengeId, generation, preferredAccountId = '', retryJob = null) {
