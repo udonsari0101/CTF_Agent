@@ -9,8 +9,5 @@ Start with the [English README](../README.md) or [한국어 README](../README.ko
 | Solver tools and limits | [CTF toolchain](guides/ctf-toolchain.md) |
 | Interface translations | [Language packs](guides/localization.md) |
 | Benchmark design and reporting | [Protocol](benchmarking/protocol.md) |
-| Solver performance research (Korean) | [Research and improvement plan](research/solving-performance-research.ko.md) |
-| Solver performance implementation (Korean) | [Implementation checklist](research/solving-performance-implementation-todo.ko.md) |
-| External tool and MCP evaluation (Korean) | [Adoption decisions and isolated pilot](research/external-tool-integration-20261113.ko.md) |
 
-Private working notes and benchmark assessments live under `docs/local/` on the development machine. That directory is excluded from Git because it can contain operational observations and references to private challenge material. Its local `README.md` indexes those notes. Benchmark inputs and private answer oracles remain in the separate `benchmark_problems/` corpus; the solver should receive only a case's `input/` directory.
+Benchmark inputs and private answer oracles are not included in this repository. The solver should receive only a case's `input/` directory.
