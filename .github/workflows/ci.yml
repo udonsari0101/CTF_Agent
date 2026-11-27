@@ -295,8 +295,14 @@ jobs:
         run: python .github/scripts/check_solver_worker_status_recovery.py
       - name: Check solver failure diagnostics
         run: python .github/scripts/check_solver_failure_diagnostics.py
+      - name: Check Claude API limit classification
+        run: python .github/scripts/check_claude_api_failure.py
       - name: Check solve workspace input copy integrity
         run: python .github/scripts/check_agent_workspace_copy_integrity.py
+      - name: Check contest category aliases
+        run: python .github/scripts/check_category_aliases.py
+      - name: Check nested archive special entries
+        run: python .github/scripts/check_archive_nested_special.py
       - name: Check solver context usage provenance
         run: python .github/scripts/check_solver_context_usage.py
       - name: Check provider-scoped session resume

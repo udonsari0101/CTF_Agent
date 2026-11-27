@@ -26,10 +26,11 @@ from ctf_agent.solver_continuation import (  # noqa: E402
     workspace_baseline,
 )
 from ctf_agent.solver import ModelConfiguration  # noqa: E402
-from ctf_agent.solver_retry import RetryCheckpoint  # noqa: E402
+from ctf_agent.solver_retry import RetryCheckpoint, encode_checkpoint  # noqa: E402
 from ctf_agent.db import SCHEMA as DATABASE_SCHEMA  # noqa: E402
 from ctf_agent.solver_exchange import (  # noqa: E402
     SCHEMA as SOLVER_SCHEMA,
+    SolverExchangeCoordinator,
     _activity_checkpoint_summary,
     _related_evidence_context,
 )
@@ -220,6 +221,51 @@ class ContinuationContractTests(unittest.TestCase):
         self.assertFalse((new_root / WORKDIR_REL / ".remote-request").exists())
         self.assertFalse((new_root / WORKDIR_REL / "original.bin").exists())
         self.assertFalse((new_root / WORKDIR_REL / "AGENTS.md").exists())
+
+    def test_remote_answer_keeps_same_provider_session(self) -> None:
+        meta = self._capture("codex")
+        source_id = "d" * 32
+        store = self.root / "continuations"
+        store.mkdir()
+        shutil.copytree(self.active / "continuation", store / source_id)
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript("""
+            CREATE TABLE solver_continuations(
+              source_job_id TEXT, owner_user_id TEXT, workspace_id TEXT,
+              challenge_id TEXT, input_sha256 TEXT, archive_sha256 TEXT,
+              archive_size INTEGER, session_id TEXT);
+            CREATE TABLE solver_jobs(
+              id TEXT, owner_user_id TEXT, workspace_id TEXT, challenge_id TEXT,
+              released_ingested INTEGER, challenge_input_sha256 TEXT,
+              challenge_base_sha256 TEXT, remote_mode TEXT, provider TEXT);
+        """)
+        db.execute("INSERT INTO solver_jobs VALUES(?,?,?,?,?,?,?,?,?)",
+                   (source_id, "owner", "workspace", "challenge", 1,
+                    INPUT_SHA256, "b" * 64, "unknown", "codex"))
+        db.execute("INSERT INTO solver_continuations VALUES(?,?,?,?,?,?,?,?)",
+                   (source_id, "owner", "workspace", "challenge", INPUT_SHA256,
+                    meta["archive_sha256"], meta["archive_size"], SESSION_ID))
+        coordinator = SimpleNamespace(_connect=lambda: db, continuations_dir=store)
+        job = {
+            "continuation_source_job_id": source_id, "job_mode": "solve",
+            "retry_checkpoint_json": encode_checkpoint(RetryCheckpoint(
+                revision=1, rejected_flags=(), private_notes="", prior_writeup="",
+                reason="needs_remote",
+            )),
+            "owner_user_id": "owner", "workspace_id": "workspace",
+            "challenge_id": "challenge", "challenge_base_sha256": "b" * 64,
+            "challenge_input_sha256": "c" * 64, "remote_mode": "endpoint",
+            "continuation_mode": "session",
+        }
+        continuation = SolverExchangeCoordinator._continuation_for_stage(coordinator, job)
+        self.assertIsNotNone(continuation)
+        self.assertEqual(continuation[3], "session")
+        self.assertEqual(continuation[1]["input_sha256"], "c" * 64)
+        job["retry_checkpoint_json"] = None
+        job["challenge_base_sha256"] = "e" * 64
+        self.assertIsNone(SolverExchangeCoordinator._continuation_for_stage(coordinator, job))
 
     def test_cross_provider_handoff_carries_work_but_not_session_history(self) -> None:
         meta = self._capture("codex")
