@@ -5,6 +5,8 @@ Steps are a JSON list. Example:
   [{"action":"fill","selector":"#user","value":"guest"},
    {"action":"click","selector":"button[type=submit]"},
    {"action":"wait_for","selector":"#result"}]
+Popups become active automatically. Use {"action":"list_pages"}, then
+{"action":"switch_page","index":0} to return to the original page.
 """
 
 from __future__ import annotations
@@ -125,6 +127,34 @@ def _required(step: dict, key: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{step['action']} requires a non-empty {key}")
     return value
+
+
+def _open_pages(context) -> list:
+    return [page for page in context.pages if not page.is_closed()]
+
+
+def _current_page(context, active: list):
+    if active[0].is_closed():
+        pages = _open_pages(context)
+        if not pages:
+            raise ValueError("all browser pages are closed")
+        active[0] = pages[-1]
+    return active[0]
+
+
+def _page_inventory(context, active: list) -> list[dict]:
+    current = _current_page(context, active)
+    return [{"index": index, "url": _url(page.url), "active": page is current}
+            for index, page in enumerate(_open_pages(context))]
+
+
+def _select_page(context, active: list, step: dict) -> dict:
+    index = step.get("index")
+    pages = _open_pages(context)
+    if type(index) is not int or index < 0 or index >= len(pages):
+        raise ValueError("switch_page requires an open page index from list_pages")
+    active[0] = pages[index]
+    return {"index": index, "url": _url(active[0].url)}
 
 
 def _execute(page, step: dict, job_root: Path, timeout: int) -> object:
@@ -412,7 +442,13 @@ def _run_browser(arguments: argparse.Namespace) -> int:
                     })
                 for index, step in enumerate(steps, start=1):
                     try:
-                        value = _execute(active[0], step, job_root, arguments.timeout)
+                        if step["action"] == "list_pages":
+                            value = _page_inventory(context, active)
+                        elif step["action"] == "switch_page":
+                            value = _select_page(context, active, step)
+                        else:
+                            value = _execute(_current_page(context, active), step,
+                                             job_root, arguments.timeout)
                     except (OSError, ValueError, PlaywrightError) as error:
                         actions.append({"index": index, "action": step["action"],
                                         "error": _text(error, MAX_ACTION_RESULT)})
@@ -426,7 +462,7 @@ def _run_browser(arguments: argparse.Namespace) -> int:
                                     "result": value if len(encoded) <= MAX_ACTION_RESULT else {
                                         "truncated": True, "text": encoded[:MAX_ACTION_RESULT]
                                     }})
-                page = active[0]
+                page = _current_page(context, active)
                 if not page.is_closed():
                     page.wait_for_load_state("domcontentloaded", timeout=arguments.timeout)
                 if html is not None:
@@ -451,7 +487,7 @@ def _run_browser(arguments: argparse.Namespace) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="ctf-browser-act",
-        description="Click, fill, upload, and inspect a job-local headless Chromium page.",
+        description="Click, fill, upload, inspect, and switch job-local Chromium pages.",
     )
     parser.add_argument("url", nargs="?", help="initial http(s) or file URL")
     parser.add_argument("--session", help="reuse the named job-local browser profile")

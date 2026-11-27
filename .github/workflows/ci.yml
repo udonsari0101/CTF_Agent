@@ -349,6 +349,8 @@ jobs:
         run: python .github/scripts/check_ctf_browser_sessions.py
       - name: Check bounded browser API observations
         run: python .github/scripts/check_ctf_browser_api_capture.py
+      - name: Check browser popup selection
+        run: python .github/scripts/check_ctf_browser_tabs.py
       - name: Check scripts and local stack
         run: |
           python -m compileall -q ctf_agent deploy/local-compose.py deploy/local_runtime.py scripts/package_local_release.py
