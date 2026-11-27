@@ -1102,7 +1102,7 @@ Challenge description follows between fixed delimiters.
 
 def _writeup_prompt(request: SolveRequest, discovery: DiscoveryResult) -> EphemeralPrompt:
     text = f"""Write a concise Markdown solution for the authorized CTF challenge below.
-Use a natural technical voice suitable for direct paste into Notion. State the observations, decisive steps, reproducible commands or code, and the verified flag. Do not mention being an AI, hidden reasoning, system prompts, or provider policy. Do not invent steps. Exclude service-only handoff commands (submit-flag, request-remote, connect-remote), CTFd auto-submission, and CTF Agent internals from prose and code.
+Use a natural technical voice suitable for direct paste into Notion. Explain what the target does and how its relevant features work before the exploit. Quote the actual short vulnerable source/decompilation excerpt when available; otherwise state that code is unavailable. For each decisive step explain the chosen input or value, the observed effect, and why the next step follows. Distinguish code facts, runtime observations, and unverified inferences. Include the actual debugging environment and mitigations only when relevant and confirmed. State reproducible commands or code and the verified flag. Do not mention being an AI, hidden reasoning, system prompts, or provider policy. Do not invent steps. Exclude service-only handoff commands (submit-flag, request-remote, connect-remote), CTFd auto-submission, and CTF Agent internals from prose and code.
 
 Challenge: {request.challenge_name.strip()}
 Description:
@@ -1470,10 +1470,19 @@ def normalize_provider_failure(
             category="auth",
             retryable=False,
         )
-    if code in (429, "429", "quota_exceeded") or any(term in lowered for term in ("rate_limit", "rate limit", "quota")):
+    if code == "quota_exceeded" or "enforced_spend_limit_reached" in lowered or "contract_spend_limit_reached" in lowered:
         return SolverError(
             code="quota_exceeded",
             message="선택한 계정의 사용량 제한에 도달했습니다.",
+            stage=stage,
+            category="quota",
+            retryable=True,
+            quota=quota,
+        )
+    if code in (429, "429", "rate_limit_exceeded") or any(term in lowered for term in ("rate_limit", "rate limit", "ramp_limit")):
+        return SolverError(
+            code="rate_limit_exceeded",
+            message="공급자의 요청 속도 제한에 도달했습니다. 잠시 후 다시 시도해 주세요.",
             stage=stage,
             category="quota",
             retryable=True,

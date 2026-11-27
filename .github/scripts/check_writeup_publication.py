@@ -15,6 +15,7 @@ from ctf_agent.solver_worker import (
     _ENGLISH_WRITEUP_SECTIONS,
     _WRITEUP_TEMPLATE_SECTIONS,
     _include_solver_source,
+    _writeup_explanation_guide,
     valid_writeup,
 )
 from ctf_agent.writeup_publication import (
@@ -53,6 +54,16 @@ def document(locale: str) -> str:
 
 
 class PublicationTests(unittest.TestCase):
+    def test_explanation_guide_is_evidence_based_and_category_scoped(self) -> None:
+        ko_pwn = _writeup_explanation_guide("ko", "pwn")
+        en_web = _writeup_explanation_guide("en", "web")
+        self.assertIn("실제 코드 발췌", ko_pwn)
+        self.assertIn("왜 선택했는지", ko_pwn)
+        self.assertIn("PIE", ko_pwn)
+        self.assertIn("PIE", _writeup_explanation_guide("ko", "포너블·리버싱"))
+        self.assertIn("unverified", en_web)
+        self.assertNotIn("ROP gadgets", en_web)
+
     def test_clean_documents_in_both_languages(self) -> None:
         for locale in ("ko", "en"):
             with self.subTest(locale=locale):

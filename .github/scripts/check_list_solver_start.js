@@ -1,70 +1,40 @@
-// Exercise the shipped list-card and detail start handlers with the same
-// account/model configuration that the detail panel has already validated.
+// List-card starts must not change the operator's current view.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const source = fs.readFileSync(process.argv[2] || path.join(__dirname, '../../ctf_agent/web/app.js'), 'utf8');
+const first = source.indexOf('async function startListSolver(');
+const last = source.indexOf('async function continueListSolver(', first);
+assert.ok(first >= 0 && last > first);
 
-const source = fs.readFileSync(
-  process.argv[2] || path.join(__dirname, '../../ctf_agent/web/app.js'), 'utf8',
-);
-function section(start, end) {
-  return source.slice(source.indexOf(start), source.indexOf(end));
-}
-const implementation = [
-  section('async function startListSolver(', 'async function continueListSolver('),
-  section('async function startSolver(', 'async function approveUltraEscalation('),
-].join('\n');
-
-async function scenario(configurationReady, provider, confirmNoRemote = false) {
+async function scenario({provider='codex', account=true, confirmNoRemote=false, active=false, selectAccount=false}={}) {
   const calls = [];
-  const notices = [];
-  let opened = false;
-  let refreshes = 0;
   const button = {
-    dataset: {workspaceId:'w', id:'c', name:'Example'},
-    isConnected: true, disabled: false, textContent:'▶ 풀이 시작',
-    attributes: new Set(),
+    dataset:{workspaceId:'w',id:'c',name:'Example'}, isConnected:true,
+    disabled:false, textContent:'▶ 풀이 시작', attributes:new Set(),
     setAttribute(name) { this.attributes.add(name); },
     removeAttribute(name) { this.attributes.delete(name); },
     hasAttribute(name) { return this.attributes.has(name); },
   };
-  const panel = {innerHTML:''};
+  if (selectAccount) button.attributes.add('data-account-selection');
   const context = {
-    currentWorkspace:{id:'w'}, currentChallenge:null, currentSolverJob:null,
-    challengeListing:{result:{challenges:[{id:'c',name:'Example'}]}},
-    currentSolverEvents:[], currentSolverGuidance:[], solverEventCursor:0,
-    solverGuidanceDraft:'', solverListedFlag:'', solverSyncedWriteup:'',
-    solverConsoleAgentId:'root', solverConsoleFollowLatest:true,
-    solverCollapsedAgentIds:new Set(), solverConsoleCardStates:new Map(),
-    solverPollTimer:null, solverRendering:0, startingListSolvers:new Set(),
-    solverProvider:provider, solverAccountId:'a'.repeat(32),
-    solverModel:provider === 'claude' ? 'claude-opus-4-8' : 'gpt-6-sol',
-    solverReasoning:'high', solverServiceTier:null, solverUltracode:false,
-    solverSubagentsEnabled:provider === 'codex', solverUltraEscalationMode:'ask',
-    i18n:{locale:'en',t:value=>value}, detail:{open:false},
-    document:{querySelector:selector=>selector === '#solver-panel' ? panel : null},
-    requireNoAttachmentWork:()=>{},
-    async openChallenge(id, waitForConfiguration) {
-      assert.equal(id,'c'); assert.equal(waitForConfiguration,true);
-      opened = true;
-      context.currentChallenge = {id:'c',workspace_id:'w',remote_mode:confirmNoRemote ? 'none' : 'unknown'};
-      if (confirmNoRemote) context.currentSolverJob = {phase:'needs_input',error:{code:'remote_input_required'},confirm_no_remote_eligible:true};
-      context.detail.open = true;
-    },
-    solverConfigurationReady:()=>configurationReady,
-    path:(challengeId,workspaceId)=>`/api/workspaces/${workspaceId}/challenges/${challengeId}`,
-    solverIsActive:()=>false,
-    solverContext:()=>true,
-    solverUltraEscalationEligible:()=>false,
-    solverPanelMarkup:()=>'<p>loading</p>',
-    normalizeSolverPayload:payload=>payload,
-    paintSolver:job=>{ context.currentSolverJob = job; },
-    solverJobId:job=>job?.id,
-    loadSolverConfiguration:async()=>{},
-    refreshChallenges:async()=>{refreshes++;},
-    toast:(message,error)=>{notices.push({message,error});},
+    button, currentWorkspace:{id:'w'}, currentChallenge:null, detail:{open:false},
+    startingListSolvers:new Set(), solverProvider:provider,
+    sessionUser:{ultra_escalation_default:'ask'}, i18n:{locale:'en',t:value=>value},
+    requireNoAttachmentWork:()=>{}, path:(id,w)=>`/api/workspaces/${w}/challenges/${id}`,
+    normalizeSolverPayload:payload=>payload, solverIsActive:job=>job?.phase==='running',
+    solverRetryConfiguration:()=>null, refreshChallenges:async()=>{}, toast:()=>{},
+    openChallenge:async(id)=>{ calls.push({opened:id}); },
     async api(url,options) {
+      if (url === '/api/workspaces/w/challenges/c') return {id:'c',workspace_id:'w',remote_mode:confirmNoRemote?'none':'unknown'};
+      if (url === '/api/workspaces/w/challenges/c/solver' && !options) {
+        if (active) return {job:{phase:'running'}};
+        if (confirmNoRemote) return {job:{phase:'needs_input',error:{code:'remote_input_required'},confirm_no_remote_eligible:true}};
+        throw {status:404};
+      }
+      if (url === '/api/accounts') return {accounts:account ? [{id:'a'.repeat(32),provider,snapshot:{status:'authenticated'},selected:true,model:provider==='codex'?'gpt-6-sol':'claude-opus-4-8',reasoning_effort:'high'}] : []};
+      if (url === `/api/accounts/${'a'.repeat(32)}/models`) return {status:'available',models:[{model:provider==='codex'?'gpt-6-sol':'claude-opus-4-8',supportedReasoningEfforts:[{reasoningEffort:'high'},{reasoningEffort:'ultra'}]}]};
       assert.equal(url,'/api/workspaces/w/challenges/c/solver');
       assert.equal(options.method,'POST');
       calls.push(options.body);
@@ -72,39 +42,40 @@ async function scenario(configurationReady, provider, confirmNoRemote = false) {
     },
   };
   vm.createContext(context);
-  vm.runInContext(implementation,context);
-  await vm.runInContext(`startListSolver(button,${confirmNoRemote})`,Object.assign(context,{button}));
-  return {calls,notices,opened,refreshes,button,context};
+  vm.runInContext(source.slice(first,last),context);
+  let error = null;
+  try { await vm.runInContext(`startListSolver(button,${confirmNoRemote})`,context); }
+  catch (caught) { error = caught; }
+  return {calls,button,context,error};
 }
 
 (async()=>{
-  const codex = await scenario(true,'codex');
-  assert.equal(codex.opened,true);
+  const codex = await scenario();
+  assert.equal(codex.error,null);
+  assert.equal(codex.context.detail.open,false);
+  assert.equal(codex.context.currentChallenge,null);
   assert.equal(codex.calls.length,1);
-  assert.equal(codex.calls[0].account_id,'a'.repeat(32));
   assert.equal(codex.calls[0].model,'gpt-6-sol');
   assert.equal(codex.calls[0].reasoning_effort,'high');
-  assert.equal(codex.calls[0].subagents_enabled,true);
+  assert.equal(codex.calls[0].subagents_enabled,false);
   assert.equal(codex.calls[0].writeup_locale,'en');
-  assert.equal(codex.refreshes,1);
   assert.equal(codex.button.disabled,false);
   assert.equal(codex.button.attributes.has('aria-busy'),false);
-
-  const claude = await scenario(true,'claude');
-  assert.equal(claude.calls.length,1);
-  assert.equal(claude.calls[0].provider,'claude');
-  assert.equal(claude.calls[0].account_id,'a'.repeat(32));
-  assert.equal(claude.calls[0].model,'claude-opus-4-8');
+  const claude = await scenario({provider:'claude'});
+  assert.equal(claude.error,null);
+  assert.equal(claude.context.detail.open,false);
   assert.equal('subagents_enabled' in claude.calls[0],false);
-
-  const missing = await scenario(false,'codex');
-  assert.equal(missing.opened,true);
+  const missing = await scenario({account:false});
+  assert.match(String(missing.error?.message),/계정/);
   assert.equal(missing.calls.length,0);
-  assert.equal(missing.context.detail.open,true);
-  assert.equal(missing.notices.some(notice=>notice.error),true);
-  assert.equal(missing.button.disabled,false);
-  const offline = await scenario(true,'codex',true);
-  assert.equal(offline.calls.length,1);
+  assert.equal(missing.context.detail.open,false);
+  const offline = await scenario({confirmNoRemote:true});
   assert.equal(offline.calls[0].confirm_no_remote,true);
-  console.log('PASS: list start uses validated account/model settings and opens detail on missing configuration');
+  const busy = await scenario({active:true});
+  assert.equal(busy.calls.length,0);
+  const selectAccount = await scenario({selectAccount:true});
+  assert.equal(selectAccount.error,null);
+  assert.equal(selectAccount.calls.length,1);
+  assert.equal(selectAccount.calls[0].opened,'c');
+  console.log('PASS: list starts in place with validated account/model defaults');
 })().catch(error=>{console.error(error);process.exitCode=1;});

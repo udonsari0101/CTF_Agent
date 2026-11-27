@@ -2330,7 +2330,7 @@ function challengeCardMarkup(challenge, workspaceId) {
       ${canCopyWriteup ? `<button type="button" class="small ghost icon-action writeup-action" data-action="copy-list-writeup" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-writeup-stamp="${esc(writeupStamp(challenge))}" aria-label="${challengeLabel('{name} write-up 복사',challenge)}" title="write-up 복사">▤</button>` : ''}
       ${latestRun ? `<button type="button" class="small ghost session-action${liveSession ? ' live' : ''}" data-action="open-solver-session" data-id="${esc(challenge.id)}" data-live="${liveSession}" aria-label="${challengeLabel(liveSession ? '{name} 실시간 풀이 터미널 보기' : '{name} 이전 풀이 터미널 보기',challenge)}" title="${liveSession ? '실시간 풀이 터미널' : '이전 풀이 터미널'}">${liveSession ? '<span class="session-live-dot" aria-hidden="true"></span>LIVE' : '<span aria-hidden="true">&gt;_</span>'}</button>` : ''}
       ${canStart ? `<button type="button" class="small ghost complete-action" data-action="complete-list-challenge" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${challengeLabel('{name} 수동 완료',challenge)}">수동 완료</button>` : ''}
-      ${canStart ? `<button type="button" class="small primary solve-action" data-action="start-list-solver" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${challengeLabel(importedPreset ? '{name} 계정 선택' : '{name} 기본 설정으로 풀이 시작',challenge)}" title="${tr(importedPreset ? '계정을 먼저 선택하세요.' : '기본 설정으로 풀이 시작')}" ${work ? 'data-attachment-hold ' : ''}${starting ? 'disabled aria-busy="true"' : work ? 'disabled' : ''}>${starting ? '시작 중' : importedPreset ? tr('계정 선택') : '▶ 풀이 시작'}</button>` : ''}
+      ${canStart ? `<button type="button" class="small primary solve-action" data-action="start-list-solver" data-id="${esc(challenge.id)}" data-workspace-id="${esc(workspaceId)}" data-name="${esc(challenge.name)}" aria-label="${challengeLabel(importedPreset ? '{name} 계정 선택' : '{name} 기본 설정으로 풀이 시작',challenge)}" title="${tr(importedPreset ? '계정을 먼저 선택하세요.' : '기본 설정으로 풀이 시작')}" ${importedPreset ? 'data-account-selection ' : ''}${work ? 'data-attachment-hold ' : ''}${starting ? 'disabled aria-busy="true"' : work ? 'disabled' : ''}>${starting ? '시작 중' : importedPreset ? tr('계정 선택') : '▶ 풀이 시작'}</button>` : ''}
       <button type="button" class="small ghost" data-action="clone-reasoning" data-id="${esc(challenge.id)}" aria-label="${esc(i18n.format('{name} 여러 설정으로 복제',{name:challenge.name}))}">${tr('여러 설정으로 복제')}</button>
       <button type="button" class="small challenge-open-action" data-action="open-challenge" data-id="${esc(challenge.id)}">${openLabel} <span aria-hidden="true">↗</span></button>
     </div></footer>
@@ -2748,6 +2748,10 @@ async function startListSolver(button, confirmNoRemote = false) {
   const workspaceId = button.dataset.workspaceId, challengeId = button.dataset.id;
   if (!currentWorkspace || currentWorkspace.id !== workspaceId) throw new Error(i18n.t('문제 목록을 다시 불러와 주세요.'));
   requireNoAttachmentWork(workspaceId,challengeId);
+  if (button.hasAttribute('data-account-selection')) {
+    await openChallenge(challengeId);
+    return;
+  }
   const key = `${workspaceId}:${challengeId}`, name = button.dataset.name;
   if (startingListSolvers.has(key)) return;
   startingListSolvers.add(key);
@@ -2757,16 +2761,73 @@ async function startListSolver(button, confirmNoRemote = false) {
   button.textContent = '시작 중';
   let started = false;
   try {
-    // List summaries omit the account ID and validated model catalog. Load
-    // the same configuration as the detail action before starting, including
-    // clone presets and the exact account/provider for a retry.
-    await openChallenge(challengeId,true);
-    if (currentWorkspace?.id !== workspaceId || currentChallenge?.id !== challengeId || !detail.open) return;
-    if (!solverConfigurationReady() || solverIsActive(currentSolverJob)) {
-      toast(i18n.t('로그인한 계정과 모델·추론 수준을 선택해 주세요.'),true);
+    // Resolve the same account/model defaults without opening the challenge
+    // dialog. The list action must leave the operator's current view intact.
+    const challenge = await api(path(challengeId,workspaceId));
+    if (currentWorkspace?.id !== workspaceId) return;
+    let previousJob = null;
+    try {
+      previousJob = normalizeSolverPayload(await api(`${path(challengeId,workspaceId)}/solver`)).job;
+    } catch (error) { if (error.status !== 404) throw error; }
+    if (solverIsActive(previousJob)) {
+      toast(i18n.t('이 문제는 이미 풀이 중입니다.'),true);
       return;
     }
-    await startSolver(confirmNoRemote);
+    if (confirmNoRemote && !(challenge.remote_mode === 'none' && previousJob?.phase === 'needs_input'
+        && previousJob?.error?.code === 'remote_input_required' && previousJob?.confirm_no_remote_eligible === true)) {
+      throw new Error(i18n.t('확인할 원격 정보 요청이 없습니다. 문제 상태를 다시 불러와 주세요.'));
+    }
+    const retry = solverRetryConfiguration(previousJob);
+    const preset = !retry && challenge.solver_preset?.provider === 'codex' ? challenge.solver_preset : null;
+    const provider = retry?.provider || preset?.provider || solverProvider;
+    const accountPayload = await api('/api/accounts');
+    const accounts = Array.isArray(accountPayload?.accounts) ? accountPayload.accounts : [];
+    const available = accounts.filter(item => item?.provider === provider && item.snapshot?.status === 'authenticated');
+    const preferredId = retry?.accountId || preset?.account_id || '';
+    const account = available.find(item => item.id === preferredId)
+      || (!preferredId && available.find(item => item.selected === true))
+      || (!preferredId && available[0]);
+    if (!account) throw new Error(i18n.t('로그인된 계정을 선택하려면 문제 상세에서 풀이 설정을 확인해 주세요.'));
+    const catalog = await api(`/api/accounts/${encodeURIComponent(account.id)}/models`);
+    if (catalog?.status !== 'available' || !Array.isArray(catalog.models)) {
+      throw new Error(i18n.t('선택한 계정의 모델 목록을 사용할 수 없습니다.'));
+    }
+    const preferredModel = retry?.model || preset?.model || account.model;
+    const models = catalog.models.filter(item => item && typeof (item.model || item.id) === 'string');
+    const model = models.find(item => (item.model || item.id) === preferredModel)
+      || (!retry && !preset && models.find(item => item.isDefault === true || item.default === true))
+      || (!retry && !preset && models[0]);
+    if (!model) throw new Error(i18n.t('이전 모델을 사용할 수 없습니다. 문제 상세에서 풀이 설정을 확인해 주세요.'));
+    const efforts = Array.isArray(model.supportedReasoningEfforts)
+      ? model.supportedReasoningEfforts.map(item => item?.reasoningEffort).filter(Boolean) : [];
+    const preferredEffort = retry?.reasoning || preset?.reasoning_effort || account.reasoning_effort;
+    const reasoning = efforts.includes(preferredEffort) ? preferredEffort
+      : (!retry && !preset && (efforts.includes(model.defaultReasoningEffort) ? model.defaultReasoningEffort : efforts[0]));
+    if (!reasoning) throw new Error(i18n.t('이전 추론 수준을 사용할 수 없습니다. 문제 상세에서 풀이 설정을 확인해 주세요.'));
+    const tiers = Array.isArray(model.serviceTiers) ? model.serviceTiers.map(item => item?.id) : [];
+    const requestedTier = retry?.serviceTier || preset?.service_tier || account.service_tier;
+    if (retry?.serviceTier === 'fast' && !tiers.includes('fast')) {
+      throw new Error(i18n.t('이전 Fast 티어를 사용할 수 없습니다. 문제 상세에서 풀이 설정을 확인해 주세요.'));
+    }
+    const ultracode = provider === 'claude' && model.supportsUltracode === true
+      && (retry ? retry.ultracode : !preset && (model.model || model.id) === account.model && account.ultracode === true);
+    if (retry?.ultracode && !ultracode) {
+      throw new Error(i18n.t('이전 Ultracode 설정을 사용할 수 없습니다. 문제 상세에서 풀이 설정을 확인해 주세요.'));
+    }
+    const escalation = retry?.ultraEscalationMode || sessionUser?.ultra_escalation_default || 'ask';
+    const canEscalate = provider === 'codex' && ['high','xhigh'].includes(reasoning)
+      && efforts.includes('ultra');
+    if (currentWorkspace?.id !== workspaceId) return;
+    const payload = await api(`${path(challengeId,workspaceId)}/solver`,{method:'POST',body:{
+      provider,account_id:account.id,model:model.model || model.id,reasoning_effort:reasoning,
+      service_tier:requestedTier === 'fast' && tiers.includes('fast') ? 'fast' : null,
+      ultracode,
+      ...(provider === 'codex' ? {subagents_enabled:retry ? retry.subagentsEnabled : preset ? preset.subagents_enabled === true : reasoning === 'ultra'} : {}),
+      ultra_escalation_mode:canEscalate ? escalation : 'off',
+      writeup_locale:i18n.locale,
+      ...(confirmNoRemote ? {confirm_no_remote:true} : {}),
+    }});
+    if (payload.capacity?.warning && payload.capacity.warning_message) toast(payload.capacity.warning_message);
     started = true;
     if (currentWorkspace?.id === workspaceId) await refreshChallenges().catch(() => {});
     toast(i18n.t('“{name}” 풀이를 시작했습니다.').replace('{name}',() => name || i18n.t('문제')));

@@ -37,12 +37,13 @@ CATEGORIES = (
 # CTFd category names are organizer-defined. Map only unambiguous, common
 # variants; an unfamiliar label still goes through the original unknown triage.
 CATEGORY_ALIASES = {
-    "web": ("webapp", "web application"),
-    "pwn": ("pwnable", "binary exploitation"),
-    "rev": ("reversing", "reverse engineering", "reverse"),
-    "crypto": ("cryptography", "cryptanalysis"),
-    "misc": ("miscellaneous", "ppc", "programming puzzle"),
-    "forensics": ("forensic", "digital forensics"),
+    "web": ("webapp", "web application", "웹", "웹해킹"),
+    "pwn": ("pwnable", "binary exploitation", "포너블"),
+    "rev": ("reversing", "reverse engineering", "reverse", "리버싱", "역공학"),
+    "crypto": ("cryptography", "cryptanalysis", "암호", "암호학"),
+    "misc": ("miscellaneous", "ppc", "programming puzzle", "미스크"),
+    "forensics": ("forensic", "digital forensics", "포렌식"),
+    "blockchain": ("블록체인",),
     "ai-ml": ("ai/ml", "machine learning"),
 }
 SCAFFOLDS = ("ANALYSIS.md", "VULN.md", "NEXT.md")
@@ -117,7 +118,7 @@ def normalize_categories(value: str) -> tuple[str, ...]:
     lowered = value.lower() if isinstance(value, str) else ""
     selected = tuple(
         category for category in CATEGORIES if category != "unknown" and any(
-            re.search(rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])", lowered)
+            re.search(rf"(?<![a-z0-9가-힣]){re.escape(label)}(?![a-z0-9가-힣])", lowered)
             for label in (category, *CATEGORY_ALIASES.get(category, ()))
         )
     )

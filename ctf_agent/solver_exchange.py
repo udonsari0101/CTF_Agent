@@ -1759,7 +1759,7 @@ class SolverExchangeCoordinator:
                                 and bool(source["subagents_enabled"]) == effective_subagents_enabled
                                 and runtime_match
                             )
-                            continuation_mode = "session" if saved_exact and exact_configuration and saved["session_id"] else "workspace"
+                            continuation_mode = "session" if (saved_exact or saved_remote) and exact_configuration and saved["session_id"] else "workspace"
                 if ultra_source_job_id is not None:
                     source = db.execute(
                         "SELECT * FROM solver_jobs WHERE id=? AND owner_user_id=? AND workspace_id=? AND challenge_id=?",
@@ -3873,7 +3873,7 @@ class SolverExchangeCoordinator:
                 )
                 and source["remote_mode"] in {"unknown", "none", "endpoint"}
                 and job["remote_mode"] in {"none", "endpoint"}
-                and job["continuation_mode"] == "workspace"
+                and job["continuation_mode"] in {"workspace", "session"}
             ):
                 return None
         location = self.continuations_dir / source_id
@@ -3888,12 +3888,14 @@ class SolverExchangeCoordinator:
             or metadata["session_id"] != saved["session_id"]
         ):
             return None
-        mode = "session" if exact_input and job["continuation_mode"] == "session" and metadata["session_id"] else "workspace"
+        mode = "session" if job["continuation_mode"] == "session" and metadata["session_id"] else "workspace"
         staged_meta = dict(metadata)
         if not exact_input:
-            # Only the workdir is restored when a confirmed needs_remote URL
-            # changes the full input digest. Rebind the copied control record
-            # to the current problem input after owner/base/archive checks.
+            # A confirmed needs_remote update changes only the operator-supplied
+            # remote input. The provider session can continue when its account,
+            # model, and runtime still match; immutable challenge files are
+            # restaged from the current problem. Rebind the trusted control
+            # record after owner/base/archive checks.
             staged_meta["input_sha256"] = job["challenge_input_sha256"]
         return location, staged_meta, size, mode
 

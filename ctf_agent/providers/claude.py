@@ -58,6 +58,25 @@ CLAUDE_API_VERSION = "2023-06-01"
 CLAUDE_API_KEY_MAX_BYTES = 8192
 
 
+def _api_catalog_limit_code(response: httpx.Response) -> str:
+    """Classify a bounded API error without retaining the upstream response."""
+
+    if len(response.content) <= 8192:
+        try:
+            payload = response.json()
+        except (ValueError, UnicodeError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                details = error.get("details")
+                if isinstance(details, dict) and details.get("error_code") in {
+                    "enforced_spend_limit_reached", "contract_spend_limit_reached"
+                }:
+                    return "quota_exceeded"
+    return "rate_limit_exceeded"
+
+
 def _usage_window(value: object, label: str) -> dict | None:
     if not isinstance(value, dict):
         return None
@@ -337,7 +356,10 @@ class ClaudeAccount:
                     if response.status_code in (401, 403):
                         raise ProviderError("Claude API 키 인증을 확인해 주세요.", "auth_required", stage="auth", retryable=False)
                     if response.status_code == 429:
-                        raise ProviderError("Claude API 요청 제한에 도달했습니다.", "quota_exceeded", stage="quota", retryable=True)
+                        limit_code = _api_catalog_limit_code(response)
+                        message = ("Claude API 지출 한도에 도달했습니다." if limit_code == "quota_exceeded"
+                                   else "Claude API 요청 속도 제한에 도달했습니다.")
+                        raise ProviderError(message, limit_code, stage="quota", retryable=True)
                     if response.status_code != 200:
                         raise ProviderError("Claude 모델 목록을 확인하지 못했습니다.", "provider_unavailable", stage="model")
                     if len(response.content) > 512 * 1024:

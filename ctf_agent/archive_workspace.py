@@ -96,6 +96,7 @@ _SKIP_REASONS = {
     "safe_7z_extractor_unavailable",
     "truncated_archive",
     "unreadable_archive",
+    "unsafe_nested_archive_entry",
     *_RECOVERABLE_ARCHIVE_CODES,
 }
 
@@ -1130,6 +1131,12 @@ def _extract_attachment_archives_direct(
         try:
             bytes_written, members = _atomic_extract(source, kind, destination, budget)
         except ArchiveSafetyError as exc:
+            if depth > 0 and exc.code == "unsafe_archive_entry":
+                # OCI layers and other nested payloads legitimately contain
+                # links. Never materialize them, but keep the immutable raw
+                # nested archive so the solver can inspect it deliberately.
+                actions.append(ArchiveAction(display_source, kind, depth, "skipped", reason="unsafe_nested_archive_entry"))
+                continue
             if exc.code not in _RECOVERABLE_ARCHIVE_CODES:
                 raise
             actions.append(ArchiveAction(display_source, kind, depth, "skipped", reason=exc.code))
