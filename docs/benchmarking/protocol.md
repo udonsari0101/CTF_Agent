@@ -2,7 +2,7 @@
 
 This document describes a paired comparison of a minimal-prompt provider CLI arm (`baseline`) and the current CTF Agent harness (`harness`). The production Codex app-server transport, credential handoff, and external container isolation are shared plumbing; the baseline omits the CTF Agent solve prompt, skills, notes, checkpoint, flag watcher, write-up, retries, and interventions. It is therefore a minimal provider-app-server control, **not** a pristine standalone CLI installation. The public scripts validate a schedule and a report; they do **not** start solvers, submit flags, read credentials, or prove that a solver is better. Keep the private oracle and raw transcripts outside the public repository.
 
-The [2026-11-04 preflight audit](preflight-audit.md) inventories the prepared private static candidates, pending service fixtures, source-code comparisons, missing field coverage, and the concrete B0/B1 execution boundary. Prepared handouts and judge metadata are not actual model trials. In particular, the current planner/reporter are a **two-arm format**, not a runner or a three-arm candidate evaluator.
+Prepared handouts and judge metadata are not actual model trials. The current planner/reporter use a **two-arm format**, not a runner or a three-arm candidate evaluator.
 
 ## Freeze the experiment before any run
 
@@ -32,6 +32,6 @@ The validator rejects duplicate cases or trial arms, mismatched digests/controls
 
 The reporter checks the **metadata** for oracle evidence, not the private evidence itself. Audit those records separately. Public CTF cases may be contaminated by training data or web search. Preserve versioned tool and model identifiers so a later rerun can explain changes.
 
-Before calling this a performance benchmark, run a no-model fixture through both arm wrappers and prove that input/answer mounts are separated, the CLI process actually starts in the frozen image, the same judge scores both arms, every remote service resets between attempts, and failure/timeout paths still yield complete paired records. Then run a small **development** pilot to validate the apparatus. The eight currently prepared static holdout cases do not support broad all-field claims: the prepared static manifests contain no runnable web/pwn service or live task. Do not silently expand a holdout after inspecting its outcomes.
+Before calling this a performance benchmark, run a no-model fixture through both arm wrappers and prove that input/answer mounts are separated, the CLI process actually starts in the frozen image, the same judge scores both arms, every remote service resets between attempts, and failure/timeout paths still yield complete paired records. Then run a small **development** pilot to validate the apparatus. Static cases alone do not support broad all-field claims; include runnable services and live tasks when those claims require them. Do not silently expand a holdout after inspecting its outcomes.
 
 Offline checks: `python .github/scripts/check_benchmark_plan.py` and `python .github/scripts/check_benchmark_report.py`.
