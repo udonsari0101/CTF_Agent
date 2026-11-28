@@ -123,6 +123,7 @@ r = c.post("/login", data={"user":"a","password":"a"}); print(r.status_code, dic
 
 ### OOB callback for blind bugs — give the target a URL, poll the hit
 No reflection ≠ no bug. If an external callback is needed, use an available listener or optional `interactsh-client`/webhook.site; inject a unique URL and poll. A **DNS** hit proves egress even when HTTP is filtered. `cloudflared` is optional, not installed in the image; check availability before using it to expose a full exploit page.
+Before sending a callback URL, verify that the target or bot can actually reach it from its own network. A listener bound to `127.0.0.1` inside the solve container is not reachable from a separate remote host. If you run a local listener, start it in the background, save its PID and log in job-local writable storage, make one short readiness request, and poll the tagged callback with a finite deadline. Never leave a long-running listener in the foreground of a shell tool call; a silent wait consumes the solve budget without testing the payload. Stop the listener when the experiment ends. If no reachable callback route exists, use same-origin feedback or a local reproduction instead of repeatedly waiting on an unreachable URL.
 | Blind bug | Injection carrier |
 |---|---|
 | Blind SSRF | any URL/host field, webhook config, PDF/HTML/image renderer, `url=`/`callback=` param |
@@ -245,7 +246,7 @@ For double-spend, one-time token, or check-then-use behavior, confirm the state 
 - **Source grep**: the one endpoint missing `@login_required`/`requireAuth`; all-zero/nil UUIDs or default admin id; predictable/sequential IDOR keys; a `/admin/login` that seeds a reusable admin cookie.
 
 ## Client-side (XSS, admin bot, CSP) — verify the bot's context
-**Bot model**: a report endpoint may launch a privileged browser, but its account, origin, cookies, navigation, and secret location vary. Observe that flow before choosing a payload. First confirm execution and readable data in that exact context; then choose an allowed output channel. If the report endpoint accepts a URL you control, or a stored-XSS path exists, test the smallest observable marker there. Solve any report-endpoint PoW. Reproduce the bot locally with `playwright`/`puppeteer` chromium when feasible; fuzz reflected/DOM sinks with `dalfox` only when evidence supports it.
+**Bot model**: a report endpoint may launch a privileged browser, but its account, origin, cookies, navigation, browser engine, and secret location vary. Observe that flow before choosing a payload. First confirm execution and readable data in that exact context; then choose an allowed output channel. If the report endpoint accepts a URL you control, or a stored-XSS path exists, test the smallest observable marker there. Solve any report-endpoint PoW. Reproduce the bot locally with its actual engine when that engine is available; otherwise record the mismatch and treat a negative local browser test as inconclusive. The solve container may be read-only: check available browsers before trying to install another one, and do not spend the solve budget repeatedly installing packages that the worker cannot persist. Fuzz reflected/DOM sinks with `dalfox` only when evidence supports it.
 
 ### Get JS to run
 | Vector | Payload |
