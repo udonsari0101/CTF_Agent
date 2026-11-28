@@ -242,6 +242,28 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     submit_flag = Path("/usr/local/bin/submit-flag")
     assert submit_flag.is_symlink()
     assert submit_flag.resolve(strict=True) == Path("/usr/local/libexec/ctf-command/submit-flag")
+    candidate_check = subprocess.run(
+        [str(submit_flag), "--help"],
+        capture_output=True,
+        timeout=10,
+        cwd=temporary,
+        env={"HOME": temporary, "LANG": "C.UTF-8", "PATH": os.environ.get("PATH", "")},
+    )
+    assert candidate_check.returncode == 65, candidate_check.stderr.decode(errors="replace")
+    assert candidate_check.stderr == b"submit-flag: invalid candidate\n"
+    assert b"Traceback" not in candidate_check.stdout + candidate_check.stderr
+    candidate_check = subprocess.run(
+        [str(submit_flag), "SMOKE{verified_candidate}"],
+        capture_output=True,
+        timeout=10,
+        cwd=temporary,
+        env={"HOME": temporary, "LANG": "C.UTF-8", "PATH": os.environ.get("PATH", "")},
+    )
+    assert candidate_check.returncode == 0, candidate_check.stderr.decode(errors="replace")
+    candidate_file = root / ".flag-candidate"
+    assert candidate_file.read_text(encoding="utf-8") == "SMOKE{verified_candidate}"
+    assert stat.S_IMODE(candidate_file.stat().st_mode) == 0o600
+    candidate_file.unlink()
     request_remote = Path("/usr/local/bin/request-remote")
     assert request_remote.is_symlink()
     assert request_remote.resolve(strict=True) == Path("/usr/local/libexec/ctf-command/request-remote")
