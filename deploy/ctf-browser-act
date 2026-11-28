@@ -538,6 +538,18 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="ctf-browser-act",
         description="Click, fill, upload, and inspect a job-local headless Chromium page.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Step JSON actions (up to 100, in one browser context):\n"
+            "  goto: {\"action\":\"goto\",\"url\":\"https://target/\"}\n"
+            "  back / forward: {\"action\":\"back\"}\n"
+            "  select_page: {\"action\":\"select_page\",\"index\":0}\n"
+            "  click / fill / press / check / uncheck / select / upload\n"
+            "  wait_for / wait / evaluate / screenshot\n"
+            "A popup becomes active. The JSON result lists open pages and indices;\n"
+            "select_page 0 returns to the original page. Separate invocations\n"
+            "do not preserve open tabs even with --session.\n"
+        ),
     )
     parser.add_argument("url", nargs="?", help="initial http(s) or file URL")
     parser.add_argument("--session", help="reuse the named job-local browser profile")
