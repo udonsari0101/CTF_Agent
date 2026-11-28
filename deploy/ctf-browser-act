@@ -10,11 +10,13 @@ Steps are a JSON list. Example:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import timezone
 from email.utils import format_datetime, parsedate_to_datetime
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 import json
+import os
 import re
 from pathlib import Path
 import shutil
@@ -35,6 +37,29 @@ MAX_API_JSON_EVENTS = 8
 INITIAL_API_JSON_EVENTS = 2
 MAX_API_JSON_BYTES = 4096
 MAX_API_PENDING_REQUESTS = 128
+
+
+@contextmanager
+def _playwright_driver_temp(path: Path):
+    """Keep Playwright's Node artifacts in the command-writable job runtime.
+
+    Chromium has its own short relative TMPDIR from browser_environment();
+    Playwright's Node driver starts earlier and inherits this process's env.
+    The model provider's private HOME is deliberately denied to commands.
+    """
+
+    keys = ("TMPDIR", "TMP", "TEMP")
+    original = {key: os.environ.get(key) for key in keys}
+    for key in keys:
+        os.environ[key] = str(path)
+    try:
+        yield
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _load_browser_guard():
@@ -331,7 +356,7 @@ def _run_browser(arguments: argparse.Namespace) -> int:
         def add(kind: str, event: dict) -> None:
             _record_event(observations, kind, event)
 
-        with sync_playwright() as playwright:
+        with _playwright_driver_temp(runtime / "tmp"), sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(runtime / "profile"),
                 executable_path=guard.CHROMIUM,
