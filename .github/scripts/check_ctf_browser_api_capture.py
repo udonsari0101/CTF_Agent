@@ -99,6 +99,53 @@ class ApiCaptureTests(unittest.TestCase):
         browser._execute(page, {"action": "wait", "milliseconds": 1200}, Path("."), 5000)
         self.assertEqual(page.waited, 1200)
 
+    def test_popup_selection_and_history_keep_the_original_page(self) -> None:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = f"<html><body>{self.path}</body></html>".encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with sync_playwright() as playwright:
+                chrome = playwright.chromium.launch(headless=True, channel="chromium")
+                try:
+                    context = chrome.new_context()
+                    original = context.new_page()
+                    base = f"http://127.0.0.1:{server.server_port}"
+                    original.goto(base + "/first")
+                    with original.expect_popup() as popup_info:
+                        original.evaluate(f"window.open('{base}/popup?token=private')")
+                    popup = popup_info.value
+                    popup.wait_for_load_state()
+                    self.assertIs(browser._select_page(context, {"index": 0}), original)
+                    self.assertIs(browser._select_page(context, {"index": 1}), popup)
+                    catalog = browser._page_catalog(context, popup)
+                    self.assertEqual(catalog["active_page"], 1)
+                    self.assertEqual(catalog["page_count"], 2)
+                    self.assertNotIn("private", str(catalog))
+                    browser._execute(original, {"action": "goto", "url": base + "/second"}, Path("."), 5000)
+                    browser._execute(original, {"action": "back"}, Path("."), 5000)
+                    self.assertTrue(original.url.endswith("/first"))
+                    browser._execute(original, {"action": "forward"}, Path("."), 5000)
+                    self.assertTrue(original.url.endswith("/second"))
+                    with self.assertRaisesRegex(ValueError, "unavailable"):
+                        browser._select_page(context, {"index": 2})
+                finally:
+                    chrome.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     def test_playwright_driver_uses_job_temp_and_restores_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             job_temp = Path(directory) / "job" / "tmp"
