@@ -75,6 +75,9 @@ INITIAL_GOAL = (
     "Write notes/{ANALYSIS,VULN,NEXT}.md at each cycle end, and keep scratch "
     "in tmp/. Verify the genuine flag from the brief, supplied artifacts, and "
     "observed target behavior; a local value may be genuine or a placeholder. "
+    "When a remote endpoint exists, a flag literal in the supplied files is "
+    "only a candidate. The automated handoff will hold such a candidate for "
+    "independent verification instead of declaring the challenge solved. "
     "Solve any PoW if required. Submit with submit-flag \"<flag>\"."
 )
 
@@ -296,6 +299,10 @@ def assemble_manual(
             )
         )
     if remote_access:
+        if mode == "endpoint":
+            lines.append(
+                "- A flag printed in an attachment or extracted source is not proof of the remote instance's flag. The automated handoff holds a source-literal candidate for independent verification, even if you also see it in a remote response. Record the remote evidence; do not claim a solved challenge or write a final write-up solely from the local literal."
+            )
         lines.append(
             "- Network: direct Internet sockets and DNS are available for challenge solving, dependency retrieval, and public research."
         )
