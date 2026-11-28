@@ -258,7 +258,10 @@ def _request_event(request) -> dict:
     except (AttributeError, PlaywrightError):
         frame_url = ""
     if frame_url:
-        event["frame_url_at_request"] = _url(frame_url)
+        event["frame_url_at_request"] = (
+            _url(frame_url) if _origin(frame_url) is not None else
+            "about:blank" if frame_url == "about:blank" else "<non-http-frame>"
+        )
     return event
 
 

@@ -80,6 +80,8 @@ class ApiCaptureTests(unittest.TestCase):
         self.assertEqual(event["frame_url_at_request"], "https://target.test/page?session=%3Credacted%3E")
         self.assertNotIn("secret", str(event))
         self.assertNotIn("private", str(event))
+        request.frame.url = "data:text/html,secret"
+        self.assertEqual(browser._request_event(request)["frame_url_at_request"], "<non-http-frame>")
         del request.frame
         self.assertNotIn("frame_url_at_request", browser._request_event(request))
 
