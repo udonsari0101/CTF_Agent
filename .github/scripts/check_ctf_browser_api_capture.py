@@ -56,6 +56,20 @@ class ApiCaptureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.observations = {"api_json": [], "api_json_dropped_events": 0}
 
+    def test_wait_accepts_short_ms_field_used_by_browser_steps(self) -> None:
+        class Page:
+            def __init__(self) -> None:
+                self.waited = None
+
+            def wait_for_timeout(self, milliseconds: int) -> None:
+                self.waited = milliseconds
+
+        page = Page()
+        browser._execute(page, {"action": "wait", "ms": 1500}, Path("."), 5000)
+        self.assertEqual(page.waited, 1500)
+        browser._execute(page, {"action": "wait", "milliseconds": 1200}, Path("."), 5000)
+        self.assertEqual(page.waited, 1200)
+
     def test_playwright_driver_uses_job_temp_and_restores_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             job_temp = Path(directory) / "job" / "tmp"
