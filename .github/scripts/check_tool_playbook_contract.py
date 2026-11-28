@@ -40,6 +40,7 @@ class ToolPlaybookContract(unittest.TestCase):
         self.assertIn("tmp/params.txt", web)
         # Keep browser-context triage near the top without encoding a
         # particular challenge's response or payload in the default prompt.
+        self.assertIn("make a compact path map", web[:1000])
         self.assertIn("record the actors, origins, pages, request order", web[:8000])
         self.assertIn("A single request or a different browser context", web[:8000])
         self.assertIn('"action":"select_page"', web)

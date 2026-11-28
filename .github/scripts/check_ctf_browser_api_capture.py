@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
+from contextlib import redirect_stdout
 import http.server
+from io import StringIO
 import os
 from pathlib import Path
 import tempfile
@@ -98,6 +100,14 @@ class ApiCaptureTests(unittest.TestCase):
         self.assertEqual(page.waited, 1500)
         browser._execute(page, {"action": "wait", "milliseconds": 1200}, Path("."), 5000)
         self.assertEqual(page.waited, 1200)
+
+    def test_help_explains_popup_and_page_switch_actions(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as exit_status:
+            browser.main(["--help"])
+        self.assertEqual(exit_status.exception.code, 0)
+        self.assertIn("select_page", output.getvalue())
+        self.assertIn("popup becomes active", output.getvalue())
 
     def test_popup_selection_and_history_keep_the_original_page(self) -> None:
         class Handler(http.server.BaseHTTPRequestHandler):
