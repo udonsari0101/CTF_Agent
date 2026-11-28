@@ -179,6 +179,33 @@ class WorkerStatusRecoveryTests(unittest.TestCase):
         )
         self.assertTrue(solver_autoscaler._slot_is_idle(storage, 2))
 
+    def test_scratch_root_link_is_unlinked_without_following_target(self) -> None:
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep")
+        link = scratch / "t"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink unavailable: {exc}")
+        worker.recover_crash_scratch(scratch)
+        worker.assert_scratch_root_clean(scratch)
+        self.assertFalse(link.exists())
+        self.assertFalse(link.is_symlink())
+        self.assertEqual((outside / "keep.txt").read_text(), "keep")
+
+    def test_unknown_scratch_root_directory_remains_blocked(self) -> None:
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        unknown = scratch / "unknown-user-directory"
+        unknown.mkdir()
+        (unknown / "keep.txt").write_text("keep")
+        with self.assertRaises(worker.WorkerRefusal):
+            worker.recover_crash_scratch(scratch)
+        self.assertEqual((unknown / "keep.txt").read_text(), "keep")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1500,6 +1500,21 @@ def recover_crash_scratch(root: Path) -> None:
                             raise invalid() from exc
 
             for name in names:
+                try:
+                    top = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                except OSError as exc:
+                    raise invalid() from exc
+                if stat.S_ISLNK(top.st_mode):
+                    # The scratch root is private to this worker. A solver can
+                    # create a convenience link here; remove only the link,
+                    # without resolving or traversing its destination.
+                    if not _scratch_entry_owned(top, current_uid):
+                        raise invalid()
+                    try:
+                        os.unlink(name, dir_fd=root_fd)
+                    except OSError as exc:
+                        raise invalid() from exc
+                    continue
                 if not _recoverable_scratch_tree(name):
                     raise WorkerRefusal(
                         "scratch_cleanup_failed",
@@ -1548,6 +1563,8 @@ def recover_crash_scratch(root: Path) -> None:
         root_resolved = root.resolve(strict=True)
         entries = list(root.iterdir())
         for entry in entries:
+            if entry.is_symlink():
+                continue
             if not _recoverable_scratch_tree(entry.name):
                 raise WorkerRefusal(
                     "scratch_cleanup_failed",
@@ -1555,13 +1572,15 @@ def recover_crash_scratch(root: Path) -> None:
                 )
             entry_details = entry.lstat()
             if (
-                entry.is_symlink()
-                or not stat.S_ISDIR(entry_details.st_mode)
+                not stat.S_ISDIR(entry_details.st_mode)
                 or entry.resolve(strict=True).parent != root_resolved
             ):
                 raise invalid()
         for entry in entries:
-            shutil.rmtree(entry)
+            if entry.is_symlink():
+                entry.unlink()
+            else:
+                shutil.rmtree(entry)
         if entries:
             _fsync_directory(root)
     except WorkerRefusal:
