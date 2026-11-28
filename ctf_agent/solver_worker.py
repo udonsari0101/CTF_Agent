@@ -43,6 +43,7 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol
 from .codex_native import native_codex_binary as _native_codex_binary
 from .agent_workspace import INITIAL_GOAL, NUDGE, POISON_REGOAL, _asset_text, normalize_categories, prepare_agent_workspace
 from .archive_workspace import ArchiveSafetyError
+from .flag_provenance import literal_in_supplied_inputs
 from .solver_continuation import (
     ContinuationInput,
     ContinuationInvalid,
@@ -8338,6 +8339,7 @@ class SolverWorker:
                     "first_tool_result_after_running", solve_started_ns, startup_run_key
                 )
                 published_flag: str | None = None
+                unverified_source_candidates: set[str] = set()
 
                 async def checkpoint_private_notes(value: str) -> None:
                     nonlocal notes, solver_artifact_payload
@@ -8361,6 +8363,14 @@ class SolverWorker:
                     if candidate in rejected:
                         return False
                     if published_flag is not None:
+                        return False
+                    if candidate in unverified_source_candidates or (
+                        manifest.remote_mode == "endpoint"
+                        and literal_in_supplied_inputs(
+                            scratch, candidate, manifest.challenge_text
+                        )
+                    ):
+                        unverified_source_candidates.add(candidate)
                         return False
                     written_notes = _solver_notes(scratch)
                     if written_notes and not notes:
@@ -8430,7 +8440,18 @@ class SolverWorker:
                 remote_request_watcher = None
                 flag = published_flag or discovery["flag"]
                 notes = discovery["private_notes"] or notes
-                publish_flag(flag)
+                if published_flag is None and not publish_flag(flag):
+                    if flag in unverified_source_candidates:
+                        raise WorkerRefusal(
+                            "unverified_source_flag",
+                            "원격 대상이 있는 문제의 첨부 자료에 그대로 적힌 Flag는 원격 정답으로 검증되지 않았습니다.",
+                            stage="solve",
+                        )
+                    raise WorkerRefusal(
+                        "unverified_flag_handoff",
+                        "제출한 Flag 후보를 검증할 수 없습니다.",
+                        stage="solve",
+                    )
                 current_artifact = _capture_solver_artifact(scratch / "solver.py")
                 if current_artifact is not None:
                     solver_artifact_payload = current_artifact.payload()
