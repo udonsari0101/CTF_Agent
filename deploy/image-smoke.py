@@ -355,6 +355,7 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     browser_job = Path("/solver-scratch/ctf-job-image-browser")
     browser_workdir = browser_job / "competition/challenge/codex-workdir"
     browser_workdir.mkdir(parents=True, mode=0o700)
+    (browser_workdir / "tmp").mkdir(mode=0o700)
     browser_input = browser_workdir / "page.html"
     browser_input.write_text("<!doctype html><title>browser smoke</title><main>ready</main>", encoding="utf-8")
     browser_environment = dict(tool_env, TMPDIR="/root", TMP="/root", TEMP="/root")
