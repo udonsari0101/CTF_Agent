@@ -75,7 +75,7 @@ jobs:
           git push --force-with-lease origin HEAD:refs/heads/automation/cli-pins
           if ! gh pr list --head automation/cli-pins --base main --state open --json number --jq '.[0].number' | grep -Eq '^[0-9]+$'; then
             cat > "$RUNNER_TEMP/cli-pr.md" <<'EOF'
-          Update the pinned Codex `latest` and Claude Code `stable` npm releases together with their runtime version checks.
+          Update the pinned Codex and Claude Code `latest` npm releases together with their runtime version checks.
 
           The candidate toolchain and application image passed `deploy/image-smoke.py` before this PR was opened. The normal image workflow will build the immutable commit-SHA image and move `production` only after its own smoke test passes.
           EOF

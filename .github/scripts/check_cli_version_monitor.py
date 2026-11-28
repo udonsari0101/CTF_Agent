@@ -15,6 +15,12 @@ from scripts import update_cli_versions  # noqa: E402
 
 
 class VersionMonitorTests(unittest.TestCase):
+    def test_official_release_channels_are_latest(self) -> None:
+        self.assertEqual(
+            {provider: channel for provider, (_, channel) in update_cli_versions.SOURCES.items()},
+            {"codex": "latest", "claude": "latest"},
+        )
+
     def test_update_keeps_image_and_provider_defaults_aligned(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

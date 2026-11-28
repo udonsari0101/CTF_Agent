@@ -1,4 +1,4 @@
-"""Prepare a reviewed, pinned Codex/Claude toolchain update from npm dist-tags.
+"""Prepare a reviewed, pinned Codex/Claude toolchain update from npm latest.
 
 The image workflow still builds and publishes from the resulting Git commit.
 This script never installs a package or moves a production image tag.
@@ -22,7 +22,7 @@ SOURCES = {
     ),
     "claude": (
         "https://registry.npmjs.org/-/package/%40anthropic-ai%2Fclaude-code/dist-tags",
-        "stable",
+        "latest",
     ),
 }
 PINS = {
@@ -40,7 +40,7 @@ PINS = {
 
 def _checked_version(value: object) -> str:
     if not isinstance(value, str) or not VERSION.fullmatch(value):
-        raise ValueError(f"Registry supplied an invalid stable version: {value!r}")
+        raise ValueError(f"Registry supplied an invalid release version: {value!r}")
     return value
 
 
@@ -107,7 +107,7 @@ def main() -> None:
     latest = {provider: registry_version(provider) for provider in SOURCES}
     if args.apply:
         update_pins(latest)
-    print(json.dumps({"current": current, "stable": latest, "changed": current != latest}, sort_keys=True))
+    print(json.dumps({"current": current, "latest": latest, "changed": current != latest}, sort_keys=True))
 
 
 if __name__ == "__main__":
