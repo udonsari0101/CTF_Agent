@@ -349,6 +349,22 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
         assert result.returncode == 0, (
             executable + " failed its runtime check: " + result.stderr.strip()
         )
+    # The provider's private HOME is inaccessible in the command domain.
+    # Playwright's driver must create artifacts in the browser's job runtime,
+    # not in the inherited provider TMPDIR. Exercise an actual page load.
+    browser_job = Path("/solver-scratch/ctf-job-image-browser")
+    browser_workdir = browser_job / "competition/challenge/codex-workdir"
+    browser_workdir.mkdir(parents=True, mode=0o700)
+    browser_input = browser_workdir / "page.html"
+    browser_input.write_text("<!doctype html><title>browser smoke</title><main>ready</main>", encoding="utf-8")
+    browser_environment = dict(tool_env, TMPDIR="/root", TMP="/root", TEMP="/root")
+    browser_check = subprocess.run(
+        ["ctf-browser-act", "--html", "tmp/result.html", browser_input.as_uri()],
+        capture_output=True, text=True, timeout=45,
+        cwd=browser_workdir, env=browser_environment,
+    )
+    assert browser_check.returncode == 0, browser_check.stderr.strip()[-1200:]
+    assert "browser smoke" in (browser_workdir / "tmp/result.html").read_text(encoding="utf-8")
     apktool_version = subprocess.run(
         ["apktool", "--version"], capture_output=True, text=True,
         timeout=15, cwd=temporary, env=tool_env,
