@@ -64,11 +64,26 @@ class ApiCaptureTests(unittest.TestCase):
         })
         response.request = Request(response, resource_type="xhr")
         event = browser._response_event(response)
+        self.assertEqual(event["resource"], "xhr")
         self.assertEqual(event["cache"], {
             "cache-control": "public, max-age=60",
             "vary": "Accept-Encoding", "etag": 'W/"example"',
         })
         self.assertNotIn("do-not-log", str(event))
+
+    def test_request_origin_context_is_redacted_and_optional(self) -> None:
+        response = Response(b"ok")
+        request = Request(response, url="https://target.test/api?token=private")
+        request.frame = type("Frame", (), {"url": "https://target.test/page?session=secret"})()
+        event = browser._request_event(request)
+        self.assertEqual(event["resource"], "fetch")
+        self.assertEqual(event["frame_url_at_request"], "https://target.test/page?session=%3Credacted%3E")
+        self.assertNotIn("secret", str(event))
+        self.assertNotIn("private", str(event))
+        request.frame.url = "data:text/html,secret"
+        self.assertEqual(browser._request_event(request)["frame_url_at_request"], "<non-http-frame>")
+        del request.frame
+        self.assertNotIn("frame_url_at_request", browser._request_event(request))
 
     def test_wait_accepts_short_ms_field_used_by_browser_steps(self) -> None:
         class Page:

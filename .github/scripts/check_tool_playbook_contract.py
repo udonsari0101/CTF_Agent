@@ -42,6 +42,8 @@ class ToolPlaybookContract(unittest.TestCase):
         # high-value browser-sequence triage visible in its first page.
         self.assertIn("map the complete browser request sequence", web[:8000])
         self.assertIn("a direct GET that returns 400 is only a control", web[:8000])
+        self.assertIn("Mark a browser-context hypothesis disproved only when", web[:8000])
+        self.assertIn("separate default invocations start with fresh profiles", web[:8000])
         self.assertIn("No \u0060rockyou.txt\u0060 wordlist is bundled", asset("skill_forensics.md"))
 
         crypto = asset("skill_crypto.md")
