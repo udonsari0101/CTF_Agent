@@ -87,7 +87,7 @@ git clone https://github.com/udonsari0101/CTF_Agent.git ~/CTF_Agent && cd ~/CTF_
 
 | 분야 | 제공 도구와 용도 |
 | --- | --- |
-| Web | `curl`, `ctf-browser`를 통한 Chromium, `ctf-browser-act`를 통한 Playwright 조작과 선택형 동일 출처 JSON API 관찰, `ffuf`, `sqlmap`, `websocat`, Python HTTP 라이브러리: 요청, 경로, 세션, 브라우저 폼·업로드 분석 |
+| Web | `curl`, `ctf-browser`를 통한 Chromium, `ctf-browser-act`를 통한 Playwright 조작과 Firefox 전용 문제에 한해 작업 공간에 내려받는 선택형 Firefox, 동일 출처 JSON API 관찰, `ffuf`, `sqlmap`, `websocat`, Python HTTP 라이브러리: 요청, 경로, 세션, 브라우저 폼·업로드 분석 |
 | Pwn | `gdb`, `gdbserver`, `pwndbg`, `pwntools`, `ROPgadget`, `ropper`, `seccomp-tools`, `patchelf`, `qemu-user`, `strace`: 바이너리 동작, seccomp 필터 분석, 익스플로잇 재현 |
 | Reverse | Ghidra headless, JADX, `GoReSym`, `radare2`, `objdump`, `readelf`, `angr`, LIEF, Capstone, Unicorn, `apktool`, `wabt`: 네이티브, Go, Android, WebAssembly 분석 |
 | Crypto | PARI/GP, PyCryptodome, SymPy, `gmpy2`, Z3, `fpylll`, `owiener`, `john`: 대수, 격자, RSA, 암호 문제 |

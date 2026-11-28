@@ -104,6 +104,17 @@ may request a DevTools port for browser automation; its address is fixed to
 `127.0.0.1` inside that solver container. General Internet access remains
 available to Chromium and every other challenge tool.
 
+`ctf-browser-act` also defaults to Chromium. For a browser behavior that depends
+on Firefox, run its first local check with `--engine firefox --install-missing`;
+later calls in the same solve job use `--engine firefox`. The pinned Playwright
+Firefox build is downloaded into that job's scratch directory only (about
+315 MiB in the 2026-11-28 smoke test), after checking enough free space to
+preserve the configured solver storage floor plus installation headroom. It is
+removed with the job and does not enlarge the distributed container image.
+Named Firefox and Chromium sessions use separate profiles. The optional
+download requires network access; a failed browser launch is a tool error, not
+evidence that a challenge payload failed.
+
 QEMU system emulation uses software TCG and can run with `-nographic` and
 `-snapshot`. The solver can debug its own child processes with GDB or strace
 when the host seccomp implementation permits it. Host KVM, GPU, USB, display

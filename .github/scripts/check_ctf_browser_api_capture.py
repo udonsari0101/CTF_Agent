@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import http.server
 from io import StringIO
 import os
@@ -108,6 +108,47 @@ class ApiCaptureTests(unittest.TestCase):
         self.assertEqual(exit_status.exception.code, 0)
         self.assertIn("select_page", output.getvalue())
         self.assertIn("popup becomes active", output.getvalue())
+
+    def test_firefox_download_cannot_be_selected_for_default_chromium(self) -> None:
+        error = StringIO()
+        with redirect_stderr(error):
+            self.assertEqual(browser.main(["--install-missing"]), 2)
+        self.assertIn("requires --engine firefox", error.getvalue())
+
+    def test_optional_browser_path_does_not_leak_to_other_calls(self) -> None:
+        original = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+        try:
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "original-browser-path"
+            with browser._playwright_browser_path(Path("job-local-browsers")):
+                self.assertEqual(os.environ["PLAYWRIGHT_BROWSERS_PATH"],
+                                 "job-local-browsers")
+            self.assertEqual(os.environ["PLAYWRIGHT_BROWSERS_PATH"],
+                             "original-browser-path")
+        finally:
+            if original is None:
+                os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+            else:
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = original
+
+    def test_firefox_install_refuses_low_disk_before_download(self) -> None:
+        low_disk = type("DiskUsage", (), {"free": browser.MIN_FIREFOX_INSTALL_FREE - 1})()
+        with patch.object(browser.shutil, "disk_usage", return_value=low_disk), \
+             patch.object(browser.subprocess, "run") as download:
+            with self.assertRaisesRegex(ValueError, "free job storage"):
+                browser._install_firefox(Path("pw-browsers"), {}, Path("."))
+        download.assert_not_called()
+
+    def test_firefox_install_preserves_configured_storage_floor(self) -> None:
+        floor = 5 * 1024**3
+        below_reserve = type("DiskUsage", (), {
+            "free": floor + browser.FIREFOX_INSTALL_HEADROOM - 1,
+        })()
+        with patch.dict(os.environ, {"CTF_SOLVER_MIN_FREE_BYTES": str(floor)}), \
+             patch.object(browser.shutil, "disk_usage", return_value=below_reserve), \
+             patch.object(browser.subprocess, "run") as download:
+            with self.assertRaisesRegex(ValueError, "free job storage"):
+                browser._install_firefox(Path("pw-browsers"), {}, Path("."))
+        download.assert_not_called()
 
     def test_popup_selection_and_history_keep_the_original_page(self) -> None:
         class Handler(http.server.BaseHTTPRequestHandler):

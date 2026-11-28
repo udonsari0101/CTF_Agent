@@ -96,7 +96,7 @@ Each solver runs in a separate container with its own scratch space. The challen
 
 | Field | Available tools and typical uses |
 | --- | --- |
-| Web | `curl`, Chromium via `ctf-browser`, Playwright interaction and optional bounded same-origin JSON API observation via `ctf-browser-act`, `ffuf`, `sqlmap`, `websocat`, Python HTTP libraries: request inspection, paths, sessions, browser forms and uploads. |
+| Web | `curl`, Chromium via `ctf-browser`, Playwright interaction via `ctf-browser-act` (with optional job-local Firefox download for Firefox-specific cases), bounded same-origin JSON API observation, `ffuf`, `sqlmap`, `websocat`, Python HTTP libraries: request inspection, paths, sessions, browser forms and uploads. |
 | Pwn | `gdb`, `gdbserver`, `pwndbg`, `pwntools`, `ROPgadget`, `ropper`, `seccomp-tools`, `patchelf`, `qemu-user`, `strace`: binary behavior, seccomp filters, and exploit reproduction. |
 | Reverse | Ghidra headless, JADX, `GoReSym`, `radare2`, `objdump`, `readelf`, `angr`, LIEF, Capstone, Unicorn, `apktool`, `wabt`: native, Go, Android, and WebAssembly analysis. |
 | Crypto | PARI/GP, PyCryptodome, SymPy, `gmpy2`, Z3, `fpylll`, `owiener`, `john`: algebra, lattice, RSA, and password challenges. |

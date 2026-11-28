@@ -1,5 +1,5 @@
 #!/usr/local/libexec/ctf-command/python
-"""Drive job-local Chromium and report bounded browser observations as JSON.
+"""Drive a job-local browser and report bounded observations as JSON.
 
 Steps are a JSON list. Example:
   [{"action":"fill","selector":"#user","value":"guest"},
@@ -11,7 +11,7 @@ Steps are a JSON list. Example:
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import timezone
 from email.utils import format_datetime, parsedate_to_datetime
 from importlib.machinery import SourceFileLoader
@@ -21,6 +21,7 @@ import os
 import re
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -38,6 +39,8 @@ MAX_API_JSON_EVENTS = 8
 INITIAL_API_JSON_EVENTS = 2
 MAX_API_JSON_BYTES = 4096
 MAX_API_PENDING_REQUESTS = 128
+MIN_FIREFOX_INSTALL_FREE = 768 * 1024 * 1024
+FIREFOX_INSTALL_HEADROOM = 400 * 1024 * 1024
 
 
 @contextmanager
@@ -61,6 +64,44 @@ def _playwright_driver_temp(path: Path):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+@contextmanager
+def _playwright_browser_path(path: Path):
+    previous = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+        else:
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = previous
+
+
+def _install_firefox(path: Path, browser_env: dict[str, str], workdir: Path) -> None:
+    try:
+        minimum_remaining = int(os.environ.get("CTF_SOLVER_MIN_FREE_BYTES", str(1024**3)))
+    except ValueError as error:
+        raise ValueError("CTF_SOLVER_MIN_FREE_BYTES must be an integer") from error
+    if minimum_remaining < 0:
+        raise ValueError("CTF_SOLVER_MIN_FREE_BYTES must be non-negative")
+    required = max(MIN_FIREFOX_INSTALL_FREE, minimum_remaining + FIREFOX_INSTALL_HEADROOM)
+    if shutil.disk_usage(workdir).free < required:
+        raise ValueError("Firefox installation needs more free job storage")
+    environment = dict(os.environ)
+    environment.update(browser_env)
+    environment["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "firefox"],
+            env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=180, check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("Firefox installation timed out") from error
+    if result.returncode:
+        raise ValueError("Firefox installation failed; check job storage and network access")
 
 
 def _load_browser_guard():
@@ -399,7 +440,12 @@ def _run_browser(arguments: argparse.Namespace) -> int:
         if ephemeral:
             runtime = guard._make_runtime(workdir)
         else:
-            runtime = guard._persistent_runtime(workdir, arguments.session)
+            session = arguments.session
+            if arguments.engine == "firefox":
+                if not guard.SESSION_NAME.fullmatch(session):
+                    raise ValueError("ctf-browser session name is invalid")
+                session = "firefox-" + guard._session_key(session)
+            runtime = guard._persistent_runtime(workdir, session)
             session_lock = guard._lock_session(runtime)
         guard._ensure_private_directory(runtime / "downloads")
         observations = {
@@ -413,26 +459,47 @@ def _run_browser(arguments: argparse.Namespace) -> int:
         def add(kind: str, event: dict) -> None:
             _record_event(observations, kind, event)
 
-        with _playwright_driver_temp(runtime / "tmp"), sync_playwright() as playwright:
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(runtime / "profile"),
-                executable_path=guard.CHROMIUM,
-                headless=True,
-                accept_downloads=True,
-                downloads_path=str(runtime / "downloads"),
-                env=guard.browser_environment(runtime),
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-background-networking",
-                    "--disable-component-update",
-                    "--disable-sync",
-                    f"--disk-cache-dir={runtime / 'cache'}",
-                    f"--crash-dumps-dir={runtime / 'crashes'}",
-                ],
-            )
+        browser_env = guard.browser_environment(runtime)
+        browser_path = guard._runtime_parent(workdir) / "pw-browsers"
+        if arguments.engine == "firefox":
+            guard._ensure_private_directory(browser_path)
+        path_context = (
+            _playwright_browser_path(browser_path)
+            if arguments.engine == "firefox" else nullcontext()
+        )
+        with ExitStack() as stack:
+            stack.enter_context(path_context)
+            stack.enter_context(_playwright_driver_temp(runtime / "tmp"))
+            playwright = stack.enter_context(sync_playwright())
+            browser_type = playwright.firefox if arguments.engine == "firefox" else playwright.chromium
+            launch_options = {
+                "user_data_dir": str(runtime / "profile"),
+                "headless": True,
+                "accept_downloads": True,
+                "downloads_path": str(runtime / "downloads"),
+                "env": browser_env,
+            }
+            if arguments.engine == "firefox":
+                if not Path(browser_type.executable_path).is_file() and arguments.install_missing:
+                    _install_firefox(browser_path, browser_env, workdir)
+                if not Path(browser_type.executable_path).is_file():
+                    raise ValueError("Firefox is not installed in this job; add --install-missing")
+            else:
+                launch_options.update({
+                    "executable_path": guard.CHROMIUM,
+                    "args": [
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-background-networking",
+                        "--disable-component-update",
+                        "--disable-sync",
+                        f"--disk-cache-dir={runtime / 'cache'}",
+                        f"--crash-dumps-dir={runtime / 'crashes'}",
+                    ],
+                })
+            context = browser_type.launch_persistent_context(**launch_options)
             try:
                 active = [context.pages[0] if context.pages else context.new_page()]
 
@@ -537,7 +604,7 @@ def _run_browser(arguments: argparse.Namespace) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="ctf-browser-act",
-        description="Click, fill, upload, and inspect a job-local headless Chromium page.",
+        description="Click, fill, upload, and inspect a job-local headless browser page.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Step JSON actions (up to 100, in one browser context):\n"
@@ -552,6 +619,14 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument("url", nargs="?", help="initial http(s) or file URL")
+    parser.add_argument(
+        "--engine", choices=("chromium", "firefox"), default="chromium",
+        help="browser engine; Firefox is optional and downloaded only when requested",
+    )
+    parser.add_argument(
+        "--install-missing", action="store_true",
+        help="download Firefox into this solve job if needed (requires --engine firefox)",
+    )
     parser.add_argument("--session", help="reuse the named job-local browser profile")
     parser.add_argument("--steps", help="JSON list of browser actions in the current solve job")
     parser.add_argument("--output", help="write bounded JSON observations to a job-local file")
@@ -564,6 +639,8 @@ def main(argv: list[str]) -> int:
     )
     arguments = parser.parse_args(argv)
     try:
+        if arguments.install_missing and arguments.engine != "firefox":
+            raise ValueError("--install-missing requires --engine firefox")
         return _run_browser(arguments)
     except (OSError, ValueError, json.JSONDecodeError, PlaywrightError) as error:
         print(f"ctf-browser-act: {error}", file=sys.stderr)
