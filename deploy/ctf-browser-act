@@ -229,7 +229,8 @@ def _summary(page, observations: dict, actions: list[dict]) -> dict:
 def _response_event(response) -> dict:
     event = {
         "event": "response", "status": response.status,
-        "method": response.request.method, "url": _url(response.url),
+        "method": response.request.method, "resource": response.request.resource_type,
+        "url": _url(response.url),
     }
     if response.request.resource_type in ("document", "xhr", "fetch"):
         headers = response.headers
@@ -244,6 +245,20 @@ def _response_event(response) -> dict:
         retry_after = _retry_after(response.headers.get("retry-after"))
         if retry_after is not None:
             event["retry_after"] = retry_after
+    return event
+
+
+def _request_event(request) -> dict:
+    event = {
+        "event": "request", "method": request.method,
+        "resource": request.resource_type, "url": _url(request.url),
+    }
+    try:
+        frame_url = request.frame.url
+    except (AttributeError, PlaywrightError):
+        frame_url = ""
+    if frame_url:
+        event["frame_url_at_request"] = _url(frame_url)
     return event
 
 
@@ -405,10 +420,7 @@ def _run_browser(arguments: argparse.Namespace) -> int:
                     active[0] = page
 
                 context.on("page", on_page)
-                context.on("request", lambda request: add("network", {
-                    "event": "request", "method": request.method,
-                    "resource": request.resource_type, "url": _url(request.url),
-                }))
+                context.on("request", lambda request: add("network", _request_event(request)))
                 context.on("response", lambda response: add("network", _response_event(response)))
                 if arguments.capture_api_json:
                     _attach_api_capture(context, observations)
