@@ -158,6 +158,12 @@ def _execute(page, step: dict, job_root: Path, timeout: int) -> object:
     if action == "goto":
         response = page.goto(_required(step, "url"), wait_until="domcontentloaded", timeout=timeout)
         return response.status if response is not None else None
+    if action == "back":
+        response = page.go_back(wait_until="domcontentloaded", timeout=timeout)
+        return response.status if response is not None else None
+    if action == "forward":
+        response = page.go_forward(wait_until="domcontentloaded", timeout=timeout)
+        return response.status if response is not None else None
     if action == "click":
         page.locator(_required(step, "selector")).click(timeout=timeout)
     elif action == "fill":
@@ -224,6 +230,29 @@ def _summary(page, observations: dict, actions: list[dict]) -> dict:
         result["api_json"] = observations["api_json"]
         result["api_json_dropped_events"] = observations["api_json_dropped_events"]
     return result
+
+
+def _page_catalog(context, selected) -> dict:
+    """Expose tab order without leaking query values or unbounded page lists."""
+    pages = [page for page in context.pages if not page.is_closed()]
+    return {
+        "active_page": pages.index(selected) if selected in pages else None,
+        "page_count": len(pages),
+        "pages": [
+            {"index": index, "url": _url(page.url)}
+            for index, page in enumerate(pages[:8])
+        ],
+    }
+
+
+def _select_page(context, step: dict):
+    index = step.get("index")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("select_page requires a non-negative numeric index")
+    pages = [page for page in context.pages if not page.is_closed()]
+    if index >= len(pages):
+        raise ValueError(f"page index {index} is unavailable; open pages: {len(pages)}")
+    return pages[index]
 
 
 def _response_event(response) -> dict:
@@ -450,6 +479,7 @@ def _run_browser(arguments: argparse.Namespace) -> int:
                             ),
                         })
                         partial = _summary(active[0], observations, actions)
+                        partial.update(_page_catalog(context, active[0]))
                         if output is not None:
                             output.write_text(
                                 json.dumps(partial, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -462,11 +492,16 @@ def _run_browser(arguments: argparse.Namespace) -> int:
                     })
                 for index, step in enumerate(steps, start=1):
                     try:
-                        value = _execute(active[0], step, job_root, arguments.timeout)
+                        if step["action"] == "select_page":
+                            active[0] = _select_page(context, step)
+                            value = _page_catalog(context, active[0])
+                        else:
+                            value = _execute(active[0], step, job_root, arguments.timeout)
                     except (OSError, ValueError, PlaywrightError) as error:
                         actions.append({"index": index, "action": step["action"],
                                         "error": _text(error, MAX_ACTION_RESULT)})
                         partial = _summary(active[0], observations, actions)
+                        partial.update(_page_catalog(context, active[0]))
                         if output is not None:
                             output.write_text(json.dumps(partial, ensure_ascii=False, indent=2), encoding="utf-8")
                         print(json.dumps(partial, ensure_ascii=False))
@@ -484,6 +519,7 @@ def _run_browser(arguments: argparse.Namespace) -> int:
                 if screenshot is not None:
                     page.screenshot(path=str(screenshot), full_page=True, timeout=arguments.timeout)
                 result = _summary(page, observations, actions)
+                result.update(_page_catalog(context, page))
                 if output is not None:
                     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
                 print(json.dumps(result, ensure_ascii=False))
