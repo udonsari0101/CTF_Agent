@@ -80,6 +80,20 @@ class BrowserSessionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 browser._persistent_runtime(self.workdir, "link")
 
+    @unittest.skipUnless(os.name == "posix", "directory mode recovery is specific to Linux")
+    def test_owned_cache_directory_recovers_private_mode(self) -> None:
+        cache = browser._runtime_parent(self.workdir)
+        marker = cache / "keep.txt"
+        marker.write_text("saved", encoding="ascii")
+        temporary = self.workdir / "tmp"
+        temporary.chmod(0o755)
+        cache.chmod(0o755)
+
+        self.assertEqual(browser._runtime_parent(self.workdir), cache)
+        self.assertEqual(temporary.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(cache.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(marker.read_text(encoding="ascii"), "saved")
+
     def test_default_cleans_only_its_profile_while_named_profile_survives(self) -> None:
         commands: list[list[str]] = []
         seen_markers: list[bool] = []
