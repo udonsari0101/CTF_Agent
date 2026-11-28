@@ -177,17 +177,38 @@ def _make_runtime(workdir: Path) -> Path:
 
 
 def _ensure_private_directory(path: Path) -> None:
-    """Reject links and directories writable by another user."""
+    """Keep an owned directory private without following a swapped symlink."""
 
     try:
         path.mkdir(mode=0o700)
     except FileExistsError:
         pass
-    details = path.lstat()
-    if not stat.S_ISDIR(details.st_mode):
-        raise ValueError("ctf-browser session directory is unsafe")
-    if os.name == "posix" and (details.st_uid != os.geteuid() or details.st_mode & 0o077):
-        raise ValueError("ctf-browser session directory is unsafe")
+    if os.name != "posix":
+        if not stat.S_ISDIR(path.lstat().st_mode):
+            raise ValueError("ctf-browser session directory is unsafe")
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError("ctf-browser session directory is unsafe") from exc
+    try:
+        details = os.fstat(fd)
+        if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.geteuid():
+            raise ValueError("ctf-browser session directory is unsafe")
+        if details.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+        current = path.lstat()
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or current.st_dev != details.st_dev
+            or current.st_ino != details.st_ino
+            or current.st_mode & 0o077
+        ):
+            raise ValueError("ctf-browser session directory is unsafe")
+    finally:
+        os.close(fd)
 
 
 def _ensure_runtime_directories(runtime: Path) -> None:
