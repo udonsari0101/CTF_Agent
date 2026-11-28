@@ -4,6 +4,8 @@ In the first few minutes with supplied source, make a compact path map: attacker
 
 Start with the supplied goal and a normal control request. When source is available, trace the user-controlled input through the reachable route to the relevant sink; compare neighboring handlers where useful. Do not assume there is exactly one vulnerable handler or that every challenge uses a framework deviation. The recipes below are options, not a sequence to exhaust. base.md owns the solve loop, submission/POISON, belief≠proof, local→remote/PoW, and the `notes/` model.
 
+Test a guard in the context where its response is consumed. If a response depends on a header, method, cookie, or other request property, check whether redirects, caches, and browser history preserve that distinction. Compare request and response headers and use a harmless marker in the same browser context. A fresh navigation that receives a denial only rules out that fresh request; a history traversal or cached response may follow a different path. Do not dismiss all such paths or pivot into deep dependency internals until the relevant sequence has been observed.
+
 For a browser-dependent hypothesis, record the actors, origins, pages, request order, headers, storage state and navigation steps needed for the claimed effect. Reproduce that sequence with a harmless marker before treating a negative result as disproof. A single request or a different browser context is only a control for that context. Use the observed network and console events to decide the next discriminating test; stop after the bounded test if it produces no new evidence. `localhost` can refer to different machines in the bot, target and solver container, so verify the address mapping.
 
 ## Evidence budget on a live target
