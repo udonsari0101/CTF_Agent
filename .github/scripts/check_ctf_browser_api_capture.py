@@ -5,9 +5,12 @@ from __future__ import annotations
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 import http.server
+import os
 from pathlib import Path
+import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from playwright.sync_api import sync_playwright
 
@@ -52,6 +55,22 @@ class Request:
 class ApiCaptureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.observations = {"api_json": [], "api_json_dropped_events": 0}
+
+    def test_playwright_driver_uses_job_temp_and_restores_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            job_temp = Path(directory) / "job" / "tmp"
+            job_temp.mkdir(parents=True)
+            with patch.dict(os.environ, {"TMPDIR": "/private/provider/home/tmp",
+                                        "TMP": "/private/provider/home/tmp",
+                                        "TEMP": "/private/provider/home/tmp"}):
+                with self.assertRaisesRegex(RuntimeError, "forced"):
+                    with browser._playwright_driver_temp(job_temp):
+                        self.assertEqual(
+                            [os.environ[key] for key in ("TMPDIR", "TMP", "TEMP")],
+                            [str(job_temp)] * 3,
+                        )
+                        raise RuntimeError("forced")
+                self.assertEqual(os.environ["TMPDIR"], "/private/provider/home/tmp")
 
     def record(self, request: Request, page_url: str = "https://target.test/page") -> None:
         browser._record_api_json(self.observations, request, page_url)
