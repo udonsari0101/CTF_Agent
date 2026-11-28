@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /usr/local/libexec/ctf-command/python /app/ctf_agent/submit_flag.py "$@"
+exec /usr/local/libexec/ctf-command/python -I -c 'import sys; sys.path.insert(0, "/app"); from ctf_agent.submit_flag import main; raise SystemExit(main())' "$@"
