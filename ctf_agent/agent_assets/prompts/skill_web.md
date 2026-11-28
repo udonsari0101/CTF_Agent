@@ -2,6 +2,8 @@
 
 Start with the supplied goal and a normal control request. When source is available, trace the user-controlled input through the reachable route to the relevant sink; compare neighboring handlers where useful. Do not assume there is exactly one vulnerable handler or that every challenge uses a framework deviation. The recipes below are options, not a sequence to exhaust. base.md owns the solve loop, submission/POISON, belief≠proof, local→remote/PoW, and the `notes/` model.
 
+Before chasing a library version, map the complete browser request sequence around a suspicious route. If a page fetches a URL with a special header or cookie and later renders that response, test whether the same URL can be reached as a document after a redirect or history traversal in the same browser context. Inspect `Cache-Control` and `Vary`; a direct GET that returns 400 is only a control and does not rule out reuse of an earlier response. Use a harmless marker and one bounded end-to-end browser test before spending time on sanitizer bypasses or broad payload searches. Discard this path when the browser trace disproves reuse.
+
 ## Evidence budget on a live target
 Map the goal, trust boundary, controlled input, and one cheapest falsifying test before probing. The tactics below are candidates, not a checklist to run in full; choose only those supported by a route, response, source line, or browser behavior. Distinguish user and admin-bot contexts, and record which context produced each observation.
 

@@ -38,6 +38,10 @@ class ToolPlaybookContract(unittest.TestCase):
         self.assertNotIn("/usr/share/wordlists/dirb/common.txt", web)
         self.assertIn("tmp/paths.txt", web)
         self.assertIn("tmp/params.txt", web)
+        # The shell activity log bounds a single tool result; keep the
+        # high-value browser-sequence triage visible in its first page.
+        self.assertIn("map the complete browser request sequence", web[:8000])
+        self.assertIn("a direct GET that returns 400 is only a control", web[:8000])
         self.assertIn("No \u0060rockyou.txt\u0060 wordlist is bundled", asset("skill_forensics.md"))
 
         crypto = asset("skill_crypto.md")
