@@ -108,7 +108,8 @@ available to Chromium and every other challenge tool.
 on Firefox, run its first local check with `--engine firefox --install-missing`;
 later calls in the same solve job use `--engine firefox`. The pinned Playwright
 Firefox build is downloaded into that job's scratch directory only (about
-315 MiB in the 2026-11-28 smoke test), after a 768 MiB free-space check. It is
+315 MiB in the 2026-11-28 smoke test), after checking enough free space to
+preserve the configured solver storage floor plus installation headroom. It is
 removed with the job and does not enlarge the distributed container image.
 Named Firefox and Chromium sessions use separate profiles. The optional
 download requires network access; a failed browser launch is a tool error, not

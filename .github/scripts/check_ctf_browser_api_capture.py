@@ -138,6 +138,18 @@ class ApiCaptureTests(unittest.TestCase):
                 browser._install_firefox(Path("pw-browsers"), {}, Path("."))
         download.assert_not_called()
 
+    def test_firefox_install_preserves_configured_storage_floor(self) -> None:
+        floor = 5 * 1024**3
+        below_reserve = type("DiskUsage", (), {
+            "free": floor + browser.FIREFOX_INSTALL_HEADROOM - 1,
+        })()
+        with patch.dict(os.environ, {"CTF_SOLVER_MIN_FREE_BYTES": str(floor)}), \
+             patch.object(browser.shutil, "disk_usage", return_value=below_reserve), \
+             patch.object(browser.subprocess, "run") as download:
+            with self.assertRaisesRegex(ValueError, "free job storage"):
+                browser._install_firefox(Path("pw-browsers"), {}, Path("."))
+        download.assert_not_called()
+
     def test_popup_selection_and_history_keep_the_original_page(self) -> None:
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:

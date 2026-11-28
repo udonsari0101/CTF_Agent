@@ -40,6 +40,7 @@ INITIAL_API_JSON_EVENTS = 2
 MAX_API_JSON_BYTES = 4096
 MAX_API_PENDING_REQUESTS = 128
 MIN_FIREFOX_INSTALL_FREE = 768 * 1024 * 1024
+FIREFOX_INSTALL_HEADROOM = 400 * 1024 * 1024
 
 
 @contextmanager
@@ -79,8 +80,15 @@ def _playwright_browser_path(path: Path):
 
 
 def _install_firefox(path: Path, browser_env: dict[str, str], workdir: Path) -> None:
-    if shutil.disk_usage(workdir).free < MIN_FIREFOX_INSTALL_FREE:
-        raise ValueError("Firefox installation needs at least 768 MiB of free job storage")
+    try:
+        minimum_remaining = int(os.environ.get("CTF_SOLVER_MIN_FREE_BYTES", str(1024**3)))
+    except ValueError as error:
+        raise ValueError("CTF_SOLVER_MIN_FREE_BYTES must be an integer") from error
+    if minimum_remaining < 0:
+        raise ValueError("CTF_SOLVER_MIN_FREE_BYTES must be non-negative")
+    required = max(MIN_FIREFOX_INSTALL_FREE, minimum_remaining + FIREFOX_INSTALL_HEADROOM)
+    if shutil.disk_usage(workdir).free < required:
+        raise ValueError("Firefox installation needs more free job storage")
     environment = dict(os.environ)
     environment.update(browser_env)
     environment["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
