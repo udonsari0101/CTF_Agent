@@ -4,7 +4,8 @@
 Steps are a JSON list. Example:
   [{"action":"fill","selector":"#user","value":"guest"},
    {"action":"click","selector":"button[type=submit]"},
-   {"action":"wait_for","selector":"#result"}]
+   {"action":"wait_for","selector":"#result"},
+   {"action":"wait","milliseconds":1500}]
 """
 
 from __future__ import annotations
@@ -183,9 +184,9 @@ def _execute(page, step: dict, job_root: Path, timeout: int) -> object:
     elif action == "wait_for":
         page.locator(_required(step, "selector")).wait_for(timeout=timeout)
     elif action == "wait":
-        milliseconds = step.get("milliseconds")
+        milliseconds = step.get("milliseconds", step.get("ms"))
         if not isinstance(milliseconds, int) or not 0 <= milliseconds <= MAX_WAIT_MS:
-            raise ValueError(f"wait milliseconds must be 0-{MAX_WAIT_MS}")
+            raise ValueError(f"wait requires milliseconds (or ms) from 0-{MAX_WAIT_MS}")
         page.wait_for_timeout(milliseconds)
     elif action == "evaluate":
         return page.evaluate(_required(step, "expression"))

@@ -95,6 +95,7 @@ ctf-browser-act --session login --steps tmp/browser-steps.json \
   --html tmp/after-login.html --screenshot tmp/after-login.png https://TARGET/login
 ```
 For uploads use `{"action":"upload","selector":"input[type=file]","files":["attachments/sample.bin"]}`; for in-page state use `{"action":"evaluate","expression":"localStorage.getItem('key')"}`. `ctf-browser-act --help` lists output and timeout options. This is a separate headless browser inside the solve job, not the operator's browser.
+For a short fixed delay in a step list, use `{"action":"wait","milliseconds":1500}` (or `"ms":1500`). Prefer `wait_for` on a selector when the page exposes a completion signal.
 ```bash
 curl -sSi https://TARGET/ | sed -n '1,25p'           # headers, cookies, server, framework tells
 curl -sS https://TARGET/robots.txt https://TARGET/sitemap.xml https://TARGET/.well-known/
