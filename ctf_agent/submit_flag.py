@@ -14,6 +14,8 @@ import tempfile
 from pathlib import Path
 from typing import Sequence
 
+from .flag_provenance import literal_in_supplied_inputs
+
 
 MAX_CANDIDATE_LENGTH = 4_000
 _CANDIDATE_NAME = ".flag-candidate"
@@ -85,6 +87,26 @@ def record_candidate(candidate: str, directory: Path | None = None) -> Path:
                 pass
 
 
+def _unverified_source_literal(workdir: Path, candidate: str) -> bool:
+    """Give the model immediate feedback before a source placeholder is handed off.
+
+    The worker repeats this check at its trust boundary; the CLI check only
+    improves the current turn's chance to continue toward a real target result.
+    """
+
+    brief = workdir.parent / "chal_desc.md"
+    try:
+        if brief.stat().st_size > 8 * 1024 * 1024:
+            return False
+        text = brief.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    remote = next((line for line in text.splitlines() if line.startswith("Remote: ")), "")
+    if not remote or remote.startswith("Remote: none") or remote.startswith("Remote: not supplied"):
+        return False
+    return literal_in_supplied_inputs(workdir, candidate, text)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point with fixed, candidate-free diagnostics."""
 
@@ -93,6 +115,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write('usage: submit-flag "<FLAG>"\n')
         return 64
     try:
+        validate_candidate(arguments[0])
+        if _unverified_source_literal(Path.cwd(), arguments[0]):
+            sys.stderr.write(
+                "submit-flag: candidate appears in supplied files; "
+                "a remote-backed challenge needs independent verification\n"
+            )
+            return 65
         record_candidate(arguments[0])
     except InvalidCandidate:
         sys.stderr.write("submit-flag: invalid candidate\n")
