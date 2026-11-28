@@ -56,6 +56,20 @@ class ApiCaptureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.observations = {"api_json": [], "api_json_dropped_events": 0}
 
+    def test_response_cache_metadata_excludes_credentials(self) -> None:
+        response = Response(b"ok")
+        response.headers.update({
+            "cache-control": "public, max-age=60", "vary": "Accept-Encoding",
+            "etag": 'W/"example"', "set-cookie": "secret=do-not-log",
+        })
+        response.request = Request(response, resource_type="xhr")
+        event = browser._response_event(response)
+        self.assertEqual(event["cache"], {
+            "cache-control": "public, max-age=60",
+            "vary": "Accept-Encoding", "etag": 'W/"example"',
+        })
+        self.assertNotIn("do-not-log", str(event))
+
     def test_wait_accepts_short_ms_field_used_by_browser_steps(self) -> None:
         class Page:
             def __init__(self) -> None:

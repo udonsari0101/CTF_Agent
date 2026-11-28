@@ -231,6 +231,15 @@ def _response_event(response) -> dict:
         "event": "response", "status": response.status,
         "method": response.request.method, "url": _url(response.url),
     }
+    if response.request.resource_type in ("document", "xhr", "fetch"):
+        headers = response.headers
+        cache = {
+            name: _text(headers[name], 160)
+            for name in ("cache-control", "vary", "etag", "age", "last-modified", "expires")
+            if name in headers
+        }
+        if cache:
+            event["cache"] = cache
     if response.status == 429:
         retry_after = _retry_after(response.headers.get("retry-after"))
         if retry_after is not None:
