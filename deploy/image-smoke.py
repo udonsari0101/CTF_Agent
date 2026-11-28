@@ -388,6 +388,14 @@ with tempfile.TemporaryDirectory(prefix="ctf-image-check-") as temporary:
     )
     assert browser_check.returncode == 0, browser_check.stderr.strip()[-1200:]
     assert "browser smoke" in (browser_workdir / "tmp/result.html").read_text(encoding="utf-8")
+    stdin_browser_check = subprocess.run(
+        ["ctf-browser-act", "--steps", "-", "--html", "tmp/stdin-result.html", browser_input.as_uri()],
+        input='[{"action":"wait","ms":10}]',
+        capture_output=True, text=True, timeout=45,
+        cwd=browser_workdir, env=browser_environment,
+    )
+    assert stdin_browser_check.returncode == 0, stdin_browser_check.stderr.strip()[-1200:]
+    assert "browser smoke" in (browser_workdir / "tmp/stdin-result.html").read_text(encoding="utf-8")
     apktool_version = subprocess.run(
         ["apktool", "--version"], capture_output=True, text=True,
         timeout=15, cwd=temporary, env=tool_env,

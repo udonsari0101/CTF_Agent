@@ -29,6 +29,7 @@ from playwright.sync_api import Error as PlaywrightError, TimeoutError as Playwr
 
 
 MAX_STEPS = 100
+MAX_STEPS_INPUT_BYTES = 128 * 1024
 MAX_EVENTS = 200
 INITIAL_EVENTS = 40
 MAX_BODY = 16000
@@ -123,6 +124,8 @@ def _job_path(value: str, job_root: Path, *, input_file: bool = False) -> Path:
 
     if not value or "\x00" in value:
         raise ValueError("a job-local file path is required")
+    if input_file and value.replace("\\", "/").startswith(("/dev/fd/", "/proc/self/fd/")):
+        raise ValueError("process substitution is unsupported; use --steps - or a job-local JSON file")
     candidate = Path(value)
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
@@ -140,10 +143,16 @@ def _job_path(value: str, job_root: Path, *, input_file: bool = False) -> Path:
     return path
 
 
-def _steps(path: Path | None) -> list[dict]:
-    if path is None:
+def _steps(path: Path | None, *, stdin: bool = False) -> list[dict]:
+    if stdin:
+        data = sys.stdin.buffer.read(MAX_STEPS_INPUT_BYTES + 1)
+        if len(data) > MAX_STEPS_INPUT_BYTES:
+            raise ValueError("browser steps on stdin exceed 128 KiB")
+        document = json.loads(data.decode("utf-8"))
+    elif path is None:
         return []
-    document = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        document = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, list) or len(document) > MAX_STEPS:
         raise ValueError(f"steps must be a JSON list of at most {MAX_STEPS} actions")
     for index, step in enumerate(document):
@@ -424,7 +433,11 @@ def _run_browser(arguments: argparse.Namespace) -> int:
     guard = _load_browser_guard()
     workdir = guard.job_workdir(Path.cwd())
     job_root = workdir.parents[2]
-    steps = _steps(_job_path(arguments.steps, job_root, input_file=True) if arguments.steps else None)
+    steps = _steps(
+        _job_path(arguments.steps, job_root, input_file=True)
+        if arguments.steps and arguments.steps != "-" else None,
+        stdin=arguments.steps == "-",
+    )
     if not arguments.url and not any(step["action"] == "goto" for step in steps):
         raise ValueError("provide a URL or a goto step")
     if not 1000 <= arguments.timeout <= 120000:
@@ -628,7 +641,7 @@ def main(argv: list[str]) -> int:
         help="download Firefox into this solve job if needed (requires --engine firefox)",
     )
     parser.add_argument("--session", help="reuse the named job-local browser profile")
-    parser.add_argument("--steps", help="JSON list of browser actions in the current solve job")
+    parser.add_argument("--steps", help="job-local JSON action list, or - to read JSON from stdin")
     parser.add_argument("--output", help="write bounded JSON observations to a job-local file")
     parser.add_argument("--html", help="save final DOM to a job-local file")
     parser.add_argument("--screenshot", help="save final PNG to a job-local file")

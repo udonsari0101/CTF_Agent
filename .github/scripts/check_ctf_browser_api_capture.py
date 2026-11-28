@@ -6,7 +6,7 @@ from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from contextlib import redirect_stderr, redirect_stdout
 import http.server
-from io import StringIO
+from io import BytesIO, StringIO
 import os
 from pathlib import Path
 import tempfile
@@ -57,6 +57,21 @@ class Request:
 class ApiCaptureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.observations = {"api_json": [], "api_json_dropped_events": 0}
+
+    def test_browser_steps_can_read_bounded_stdin(self) -> None:
+        source = type("Stdin", (), {"buffer": BytesIO(b'[{"action":"wait","ms":10}]')})()
+        with patch.object(browser.sys, "stdin", source):
+            self.assertEqual(browser._steps(None, stdin=True), [{"action": "wait", "ms": 10}])
+        oversized = type("Stdin", (), {
+            "buffer": BytesIO(b" " * (browser.MAX_STEPS_INPUT_BYTES + 1)),
+        })()
+        with patch.object(browser.sys, "stdin", oversized):
+            with self.assertRaisesRegex(ValueError, "exceed 128 KiB"):
+                browser._steps(None, stdin=True)
+
+    def test_browser_steps_reject_process_substitution_with_guidance(self) -> None:
+        with self.assertRaisesRegex(ValueError, "use --steps -"):
+            browser._job_path("/dev/fd/63", Path.cwd(), input_file=True)
 
     def test_response_cache_metadata_excludes_credentials(self) -> None:
         response = Response(b"ok")
